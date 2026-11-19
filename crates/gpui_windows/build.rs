@@ -7,7 +7,8 @@
 //! no build needs `fxc.exe`, and builds from another OS (a Linux cross build to
 //! `x86_64-pc-windows-gnu`, for example) work. After changing a `.hlsl` file,
 //! regenerate the bytes: build in release with `GPUI_REGENERATE_SHADERS=1`
-//! (and `GPUI_FXC_PATH`, or `fxc.exe` on `PATH` or in the Windows SDK).
+//! (and `GPUI_FXC_PATH`, or `fxc.exe` on `PATH` or in the Windows SDK), or
+//! run `scripts/regen-windows-shaders.sh` on WSL via `tooling/fxc-lite`.
 //! Debug builds compile the shaders at run time and need none of this.
 //!
 //! Everything here follows the *target* (`CARGO_CFG_*`): in a build script,

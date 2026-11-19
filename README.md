@@ -140,6 +140,9 @@ cargo run -p gpui --example components_showcase
 
 # Regenerate crates/gpui/src/icons/lucide_generated.rs after updating SVGs
 python3 scripts/generate_lucide.py
+
+# Regenerate crates/gpui_windows/src/shaders_bytes.rs from WSL after editing .hlsl files
+./scripts/regen-windows-shaders.sh
 ```
 
 ## Licenses

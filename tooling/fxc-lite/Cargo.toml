@@ -1,0 +1,14 @@
+[package]
+name = "fxc-lite"
+version = "0.1.0"
+description = "Minimal fxc.exe stand-in over Windows' d3dcompiler_47.dll for regenerating gpui_windows HLSL shaders"
+edition.workspace = true
+publish = false
+license = "Apache-2.0"
+
+[lints]
+workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = ["Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D_Fxc"] }
+windows-core.workspace = true

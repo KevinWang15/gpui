@@ -27,6 +27,7 @@ members = [
     "crates/zlog",
     "crates/ztracing",
     "crates/ztracing_macro",
+    "tooling/fxc-lite",
     "tooling/perf",
 ]
 default-members = ["crates/gpui"]
