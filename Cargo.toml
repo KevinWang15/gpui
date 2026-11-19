@@ -10,6 +10,7 @@ members = [
     "crates/gpui_macos",
     "crates/gpui_macros",
     "crates/gpui_platform",
+    "crates/gpui_playground",
     "crates/gpui_shared_string",
     "crates/gpui_util",
     "crates/gpui_web",

@@ -1,0 +1,17 @@
+[package]
+name = "gpui_playground"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+license = "Apache-2.0"
+description = "Interactive developer playground for GPUI Tailwind-inspired components and Lucide icons"
+
+[lints]
+workspace = true
+
+[dependencies]
+gpui = { workspace = true, features = ["components", "lucide"] }
+gpui_platform = { workspace = true, features = ["font-kit", "wayland", "x11"] }
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["components", "lucide", "test-support"] }
