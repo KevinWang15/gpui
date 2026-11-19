@@ -1,0 +1,4 @@
+Source: https://github.com/lucide-icons/lucide
+Commit: de8d11aac831d519d2377ff516868244475fac06
+License: ISC (with MIT for Feather-derived icons; see LICENSE)
+Icon count: 2092

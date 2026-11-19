@@ -15,13 +15,27 @@ use crate::{
 };
 use gpui_util::ResultExt;
 
+enum SvgBytes {
+    Owned(Arc<[u8]>),
+    Static(&'static [u8]),
+}
+
+impl SvgBytes {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Owned(bytes) => bytes,
+            Self::Static(bytes) => bytes,
+        }
+    }
+}
+
 /// An SVG element.
 pub struct Svg {
     interactivity: Interactivity,
     transformation: Option<TimedTransformation>,
     path: Option<SharedString>,
     external_path: Option<SharedString>,
-    data: Option<Arc<[u8]>>,
+    data: Option<SvgBytes>,
     data_path: Option<SharedString>,
 }
 
@@ -59,8 +73,15 @@ impl Svg {
         data.hash(&mut hasher);
         let hash = hasher.finish();
         let path = SharedString::from(format!("__binary_svg__{}", hash));
-        self.data = Some(Arc::from(data));
+        self.data = Some(SvgBytes::Owned(Arc::from(data)));
         self.data_path = Some(path);
+        self
+    }
+
+    /// Set static SVG bytes with a caller-supplied cache key, avoiding per-frame hashing and copies.
+    pub fn static_data(mut self, cache_key: impl Into<SharedString>, data: &'static [u8]) -> Self {
+        self.data = Some(SvgBytes::Static(data));
+        self.data_path = Some(cache_key.into());
         self
     }
 
@@ -180,7 +201,7 @@ impl Element for Svg {
                             .paint_animated_svg(
                                 bounds,
                                 path.clone(),
-                                Some(&**data),
+                                Some(data.as_slice()),
                                 transformation,
                                 animation,
                                 color.opacity(alpha),
