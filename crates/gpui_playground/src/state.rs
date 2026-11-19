@@ -237,7 +237,7 @@ impl PlaygroundApp {
         });
 
         let sandbox_textbox = Self::build_sandbox_textbox(
-            "GPUI renders Tailwind-style UI at 120 FPS on the GPU.\nTry selecting across lines, pressing Up/Down, Undo (Ctrl/Cmd+Z), or Submit (Ctrl/Cmd+Enter)!".to_owned(),
+            "GPUI renders Tailwind-style UI at 120 FPS on the GPU.\nTry selecting across lines, pressing Up/Down,\nUndo (Ctrl/Cmd+Z), or Submit (Ctrl/Cmd+Enter)!".to_owned(),
             4,
             true,
             false,

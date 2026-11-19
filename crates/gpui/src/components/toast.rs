@@ -3,12 +3,12 @@
 use std::rc::Rc;
 
 use crate::{
-    App, ClickEvent, ElementId, FontWeight, Hsla, IntoElement, RenderOnce, SharedString, Window,
-    deferred, div, prelude::*, px,
+    Animation, AnimationExt, App, ClickEvent, ElementId, FontWeight, Hsla, IntoElement,
+    RenderOnce, SharedString, Window, deferred, div, ease_out_quint, prelude::*, px,
 };
 use crate::icons::{Icon, IconSize, LucideIcon};
 
-use super::theme::{ActiveTheme, Theme};
+use super::theme::{ANIM_NORMAL, ActiveTheme, Theme};
 
 /// Semantic variant for a [`Toast`] notification.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -103,6 +103,7 @@ impl RenderOnce for Toast {
         let theme = cx.theme();
         let (accent, icon) = Self::accent(self.item.variant, &theme);
 
+        let anim_id = (self.id.clone(), "toast-enter");
         div()
             .id(self.id.clone())
             .flex()
@@ -163,6 +164,11 @@ impl RenderOnce for Toast {
                         ),
                 )
             })
+            .with_animation(
+                anim_id,
+                Animation::new(ANIM_NORMAL).with_easing(ease_out_quint()),
+                |el, delta| el.opacity(delta).mr(px(-24.0 * (1.0 - delta))),
+            )
     }
 }
 

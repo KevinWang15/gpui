@@ -193,7 +193,8 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
                                         .child(slider(&app.demo_slider))
                                         .child(
                                             progress_bar(app.synced_progress)
-                                                .label("Mirrored ProgressBar")
+                                                .animated("controls-synced-progress")
+                                                .label("Mirrored ProgressBar (spring animated)")
                                                 .show_percentage(true),
                                         ),
                                 ),

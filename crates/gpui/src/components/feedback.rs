@@ -4,16 +4,18 @@
 use smallvec::SmallVec;
 
 use crate::{
-    AnyElement, App, FontWeight, Hsla, IntoElement, Pixels, RenderOnce, SharedString,
-    StyleRefinement, Styled, Window, div, prelude::*, px, relative,
+    AnimationExt, AnyElement, App, ElementId, FontWeight, Hsla, IntoElement, Pixels, RenderOnce,
+    SharedString, SpringAnimation, StyleRefinement, Styled, Window, div, prelude::*, px, relative,
 };
 use crate::icons::{Icon, IconSize, LucideIcon};
 
-use super::theme::{ActiveTheme, ComponentSize};
+use super::theme::{ActiveTheme, ComponentSize, SPRING_SMOOTH};
 
-/// Determinate progress bar with optional label, percentage readout, and custom color.
+/// Determinate progress bar with optional label, percentage readout, custom color,
+/// and optional smooth spring width animation via [`ProgressBar::animated`].
 #[derive(IntoElement)]
 pub struct ProgressBar {
+    id: Option<ElementId>,
     value: f32,
     max: f32,
     size: ComponentSize,
@@ -32,6 +34,7 @@ impl ProgressBar {
     /// Creates a progress bar where `value` is in `0.0..=100.0` by default.
     pub fn new(value: f32) -> Self {
         Self {
+            id: None,
             value,
             max: 100.0,
             size: ComponentSize::Md,
@@ -40,6 +43,12 @@ impl ProgressBar {
             show_percentage: false,
             style: StyleRefinement::default(),
         }
+    }
+
+    /// Enables smooth spring interpolation between value changes keyed by `id`.
+    pub fn animated(mut self, id: impl Into<ElementId>) -> Self {
+        self.id = Some(id.into());
+        self
     }
 
     /// Sets the maximum value (default `100.0`).
@@ -129,13 +138,25 @@ impl RenderOnce for ProgressBar {
                     .rounded_full()
                     .bg(theme.surface_muted)
                     .overflow_hidden()
-                    .child(
+                    .child(if let Some(anim_id) = self.id {
+                        div()
+                            .h_full()
+                            .rounded_full()
+                            .bg(fill_color)
+                            .with_spring(
+                                anim_id,
+                                SpringAnimation::new(SPRING_SMOOTH).to(ratio),
+                                |el, val| el.w(relative(val.clamp(0.0, 1.0))),
+                            )
+                            .into_any_element()
+                    } else {
                         div()
                             .h_full()
                             .w(relative(ratio))
                             .rounded_full()
-                            .bg(fill_color),
-                    ),
+                            .bg(fill_color)
+                            .into_any_element()
+                    }),
             );
 
         crate::Refineable::refine(root.style(), &self.style);
@@ -345,6 +366,7 @@ impl RenderOnce for EmptyState {
         let mut el = div()
             .flex()
             .flex_col()
+            .flex_shrink_0()
             .items_center()
             .justify_center()
             .gap(px(10.))

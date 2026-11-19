@@ -158,6 +158,7 @@ impl RenderOnce for Alert {
         let mut root = div()
             .flex()
             .flex_row()
+            .flex_shrink_0()
             .items_start()
             .gap(px(12.))
             .w_full()

@@ -4,12 +4,12 @@
 use smallvec::SmallVec;
 
 use crate::{
-    AnyElement, App, ClickEvent, ElementId, FontWeight, IntoElement, ParentElement, RenderOnce,
-    SharedString, StyleRefinement, Styled, Window, div, prelude::*, px,
+    AnimationExt, AnyElement, App, ClickEvent, ElementId, FontWeight, IntoElement, ParentElement,
+    RenderOnce, SharedString, SpringAnimation, StyleRefinement, Styled, Window, div, prelude::*, px,
 };
 use crate::icons::{Icon, IconSize, LucideIcon};
 
-use super::theme::ActiveTheme;
+use super::theme::{ActiveTheme, SPRING_SNAPPY};
 
 /// Tri-state value for [`Checkbox`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -123,19 +123,29 @@ impl RenderOnce for Checkbox {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
         let active = !matches!(self.state, CheckState::Unchecked);
-        let box_bg = if active {
-            theme.primary
-        } else if self.disabled {
+        let off_bg = if self.disabled {
             theme.disabled_bg
         } else {
             theme.surface
         };
-        let box_border = if self.invalid {
+        let on_bg = theme.primary;
+        let off_border = if self.invalid {
             theme.destructive
-        } else if active {
-            theme.primary
         } else {
             theme.input_border
+        };
+        let on_border = if self.invalid {
+            theme.destructive
+        } else {
+            theme.primary
+        };
+        let box_id = (self.id.clone(), "box");
+        let mark_id = (self.id.clone(), "mark");
+        let fg = theme.primary_foreground;
+        let icon_opt = match self.state {
+            CheckState::Checked => Some(LucideIcon::Check),
+            CheckState::Indeterminate => Some(LucideIcon::Minus),
+            CheckState::Unchecked => None,
         };
 
         let box_el = div()
@@ -147,23 +157,36 @@ impl RenderOnce for Checkbox {
             .h(px(18.))
             .mt(px(1.))
             .rounded(theme.radius_sm)
-            .bg(box_bg)
             .border_1()
-            .border_color(box_border)
             .when(!active && !self.disabled, |el| el.shadow_2xs())
-            .when_some(
-                match self.state {
-                    CheckState::Checked => Some(LucideIcon::Check),
-                    CheckState::Indeterminate => Some(LucideIcon::Minus),
-                    CheckState::Unchecked => None,
-                },
-                |el, icon| {
-                    el.child(
-                        Icon::new(icon)
-                            .size(IconSize::Xs)
-                            .stroke_width(2.75)
-                            .color(theme.primary_foreground),
-                    )
+            .when_some(icon_opt, |el, icon| {
+                el.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            Icon::new(icon)
+                                .size(IconSize::Xs)
+                                .stroke_width(2.75)
+                                .color(fg),
+                        )
+                        .with_spring(
+                            mark_id,
+                            SpringAnimation::new(SPRING_SNAPPY).to(true).from(false),
+                            |el, phase| {
+                                let p = phase.0.clamp(0.0, 1.0);
+                                el.opacity(p).mt(px((1.0 - p) * 2.5))
+                            },
+                        ),
+                )
+            })
+            .with_spring(
+                box_id,
+                SpringAnimation::new(SPRING_SNAPPY).to(active),
+                move |el, phase| {
+                    el.bg(phase.interpolate_clamped(off_bg, on_bg))
+                        .border_color(phase.interpolate_clamped(off_border, on_border))
                 },
             );
 

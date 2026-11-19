@@ -4,12 +4,12 @@
 use std::rc::Rc;
 
 use crate::{
-    App, ClickEvent, ElementId, FontWeight, IntoElement, RenderOnce, SharedString, StyleRefinement,
-    Styled, Window, div, prelude::*, px,
+    AnimationExt, App, ClickEvent, ElementId, FontWeight, IntoElement, RenderOnce, SharedString,
+    SpringAnimation, StyleRefinement, Styled, Window, div, prelude::*, px,
 };
 use crate::icons::{Icon, IconSize, LucideIcon};
 
-use super::theme::ActiveTheme;
+use super::theme::{ActiveTheme, SPRING_SMOOTH};
 
 /// Visual presentation style for [`Tabs`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -287,7 +287,30 @@ impl RenderOnce for Tabs {
                 );
             }
 
-            bar = bar.child(tab);
+            let tab_anim_id = (self.id.clone(), format!("tab-anim-{index}"));
+            let variant = self.variant;
+            let primary = theme.primary;
+            let primary_soft = theme.primary_soft;
+            let surface = theme.surface;
+            let transparent = crate::transparent_black();
+
+            let animated_tab = tab.with_spring(
+                tab_anim_id,
+                SpringAnimation::new(SPRING_SMOOTH).to(active),
+                move |el, phase| match variant {
+                    TabsVariant::Underline => {
+                        el.border_color(phase.interpolate_clamped(transparent, primary))
+                    }
+                    TabsVariant::Pills => {
+                        el.bg(phase.interpolate_clamped(transparent, primary_soft))
+                    }
+                    TabsVariant::Segmented => {
+                        el.bg(phase.interpolate_clamped(transparent, surface))
+                    }
+                },
+            );
+
+            bar = bar.child(animated_tab);
         }
 
         crate::Refineable::refine(bar.style(), &self.style);

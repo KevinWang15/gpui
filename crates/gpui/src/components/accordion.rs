@@ -3,12 +3,13 @@
 use smallvec::SmallVec;
 
 use crate::{
-    AnyElement, App, ClickEvent, ElementId, FontWeight, IntoElement, ParentElement, RenderOnce,
-    SharedString, StyleRefinement, Styled, Window, div, prelude::*, px,
+    Animation, AnimationExt, AnyElement, App, ClickEvent, ElementId, FontWeight, IntoElement,
+    ParentElement, RenderOnce, SharedString, SpringAnimation, StyleRefinement, Styled, Window,
+    div, ease_out_quint, prelude::*, px, radians,
 };
 use crate::icons::{Icon, IconSize, LucideIcon};
 
-use super::theme::ActiveTheme;
+use super::theme::{ANIM_FAST, ActiveTheme, SPRING_SNAPPY};
 
 /// Single collapsible disclosure section (Headless UI `<Disclosure>`).
 #[derive(IntoElement)]
@@ -93,11 +94,17 @@ impl RenderOnce for Disclosure {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
         let next = !self.open;
-        let chevron = if self.open {
-            LucideIcon::ChevronUp
-        } else {
-            LucideIcon::ChevronDown
-        };
+        let chevron_id = (self.id.clone(), "chevron");
+        let body_id = (self.id.clone(), "body");
+
+        let chevron_el = Icon::new(LucideIcon::ChevronDown)
+            .size(IconSize::Md)
+            .color(theme.muted_foreground)
+            .with_spring(
+                chevron_id,
+                SpringAnimation::new(SPRING_SNAPPY).to(self.open),
+                |icon, phase| icon.rotate(radians(phase.0 * std::f32::consts::PI)),
+            );
 
         let header = div()
             .id((self.id.clone(), "trigger"))
@@ -146,16 +153,13 @@ impl RenderOnce for Disclosure {
                             }),
                     ),
             )
-            .child(
-                Icon::new(chevron)
-                    .size(IconSize::Md)
-                    .color(theme.muted_foreground),
-            );
+            .child(chevron_el);
 
         let mut root = div()
             .id(self.id)
             .flex()
             .flex_col()
+            .flex_shrink_0()
             .w_full()
             .bg(theme.surface)
             .when(self.bordered, |el| {
@@ -176,7 +180,12 @@ impl RenderOnce for Disclosure {
                         .pt(px(2.))
                         .text_size(px(13.5))
                         .text_color(theme.muted_foreground)
-                        .children(self.children),
+                        .children(self.children)
+                        .with_animation(
+                            body_id,
+                            Animation::new(ANIM_FAST).with_easing(ease_out_quint()),
+                            |el, delta| el.opacity(delta).mt(px(-6.0 * (1.0 - delta))),
+                        ),
                 )
             });
 
@@ -219,6 +228,7 @@ impl RenderOnce for Accordion {
         let mut root = div()
             .flex()
             .flex_col()
+            .flex_shrink_0()
             .w_full()
             .rounded(theme.radius_xl)
             .border_1()

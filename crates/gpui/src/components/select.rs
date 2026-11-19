@@ -5,14 +5,15 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use crate::{
-    Anchor, App, Bounds, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
-    IntoElement, KeyDownEvent, MouseButton, Pixels, Render, RenderOnce, SharedString,
-    StyleRefinement, Styled, Window, anchored, canvas, deferred, div, point, prelude::*, px,
+    Anchor, Animation, AnimationExt, App, Bounds, Context, Entity, EventEmitter, FocusHandle,
+    Focusable, FontWeight, IntoElement, KeyDownEvent, MouseButton, Pixels, Render, RenderOnce,
+    SharedString, StyleRefinement, Styled, Window, anchored, canvas, deferred, div,
+    ease_out_quint, point, prelude::*, px,
 };
 use crate::icons::{Icon, IconSize, LucideIcon};
 
 use super::layout::focus_ring_shadow;
-use super::theme::{ActiveTheme, ComponentSize};
+use super::theme::{ANIM_FAST, ActiveTheme, ComponentSize};
 
 /// A selectable option inside a [`Select`] control.
 #[derive(Clone, Debug)]
@@ -518,30 +519,14 @@ impl<T: Clone + PartialEq + 'static> Render for SelectState<T> {
             );
 
         let menu = if self.open {
-            let mut list = div()
-                .id("gpui-select-menu")
-                .flex()
-                .flex_col()
-                .min_w(menu_min_w)
-                .max_h(self.max_menu_height)
-                .overflow_y_scroll()
-                .p(px(4.))
-                .rounded(theme.radius_lg)
-                .bg(theme.popover)
-                .text_color(theme.popover_foreground)
-                .border_1()
-                .border_color(theme.border)
-                .shadow_lg()
-                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                    this.close_menu(cx);
-                }));
+            let mut list_items = div().flex().flex_col().w_full().p(px(4.));
 
             let mut last_group: Option<SharedString> = None;
             for (index, option) in self.options.iter().enumerate() {
                 if option.group != last_group
                     && let Some(group_name) = option.group.clone()
                 {
-                    list = list.child(
+                    list_items = list_items.child(
                         div()
                             .px(px(10.))
                             .pt(px(6.))
@@ -563,7 +548,7 @@ impl<T: Clone + PartialEq + 'static> Render for SelectState<T> {
                 };
                 let entity_opt = entity.clone();
 
-                list = list.child(
+                list_items = list_items.child(
                     div()
                         .id(("gpui-select-option", index))
                         .flex()
@@ -643,6 +628,27 @@ impl<T: Clone + PartialEq + 'static> Render for SelectState<T> {
                         }),
                 );
             }
+
+            let list = div()
+                .id("gpui-select-menu")
+                .min_w(menu_min_w)
+                .max_h(self.max_menu_height)
+                .overflow_y_scroll()
+                .rounded(theme.radius_lg)
+                .bg(theme.popover)
+                .text_color(theme.popover_foreground)
+                .border_1()
+                .border_color(theme.border)
+                .shadow_lg()
+                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                    this.close_menu(cx);
+                }))
+                .child(list_items)
+                .with_animation(
+                    "gpui-select-menu-anim",
+                    Animation::new(ANIM_FAST).with_easing(ease_out_quint()),
+                    |el, delta| el.opacity(delta).mt(px(-6.0 * (1.0 - delta))),
+                );
 
             let mut anchor = anchored()
                 .anchor(Anchor::TopLeft)

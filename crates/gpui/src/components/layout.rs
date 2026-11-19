@@ -123,13 +123,19 @@ impl RenderOnce for Container {
         let mut inner = div()
             .flex()
             .flex_col()
+            .flex_shrink_0()
             .w_full()
             .px(self.padding_x)
             .when_some(self.max_width.pixels(), |el, max_w| el.max_w(max_w))
             .children(self.children);
         crate::Refineable::refine(inner.style(), &self.style);
 
-        div().w_full().flex().justify_center().child(inner)
+        div()
+            .w_full()
+            .flex_shrink_0()
+            .flex()
+            .justify_center()
+            .child(inner)
     }
 }
 
@@ -223,7 +229,7 @@ impl RenderOnce for Stack {
         let theme = cx.theme();
         let mut el = div().flex().gap(self.gap);
         el = match self.direction {
-            StackDirection::Vertical => el.flex_col(),
+            StackDirection::Vertical => el.flex_col().flex_shrink_0(),
             StackDirection::Horizontal => el.flex_row(),
         };
         crate::Refineable::refine(el.style(), &self.style);
@@ -299,6 +305,7 @@ impl RenderOnce for Grid {
             .grid_cols(self.cols)
             .gap(self.gap)
             .w_full()
+            .flex_shrink_0()
             .children(self.children);
         crate::Refineable::refine(el.style(), &self.style);
         el
@@ -367,6 +374,7 @@ impl RenderOnce for Card {
         let mut el = div()
             .flex()
             .flex_col()
+            .flex_shrink_0()
             .bg(theme.surface)
             .text_color(theme.foreground)
             .border_1()
@@ -710,6 +718,7 @@ impl RenderOnce for PageHeader {
         div()
             .flex()
             .flex_row()
+            .flex_shrink_0()
             .items_center()
             .justify_between()
             .gap(px(16.))
@@ -812,6 +821,7 @@ impl RenderOnce for Navbar {
         div()
             .flex()
             .flex_row()
+            .flex_shrink_0()
             .items_center()
             .justify_between()
             .w_full()
@@ -1098,11 +1108,15 @@ impl RenderOnce for Sidebar {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
-                    .flex()
-                    .flex_col()
-                    .gap(px(8.))
-                    .p(px(10.))
-                    .children(self.children),
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .w_full()
+                            .gap(px(8.))
+                            .p(px(10.))
+                            .children(self.children),
+                    ),
             )
             .when_some(self.footer, |el, footer| {
                 el.child(
@@ -1181,9 +1195,13 @@ impl RenderOnce for AppShell {
                             .flex_1()
                             .min_h_0()
                             .overflow_y_scroll()
-                            .flex()
-                            .flex_col()
-                            .children(self.content),
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .w_full()
+                                    .children(self.content),
+                            ),
                     ),
             )
     }

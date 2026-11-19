@@ -1,10 +1,25 @@
 //! Semantic design tokens, light/dark Tailwind themes, sizing tokens, and component initialization.
 
 use std::sync::Arc;
+use std::time::Duration;
 
-use crate::{App, Global, Hsla, Pixels, Window, WindowAppearance, px};
+use crate::{App, Global, Hsla, Pixels, SpringConfig, Window, WindowAppearance, px};
 
 use super::palette as tw;
+
+/// Snappy, tactile spring preset for micro-interactions (toggle thumb slide, checkbox/radio pop, chevron rotation).
+///
+/// Damping ratio ~0.75 gives a crisp, quick feel (~160ms) with barely perceptible organic settle.
+pub const SPRING_SNAPPY: SpringConfig = SpringConfig::new(560.0, 35.0, 1.0);
+
+/// Smooth critically-damped spring preset for color fades, progress bars, and selection highlights.
+pub const SPRING_SMOOTH: SpringConfig = SpringConfig::new(360.0, 34.0, 1.0);
+
+/// Fast duration (140ms) for popover/dropdown/disclosure entrance animations.
+pub const ANIM_FAST: Duration = Duration::from_millis(140);
+
+/// Standard duration (175ms) for modal dialog and toast entrance animations.
+pub const ANIM_NORMAL: Duration = Duration::from_millis(175);
 
 /// Whether the active UI theme is light or dark.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

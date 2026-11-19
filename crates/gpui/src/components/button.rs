@@ -283,8 +283,10 @@ impl RenderOnce for Button {
 
         let mut el = div()
             .id(self.id)
+            .relative()
             .flex()
             .flex_row()
+            .flex_shrink_0()
             .items_center()
             .justify_center()
             .gap(px(6.))
@@ -313,7 +315,7 @@ impl RenderOnce for Button {
                             s
                         }
                     })
-                    .active(move |style| style.bg(hover_bg.opacity(0.9)))
+                    .active(move |style| style.top(px(1.)).bg(hover_bg.opacity(0.92)))
             })
             .when(!interactive, |el| el.opacity(0.55).cursor_not_allowed());
 

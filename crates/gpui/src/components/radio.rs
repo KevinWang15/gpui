@@ -3,13 +3,13 @@
 use std::rc::Rc;
 
 use crate::{
-    App, ClickEvent, ElementId, FontWeight, IntoElement, RenderOnce, SharedString, StyleRefinement,
-    Styled, Window, div, prelude::*, px,
+    AnimationExt, App, ClickEvent, ElementId, FontWeight, IntoElement, RenderOnce, SharedString,
+    SpringAnimation, StyleRefinement, Styled, Window, div, prelude::*, px,
 };
 use crate::icons::{Icon, IconSize, LucideIcon};
 
 use super::palette as tw;
-use super::theme::ActiveTheme;
+use super::theme::{ActiveTheme, SPRING_SMOOTH, SPRING_SNAPPY};
 
 /// Presentation style for [`RadioGroup`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -167,6 +167,25 @@ impl<T: Clone + PartialEq + 'static> RenderOnce for RadioGroup<T> {
 
             let row = match self.variant {
                 RadioVariant::List => {
+                    let off_bg = theme.surface;
+                    let on_bg = theme.primary;
+                    let off_border = theme.input_border;
+                    let on_border = theme.primary;
+                    let circle_id = (self.id.clone(), format!("radio-ring-{index}"));
+                    let dot_id = (self.id.clone(), format!("radio-dot-{index}"));
+
+                    let dot = div()
+                        .rounded_full()
+                        .bg(tw::WHITE)
+                        .with_spring(
+                            dot_id,
+                            SpringAnimation::new(SPRING_SNAPPY).to(is_selected),
+                            |el, phase| {
+                                let dim = phase.0.clamp(0.0, 1.15) * 6.0;
+                                el.w(px(dim)).h(px(dim)).opacity(phase.0.clamp(0.0, 1.0))
+                            },
+                        );
+
                     let circle = div()
                         .flex()
                         .items_center()
@@ -177,19 +196,15 @@ impl<T: Clone + PartialEq + 'static> RenderOnce for RadioGroup<T> {
                         .mt(px(1.))
                         .rounded_full()
                         .border_1()
-                        .border_color(if is_selected {
-                            theme.primary
-                        } else {
-                            theme.input_border
-                        })
-                        .bg(if is_selected {
-                            theme.primary
-                        } else {
-                            theme.surface
-                        })
-                        .when(is_selected, |el| {
-                            el.child(div().w(px(6.)).h(px(6.)).rounded_full().bg(tw::WHITE))
-                        });
+                        .child(dot)
+                        .with_spring(
+                            circle_id,
+                            SpringAnimation::new(SPRING_SNAPPY).to(is_selected),
+                            move |el, phase| {
+                                el.bg(phase.interpolate_clamped(off_bg, on_bg))
+                                    .border_color(phase.interpolate_clamped(off_border, on_border))
+                            },
+                        );
 
                     div()
                         .id(item_id)
@@ -221,93 +236,118 @@ impl<T: Clone + PartialEq + 'static> RenderOnce for RadioGroup<T> {
                                     )
                                 }),
                         )
+                        .into_any_element()
                 }
-                RadioVariant::Cards => div()
-                    .id(item_id)
-                    .flex()
-                    .flex_row()
-                    .items_start()
-                    .justify_between()
-                    .gap(px(12.))
-                    .when(self.horizontal, |el| el.flex_1().min_w(px(180.)))
-                    .when(!self.horizontal, |el| el.w_full())
-                    .p(px(14.))
-                    .rounded(theme.radius_lg)
-                    .bg(if is_selected {
-                        theme.primary_soft.opacity(0.55)
-                    } else {
-                        theme.surface
-                    })
-                    .border_1()
-                    .border_color(if is_selected {
-                        theme.primary
-                    } else {
-                        theme.border
-                    })
-                    .shadow_2xs()
-                    .when(!item_disabled, |el| {
-                        el.cursor_pointer().hover(|s| {
-                            if is_selected {
-                                s
-                            } else {
-                                s.border_color(theme.input_border_hover)
-                            }
-                        })
-                    })
-                    .when(item_disabled, |el| el.opacity(0.55).cursor_not_allowed())
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap(px(3.))
-                            .child(
-                                div()
-                                    .text_size(px(14.))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(theme.foreground)
-                                    .child(option.label),
-                            )
-                            .when_some(option.description, |el, desc| {
-                                el.child(
-                                    div()
-                                        .text_size(px(12.5))
-                                        .text_color(theme.muted_foreground)
-                                        .child(desc),
-                                )
+                RadioVariant::Cards => {
+                    let off_bg = theme.surface;
+                    let on_bg = theme.primary_soft.opacity(0.55);
+                    let off_border = theme.border;
+                    let on_border = theme.primary;
+                    let card_anim_id = (self.id.clone(), format!("radio-card-{index}"));
+                    let card_div = div()
+                        .id(item_id)
+                        .flex()
+                        .flex_row()
+                        .items_start()
+                        .justify_between()
+                        .gap(px(12.))
+                        .when(self.horizontal, |el| el.flex_1().min_w(px(180.)))
+                        .when(!self.horizontal, |el| el.w_full())
+                        .p(px(14.))
+                        .rounded(theme.radius_lg)
+                        .border_1()
+                        .shadow_2xs()
+                        .when(!item_disabled, |el| {
+                            el.cursor_pointer().hover(|s| {
+                                if is_selected {
+                                    s
+                                } else {
+                                    s.border_color(theme.input_border_hover)
+                                }
                             })
-                            .when_some(option.meta, |el, meta| {
-                                el.child(
+                        })
+                        .when(item_disabled, |el| el.opacity(0.55).cursor_not_allowed())
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(3.))
+                                .child(
                                     div()
-                                        .pt(px(4.))
-                                        .text_size(px(12.5))
-                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_size(px(14.))
+                                        .font_weight(FontWeight::SEMIBOLD)
                                         .text_color(theme.foreground)
-                                        .child(meta),
+                                        .child(option.label),
                                 )
-                            }),
-                    )
-                    .child(if is_selected {
-                        Icon::new(LucideIcon::CircleCheck)
-                            .size(IconSize::Lg)
-                            .color(theme.primary)
-                            .into_any_element()
+                                .when_some(option.description, |el, desc| {
+                                    el.child(
+                                        div()
+                                            .text_size(px(12.5))
+                                            .text_color(theme.muted_foreground)
+                                            .child(desc),
+                                    )
+                                })
+                                .when_some(option.meta, |el, meta| {
+                                    el.child(
+                                        div()
+                                            .pt(px(4.))
+                                            .text_size(px(12.5))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(theme.foreground)
+                                            .child(meta),
+                                    )
+                                }),
+                        )
+                        .child(if is_selected {
+                            Icon::new(LucideIcon::CircleCheck)
+                                .size(IconSize::Lg)
+                                .color(theme.primary)
+                                .into_any_element()
+                        } else {
+                            div()
+                                .w(px(18.))
+                                .h(px(18.))
+                                .rounded_full()
+                                .border_1()
+                                .border_color(theme.input_border)
+                                .into_any_element()
+                        });
+
+                    let card_div = if !item_disabled
+                        && let Some(handler) = on_change.clone()
+                    {
+                        let value_c = value.clone();
+                        card_div.on_click(move |_: &ClickEvent, window, cx| {
+                            handler(&value_c, window, cx);
+                        })
                     } else {
-                        div()
-                            .w(px(18.))
-                            .h(px(18.))
-                            .rounded_full()
-                            .border_1()
-                            .border_color(theme.input_border)
-                            .into_any_element()
-                    }),
+                        card_div
+                    };
+
+                    card_div
+                        .with_spring(
+                            card_anim_id,
+                            SpringAnimation::new(SPRING_SMOOTH).to(is_selected),
+                            move |el, phase| {
+                                el.bg(phase.interpolate_clamped(off_bg, on_bg))
+                                    .border_color(phase.interpolate_clamped(off_border, on_border))
+                            },
+                        )
+                        .into_any_element()
+                }
             };
 
-            let row = if !item_disabled
+            let row = if self.variant == RadioVariant::List
+                && !item_disabled
                 && let Some(handler) = on_change
             {
-                row.on_click(move |_: &ClickEvent, window, cx| {
-                    handler(&value, window, cx);
-                })
+                div()
+                    .id((self.id.clone(), format!("radio-wrap-{index}")))
+                    .on_click(move |_: &ClickEvent, window, cx| {
+                        handler(&value, window, cx);
+                    })
+                    .child(row)
+                    .into_any_element()
             } else {
                 row
             };

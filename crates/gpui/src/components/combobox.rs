@@ -6,16 +6,16 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use crate::{
-    Anchor, App, Bounds, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
-    IntoElement, KeyDownEvent, MouseButton, Pixels, Render, RenderOnce, SharedString,
-    StyleRefinement, Styled, Subscription, Window, anchored, canvas, deferred, div, point,
-    prelude::*, px,
+    Anchor, Animation, AnimationExt, App, Bounds, Context, Entity, EventEmitter, FocusHandle,
+    Focusable, FontWeight, IntoElement, KeyDownEvent, MouseButton, Pixels, Render, RenderOnce,
+    SharedString, StyleRefinement, Styled, Subscription, Window, anchored, canvas, deferred, div,
+    ease_out_quint, point, prelude::*, px,
 };
 use crate::icons::{Icon, IconSize, LucideIcon};
 
 use super::input::{InputEvent, InputState};
 use super::layout::focus_ring_shadow;
-use super::theme::{ActiveTheme, ComponentSize};
+use super::theme::{ANIM_FAST, ActiveTheme, ComponentSize};
 
 /// An item in a [`ComboBox`].
 #[derive(Clone, Debug)]
@@ -724,16 +724,10 @@ impl<T: Clone + PartialEq + 'static> Render for ComboBoxState<T> {
             let filtered = self.filtered_option_indices(cx);
             let query_text = self.search_input.read(cx).value().trim().to_owned();
 
-            let mut list_body = div()
-                .id("gpui-combobox-list")
-                .flex()
-                .flex_col()
-                .max_h(self.max_menu_height)
-                .overflow_y_scroll()
-                .p(px(4.));
+            let mut list_items = div().flex().flex_col().w_full().p(px(4.));
 
             if filtered.is_empty() {
-                list_body = list_body.child(
+                list_items = list_items.child(
                     div()
                         .flex()
                         .flex_col()
@@ -750,7 +744,7 @@ impl<T: Clone + PartialEq + 'static> Render for ComboBoxState<T> {
                     let create_label = SharedString::from(format!("Create \"{query_text}\""));
                     let create_value = SharedString::from(query_text);
                     let entity_create = entity;
-                    list_body = list_body.child(
+                    list_items = list_items.child(
                         div()
                             .id("gpui-combobox-create")
                             .flex()
@@ -788,7 +782,7 @@ impl<T: Clone + PartialEq + 'static> Render for ComboBoxState<T> {
                     if option.group != last_group
                         && let Some(group_name) = option.group.clone()
                     {
-                        list_body = list_body.child(
+                        list_items = list_items.child(
                             div()
                                 .px(px(10.))
                                 .pt(px(6.))
@@ -805,7 +799,7 @@ impl<T: Clone + PartialEq + 'static> Render for ComboBoxState<T> {
                     let is_highlighted = self.highlighted_filtered_pos == Some(filtered_pos);
                     let entity_opt = entity.clone();
 
-                    list_body = list_body.child(
+                    list_items = list_items.child(
                         div()
                             .id(("gpui-combobox-option", opt_idx))
                             .flex()
@@ -887,6 +881,12 @@ impl<T: Clone + PartialEq + 'static> Render for ComboBoxState<T> {
                 }
             }
 
+            let list_body = div()
+                .id("gpui-combobox-list")
+                .max_h(self.max_menu_height)
+                .overflow_y_scroll()
+                .child(list_items);
+
             let panel = div()
                 .flex()
                 .flex_col()
@@ -908,7 +908,12 @@ impl<T: Clone + PartialEq + 'static> Render for ComboBoxState<T> {
                         .border_color(theme.border)
                         .child(self.search_input.clone()),
                 )
-                .child(list_body);
+                .child(list_body)
+                .with_animation(
+                    "gpui-combobox-menu-anim",
+                    Animation::new(ANIM_FAST).with_easing(ease_out_quint()),
+                    |el, delta| el.opacity(delta).mt(px(-6.0 * (1.0 - delta))),
+                );
 
             let mut anchor = anchored()
                 .anchor(Anchor::TopLeft)

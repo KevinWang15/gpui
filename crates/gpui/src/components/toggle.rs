@@ -3,13 +3,14 @@
 use smallvec::SmallVec;
 
 use crate::{
-    AnyElement, App, ClickEvent, ElementId, FontWeight, IntoElement, KeyDownEvent, ParentElement,
-    RenderOnce, SharedString, StyleRefinement, Styled, Window, div, prelude::*, px,
+    AnimationExt, AnyElement, App, ClickEvent, ElementId, FontWeight, Hsla, IntoElement,
+    KeyDownEvent, ParentElement, RenderOnce, SharedString, SpringAnimation, StyleRefinement,
+    Styled, Window, div, prelude::*, px,
 };
 use crate::icons::{Icon, IconSize, LucideIcon};
 
 use super::palette as tw;
-use super::theme::{ActiveTheme, ComponentSize};
+use super::theme::{ActiveTheme, ComponentSize, SPRING_SNAPPY};
 
 /// Alias for [`Toggle`].
 pub type Switch = Toggle;
@@ -118,13 +119,17 @@ impl RenderOnce for Toggle {
             ComponentSize::Lg | ComponentSize::Xl => (px(52.), px(28.), px(24.), px(2.)),
         };
 
-        let track_bg = if self.checked {
-            theme.primary
-        } else {
-            theme.input_border
-        };
+        let off_bg: Hsla = theme.input_border;
+        let on_bg: Hsla = theme.primary;
+        let travel_end = track_w - thumb_size - pad;
+        let checked = self.checked;
+        let with_icons = self.with_icons;
+        let track_id = (self.id.clone(), "track");
+        let thumb_id = (self.id.clone(), "thumb");
 
         let thumb = div()
+            .absolute()
+            .top(pad)
             .flex()
             .items_center()
             .justify_center()
@@ -133,33 +138,37 @@ impl RenderOnce for Toggle {
             .rounded_full()
             .bg(tw::WHITE)
             .shadow_xs()
-            .when(self.with_icons, |el| {
-                let icon = if self.checked {
+            .when(with_icons, |el| {
+                let icon = if checked {
                     LucideIcon::Check
                 } else {
                     LucideIcon::X
                 };
-                let color = if self.checked {
+                let color = if checked {
                     theme.primary
                 } else {
                     theme.muted_foreground
                 };
                 el.child(Icon::new(icon).size(IconSize::Xs).color(color))
-            });
+            })
+            .with_spring(
+                thumb_id,
+                SpringAnimation::new(SPRING_SNAPPY).to(checked),
+                move |el, phase| el.left(phase.interpolate(pad, travel_end)),
+            );
 
         let track = div()
-            .flex()
-            .flex_row()
-            .items_center()
+            .relative()
             .flex_shrink_0()
             .w(track_w)
             .h(track_h)
-            .p(pad)
             .rounded_full()
-            .bg(track_bg)
-            .when(self.checked, |el| el.justify_end())
-            .when(!self.checked, |el| el.justify_start())
-            .child(thumb);
+            .child(thumb)
+            .with_spring(
+                track_id,
+                SpringAnimation::new(SPRING_SNAPPY).to(checked),
+                move |el, phase| el.bg(phase.interpolate_clamped(off_bg, on_bg)),
+            );
 
         let has_text = self.label.is_some() || self.description.is_some();
         let text_block = if has_text {

@@ -139,6 +139,7 @@ pub struct TextBoxState {
     last_lines: Vec<LineLayout>,
     last_bounds: Option<Bounds<Pixels>>,
     last_line_height: Pixels,
+    scroll_x: Pixels,
     scroll_y: Pixels,
     is_selecting: bool,
     rows: usize,
@@ -174,6 +175,7 @@ impl TextBoxState {
             last_lines: Vec::new(),
             last_bounds: None,
             last_line_height: px(20.),
+            scroll_x: px(0.),
             scroll_y: px(0.),
             is_selecting: false,
             rows: 4,
@@ -418,7 +420,7 @@ impl TextBoxState {
         let line_idx = ((rel_y.0 / self.last_line_height.0.max(1.0)).floor() as usize)
             .min(self.last_lines.len().saturating_sub(1));
         let layout = &self.last_lines[line_idx];
-        let local_x = (position.x - bounds.left()).max(px(0.));
+        let local_x = (position.x - bounds.left() + self.scroll_x).max(px(0.));
         let local_idx = layout.shaped.closest_index_for_x(local_x);
         (layout.byte_range.start + local_idx).min(layout.byte_range.end)
     }
@@ -924,6 +926,7 @@ struct MultiLinePrepaint {
     selections: Vec<PaintQuad>,
     cursor: Option<PaintQuad>,
     line_height: Pixels,
+    scroll_x: Pixels,
     scroll_y: Pixels,
 }
 
@@ -972,6 +975,7 @@ impl Element for MultiLineTextElement {
         let selected_range = state.selected_range.clone();
         let cursor_offset = state.cursor_offset();
         let marked_range = state.marked_range.clone();
+        let mut scroll_x = state.scroll_x;
         let mut scroll_y = state.scroll_y;
 
         let mut lines = Vec::with_capacity(ranges.len());
@@ -1061,13 +1065,32 @@ impl Element for MultiLineTextElement {
             scroll_y = cursor_top_abs.max(px(0.));
         }
 
+        let visible_width = bounds.size.width.max(px(1.));
+        let max_line_width = lines
+            .iter()
+            .map(|l| l.shaped.width)
+            .fold(px(0.), |a, b| a.max(b));
+        if let Some(layout) = lines.get(cursor_line) {
+            let local = cursor_offset.saturating_sub(layout.byte_range.start);
+            let cursor_x = layout.shaped.x_for_index(local);
+            let pad = px(6.);
+            if cursor_x - scroll_x > visible_width - pad {
+                scroll_x = (cursor_x - visible_width + pad).max(px(0.));
+            } else if cursor_x < scroll_x {
+                scroll_x = cursor_x.max(px(0.));
+            }
+        }
+        if max_line_width <= visible_width {
+            scroll_x = px(0.);
+        }
+
         let mut selections = Vec::new();
         let mut cursor = None;
 
         if selected_range.is_empty() {
             if let Some(layout) = lines.get(cursor_line) {
                 let local = cursor_offset.saturating_sub(layout.byte_range.start);
-                let x = bounds.left() + layout.shaped.x_for_index(local);
+                let x = bounds.left() + layout.shaped.x_for_index(local) - scroll_x;
                 let y = bounds.top() + cursor_top_abs - scroll_y;
                 if y + line_height >= bounds.top() && y <= bounds.bottom() {
                     cursor = Some(fill(
@@ -1089,13 +1112,17 @@ impl Element for MultiLineTextElement {
                     if y + line_height < bounds.top() || y > bounds.bottom() {
                         continue;
                     }
-                    let x1 = bounds.left()
-                        + layout.shaped.x_for_index(sel_start.saturating_sub(line_start));
+                    let x1 = (bounds.left()
+                        + layout.shaped.x_for_index(sel_start.saturating_sub(line_start))
+                        - scroll_x)
+                        .max(bounds.left());
                     let mut x2 = bounds.left()
-                        + layout.shaped.x_for_index(sel_end.saturating_sub(line_start));
+                        + layout.shaped.x_for_index(sel_end.saturating_sub(line_start))
+                        - scroll_x;
                     if includes_newline {
-                        x2 = (x2 + px(6.)).min(bounds.right());
+                        x2 = x2 + px(6.);
                     }
+                    x2 = x2.min(bounds.right());
                     if x2 > x1 {
                         selections.push(fill(
                             Bounds::from_corners(point(x1, y), point(x2, y + line_height)),
@@ -1112,6 +1139,7 @@ impl Element for MultiLineTextElement {
             selections,
             cursor,
             line_height,
+            scroll_x,
             scroll_y,
         }
     }
@@ -1156,7 +1184,7 @@ impl Element for MultiLineTextElement {
                     continue;
                 }
                 let _ = layout.shaped.paint(
-                    point(bounds.left(), y),
+                    point(bounds.left() - prepaint.scroll_x, y),
                     prepaint.line_height,
                     TextAlign::Left,
                     None,
@@ -1175,11 +1203,13 @@ impl Element for MultiLineTextElement {
 
         let lines = std::mem::take(&mut prepaint.lines);
         let line_height = prepaint.line_height;
+        let scroll_x = prepaint.scroll_x;
         let scroll_y = prepaint.scroll_y;
         self.state.update(cx, |state, _cx| {
             state.last_lines = lines;
             state.last_bounds = Some(bounds);
             state.last_line_height = line_height;
+            state.scroll_x = scroll_x;
             state.scroll_y = scroll_y;
         });
     }

@@ -342,6 +342,7 @@ impl RenderOnce for Table {
             .id(self.id)
             .flex()
             .flex_col()
+            .flex_shrink_0()
             .w_full()
             .rounded(theme.radius_xl)
             .border_1()

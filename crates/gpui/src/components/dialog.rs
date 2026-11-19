@@ -6,13 +6,13 @@ use std::rc::Rc;
 use smallvec::SmallVec;
 
 use crate::{
-    AnyElement, App, ClickEvent, ElementId, FontWeight, IntoElement, KeyDownEvent, MouseButton,
-    ParentElement, Pixels, RenderOnce, SharedString, StyleRefinement, Styled, Window, deferred,
-    div, prelude::*, px,
+    Animation, AnimationExt, AnyElement, App, ClickEvent, ElementId, FontWeight, IntoElement,
+    KeyDownEvent, MouseButton, ParentElement, Pixels, RenderOnce, SharedString, StyleRefinement,
+    Styled, Window, deferred, div, ease_out_quint, prelude::*, px,
 };
 use crate::icons::{Icon, IconSize, LucideIcon};
 
-use super::theme::ActiveTheme;
+use super::theme::{ANIM_NORMAL, ActiveTheme};
 
 /// Width presets for [`Dialog`].
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -303,6 +303,16 @@ impl RenderOnce for Dialog {
 
         crate::Refineable::refine(panel.style(), &self.style);
 
+        let panel_anim_id = (self.id.clone(), "panel-anim");
+        let backdrop_anim_id = (self.id.clone(), "backdrop-anim");
+        let backdrop_color = theme.backdrop;
+
+        let animated_panel = panel.with_animation(
+            panel_anim_id,
+            Animation::new(ANIM_NORMAL).with_easing(ease_out_quint()),
+            |el, delta| el.opacity(delta).mt(px(14.0 * (1.0 - delta))),
+        );
+
         let overlay = div()
             .id(self.id)
             .absolute()
@@ -311,7 +321,6 @@ impl RenderOnce for Dialog {
             .items_center()
             .justify_center()
             .p(px(20.))
-            .bg(theme.backdrop)
             .when(self.dismiss_on_backdrop, |el| {
                 el.when_some(on_close_backdrop, |el, cb| {
                     el.on_click(move |_, window, cx| cb(&(), window, cx))
@@ -324,7 +333,12 @@ impl RenderOnce for Dialog {
                     }
                 })
             })
-            .child(panel);
+            .child(animated_panel)
+            .with_animation(
+                backdrop_anim_id,
+                Animation::new(ANIM_NORMAL).with_easing(ease_out_quint()),
+                move |el, delta| el.bg(backdrop_color.opacity(delta)),
+            );
 
         deferred(overlay).priority(50).into_any_element()
     }

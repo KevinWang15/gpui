@@ -599,3 +599,80 @@ fn full_component_suite_renders_cleanly_in_light_and_dark_mode(cx: &mut TestAppC
     // Verify Keystroke construction doesn't affect state
     let _ = Keystroke::parse("cmd-k").unwrap();
 }
+
+struct ScrollableCardsRegressionView {
+    first_card_height: Rc<Cell<f32>>,
+    second_card_height: Rc<Cell<f32>>,
+}
+
+impl Render for ScrollableCardsRegressionView {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let h1 = self.first_card_height.clone();
+        let h2 = self.second_card_height.clone();
+        AppShell::new("regression-shell").child(
+            container().py(px(24.)).child(
+                v_stack()
+                    .spacing(px(20.))
+                    .child(page_header("Tall Scrollable Page"))
+                    .child(
+                        grid(2).child(
+                            card()
+                                .child(card_header().bordered().child(card_title("Row 1 Card")))
+                                .child(
+                                    card_content().child(
+                                        crate::canvas(
+                                            move |bounds, _, _| h1.set(bounds.size.height.0),
+                                            |_, _, _, _| {},
+                                        )
+                                        .w_full()
+                                        .h(px(360.)),
+                                    ),
+                                ),
+                        ),
+                    )
+                    .child(
+                        grid(2).child(
+                            card()
+                                .child(card_header().bordered().child(card_title("Row 2 Card")))
+                                .child(
+                                    card_content().child(
+                                        crate::canvas(
+                                            move |bounds, _, _| h2.set(bounds.size.height.0),
+                                            |_, _, _, _| {},
+                                        )
+                                        .w_full()
+                                        .h(px(480.)),
+                                    ),
+                                ),
+                        ),
+                    ),
+            ),
+        )
+    }
+}
+
+#[gpui::test]
+fn app_shell_scroll_container_never_squishes_tall_cards(cx: &mut TestAppContext) {
+    cx.update(init_components);
+    let first_card_height = Rc::new(Cell::new(0.0f32));
+    let second_card_height = Rc::new(Cell::new(0.0f32));
+
+    let _window = cx.open_window(size(px(1200.), px(640.)), |_, _| {
+        ScrollableCardsRegressionView {
+            first_card_height: first_card_height.clone(),
+            second_card_height: second_card_height.clone(),
+        }
+    });
+    cx.run_until_parked();
+
+    assert!(
+        first_card_height.get() >= 359.0,
+        "Row 1 card content was squished to {}px (expected >= 360px)",
+        first_card_height.get()
+    );
+    assert!(
+        second_card_height.get() >= 479.0,
+        "Row 2 card content was squished to {}px (expected >= 480px)",
+        second_card_height.get()
+    );
+}

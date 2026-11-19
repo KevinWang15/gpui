@@ -62,7 +62,10 @@ pub use textbox::{
     TextArea, TextAreaState, TextBox, TextBoxEvent, TextBoxState, bind_textbox_keys, text_area,
     text_box,
 };
-pub use theme::{ActiveTheme, ComponentSize, GlobalTheme, Theme, ThemeMode, init_components};
+pub use theme::{
+    ANIM_FAST, ANIM_NORMAL, ActiveTheme, ComponentSize, GlobalTheme, SPRING_SMOOTH, SPRING_SNAPPY,
+    Theme, ThemeMode, init_components,
+};
 pub use toast::{Toast, ToastHost, ToastItem, ToastVariant, toast_host};
 pub use toggle::{Switch, Toggle, ToggleButton, ToggleGroup, switch, toggle, toggle_group};
 pub use tooltip::Tooltip;

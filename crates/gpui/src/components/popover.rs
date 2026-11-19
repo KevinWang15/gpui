@@ -5,13 +5,13 @@ use std::rc::Rc;
 use smallvec::SmallVec;
 
 use crate::{
-    Anchor, AnyElement, App, ClickEvent, ElementId, FontWeight, IntoElement, ParentElement, Pixels,
-    RenderOnce, SharedString, StyleRefinement, Styled, Window, anchored, deferred, div, point,
-    prelude::*, px,
+    Anchor, Animation, AnimationExt, AnyElement, App, ClickEvent, ElementId, FontWeight,
+    IntoElement, ParentElement, Pixels, RenderOnce, SharedString, StyleRefinement, Styled, Window,
+    anchored, deferred, div, ease_out_quint, point, prelude::*, px,
 };
 use crate::icons::{Icon, IconSize, LucideIcon};
 
-use super::theme::ActiveTheme;
+use super::theme::{ANIM_FAST, ActiveTheme};
 
 /// Anchored floating [`Popover`] positioned relative to its trigger element.
 #[derive(IntoElement)]
@@ -109,13 +109,20 @@ impl RenderOnce for Popover {
                 .children(self.content);
             crate::Refineable::refine(card.style(), &self.style);
 
+            let anim_id = (self.id.clone(), "pop-anim");
+            let animated_card = card.with_animation(
+                anim_id,
+                Animation::new(ANIM_FAST).with_easing(ease_out_quint()),
+                |el, delta| el.opacity(delta).mt(px(-6.0 * (1.0 - delta))),
+            );
+
             Some(
                 deferred(
                     anchored()
                         .anchor(self.anchor)
                         .offset(point(px(0.), self.offset_y))
                         .snap_to_window_with_margin(px(8.))
-                        .child(card),
+                        .child(animated_card),
                 )
                 .priority(25),
             )

@@ -222,25 +222,33 @@ impl Render for PlaygroundApp {
                             .flex_1()
                             .min_h_0()
                             .overflow_y_scroll()
-                            .flex()
-                            .flex_col()
-                            .gap(px(4.))
-                            .px(px(16.))
-                            .py(px(8.))
-                            .font_family("Lilex")
-                            .text_size(px(12.))
-                            .children(self.event_log.iter().rev().map(|entry| {
-                                h_stack()
-                                    .spacing(px(10.))
-                                    .child(
-                                        div()
-                                            .w(px(36.))
-                                            .text_color(theme.muted_foreground)
-                                            .child(format!("#{:02}", entry.seq)),
-                                    )
-                                    .child(badge(entry.source.clone()).color(BadgeColor::Gray))
-                                    .child(div().text_color(theme.foreground).child(entry.detail.clone()))
-                            })),
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .w_full()
+                                    .gap(px(4.))
+                                    .px(px(16.))
+                                    .py(px(8.))
+                                    .font_family("Lilex")
+                                    .text_size(px(12.))
+                                    .children(self.event_log.iter().rev().map(|entry| {
+                                        h_stack()
+                                            .spacing(px(10.))
+                                            .child(
+                                                div()
+                                                    .w(px(36.))
+                                                    .text_color(theme.muted_foreground)
+                                                    .child(format!("#{:02}", entry.seq)),
+                                            )
+                                            .child(badge(entry.source.clone()).color(BadgeColor::Gray))
+                                            .child(
+                                                div()
+                                                    .text_color(theme.foreground)
+                                                    .child(entry.detail.clone()),
+                                            )
+                                    })),
+                            ),
                     ),
             )
         } else {
