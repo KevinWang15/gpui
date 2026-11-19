@@ -1,8 +1,10 @@
 //! Shared interactive state for the GPUI Tailwind Playground application.
 
+use std::time::Duration;
+
 use gpui::components::*;
 use gpui::icons::{IconSize, LucideIcon};
-use gpui::{Context, Entity, SharedString, prelude::*};
+use gpui::{Context, DisplayId, Entity, SharedString, Window, WindowHandle, prelude::*};
 
 use crate::accent::AccentPreset;
 
@@ -51,7 +53,7 @@ impl Page {
                 "layout container grid stack card divider tabs accordion disclosure breadcrumb pagination"
             }
             Self::OverlaysData => {
-                "dialog modal popover dropdown menu toast tooltip table sort badge avatar alert progress spinner skeleton empty"
+                "dialog modal native os window popup popover dropdown menu toast notification tooltip table sort badge avatar alert progress spinner skeleton empty"
             }
             Self::LucideIcons => "lucide icons svg gallery stroke search 2092",
             Self::Palette => "tailwind color palette swatch theme slate indigo emerald rose",
@@ -159,6 +161,13 @@ pub struct PlaygroundApp {
     pub dialog_open: bool,
     pub dialog_size: DialogSize,
     pub dialog_destructive: bool,
+    pub dialog_presentation: OverlayPresentation,
+    pub dialog_native_titlebar: bool,
+    pub active_native_dialog: Option<WindowHandle<DialogWindowView>>,
+    pub toast_presentation: OverlayPresentation,
+    pub toast_position: ToastPosition,
+    pub toast_auto_dismiss: bool,
+    pub native_toasts: NativeToastManager,
     pub dropdown_open: bool,
     pub dropdown_show_grid: bool,
     pub dropdown_compact: bool,
@@ -488,6 +497,18 @@ impl PlaygroundApp {
         )
         .detach();
 
+        let native_toasts = NativeToastManager::new();
+        {
+            let weak_app = cx.entity().downgrade();
+            native_toasts.on_dismiss(move |id, cx| {
+                if let Some(app) = weak_app.upgrade() {
+                    app.update(cx, |this, cx| {
+                        this.log_event("Toast (Native)", format!("dismissed #{id}"), cx);
+                    });
+                }
+            });
+        }
+
         let mut app = Self {
             page: Page::Analytics,
             accent: AccentPreset::Indigo,
@@ -565,6 +586,13 @@ impl PlaygroundApp {
             dialog_open: false,
             dialog_size: DialogSize::Md,
             dialog_destructive: false,
+            dialog_presentation: OverlayPresentation::InWindow,
+            dialog_native_titlebar: false,
+            active_native_dialog: None,
+            toast_presentation: OverlayPresentation::InWindow,
+            toast_position: ToastPosition::BottomRight,
+            toast_auto_dismiss: true,
+            native_toasts,
             dropdown_open: false,
             dropdown_show_grid: true,
             dropdown_compact: false,
@@ -750,11 +778,131 @@ impl PlaygroundApp {
         cx.notify();
     }
 
+    pub fn close_native_overlays(&mut self, cx: &mut Context<Self>) {
+        if let Some(handle) = self.active_native_dialog.take() {
+            let _ = handle.update(cx, |_, window, _| window.remove_window());
+        }
+        self.native_toasts.dismiss_all(cx);
+    }
+
+    pub fn open_dialog(
+        &mut self,
+        destructive: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.dialog_destructive = destructive;
+        let kind_label = if destructive {
+            "destructive"
+        } else {
+            "standard"
+        };
+        match self.dialog_presentation {
+            OverlayPresentation::InWindow => {
+                self.dialog_open = true;
+                self.log_event("Dialog (In-Window)", format!("opened ({kind_label})"), cx);
+            }
+            OverlayPresentation::NativeWindow => {
+                if let Some(prev) = self.active_native_dialog.take() {
+                    let _ = prev.update(cx, |_, win, _| win.remove_window());
+                }
+
+                let title = if destructive {
+                    "Delete production cluster?"
+                } else {
+                    "Publish release v0.2.2?"
+                };
+                let description = if destructive {
+                    "This permanently removes the cluster and all active sessions. This cannot be undone."
+                } else {
+                    "All 25 Tailwind-inspired component modules and 2,092 Lucide icons are verified and ready."
+                };
+                let confirm_label = if destructive {
+                    "Delete Cluster"
+                } else {
+                    "Confirm Publish"
+                };
+                let icon = if destructive {
+                    LucideIcon::TriangleExclamationPoint
+                } else {
+                    LucideIcon::Rocket
+                };
+
+                let weak_confirm = cx.entity().downgrade();
+                let weak_close = cx.entity().downgrade();
+
+                let result = DialogWindow::new()
+                    .size(self.dialog_size)
+                    .destructive(destructive)
+                    .native_titlebar(self.dialog_native_titlebar)
+                    .icon(icon)
+                    .title(title)
+                    .description(description)
+                    .center_over(window, cx)
+                    .cancel_button("Cancel")
+                    .confirm_button(confirm_label, move |dlg_win, cx| {
+                        let display_id = dlg_win.display(cx).map(|d| d.id());
+                        if let Some(app) = weak_confirm.upgrade() {
+                            app.update(cx, |this, cx| {
+                                this.active_native_dialog = None;
+                                this.log_event("Dialog (Native)", "confirmed", cx);
+                                this.push_toast_on_display(
+                                    if destructive {
+                                        ToastVariant::Destructive
+                                    } else {
+                                        ToastVariant::Success
+                                    },
+                                    if destructive {
+                                        "Cluster deleted"
+                                    } else {
+                                        "Release published"
+                                    },
+                                    Some("Confirmed from native OS dialog window."),
+                                    display_id,
+                                    cx,
+                                );
+                            });
+                        }
+                    })
+                    .on_close(move |_, cx| {
+                        if let Some(app) = weak_close.upgrade() {
+                            app.update(cx, |this, cx| {
+                                this.active_native_dialog = None;
+                                this.log_event("Dialog (Native)", "dismissed", cx);
+                            });
+                        }
+                    })
+                    .open(cx);
+
+                match result {
+                    Ok(handle) => {
+                        self.active_native_dialog = Some(handle);
+                        self.log_event("Dialog (Native)", format!("opened ({kind_label})"), cx);
+                    }
+                    Err(err) => {
+                        self.log_event("Dialog (Native)", format!("open failed: {err}"), cx);
+                    }
+                }
+            }
+        }
+    }
+
     pub fn push_toast(
         &mut self,
         variant: ToastVariant,
         title: impl Into<SharedString>,
         description: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
+        self.push_toast_on_display(variant, title, description, None, cx);
+    }
+
+    pub fn push_toast_on_display(
+        &mut self,
+        variant: ToastVariant,
+        title: impl Into<SharedString>,
+        description: Option<&str>,
+        display_id: Option<DisplayId>,
         cx: &mut Context<Self>,
     ) {
         let id = self.next_toast_id;
@@ -763,11 +911,45 @@ impl PlaygroundApp {
         if let Some(desc) = description {
             item = item.description(desc.to_owned());
         }
-        self.toasts.push(item);
-        if self.toasts.len() > 4 {
-            self.toasts.remove(0);
+        match self.toast_presentation {
+            OverlayPresentation::InWindow => {
+                self.toasts.push(item);
+                if self.toasts.len() > 4 {
+                    self.toasts.remove(0);
+                }
+                self.log_event(
+                    "Toast (In-Window)",
+                    format!("pushed #{id} ({})", self.toast_position.label()),
+                    cx,
+                );
+            }
+            OverlayPresentation::NativeWindow => {
+                self.native_toasts.position(self.toast_position);
+                self.native_toasts.auto_dismiss(if self.toast_auto_dismiss {
+                    Some(Duration::from_secs(5))
+                } else {
+                    None
+                });
+                match self.native_toasts.push(item, display_id, cx) {
+                    Ok(_) => {
+                        self.log_event(
+                            "Toast (Native)",
+                            format!("opened OS popup #{id} ({})", self.toast_position.label()),
+                            cx,
+                        );
+                    }
+                    Err(err) => {
+                        self.log_event("Toast (Native)", format!("open failed: {err}"), cx);
+                    }
+                }
+            }
         }
-        cx.notify();
+    }
+
+    pub fn dismiss_all_toasts(&mut self, cx: &mut Context<Self>) {
+        self.toasts.clear();
+        self.native_toasts.dismiss_all(cx);
+        self.log_event("Toast", "cleared all", cx);
     }
 
     pub fn parent_check_state(&self) -> CheckState {

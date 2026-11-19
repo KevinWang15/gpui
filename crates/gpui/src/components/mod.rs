@@ -53,7 +53,10 @@ pub use charts::{
 };
 pub use checkbox::{CheckState, Checkbox, CheckboxGroup, checkbox, checkbox_group};
 pub use combobox::{ComboBox, ComboBoxEvent, ComboBoxOption, ComboBoxState, combo_box};
-pub use dialog::{Dialog, DialogSize, dialog};
+pub use dialog::{
+    Dialog, DialogSize, DialogWindow, DialogWindowAction, DialogWindowView, OverlayPresentation,
+    dialog, dialog_window,
+};
 pub use feedback::{EmptyState, ProgressBar, Skeleton, Spinner, empty_state, progress_bar, skeleton, spinner};
 pub use field::{Field, Kbd, Label, field, kbd, label};
 pub use filter_bar::{
@@ -90,7 +93,10 @@ pub use time_range::{
     CalendarDate, CalendarGrid, DateRange, TimeRangeEvent, TimeRangePicker, TimeRangePickerState,
     TimeRangePreset, TimeRangeUnit, calendar_grid, time_range_picker,
 };
-pub use toast::{Toast, ToastHost, ToastItem, ToastVariant, toast_host};
+pub use toast::{
+    NativeToastManager, Toast, ToastHost, ToastItem, ToastPosition, ToastVariant, ToastWindowView,
+    toast_host,
+};
 pub use toggle::{Switch, Toggle, ToggleButton, ToggleGroup, switch, toggle, toggle_group};
 pub use tooltip::Tooltip;
 

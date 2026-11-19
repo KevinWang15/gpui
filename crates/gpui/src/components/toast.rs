@@ -1,15 +1,46 @@
-//! Tailwind UI floating [`Toast`] notifications and [`ToastHost`] stack overlay.
+//! Floating [`Toast`] notifications supporting both **In-Window Overlay** ([`ToastHost`])
+//! and **Native OS Window** ([`NativeToastManager`], backed by non-activating [`WindowKind::PopUp`]
+//! OS notification windows anchored to any display corner).
 
+use std::cell::RefCell;
 use std::rc::Rc;
+use std::time::Duration;
 
 use crate::{
-    Animation, AnimationExt, App, ClickEvent, ElementId, FontWeight, Hsla, IntoElement,
-    RenderOnce, SharedString, StyleRefinement, Styled, Window, deferred, div, ease_out_quint,
-    prelude::*, px,
+    Animation, AnimationExt, AnyWindowHandle, App, Bounds, ClickEvent, Context, DisplayId,
+    ElementId, FontWeight, Hsla, IntoElement, Pixels, Render, RenderOnce, SharedString,
+    StyleRefinement, Styled, Window, WindowBackgroundAppearance, WindowBounds, WindowDecorations,
+    WindowKind, WindowOptions, deferred, div, ease_out_quint, point, prelude::*, px, size,
 };
 use crate::icons::{Icon, IconSize, LucideIcon};
 
 use super::theme::{ANIM_NORMAL, ActiveTheme, Theme};
+
+/// Screen or window corner where toast notifications appear.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ToastPosition {
+    /// Bottom-right corner (default).
+    #[default]
+    BottomRight,
+    /// Top-right corner.
+    TopRight,
+    /// Bottom-left corner.
+    BottomLeft,
+    /// Top-left corner.
+    TopLeft,
+}
+
+impl ToastPosition {
+    /// Human-readable label for settings & playground pickers.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::BottomRight => "Bottom Right",
+            Self::TopRight => "Top Right",
+            Self::BottomLeft => "Bottom Left",
+            Self::TopLeft => "Top Left",
+        }
+    }
+}
 
 /// Semantic variant for a [`Toast`] notification.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -55,10 +86,39 @@ impl ToastItem {
         self
     }
 
+    /// Sets the variant to [`ToastVariant::Info`].
+    pub fn info(self) -> Self {
+        self.variant(ToastVariant::Info)
+    }
+
+    /// Sets the variant to [`ToastVariant::Success`].
+    pub fn success(self) -> Self {
+        self.variant(ToastVariant::Success)
+    }
+
+    /// Sets the variant to [`ToastVariant::Warning`].
+    pub fn warning(self) -> Self {
+        self.variant(ToastVariant::Warning)
+    }
+
+    /// Sets the variant to [`ToastVariant::Destructive`].
+    pub fn destructive(self) -> Self {
+        self.variant(ToastVariant::Destructive)
+    }
+
     /// Sets optional description text.
     pub fn description(mut self, description: impl Into<SharedString>) -> Self {
         self.description = Some(description.into());
         self
+    }
+}
+
+fn toast_accent(variant: ToastVariant, theme: &Theme) -> (Hsla, LucideIcon) {
+    match variant {
+        ToastVariant::Info => (theme.info, LucideIcon::Info),
+        ToastVariant::Success => (theme.success, LucideIcon::CircleCheck),
+        ToastVariant::Warning => (theme.warning, LucideIcon::TriangleExclamationPoint),
+        ToastVariant::Destructive => (theme.destructive, LucideIcon::CircleX),
     }
 }
 
@@ -90,15 +150,6 @@ impl Toast {
         self.on_dismiss = Some(Box::new(handler));
         self
     }
-
-    fn accent(variant: ToastVariant, theme: &Theme) -> (Hsla, LucideIcon) {
-        match variant {
-            ToastVariant::Info => (theme.info, LucideIcon::Info),
-            ToastVariant::Success => (theme.success, LucideIcon::CircleCheck),
-            ToastVariant::Warning => (theme.warning, LucideIcon::TriangleExclamationPoint),
-            ToastVariant::Destructive => (theme.destructive, LucideIcon::CircleX),
-        }
-    }
 }
 
 impl Styled for Toast {
@@ -110,11 +161,12 @@ impl Styled for Toast {
 impl RenderOnce for Toast {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
-        let (accent, icon) = Self::accent(self.item.variant, &theme);
+        let (accent, icon) = toast_accent(self.item.variant, &theme);
 
         let anim_id = (self.id.clone(), "toast-enter");
         let mut el = div()
             .id(self.id.clone())
+            .occlude()
             .flex()
             .flex_row()
             .items_start()
@@ -182,10 +234,14 @@ impl RenderOnce for Toast {
     }
 }
 
-/// Floating bottom-right notification stack rendered in a deferred overlay layer.
+/// Floating in-window notification stack rendered in a deferred overlay layer.
+///
+/// To present toast notifications as dedicated OS-level desktop popups instead, see
+/// [`NativeToastManager`].
 #[derive(IntoElement)]
 pub struct ToastHost {
     toasts: Vec<ToastItem>,
+    position: ToastPosition,
     style: StyleRefinement,
     on_dismiss: Option<Rc<dyn Fn(&u64, &mut Window, &mut App) + 'static>>,
 }
@@ -196,13 +252,20 @@ pub fn toast_host(toasts: Vec<ToastItem>) -> ToastHost {
 }
 
 impl ToastHost {
-    /// Creates a floating stack for `toasts`.
+    /// Creates a floating in-window stack for `toasts`.
     pub fn new(toasts: Vec<ToastItem>) -> Self {
         Self {
             toasts,
+            position: ToastPosition::BottomRight,
             style: StyleRefinement::default(),
             on_dismiss: None,
         }
+    }
+
+    /// Sets the viewport corner where the toast stack anchors (default [`ToastPosition::BottomRight`]).
+    pub fn position(mut self, position: ToastPosition) -> Self {
+        self.position = position;
+        self
     }
 
     /// Registers a callback invoked with the dismissed toast's `id`.
@@ -225,13 +288,13 @@ impl RenderOnce for ToastHost {
         if self.toasts.is_empty() {
             return div().into_any_element();
         }
-        let mut stack = div()
-            .absolute()
-            .bottom(px(20.))
-            .right(px(20.))
-            .flex()
-            .flex_col()
-            .gap(px(10.));
+        let mut stack = div().absolute().flex().flex_col().gap(px(10.));
+        stack = match self.position {
+            ToastPosition::BottomRight => stack.bottom(px(20.)).right(px(20.)),
+            ToastPosition::TopRight => stack.top(px(20.)).right(px(20.)),
+            ToastPosition::BottomLeft => stack.bottom(px(20.)).left(px(20.)),
+            ToastPosition::TopLeft => stack.top(px(20.)).left(px(20.)),
+        };
 
         for item in self.toasts {
             let toast_id = item.id;
@@ -245,5 +308,372 @@ impl RenderOnce for ToastHost {
 
         crate::Refineable::refine(stack.style(), &self.style);
         deferred(stack).priority(60).into_any_element()
+    }
+}
+
+// ============================================================================
+// Native OS Window Toasts (`WindowKind::PopUp`)
+// ============================================================================
+
+const NATIVE_TOAST_WIDTH: f32 = 356.0;
+const NATIVE_TOAST_SLOT_HEIGHT: f32 = 82.0;
+
+struct ActiveNativeToast {
+    id: u64,
+    slot: usize,
+    window: AnyWindowHandle,
+}
+
+struct NativeToastManagerInner {
+    position: ToastPosition,
+    max_visible: usize,
+    auto_dismiss: Option<Duration>,
+    margin: Pixels,
+    gap: Pixels,
+    active: Vec<ActiveNativeToast>,
+    on_dismiss: Option<Rc<dyn Fn(u64, &mut App) + 'static>>,
+}
+
+/// Manages floating native OS notification windows ([`WindowKind::PopUp`]) anchored to a
+/// screen corner.
+///
+/// Each toast opens in its own compact, non-focus-stealing OS popup window so:
+/// - Toasts float above all desktop windows even outside a small parent app window.
+/// - Zero invisible transparent capture area blocks mouse clicks to underlying windows.
+/// - Works cleanly on composited (macOS, Windows, Wayland, X11) and non-composited desktops alike.
+/// - Live-syncs with global [`Theme`] changes via `cx.refresh_windows()`.
+#[derive(Clone)]
+pub struct NativeToastManager {
+    inner: Rc<RefCell<NativeToastManagerInner>>,
+}
+
+impl Default for NativeToastManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl NativeToastManager {
+    /// Creates a new [`NativeToastManager`] defaulting to bottom-right, max 4 simultaneous
+    /// OS popups, and a 5-second auto-dismiss timer.
+    pub fn new() -> Self {
+        Self {
+            inner: Rc::new(RefCell::new(NativeToastManagerInner {
+                position: ToastPosition::BottomRight,
+                max_visible: 4,
+                auto_dismiss: Some(Duration::from_secs(5)),
+                margin: px(20.),
+                gap: px(10.),
+                active: Vec::new(),
+                on_dismiss: None,
+            })),
+        }
+    }
+
+    /// Sets the display corner where OS toast windows stack.
+    pub fn position(&self, position: ToastPosition) -> &Self {
+        self.inner.borrow_mut().position = position;
+        self
+    }
+
+    /// Returns the currently configured [`ToastPosition`].
+    pub fn current_position(&self) -> ToastPosition {
+        self.inner.borrow().position
+    }
+
+    /// Sets the maximum simultaneous OS toast windows before the oldest is evicted (default `4`).
+    pub fn max_visible(&self, max: usize) -> &Self {
+        self.inner.borrow_mut().max_visible = max.max(1);
+        self
+    }
+
+    /// Configures automatic dismissal after `duration` (`None` keeps toasts open until manually dismissed).
+    pub fn auto_dismiss(&self, duration: Option<Duration>) -> &Self {
+        self.inner.borrow_mut().auto_dismiss = duration;
+        self
+    }
+
+    /// Returns the currently configured auto-dismiss duration.
+    pub fn auto_dismiss_duration(&self) -> Option<Duration> {
+        self.inner.borrow().auto_dismiss
+    }
+
+    /// Sets outer screen-edge margin in logical pixels (default `20px`).
+    pub fn margin(&self, margin: Pixels) -> &Self {
+        self.inner.borrow_mut().margin = margin;
+        self
+    }
+
+    /// Sets vertical spacing between stacked OS toast windows in logical pixels (default `10px`).
+    pub fn gap(&self, gap: Pixels) -> &Self {
+        self.inner.borrow_mut().gap = gap;
+        self
+    }
+
+    /// Registers a callback invoked whenever an OS toast window is dismissed (by click or timer).
+    pub fn on_dismiss(&self, handler: impl Fn(u64, &mut App) + 'static) -> &Self {
+        self.inner.borrow_mut().on_dismiss = Some(Rc::new(handler));
+        self
+    }
+
+    /// Returns the number of currently open OS toast windows.
+    pub fn active_count(&self) -> usize {
+        self.inner.borrow().active.len()
+    }
+
+    /// Opens a dedicated native OS [`WindowKind::PopUp`] window displaying `item`.
+    pub fn push(
+        &self,
+        item: ToastItem,
+        display_id: Option<DisplayId>,
+        cx: &mut App,
+    ) -> anyhow::Result<u64> {
+        let toast_id = item.id;
+
+        // If at capacity, evict the oldest toast window before opening the new one.
+        let evicted = {
+            let mut inner = self.inner.borrow_mut();
+            if inner.active.len() >= inner.max_visible {
+                Some(inner.active.remove(0))
+            } else {
+                None
+            }
+        };
+        if let Some(old) = evicted {
+            let _ = old.window.update(cx, |_, window, _| window.remove_window());
+        }
+
+        let (slot, position, margin, gap, auto_dismiss) = {
+            let inner = self.inner.borrow();
+            let slot = (0..inner.max_visible)
+                .find(|&candidate| inner.active.iter().all(|t| t.slot != candidate))
+                .unwrap_or(0);
+            (
+                slot,
+                inner.position,
+                inner.margin,
+                inner.gap,
+                inner.auto_dismiss,
+            )
+        };
+
+        let visible_bounds = display_id
+            .and_then(|id| cx.find_display(id))
+            .or_else(|| cx.primary_display())
+            .map(|display| display.visible_bounds())
+            .unwrap_or_else(|| Bounds::new(point(px(0.), px(0.)), size(px(1280.), px(800.))));
+
+        let toast_w = px(NATIVE_TOAST_WIDTH);
+        let toast_h = px(NATIVE_TOAST_SLOT_HEIGHT);
+        let step = toast_h + gap;
+        let offset = step * (slot as f32);
+
+        let origin = match position {
+            ToastPosition::BottomRight => point(
+                visible_bounds.origin.x + visible_bounds.size.width - toast_w - margin,
+                visible_bounds.origin.y + visible_bounds.size.height - margin - toast_h - offset,
+            ),
+            ToastPosition::TopRight => point(
+                visible_bounds.origin.x + visible_bounds.size.width - toast_w - margin,
+                visible_bounds.origin.y + margin + offset,
+            ),
+            ToastPosition::BottomLeft => point(
+                visible_bounds.origin.x + margin,
+                visible_bounds.origin.y + visible_bounds.size.height - margin - toast_h - offset,
+            ),
+            ToastPosition::TopLeft => point(
+                visible_bounds.origin.x + margin,
+                visible_bounds.origin.y + margin + offset,
+            ),
+        };
+
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                origin,
+                size(toast_w, toast_h),
+            ))),
+            titlebar: None,
+            focus: false,
+            show: true,
+            kind: WindowKind::PopUp,
+            is_movable: false,
+            is_resizable: false,
+            is_minimizable: false,
+            display_id,
+            window_background: WindowBackgroundAppearance::Opaque,
+            window_decorations: Some(WindowDecorations::Client),
+            ..Default::default()
+        };
+
+        let manager_for_click = self.clone();
+        let manager_for_close = self.clone();
+        let handle = cx.open_window(options, move |window, cx| {
+            window.on_window_should_close(cx, move |_, cx| {
+                manager_for_close.detach_entry(toast_id, cx);
+                true
+            });
+            cx.new(|_| ToastWindowView {
+                item,
+                manager: manager_for_click,
+            })
+        })?;
+
+        self.inner.borrow_mut().active.push(ActiveNativeToast {
+            id: toast_id,
+            slot,
+            window: handle.into(),
+        });
+
+        if let Some(delay) = auto_dismiss {
+            let manager_timer = self.clone();
+            cx.spawn(async move |cx| {
+                cx.background_executor().timer(delay).await;
+                cx.update(|cx| {
+                    manager_timer.dismiss(toast_id, cx);
+                });
+            })
+            .detach();
+        }
+
+        Ok(toast_id)
+    }
+
+    fn detach_entry(&self, id: u64, cx: &mut App) {
+        let on_dismiss = {
+            let mut inner = self.inner.borrow_mut();
+            let existed = if let Some(pos) = inner.active.iter().position(|t| t.id == id) {
+                inner.active.remove(pos);
+                true
+            } else {
+                false
+            };
+            if existed {
+                inner.on_dismiss.clone()
+            } else {
+                None
+            }
+        };
+        if let Some(cb) = on_dismiss {
+            cb(id, cx);
+        }
+    }
+
+    /// Dismisses the native OS toast window matching `id` if it is still open.
+    pub fn dismiss(&self, id: u64, cx: &mut App) {
+        let removed = {
+            let mut inner = self.inner.borrow_mut();
+            let pos = inner.active.iter().position(|t| t.id == id);
+            pos.map(|idx| (inner.active.remove(idx), inner.on_dismiss.clone()))
+        };
+        if let Some((entry, on_dismiss)) = removed {
+            let _ = entry
+                .window
+                .update(cx, |_, window, _| window.remove_window());
+            if let Some(cb) = on_dismiss {
+                cb(id, cx);
+            }
+        }
+    }
+
+    /// Closes every currently open native OS toast window.
+    pub fn dismiss_all(&self, cx: &mut App) {
+        let entries: Vec<ActiveNativeToast> = {
+            let mut inner = self.inner.borrow_mut();
+            std::mem::take(&mut inner.active)
+        };
+        for entry in entries {
+            let _ = entry
+                .window
+                .update(cx, |_, window, _| window.remove_window());
+        }
+    }
+}
+
+/// Root GPUI view hosted inside a dedicated native OS [`WindowKind::PopUp`] toast window.
+pub struct ToastWindowView {
+    item: ToastItem,
+    manager: NativeToastManager,
+}
+
+impl Render for ToastWindowView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let (accent, icon) = toast_accent(self.item.variant, &theme);
+        let toast_id = self.item.id;
+        let manager = self.manager.clone();
+        let hover_bg = theme.surface_hover;
+
+        div()
+            .id(("native-toast-win", toast_id as usize))
+            .size_full()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(12.))
+            .p(px(14.))
+            .bg(theme.popover)
+            .border_1()
+            .border_color(theme.input_border)
+            .child(
+                // Left semantic accent stripe + icon
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .child(div().w(px(3.)).h(px(46.)).rounded_full().bg(accent))
+                    .child(Icon::new(icon).size(IconSize::Lg).color(accent)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(3.))
+                    .flex_1()
+                    .min_w_0()
+                    .child(
+                        div()
+                            .text_size(px(13.5))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme.popover_foreground)
+                            .truncate()
+                            .child(self.item.title.clone()),
+                    )
+                    .when_some(self.item.description.clone(), |el, desc| {
+                        el.child(
+                            div()
+                                .text_size(px(12.5))
+                                .text_color(theme.muted_foreground)
+                                .truncate()
+                                .child(desc),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .id("native-toast-close")
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .p(px(4.))
+                    .rounded(theme.radius_sm)
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(hover_bg))
+                    .on_click(move |_, window, cx| {
+                        // Detach tracking first, then close `window` directly to avoid
+                        // re-entrantly borrowing this window handle through `cx`.
+                        manager.detach_entry(toast_id, cx);
+                        window.remove_window();
+                    })
+                    .child(
+                        Icon::new(LucideIcon::X)
+                            .size(IconSize::Sm)
+                            .color(theme.muted_foreground),
+                    ),
+            )
+            .with_animation(
+                ("native-toast-enter", toast_id as usize),
+                Animation::new(ANIM_NORMAL).with_easing(ease_out_quint()),
+                |el, delta| el.opacity(delta),
+            )
     }
 }

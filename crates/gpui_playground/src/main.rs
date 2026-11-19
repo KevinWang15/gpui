@@ -425,11 +425,11 @@ impl Render for PlaygroundApp {
                             } else {
                                 "Confirm Publish"
                             })
-                            .on_click(cx.listener(|this, _, _, cx| {
+                            .on_click(cx.listener(|this, _, window, cx| {
                                 let destructive = this.dialog_destructive;
                                 this.dialog_open = false;
-                                this.log_event("Dialog", "confirmed", cx);
-                                this.push_toast(
+                                this.log_event("Dialog (In-Window)", "confirmed", cx);
+                                this.push_toast_on_display(
                                     if destructive {
                                         ToastVariant::Destructive
                                     } else {
@@ -440,17 +440,20 @@ impl Render for PlaygroundApp {
                                     } else {
                                         "Release published"
                                     },
-                                    None,
+                                    Some("Confirmed from in-window dialog overlay."),
+                                    window.display(cx).map(|d| d.id()),
                                     cx,
                                 );
                             })),
                     ),
             )
             .child(
-                toast_host(self.toasts.clone()).on_dismiss(cx.listener(|this, id, _, cx| {
-                    this.toasts.retain(|t| t.id != *id);
-                    cx.notify();
-                })),
+                toast_host(self.toasts.clone())
+                    .position(self.toast_position)
+                    .on_dismiss(cx.listener(|this, id, _, cx| {
+                        this.toasts.retain(|t| t.id != *id);
+                        this.log_event("Toast (In-Window)", format!("dismissed #{id}"), cx);
+                    })),
             )
     }
 }
@@ -479,6 +482,13 @@ fn main() {
                 |window, cx| {
                     let app = cx.new(PlaygroundApp::new);
                     let app_weak = app.downgrade();
+                    let app_weak_close = app.downgrade();
+                    window.on_window_should_close(cx, move |_, cx| {
+                        if let Some(entity) = app_weak_close.upgrade() {
+                            entity.update(cx, |this, cx| this.close_native_overlays(cx));
+                        }
+                        true
+                    });
                     Theme::observe_system_appearance(window, move |mode, pref, cx| {
                         let accent = app_weak
                             .upgrade()

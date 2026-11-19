@@ -1,10 +1,13 @@
 //! Overlays (Dialog, DropdownMenu, Popover, Toast, Tooltip), sortable Data Table, Badges,
 //! Avatars, Alerts, Progress, Spinner, Skeleton & EmptyState.
 
+use std::time::Duration;
+
 use gpui::components::*;
-use gpui::icons::LucideIcon;
+use gpui::icons::{Icon, IconSize, LucideIcon};
 use gpui::{Context, FontWeight, IntoElement, div, prelude::*, px};
 
+use crate::code_box::code_snippet;
 use crate::state::{PlaygroundApp, TableSortCol};
 
 pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl IntoElement {
@@ -108,327 +111,764 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
         (BadgeColor::Pink, "Pink"),
     ];
 
+    let theme = cx.theme();
+    let dlg_mode_val = match app.dialog_presentation {
+        OverlayPresentation::InWindow => "in-window",
+        OverlayPresentation::NativeWindow => "native",
+    };
+    let toast_mode_val = match app.toast_presentation {
+        OverlayPresentation::InWindow => "in-window",
+        OverlayPresentation::NativeWindow => "native",
+    };
+    let native_toast_count = app.native_toasts.active_count();
+    let total_active_toasts = app.toasts.len() + native_toast_count;
+
+    let snippet_code = {
+        let dlg_part = match app.dialog_presentation {
+            OverlayPresentation::InWindow => format!(
+                "// In-Window Dialog overlay\ndialog(\"confirm-dlg\", self.open)\n    .size(DialogSize::{:?})\n    .title(\"Publish release v0.2.2?\")\n    .on_close(cx.listener(|this, _, _, cx| {{ this.open = false; cx.notify(); }}))",
+                app.dialog_size
+            ),
+            OverlayPresentation::NativeWindow => format!(
+                "// Dedicated Native OS Dialog window (WindowKind::Dialog)\nDialogWindow::new()\n    .size(DialogSize::{:?})\n    .native_titlebar({})\n    .title(\"Publish release v0.2.2?\")\n    .center_over(window, cx)\n    .cancel_button(\"Cancel\")\n    .confirm_button(\"Confirm Publish\", |_, cx| {{ /* confirmed */ }})\n    .open(cx)?;",
+                app.dialog_size, app.dialog_native_titlebar
+            ),
+        };
+        let toast_part = match app.toast_presentation {
+            OverlayPresentation::InWindow => format!(
+                "// In-Window ToastHost overlay\ntoast_host(self.toasts.clone())\n    .position(ToastPosition::{:?})\n    .on_dismiss(cx.listener(|this, id, _, cx| this.toasts.retain(|t| t.id != *id)))",
+                app.toast_position
+            ),
+            OverlayPresentation::NativeWindow => format!(
+                "// Dedicated Native OS Toast popups (WindowKind::PopUp)\nself.native_toasts\n    .position(ToastPosition::{:?})\n    .auto_dismiss({});\nself.native_toasts.push(ToastItem::new(id, \"Changes saved\").success(), display_id, cx)?;",
+                app.toast_position,
+                if app.toast_auto_dismiss {
+                    "Some(Duration::from_secs(5))"
+                } else {
+                    "None"
+                }
+            ),
+        };
+        format!("{dlg_part}\n\n{toast_part}")
+    };
+
     v_stack()
         .spacing(px(20.))
         .child(
             page_header("Overlays, Data Table, Badges & Feedback")
                 .description(
-                    "Launch modal dialogs, dropdown menus, popovers, and toast notifications; sort table columns; inspect badges, avatars, and loading states.",
+                    "Compare In-Window Overlays vs. Dedicated Native OS Windows for dialogs and toasts; inspect menus, popovers, sortable tables, badges, and feedback states.",
                 ),
         )
-        // Overlays & Menus Launcher Card
+        // Dual-Mode Dialog & Toast Comparison Lab
         .child(
-            grid(2)
-                .spacing(px(16.))
+            card()
                 .child(
-                    card()
-                        .child(
-                            card_header()
-                                .bordered()
-                                .child(card_title("Modal Dialog & Toast Launcher")),
-                        )
-                        .child(
-                            card_content()
-                                .child(
-                                    h_stack()
-                                        .justify_between()
-                                        .child(label("Dialog size"))
-                                        .child(
-                                            h_stack().spacing(px(6.)).children(
-                                                [
-                                                    (DialogSize::Sm, "Sm"),
-                                                    (DialogSize::Md, "Md"),
-                                                    (DialogSize::Lg, "Lg"),
-                                                    (DialogSize::Xl, "Xl"),
-                                                ]
-                                                .into_iter()
-                                                .enumerate()
-                                                .map(|(i, (sz, name))| {
-                                                    button(("dlg-sz", i))
-                                                        .size(ComponentSize::Xs)
-                                                        .outline()
-                                                        .selected(app.dialog_size == sz)
-                                                        .label(name)
-                                                        .on_click(cx.listener(
-                                                            move |this, _, _, cx| {
-                                                                this.dialog_size = sz;
-                                                                cx.notify();
-                                                            },
-                                                        ))
-                                                }),
-                                            ),
-                                        ),
-                                )
-                                .child(
-                                    h_stack()
-                                        .flex_wrap()
-                                        .child(
-                                            button("launch-dlg")
-                                                .primary()
-                                                .leading_icon(LucideIcon::SquareArrowUpRight)
-                                                .label("Open Standard Dialog")
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.dialog_destructive = false;
-                                                    this.dialog_open = true;
-                                                    this.log_event("Dialog", "opened (standard)", cx);
-                                                })),
+                    card_header().bordered().child(
+                        h_stack()
+                            .justify_between()
+                            .flex_wrap()
+                            .spacing(px(8.))
+                            .child(
+                                h_stack()
+                                    .spacing(px(8.))
+                                    .child(card_title("Dialog & Toast Modes — In-Window vs. Native OS Window"))
+                                    .child(
+                                        badge("Dual Mode")
+                                            .color(BadgeColor::Indigo)
+                                            .pill(true),
+                                    ),
+                            )
+                            .child(
+                                h_stack()
+                                    .spacing(px(6.))
+                                    .when(app.active_native_dialog.is_some(), |el| {
+                                        el.child(
+                                            badge("OS Dialog Open")
+                                                .color(BadgeColor::Purple)
+                                                .dot(true)
+                                                .pill(true),
                                         )
-                                        .child(
-                                            button("launch-alert-dlg")
-                                                .destructive()
-                                                .leading_icon(LucideIcon::Trash)
-                                                .label("Open Destructive Alert")
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.dialog_destructive = true;
-                                                    this.dialog_open = true;
-                                                    this.log_event("Dialog", "opened (destructive)", cx);
-                                                })),
-                                        ),
-                                )
-                                .child(divider())
-                                .child(label("Trigger Toast Notifications"))
-                                .child(
-                                    h_stack()
-                                        .flex_wrap()
-                                        .spacing(px(8.))
-                                        .child(
-                                            button("t-info")
-                                                .outline()
-                                                .size(ComponentSize::Sm)
-                                                .label("Info")
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.push_toast(
-                                                        ToastVariant::Info,
-                                                        "New version ready",
-                                                        Some("Refresh to load GPUI 0.2.2."),
-                                                        cx,
-                                                    );
-                                                })),
+                                    })
+                                    .when(!app.toasts.is_empty(), |el| {
+                                        el.child(
+                                            badge(format!("In-Window: {}", app.toasts.len()))
+                                                .color(BadgeColor::Blue)
+                                                .pill(true),
                                         )
-                                        .child(
-                                            button("t-ok")
-                                                .outline()
-                                                .size(ComponentSize::Sm)
-                                                .label("Success")
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.push_toast(
-                                                        ToastVariant::Success,
-                                                        "Changes saved",
-                                                        Some("Synced to workspace cleanly."),
-                                                        cx,
-                                                    );
-                                                })),
+                                    })
+                                    .when(native_toast_count > 0, |el| {
+                                        el.child(
+                                            badge(format!("OS Popups: {native_toast_count}"))
+                                                .color(BadgeColor::Green)
+                                                .dot(true)
+                                                .pill(true),
                                         )
-                                        .child(
-                                            button("t-warn")
-                                                .outline()
-                                                .size(ComponentSize::Sm)
-                                                .label("Warning")
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.push_toast(
-                                                        ToastVariant::Warning,
-                                                        "High memory usage",
-                                                        Some("Atlas cache reached 82%."),
-                                                        cx,
-                                                    );
-                                                })),
-                                        )
-                                        .child(
-                                            button("t-err")
-                                                .outline()
-                                                .size(ComponentSize::Sm)
-                                                .label("Destructive")
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.push_toast(
-                                                        ToastVariant::Destructive,
-                                                        "Connection lost",
-                                                        Some("Retrying automatically..."),
-                                                        cx,
-                                                    );
-                                                })),
-                                        ),
-                                ),
-                        ),
+                                    }),
+                            ),
+                    ),
                 )
-                // DropdownMenu + Popover + Tooltips
                 .child(
-                    card()
+                    card_content()
                         .child(
-                            card_header()
-                                .bordered()
-                                .child(card_title("DropdownMenu, Popover & Tooltips")),
-                        )
-                        .child(
-                            card_content()
+                            grid(2)
+                                .spacing(px(20.))
+                                // Left Column: Modal Dialog controls
                                 .child(
-                                    h_stack()
-                                        .flex_wrap()
-                                        .spacing(px(10.))
+                                    v_stack()
+                                        .spacing(px(12.))
                                         .child(
-                                            dropdown_menu("pg-dd", app.dropdown_open)
-                                                .trigger(
-                                                    button("pg-dd-btn")
-                                                        .secondary()
-                                                        .label("Dropdown Menu")
-                                                        .trailing_icon(LucideIcon::ChevronDown)
-                                                        .on_click(cx.listener(|this, _, _, cx| {
-                                                            this.dropdown_open = !this.dropdown_open;
-                                                            cx.notify();
-                                                        })),
-                                                )
-                                                .on_close(cx.listener(|this, _, _, cx| {
-                                                    this.dropdown_open = false;
-                                                    cx.notify();
-                                                }))
-                                                .entry(MenuEntry::Label("View Options".into()))
-                                                .entry(MenuEntry::checkbox_item(
-                                                    "Show layout grid",
-                                                    app.dropdown_show_grid,
-                                                    cx.listener(|this, _, _, cx| {
-                                                        this.dropdown_show_grid =
-                                                            !this.dropdown_show_grid;
-                                                        this.log_event(
-                                                            "DropdownMenu",
-                                                            format!(
-                                                                "show_grid -> {}",
-                                                                this.dropdown_show_grid
-                                                            ),
-                                                            cx,
-                                                        );
-                                                    }),
-                                                ))
-                                                .entry(MenuEntry::checkbox_item(
-                                                    "Compact density",
-                                                    app.dropdown_compact,
-                                                    cx.listener(|this, _, _, cx| {
-                                                        this.dropdown_compact =
-                                                            !this.dropdown_compact;
-                                                        this.table_compact = this.dropdown_compact;
-                                                        cx.notify();
-                                                    }),
-                                                ))
-                                                .entry(MenuEntry::Separator)
-                                                .entry(
-                                                    MenuEntry::item_with_icon(
-                                                        "Export JSON",
-                                                        LucideIcon::Download,
-                                                        cx.listener(|this, _, _, cx| {
-                                                            this.push_toast(
-                                                                ToastVariant::Info,
-                                                                "Exported theme.json",
-                                                                None,
-                                                                cx,
-                                                            );
-                                                        }),
-                                                    )
-                                                    .with_shortcut("⌘E"),
-                                                )
-                                                .entry(MenuEntry::destructive_item(
-                                                    "Reset workspace",
-                                                    Some(LucideIcon::RotateCcw),
-                                                    cx.listener(|this, _, _, cx| {
-                                                        this.push_toast(
-                                                            ToastVariant::Warning,
-                                                            "Workspace reset",
-                                                            None,
-                                                            cx,
-                                                        );
-                                                    }),
-                                                )),
-                                        )
-                                        .child(
-                                            popover("pg-pop", app.popover_open)
-                                                .trigger(
-                                                    button("pg-pop-btn")
-                                                        .outline()
-                                                        .leading_icon(LucideIcon::SlidersHorizontal)
-                                                        .label("Interactive Popover")
-                                                        .on_click(cx.listener(|this, _, _, cx| {
-                                                            this.popover_open = !this.popover_open;
-                                                            cx.notify();
-                                                        })),
-                                                )
-                                                .on_close(cx.listener(|this, _, _, cx| {
-                                                    this.popover_open = false;
-                                                    cx.notify();
-                                                }))
+                                            h_stack()
+                                                .justify_between()
+                                                .flex_wrap()
+                                                .spacing(px(8.))
                                                 .child(
-                                                    v_stack()
-                                                        .spacing(px(10.))
-                                                        .w(px(240.))
+                                                    h_stack()
+                                                        .spacing(px(6.))
+                                                        .child(
+                                                            Icon::new(LucideIcon::AppWindow)
+                                                                .size(IconSize::Sm)
+                                                                .color(theme.primary),
+                                                        )
                                                         .child(
                                                             div()
+                                                                .text_size(px(13.5))
                                                                 .font_weight(FontWeight::SEMIBOLD)
-                                                                .child("Table Display"),
-                                                        )
-                                                        .child(
-                                                            toggle("pop-str", app.table_striped)
-                                                                .size(ComponentSize::Sm)
-                                                                .label("Striped rows")
-                                                                .on_change(cx.listener(
-                                                                    |this, v, _, cx| {
-                                                                        this.table_striped = *v;
-                                                                        cx.notify();
-                                                                    },
-                                                                )),
-                                                        )
-                                                        .child(
-                                                            toggle("pop-cmp", app.table_compact)
-                                                                .size(ComponentSize::Sm)
-                                                                .label("Compact rows")
-                                                                .on_change(cx.listener(
-                                                                    |this, v, _, cx| {
-                                                                        this.table_compact = *v;
-                                                                        cx.notify();
-                                                                    },
-                                                                )),
+                                                                .child("Modal Dialog"),
                                                         ),
+                                                )
+                                                .child(
+                                                    segmented_control("dlg-mode-seg", dlg_mode_val)
+                                                        .size(ComponentSize::Xs)
+                                                        .item(
+                                                            SegmentedItem::new(
+                                                                "in-window",
+                                                                "In-Window",
+                                                            )
+                                                            .icon(LucideIcon::Layers),
+                                                        )
+                                                        .item(
+                                                            SegmentedItem::new(
+                                                                "native",
+                                                                "Native OS Window",
+                                                            )
+                                                            .icon(LucideIcon::AppWindow),
+                                                        )
+                                                        .on_change(cx.listener(|this, val: &gpui::SharedString, _, cx| {
+                                                            let mode = if val.as_ref() == "native" {
+                                                                OverlayPresentation::NativeWindow
+                                                            } else {
+                                                                OverlayPresentation::InWindow
+                                                            };
+                                                            this.dialog_presentation = mode;
+                                                            this.log_event(
+                                                                "Dialog Mode",
+                                                                mode.label(),
+                                                                cx,
+                                                            );
+                                                        })),
+                                                ),
+                                        )
+                                        .child(
+                                            h_stack()
+                                                .justify_between()
+                                                .child(label("Dialog size"))
+                                                .child(
+                                                    h_stack().spacing(px(6.)).children(
+                                                        [
+                                                            (DialogSize::Sm, "Sm"),
+                                                            (DialogSize::Md, "Md"),
+                                                            (DialogSize::Lg, "Lg"),
+                                                            (DialogSize::Xl, "Xl"),
+                                                        ]
+                                                        .into_iter()
+                                                        .enumerate()
+                                                        .map(|(i, (sz, name))| {
+                                                            button(("dlg-sz", i))
+                                                                .size(ComponentSize::Xs)
+                                                                .outline()
+                                                                .selected(app.dialog_size == sz)
+                                                                .label(name)
+                                                                .on_click(cx.listener(
+                                                                    move |this, _, _, cx| {
+                                                                        this.dialog_size = sz;
+                                                                        cx.notify();
+                                                                    },
+                                                                ))
+                                                        }),
+                                                    ),
+                                                ),
+                                        )
+                                        .when(
+                                            app.dialog_presentation
+                                                == OverlayPresentation::NativeWindow,
+                                            |el| {
+                                                el.child(
+                                                    toggle(
+                                                        "dlg-native-tb",
+                                                        app.dialog_native_titlebar,
+                                                    )
+                                                    .size(ComponentSize::Sm)
+                                                    .label("Use OS titlebar chrome")
+                                                    .description(
+                                                        "Off: borderless draggable header; On: server-side OS window titlebar.",
+                                                    )
+                                                    .on_change(cx.listener(|this, v, _, cx| {
+                                                        this.dialog_native_titlebar = *v;
+                                                        cx.notify();
+                                                    })),
+                                                )
+                                            },
+                                        )
+                                        .child(
+                                            div()
+                                                .p(px(10.))
+                                                .rounded(theme.radius_md)
+                                                .bg(theme.surface_muted.opacity(0.6))
+                                                .border_1()
+                                                .border_color(theme.border)
+                                                .text_size(px(12.))
+                                                .text_color(theme.muted_foreground)
+                                                .child(match app.dialog_presentation {
+                                                    OverlayPresentation::InWindow => {
+                                                        "Renders inside the app viewport with an animated dimmed backdrop, Escape & backdrop click dismissal, and zero OS window chrome."
+                                                    }
+                                                    OverlayPresentation::NativeWindow => {
+                                                        "Opens a dedicated OS modal window (WindowKind::Dialog). Drag it freely beyond the parent window bounds, test OS focus/modality, and switch Light/Dark theme live."
+                                                    }
+                                                }),
+                                        )
+                                        .child(
+                                            h_stack()
+                                                .flex_wrap()
+                                                .spacing(px(8.))
+                                                .child(
+                                                    button("launch-dlg")
+                                                        .primary()
+                                                        .leading_icon(if app.dialog_presentation
+                                                            == OverlayPresentation::NativeWindow
+                                                        {
+                                                            LucideIcon::ExternalLink
+                                                        } else {
+                                                            LucideIcon::SquareArrowUpRight
+                                                        })
+                                                        .label("Open Standard Dialog")
+                                                        .on_click(cx.listener(
+                                                            |this, _, window, cx| {
+                                                                this.open_dialog(false, window, cx);
+                                                            },
+                                                        )),
+                                                )
+                                                .child(
+                                                    button("launch-alert-dlg")
+                                                        .destructive()
+                                                        .leading_icon(LucideIcon::Trash)
+                                                        .label("Open Destructive Alert")
+                                                        .on_click(cx.listener(
+                                                            |this, _, window, cx| {
+                                                                this.open_dialog(true, window, cx);
+                                                            },
+                                                        )),
                                                 ),
                                         ),
                                 )
-                                .child(divider())
-                                .child(label("Hover for Styled Tooltips"))
+                                // Right Column: Toast Notifications controls
                                 .child(
-                                    h_stack()
-                                        .spacing(px(10.))
+                                    v_stack()
+                                        .spacing(px(12.))
                                         .child(
-                                            div()
-                                                .id("tt-plain")
-                                                .tooltip(|w, cx| {
-                                                    Tooltip::text(
-                                                        "Rendered in GPUI's native tooltip layer",
-                                                        w,
-                                                        cx,
-                                                    )
-                                                })
+                                            h_stack()
+                                                .justify_between()
+                                                .flex_wrap()
+                                                .spacing(px(8.))
                                                 .child(
-                                                    button("tt-b1")
-                                                        .soft()
-                                                        .size(ComponentSize::Sm)
-                                                        .label("Plain Tooltip"),
+                                                    h_stack()
+                                                        .spacing(px(6.))
+                                                        .child(
+                                                            Icon::new(LucideIcon::BellRing)
+                                                                .size(IconSize::Sm)
+                                                                .color(theme.primary),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .text_size(px(13.5))
+                                                                .font_weight(FontWeight::SEMIBOLD)
+                                                                .child("Toast Notifications"),
+                                                        ),
+                                                )
+                                                .child(
+                                                    segmented_control(
+                                                        "toast-mode-seg",
+                                                        toast_mode_val,
+                                                    )
+                                                    .size(ComponentSize::Xs)
+                                                    .item(
+                                                        SegmentedItem::new(
+                                                            "in-window",
+                                                            "In-Window",
+                                                        )
+                                                        .icon(LucideIcon::Layers),
+                                                    )
+                                                    .item(
+                                                        SegmentedItem::new(
+                                                            "native",
+                                                            "Native OS Window",
+                                                        )
+                                                        .icon(LucideIcon::BellRing),
+                                                    )
+                                                    .on_change(cx.listener(|this, val: &gpui::SharedString, _, cx| {
+                                                        let mode = if val.as_ref() == "native" {
+                                                            OverlayPresentation::NativeWindow
+                                                        } else {
+                                                            OverlayPresentation::InWindow
+                                                        };
+                                                        this.toast_presentation = mode;
+                                                        this.log_event(
+                                                            "Toast Mode",
+                                                            mode.label(),
+                                                            cx,
+                                                        );
+                                                    })),
                                                 ),
                                         )
                                         .child(
-                                            div()
-                                                .id("tt-sc")
-                                                .tooltip(|w, cx| {
-                                                    Tooltip::with_shortcut(
-                                                        "Quick command search",
-                                                        "⌘K",
-                                                        w,
-                                                        cx,
-                                                    )
-                                                })
+                                            h_stack()
+                                                .justify_between()
+                                                .flex_wrap()
+                                                .spacing(px(6.))
+                                                .child(label("Corner"))
                                                 .child(
-                                                    button("tt-b2")
-                                                        .soft()
-                                                        .size(ComponentSize::Sm)
-                                                        .label("Tooltip + Kbd"),
+                                                    h_stack().spacing(px(4.)).children(
+                                                        [
+                                                            (ToastPosition::BottomRight, "BR"),
+                                                            (ToastPosition::TopRight, "TR"),
+                                                            (ToastPosition::BottomLeft, "BL"),
+                                                            (ToastPosition::TopLeft, "TL"),
+                                                        ]
+                                                        .into_iter()
+                                                        .enumerate()
+                                                        .map(|(i, (pos, short))| {
+                                                            button(("toast-pos", i))
+                                                                .size(ComponentSize::Xs)
+                                                                .outline()
+                                                                .selected(app.toast_position == pos)
+                                                                .label(short)
+                                                                .on_click(cx.listener(
+                                                                    move |this, _, _, cx| {
+                                                                        this.toast_position = pos;
+                                                                        this.native_toasts
+                                                                            .position(pos);
+                                                                        this.log_event(
+                                                                            "Toast Corner",
+                                                                            pos.label(),
+                                                                            cx,
+                                                                        );
+                                                                    },
+                                                                ))
+                                                        }),
+                                                    ),
                                                 ),
                                         )
-                                        .child(kbd("⌘K"))
-                                        .child(kbd("Esc")),
+                                        .when(
+                                            app.toast_presentation
+                                                == OverlayPresentation::NativeWindow,
+                                            |el| {
+                                                el.child(
+                                                    toggle(
+                                                        "toast-auto-dismiss",
+                                                        app.toast_auto_dismiss,
+                                                    )
+                                                    .size(ComponentSize::Sm)
+                                                    .label("Auto-dismiss after 5s")
+                                                    .description(
+                                                        "Off: native popups stay pinned until clicked or cleared.",
+                                                    )
+                                                    .on_change(cx.listener(|this, v, _, cx| {
+                                                        this.toast_auto_dismiss = *v;
+                                                        this.native_toasts.auto_dismiss(if *v {
+                                                            Some(Duration::from_secs(5))
+                                                        } else {
+                                                            None
+                                                        });
+                                                        cx.notify();
+                                                    })),
+                                                )
+                                            },
+                                        )
+                                        .child(
+                                            div()
+                                                .p(px(10.))
+                                                .rounded(theme.radius_md)
+                                                .bg(theme.surface_muted.opacity(0.6))
+                                                .border_1()
+                                                .border_color(theme.border)
+                                                .text_size(px(12.))
+                                                .text_color(theme.muted_foreground)
+                                                .child(match app.toast_presentation {
+                                                    OverlayPresentation::InWindow => {
+                                                        "Renders via deferred ToastHost inside the app viewport corner. Ideal for compact notifications tied strictly to this window."
+                                                    }
+                                                    OverlayPresentation::NativeWindow => {
+                                                        "Spawns tight-fitted non-activating OS popups (WindowKind::PopUp) anchored to the display corner — floats above all apps without stealing focus."
+                                                    }
+                                                }),
+                                        )
+                                        .child(
+                                            h_stack()
+                                                .flex_wrap()
+                                                .spacing(px(6.))
+                                                .child(
+                                                    button("t-info")
+                                                        .outline()
+                                                        .size(ComponentSize::Sm)
+                                                        .label("Info")
+                                                        .on_click(cx.listener(
+                                                            |this, _, window, cx| {
+                                                                this.push_toast_on_display(
+                                                                    ToastVariant::Info,
+                                                                    "New version ready",
+                                                                    Some(
+                                                                        "Refresh to load GPUI 0.2.2.",
+                                                                    ),
+                                                                    window.display(cx).map(|d| d.id()),
+                                                                    cx,
+                                                                );
+                                                            },
+                                                        )),
+                                                )
+                                                .child(
+                                                    button("t-ok")
+                                                        .outline()
+                                                        .size(ComponentSize::Sm)
+                                                        .label("Success")
+                                                        .on_click(cx.listener(
+                                                            |this, _, window, cx| {
+                                                                this.push_toast_on_display(
+                                                                    ToastVariant::Success,
+                                                                    "Changes saved",
+                                                                    Some(
+                                                                        "Synced to workspace cleanly.",
+                                                                    ),
+                                                                    window.display(cx).map(|d| d.id()),
+                                                                    cx,
+                                                                );
+                                                            },
+                                                        )),
+                                                )
+                                                .child(
+                                                    button("t-warn")
+                                                        .outline()
+                                                        .size(ComponentSize::Sm)
+                                                        .label("Warning")
+                                                        .on_click(cx.listener(
+                                                            |this, _, window, cx| {
+                                                                this.push_toast_on_display(
+                                                                    ToastVariant::Warning,
+                                                                    "High memory usage",
+                                                                    Some(
+                                                                        "Atlas cache reached 82%.",
+                                                                    ),
+                                                                    window.display(cx).map(|d| d.id()),
+                                                                    cx,
+                                                                );
+                                                            },
+                                                        )),
+                                                )
+                                                .child(
+                                                    button("t-err")
+                                                        .outline()
+                                                        .size(ComponentSize::Sm)
+                                                        .label("Destructive")
+                                                        .on_click(cx.listener(
+                                                            |this, _, window, cx| {
+                                                                this.push_toast_on_display(
+                                                                    ToastVariant::Destructive,
+                                                                    "Connection lost",
+                                                                    Some(
+                                                                        "Retrying automatically...",
+                                                                    ),
+                                                                    window.display(cx).map(|d| d.id()),
+                                                                    cx,
+                                                                );
+                                                            },
+                                                        )),
+                                                )
+                                                .when(total_active_toasts > 0, |el| {
+                                                    el.child(
+                                                        button("t-clear-all")
+                                                            .ghost()
+                                                            .size(ComponentSize::Sm)
+                                                            .leading_icon(LucideIcon::X)
+                                                            .label("Clear All")
+                                                            .on_click(cx.listener(
+                                                                |this, _, _, cx| {
+                                                                    this.dismiss_all_toasts(cx);
+                                                                },
+                                                            )),
+                                                    )
+                                                }),
+                                        ),
                                 ),
+                        )
+                        .child(divider())
+                        // Quick A/B comparison strip
+                        .child(
+                            grid(2)
+                                .spacing(px(12.))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(4.))
+                                        .p(px(12.))
+                                        .rounded(theme.radius_md)
+                                        .bg(theme.surface_muted.opacity(0.4))
+                                        .border_1()
+                                        .border_color(theme.border)
+                                        .child(
+                                            h_stack()
+                                                .spacing(px(6.))
+                                                .child(
+                                                    Icon::new(LucideIcon::Layers)
+                                                        .size(IconSize::Sm)
+                                                        .color(theme.primary),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_size(px(12.5))
+                                                        .font_weight(FontWeight::SEMIBOLD)
+                                                        .child("In-Window Overlay"),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(12.))
+                                                .text_color(theme.muted_foreground)
+                                                .child(
+                                                    "• Dimmed backdrop & spring enter animation inside one window\n• Direct access to parent Entity<T> state during render()\n• Zero extra GPU swapchains; stays clipped to app viewport",
+                                                ),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(4.))
+                                        .p(px(12.))
+                                        .rounded(theme.radius_md)
+                                        .bg(theme.surface_muted.opacity(0.4))
+                                        .border_1()
+                                        .border_color(theme.border)
+                                        .child(
+                                            h_stack()
+                                                .spacing(px(6.))
+                                                .child(
+                                                    Icon::new(LucideIcon::Monitor)
+                                                        .size(IconSize::Sm)
+                                                        .color(theme.primary),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_size(px(12.5))
+                                                        .font_weight(FontWeight::SEMIBOLD)
+                                                        .child("Native OS Window"),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(12.))
+                                                .text_color(theme.muted_foreground)
+                                                .child(
+                                                    "• Real OS modal dialog (X11/Wayland/macOS/Windows) & floating PopUp toasts\n• Draggable & visible outside small windows across the whole desktop\n• Non-activating OS toast popups never steal keyboard focus; live theme sync",
+                                                ),
+                                        ),
+                                ),
+                        )
+                        .child(code_snippet(
+                            "copy-overlay-mode-code",
+                            "Active Mode Rust API",
+                            snippet_code,
+                            cx.listener(|this, _, window, cx| {
+                                this.push_toast_on_display(
+                                    ToastVariant::Success,
+                                    "Copied Rust snippet",
+                                    Some("Paste directly into your GPUI view."),
+                                    window.display(cx).map(|d| d.id()),
+                                    cx,
+                                );
+                            }),
+                            cx,
+                        )),
+                ),
+        )
+        // DropdownMenu + Popover + Tooltips
+        .child(
+            card()
+                .child(
+                    card_header()
+                        .bordered()
+                        .child(card_title("DropdownMenu, Popover & Tooltips")),
+                )
+                .child(
+                    card_content()
+                        .child(
+                            h_stack()
+                                .flex_wrap()
+                                .spacing(px(10.))
+                                .child(
+                                    dropdown_menu("pg-dd", app.dropdown_open)
+                                        .trigger(
+                                            button("pg-dd-btn")
+                                                .secondary()
+                                                .label("Dropdown Menu")
+                                                .trailing_icon(LucideIcon::ChevronDown)
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.dropdown_open = !this.dropdown_open;
+                                                    cx.notify();
+                                                })),
+                                        )
+                                        .on_close(cx.listener(|this, _, _, cx| {
+                                            this.dropdown_open = false;
+                                            cx.notify();
+                                        }))
+                                        .entry(MenuEntry::Label("View Options".into()))
+                                        .entry(MenuEntry::checkbox_item(
+                                            "Show layout grid",
+                                            app.dropdown_show_grid,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.dropdown_show_grid = !this.dropdown_show_grid;
+                                                this.log_event(
+                                                    "DropdownMenu",
+                                                    format!(
+                                                        "show_grid -> {}",
+                                                        this.dropdown_show_grid
+                                                    ),
+                                                    cx,
+                                                );
+                                            }),
+                                        ))
+                                        .entry(MenuEntry::checkbox_item(
+                                            "Compact density",
+                                            app.dropdown_compact,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.dropdown_compact = !this.dropdown_compact;
+                                                this.table_compact = this.dropdown_compact;
+                                                cx.notify();
+                                            }),
+                                        ))
+                                        .entry(MenuEntry::Separator)
+                                        .entry(
+                                            MenuEntry::item_with_icon(
+                                                "Export JSON",
+                                                LucideIcon::Download,
+                                                cx.listener(|this, _, window, cx| {
+                                                    this.push_toast_on_display(
+                                                        ToastVariant::Info,
+                                                        "Exported theme.json",
+                                                        None,
+                                                        window.display(cx).map(|d| d.id()),
+                                                        cx,
+                                                    );
+                                                }),
+                                            )
+                                            .with_shortcut("⌘E"),
+                                        )
+                                        .entry(MenuEntry::destructive_item(
+                                            "Reset workspace",
+                                            Some(LucideIcon::RotateCcw),
+                                            cx.listener(|this, _, window, cx| {
+                                                this.push_toast_on_display(
+                                                    ToastVariant::Warning,
+                                                    "Workspace reset",
+                                                    None,
+                                                    window.display(cx).map(|d| d.id()),
+                                                    cx,
+                                                );
+                                            }),
+                                        )),
+                                )
+                                .child(
+                                    popover("pg-pop", app.popover_open)
+                                        .trigger(
+                                            button("pg-pop-btn")
+                                                .outline()
+                                                .leading_icon(LucideIcon::SlidersHorizontal)
+                                                .label("Interactive Popover")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.popover_open = !this.popover_open;
+                                                    cx.notify();
+                                                })),
+                                        )
+                                        .on_close(cx.listener(|this, _, _, cx| {
+                                            this.popover_open = false;
+                                            cx.notify();
+                                        }))
+                                        .child(
+                                            v_stack()
+                                                .spacing(px(10.))
+                                                .w(px(240.))
+                                                .child(
+                                                    div()
+                                                        .font_weight(FontWeight::SEMIBOLD)
+                                                        .child("Table Display"),
+                                                )
+                                                .child(
+                                                    toggle("pop-str", app.table_striped)
+                                                        .size(ComponentSize::Sm)
+                                                        .label("Striped rows")
+                                                        .on_change(cx.listener(|this, v, _, cx| {
+                                                            this.table_striped = *v;
+                                                            cx.notify();
+                                                        })),
+                                                )
+                                                .child(
+                                                    toggle("pop-cmp", app.table_compact)
+                                                        .size(ComponentSize::Sm)
+                                                        .label("Compact rows")
+                                                        .on_change(cx.listener(|this, v, _, cx| {
+                                                            this.table_compact = *v;
+                                                            cx.notify();
+                                                        })),
+                                                ),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .id("tt-plain")
+                                        .tooltip(|w, cx| {
+                                            Tooltip::text(
+                                                "Rendered in GPUI's native tooltip layer",
+                                                w,
+                                                cx,
+                                            )
+                                        })
+                                        .child(
+                                            button("tt-b1")
+                                                .soft()
+                                                .size(ComponentSize::Sm)
+                                                .label("Plain Tooltip"),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .id("tt-sc")
+                                        .tooltip(|w, cx| {
+                                            Tooltip::with_shortcut(
+                                                "Quick command search",
+                                                "⌘K",
+                                                w,
+                                                cx,
+                                            )
+                                        })
+                                        .child(
+                                            button("tt-b2")
+                                                .soft()
+                                                .size(ComponentSize::Sm)
+                                                .label("Tooltip + Kbd"),
+                                        ),
+                                )
+                                .child(kbd("⌘K"))
+                                .child(kbd("Esc")),
                         ),
                 ),
         )

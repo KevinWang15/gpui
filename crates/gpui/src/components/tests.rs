@@ -1277,3 +1277,170 @@ fn chart_drag_selection_updates_time_range_when_selectable(cx: &mut TestAppConte
         "selectable(false) must suppress drag brush selection"
     );
 }
+
+#[gpui::test]
+fn native_dialog_window_opens_dismisses_and_syncs_theme(cx: &mut TestAppContext) {
+    cx.update(init_components);
+    let parent = cx.open_window(size(px(960.), px(640.)), |_, _| crate::Empty);
+    cx.run_until_parked();
+    assert_eq!(cx.update(|cx| cx.windows().len()), 1);
+
+    let close_count = Rc::new(std::cell::Cell::new(0usize));
+    let confirm_count = Rc::new(std::cell::Cell::new(0usize));
+
+    // 1. Open borderless native dialog centered over parent and dismiss via Escape
+    let dlg_handle = parent
+        .update(cx, |_, window, cx| {
+            let on_close_cnt = close_count.clone();
+            let on_confirm_cnt = confirm_count.clone();
+            dialog_window()
+                .size(DialogSize::Sm)
+                .icon(LucideIcon::Rocket)
+                .title("Deploy release?")
+                .description("Runs as a dedicated native WindowKind::Dialog.")
+                .center_over(window, cx)
+                .cancel_button("Cancel")
+                .confirm_button("Deploy", move |_, _| {
+                    on_confirm_cnt.set(on_confirm_cnt.get() + 1);
+                })
+                .on_close(move |_, _| {
+                    on_close_cnt.set(on_close_cnt.get() + 1);
+                })
+                .open(cx)
+                .expect("native dialog window opens")
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(cx.update(|cx| cx.windows().len()), 2);
+
+    // Live theme switch refreshes the open native dialog cleanly
+    cx.update(|cx| Theme::set_global(Theme::dark(), cx));
+    cx.run_until_parked();
+
+    // Press Escape inside the native dialog window
+    let mut dlg_cx = crate::VisualTestContext::from_window(dlg_handle.into(), cx);
+    dlg_cx.simulate_keystrokes("escape");
+    dlg_cx.run_until_parked();
+
+    assert_eq!(close_count.get(), 1, "Escape should fire on_close once");
+    assert_eq!(confirm_count.get(), 0);
+    assert_eq!(cx.update(|cx| cx.windows().len()), 1);
+
+    // 2. Open native-titlebar destructive dialog and trigger Confirm button click
+    let dlg_handle_2 = parent
+        .update(cx, |_, window, cx| {
+            let on_close_cnt = close_count.clone();
+            let on_confirm_cnt = confirm_count.clone();
+            dialog_window()
+                .size(DialogSize::Sm)
+                .height(px(210.))
+                .destructive(true)
+                .native_titlebar(true)
+                .icon(LucideIcon::TriangleExclamationPoint)
+                .title("Delete cluster?")
+                .description("Cannot be undone.")
+                .center_over(window, cx)
+                .cancel_button("Cancel")
+                .confirm_button("Delete", move |_, _| {
+                    on_confirm_cnt.set(on_confirm_cnt.get() + 1);
+                })
+                .on_close(move |_, _| {
+                    on_close_cnt.set(on_close_cnt.get() + 1);
+                })
+                .open(cx)
+                .expect("second native dialog opens")
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(cx.update(|cx| cx.windows().len()), 2);
+
+    // Click the right-most footer button ("Delete") in the 384x210 dialog
+    let mut dlg_cx_2 = crate::VisualTestContext::from_window(dlg_handle_2.into(), cx);
+    dlg_cx_2.simulate_click(
+        crate::point(px(330.), px(178.)),
+        crate::Modifiers::default(),
+    );
+    dlg_cx_2.run_until_parked();
+
+    assert_eq!(
+        confirm_count.get(),
+        1,
+        "clicking Confirm button should invoke confirm handler"
+    );
+    assert_eq!(
+        close_count.get(),
+        1,
+        "confirming a dialog must not fire the cancellation on_close callback"
+    );
+    assert_eq!(cx.update(|cx| cx.windows().len()), 1);
+}
+
+#[gpui::test]
+fn native_toast_manager_slots_eviction_and_dismiss(cx: &mut TestAppContext) {
+    cx.update(init_components);
+    let dismissed: Rc<RefCell<Vec<u64>>> = Rc::new(RefCell::new(Vec::new()));
+    let dismissed_cb = dismissed.clone();
+
+    let manager = NativeToastManager::new();
+    manager
+        .max_visible(3)
+        .auto_dismiss(None)
+        .position(ToastPosition::BottomRight)
+        .on_dismiss(move |id, _| dismissed_cb.borrow_mut().push(id));
+
+    cx.update(|cx| {
+        manager
+            .push(
+                ToastItem::new(1, "Toast 1")
+                    .description("First notification")
+                    .info(),
+                None,
+                cx,
+            )
+            .unwrap();
+        manager.position(ToastPosition::TopRight);
+        manager
+            .push(ToastItem::new(2, "Toast 2").success(), None, cx)
+            .unwrap();
+        manager.position(ToastPosition::BottomLeft);
+        manager
+            .push(ToastItem::new(3, "Toast 3").warning(), None, cx)
+            .unwrap();
+        // 4th push should evict oldest toast (#1) so active_count stays at 3
+        manager.position(ToastPosition::TopLeft);
+        manager
+            .push(ToastItem::new(4, "Toast 4").destructive(), None, cx)
+            .unwrap();
+    });
+    cx.run_until_parked();
+
+    assert_eq!(manager.active_count(), 3);
+    assert_eq!(cx.update(|cx| cx.windows().len()), 3);
+
+    // Theme changes refresh every open native toast window without errors
+    cx.update(|cx| Theme::set_global(Theme::dark(), cx));
+    cx.run_until_parked();
+
+    // Dismissing a single toast removes its window and fires on_dismiss
+    cx.update(|cx| manager.dismiss(2, cx));
+    cx.run_until_parked();
+    assert_eq!(manager.active_count(), 2);
+    assert_eq!(cx.update(|cx| cx.windows().len()), 2);
+    assert_eq!(*dismissed.borrow(), vec![2]);
+
+    // Pushing another toast reuses the freed vertical slot cleanly
+    cx.update(|cx| {
+        manager
+            .push(ToastItem::new(5, "Toast 5").success(), None, cx)
+            .unwrap();
+    });
+    cx.run_until_parked();
+    assert_eq!(manager.active_count(), 3);
+    assert_eq!(cx.update(|cx| cx.windows().len()), 3);
+
+    // Dismiss all closes every popup window
+    cx.update(|cx| manager.dismiss_all(cx));
+    cx.run_until_parked();
+    assert_eq!(manager.active_count(), 0);
+    assert_eq!(cx.update(|cx| cx.windows().len()), 0);
+}
