@@ -95,6 +95,12 @@ pub const DEFAULT_ADDITIONAL_WINDOW_SIZE: Size<Pixels> = Size {
     height: Pixels(750.),
 };
 
+/// Called right after a window draws and presents a new frame, with how long
+/// drawing (layout and paint) and drawing plus presenting took. Set it once at
+/// startup to measure latency; it must be cheap and must not call back into
+/// gpui.
+pub static PRESENT_HOOK: std::sync::OnceLock<fn(Duration, Duration)> = std::sync::OnceLock::new();
+
 /// Represents the two different phases when dispatching events.
 #[derive(Default, Copy, Clone, Debug, Eq, PartialEq)]
 pub enum DispatchPhase {
@@ -2067,6 +2073,7 @@ impl Window {
                     || high_rate_input;
                 if should_draw {
                     measure("frame duration", || {
+                        let started = std::time::Instant::now();
                         handle
                             .update(&mut cx, |_, window, cx| {
                                 #[cfg(feature = "profiler")]
@@ -2079,9 +2086,14 @@ impl Window {
                                     window.refresh();
                                 }
                                 let arena_clear_needed = window.draw(cx);
+                                let drawn = started.elapsed();
                                 window.advance_scene_animations(cx);
                                 window.present();
+                                let presented = started.elapsed();
                                 arena_clear_needed.clear(cx);
+                                if let Some(hook) = PRESENT_HOOK.get() {
+                                    hook(drawn, presented);
+                                }
                             })
                             .with_context(|| {
                                 format!(
