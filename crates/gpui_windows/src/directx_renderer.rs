@@ -414,6 +414,7 @@ impl DirectXRenderer {
             }
 
             match batch {
+                PrimitiveBatch::BackdropBlurs(_) => {}
                 PrimitiveBatch::Shadows(range) => self.draw_shadows(range.start, range.len()),
                 PrimitiveBatch::Quads(range) => {
                     quad_cursor += range.len() as u32;

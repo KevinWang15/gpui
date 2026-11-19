@@ -45,6 +45,7 @@ const SUBPIXEL_SHADERS: &str = concat!(
 );
 
 const VIEW_TRANSITION_SHADER: &str = include_str!("shaders_view_transition.wgsl");
+const BACKDROP_BLUR_SHADER: &str = include_str!("shaders_backdrop_blur.wgsl");
 
 fn least_common_multiple(left: u64, right: u64) -> u64 {
     let mut first = left;
@@ -109,6 +110,45 @@ impl From<SceneTransition> for ViewTransitionParams {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
+struct BackdropBlurParams {
+    viewport_size: [f32; 2],
+    texel_size: [f32; 2],
+    blur_radius: f32,
+    kawase_offset: f32,
+    premultiplied_alpha: u32,
+    _pad: u32,
+    bounds_origin: [f32; 2],
+    bounds_size: [f32; 2],
+    corner_radii: [f32; 4],
+    mask_origin: [f32; 2],
+    mask_size: [f32; 2],
+}
+
+struct BackdropBlurTargets {
+    size: Size<DevicePixels>,
+    buffer_generation: u64,
+    scene: TransitionTexture,
+    half: TransitionTexture,
+    quarter: TransitionTexture,
+    depth: DepthTexture,
+    scene_bind_group: wgpu::BindGroup,
+    half_bind_group: wgpu::BindGroup,
+    quarter_bind_group: wgpu::BindGroup,
+}
+
+#[derive(Clone)]
+struct CachedSceneInstances {
+    base_generation: u64,
+    instance_buffer_generation: u64,
+    quads_offset: u64,
+    quads_len: usize,
+    mono_sprites_offset: u64,
+    mono_sprites_len: usize,
+    bindings: InstanceBindings,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
 struct PodBounds {
     origin: [f32; 2],
     size: [f32; 2],
@@ -164,10 +204,15 @@ struct WgpuPipelines {
     #[allow(dead_code)]
     surfaces: wgpu::RenderPipeline,
     view_transition: wgpu::RenderPipeline,
+    kawase_downsample: wgpu::RenderPipeline,
+    kawase_upsample: wgpu::RenderPipeline,
+    backdrop_blur_composite: wgpu::RenderPipeline,
+    backdrop_blit: wgpu::RenderPipeline,
     premultiplied_alpha: bool,
 }
 
 /// One frame allocation of instance data, ready to bind.
+#[derive(Clone)]
 struct InstanceBinding {
     bind_group: wgpu::BindGroup,
     /// Index of the allocation's first instance within the bound data. Always
@@ -178,6 +223,7 @@ struct InstanceBinding {
     first_instance: u32,
 }
 
+#[derive(Clone)]
 struct PathTileBinding {
     tiles: InstanceBinding,
     paint_base: u32,
@@ -191,6 +237,7 @@ struct InstanceAllocation {
     first_instance: u32,
 }
 
+#[derive(Clone)]
 struct InstanceBindings {
     quads: InstanceBinding,
     shadows: InstanceBinding,
@@ -208,6 +255,7 @@ struct WgpuBindGroupLayouts {
     texture: wgpu::BindGroupLayout,
     surfaces: wgpu::BindGroupLayout,
     view_transition: wgpu::BindGroupLayout,
+    backdrop_blur: wgpu::BindGroupLayout,
 }
 
 /// Shared GPU context reference, used to coordinate device recovery across multiple windows.
@@ -236,6 +284,9 @@ struct WgpuResources {
     globals_buffer: wgpu::Buffer,
     globals_bind_group: wgpu::BindGroup,
     view_transition_buffer: wgpu::Buffer,
+    backdrop_blur_buffer: wgpu::Buffer,
+    backdrop_blur_slot_capacity: usize,
+    backdrop_blur_buffer_generation: u64,
     instance_data: InstanceData,
 }
 
@@ -248,9 +299,16 @@ struct WgpuRendererCore {
     resources: WgpuResources,
     atlas: Arc<WgpuAtlas>,
     gamma_offset: u64,
+    backdrop_blur_stride: u64,
     instance_data_capacity: u64,
     max_instance_data_size: u64,
     instance_data_alignment: u64,
+    instance_buffer_generation: u64,
+    cached_instances: Option<CachedSceneInstances>,
+    #[cfg(test)]
+    delta_upload_hits: u64,
+    #[cfg(test)]
+    full_upload_count: u64,
     uses_webgl_instance_data: bool,
     rendering_params: RenderingParameters,
     is_bgr: bool,
@@ -262,6 +320,7 @@ struct WgpuRendererCore {
     transition_new: Option<TransitionTexture>,
     transition_new_generation: Option<u64>,
     transition_bind_group: Option<wgpu::BindGroup>,
+    backdrop_blur_targets: Option<BackdropBlurTargets>,
     target_format: wgpu::TextureFormat,
     max_texture_size: u32,
 }
@@ -746,6 +805,40 @@ impl WgpuRendererCore {
             ],
         });
 
+        let backdrop_blur = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("backdrop_blur_layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: true,
+                        min_binding_size: NonZeroU64::new(
+                            std::mem::size_of::<BackdropBlurParams>() as u64,
+                        ),
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+
         WgpuBindGroupLayouts {
             globals,
             instances,
@@ -753,6 +846,7 @@ impl WgpuRendererCore {
             texture,
             surfaces,
             view_transition,
+            backdrop_blur,
         }
     }
 
@@ -1098,6 +1192,84 @@ impl WgpuRendererCore {
             cache: None,
         });
 
+        let backdrop_blur_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("gpui_backdrop_blur_shader"),
+            source: wgpu::ShaderSource::Wgsl(BACKDROP_BLUR_SHADER.into()),
+        });
+        let backdrop_blur_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("backdrop_blur_pipeline_layout"),
+                bind_group_layouts: &[Some(&layouts.backdrop_blur)],
+                immediate_size: 0,
+            });
+        let create_backdrop_pipeline = |label: &str,
+                                        vs_entry: &str,
+                                        fs_entry: &str,
+                                        topology: wgpu::PrimitiveTopology,
+                                        blend: Option<wgpu::BlendState>| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&backdrop_blur_layout),
+                vertex: wgpu::VertexState {
+                    module: &backdrop_blur_module,
+                    entry_point: Some(vs_entry),
+                    buffers: &[],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &backdrop_blur_module,
+                    entry_point: Some(fs_entry),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: surface_format,
+                        blend,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let kawase_downsample = create_backdrop_pipeline(
+            "kawase_downsample",
+            "vs_fullscreen",
+            "fs_kawase_downsample",
+            wgpu::PrimitiveTopology::TriangleList,
+            None,
+        );
+        let kawase_upsample = create_backdrop_pipeline(
+            "kawase_upsample",
+            "vs_fullscreen",
+            "fs_kawase_upsample",
+            wgpu::PrimitiveTopology::TriangleList,
+            None,
+        );
+        let backdrop_blur_composite = create_backdrop_pipeline(
+            "backdrop_blur_composite",
+            "vs_backdrop_blur",
+            "fs_backdrop_blur",
+            wgpu::PrimitiveTopology::TriangleStrip,
+            Some(blend_mode),
+        );
+        let backdrop_blit = create_backdrop_pipeline(
+            "backdrop_blit",
+            "vs_fullscreen",
+            "fs_blit",
+            wgpu::PrimitiveTopology::TriangleList,
+            None,
+        );
+
         WgpuPipelines {
             quads,
             opaque_quads,
@@ -1109,6 +1281,10 @@ impl WgpuRendererCore {
             poly_sprites,
             surfaces,
             view_transition,
+            kawase_downsample,
+            kawase_upsample,
+            backdrop_blur_composite,
+            backdrop_blit,
             premultiplied_alpha,
         }
     }
@@ -1369,6 +1545,15 @@ impl WgpuRendererCore {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let backdrop_blur_stride = (std::mem::size_of::<BackdropBlurParams>() as u64)
+            .next_multiple_of(uniform_alignment.max(1));
+        let backdrop_blur_slot_capacity = 32usize;
+        let backdrop_blur_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("backdrop_blur_buffer"),
+            size: backdrop_blur_stride * (backdrop_blur_slot_capacity as u64),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let (
             instance_data,
             instance_data_capacity,
@@ -1443,13 +1628,23 @@ impl WgpuRendererCore {
                 globals_buffer,
                 globals_bind_group,
                 view_transition_buffer,
+                backdrop_blur_buffer,
+                backdrop_blur_slot_capacity,
+                backdrop_blur_buffer_generation: 1,
                 instance_data,
             },
             atlas,
             gamma_offset,
+            backdrop_blur_stride,
             instance_data_capacity,
             max_instance_data_size,
             instance_data_alignment,
+            instance_buffer_generation: 1,
+            cached_instances: None,
+            #[cfg(test)]
+            delta_upload_hits: 0,
+            #[cfg(test)]
+            full_upload_count: 0,
             uses_webgl_instance_data,
             rendering_params,
             is_bgr: false,
@@ -1461,6 +1656,7 @@ impl WgpuRendererCore {
             transition_new: None,
             transition_new_generation: None,
             transition_bind_group: None,
+            backdrop_blur_targets: None,
             target_format,
             max_texture_size,
         }
@@ -1477,6 +1673,8 @@ impl WgpuRendererCore {
     ) {
         self.target_format = surface_format;
         self.clear_transition_snapshot();
+        self.backdrop_blur_targets = None;
+        self.cached_instances = None;
         self.resources.pipelines = Self::create_pipelines(
             &self.resources.device,
             &self.resources.bind_group_layouts,
@@ -1719,15 +1917,47 @@ impl WgpuRendererCore {
             })
     }
 
-    fn record_frame(
-        &mut self,
-        scene: &Scene,
-        frame_view: &wgpu::TextureView,
-        size: Size<DevicePixels>,
-        clear_color: wgpu::Color,
-    ) -> Result<wgpu::SubmissionIndex> {
+    fn prepare_instances(&mut self, scene: &Scene) -> Result<InstanceBindings> {
+        let base_gen = scene.base_generation();
+        if !self.uses_webgl_instance_data
+            && base_gen != 0
+            && let Some(cached) = &self.cached_instances
+            && cached.base_generation == base_gen
+            && cached.instance_buffer_generation == self.instance_buffer_generation
+            && cached.quads_len == scene.quads.len()
+            && cached.mono_sprites_len == scene.monochrome_sprites.len()
+        {
+            if let InstanceData::Storage(buffer) = &self.resources.instance_data {
+                if let Some(range) = scene.animated_quad_range()
+                    && !range.is_empty()
+                    && range.end <= scene.quads.len()
+                {
+                    let stride = std::mem::size_of::<gpui::Quad>() as u64;
+                    let byte_offset = cached.quads_offset + (range.start as u64) * stride;
+                    let bytes = unsafe { Self::instance_bytes(&scene.quads[range]) };
+                    self.resources.queue.write_buffer(buffer, byte_offset, bytes);
+                }
+                if let Some(range) = scene.animated_monochrome_sprite_range()
+                    && !range.is_empty()
+                    && range.end <= scene.monochrome_sprites.len()
+                {
+                    let stride = std::mem::size_of::<gpui::MonochromeSprite>() as u64;
+                    let byte_offset = cached.mono_sprites_offset + (range.start as u64) * stride;
+                    let bytes = unsafe { Self::instance_bytes(&scene.monochrome_sprites[range]) };
+                    self.resources.queue.write_buffer(buffer, byte_offset, bytes);
+                }
+            }
+            let bindings = cached.bindings.clone();
+            #[cfg(test)]
+            {
+                self.delta_upload_hits += 1;
+            }
+            return Ok(bindings);
+        }
+
+        let buf_gen_before = self.instance_buffer_generation;
         let mut instance_offset = 0;
-        let instance_bindings = self
+        let (bindings, quads_offset, mono_sprites_offset) = self
             .write_instances(scene, &mut instance_offset)
             .with_context(|| {
                 format!(
@@ -1741,6 +1971,617 @@ impl WgpuRendererCore {
                     scene.polychrome_sprites.len(),
                 )
             })?;
+
+        #[cfg(test)]
+        {
+            self.full_upload_count += 1;
+        }
+
+        if !self.uses_webgl_instance_data
+            && base_gen != 0
+            && self.instance_buffer_generation == buf_gen_before
+        {
+            self.cached_instances = Some(CachedSceneInstances {
+                base_generation: base_gen,
+                instance_buffer_generation: self.instance_buffer_generation,
+                quads_offset,
+                quads_len: scene.quads.len(),
+                mono_sprites_offset,
+                mono_sprites_len: scene.monochrome_sprites.len(),
+                bindings: bindings.clone(),
+            });
+        } else {
+            self.cached_instances = None;
+        }
+
+        Ok(bindings)
+    }
+
+    fn draw_batch<'a>(
+        &'a self,
+        scene: &Scene,
+        instance_bindings: &'a InstanceBindings,
+        batch: PrimitiveBatch,
+        quad_cursor: &mut u32,
+        path_tile_cursor: &mut usize,
+        viewport_width: f32,
+        viewport_height: f32,
+        depth_scale: f32,
+        pass: &mut wgpu::RenderPass<'a>,
+    ) -> Result<()> {
+        // Quad shaders assign each quad its own depth.
+        // In every other batch type, the depth is fixed to the position of the quad cursor.
+        let (minimum_depth, maximum_depth) = if matches!(&batch, PrimitiveBatch::Quads(_)) {
+            (0.0, 1.0)
+        } else {
+            let depth = quad_depth(*quad_cursor, depth_scale);
+            (depth, depth)
+        };
+        pass.set_viewport(
+            0.0,
+            0.0,
+            viewport_width,
+            viewport_height,
+            minimum_depth,
+            maximum_depth,
+        );
+
+        match batch {
+            PrimitiveBatch::BackdropBlurs(_) => {}
+            PrimitiveBatch::Quads(range) => {
+                *quad_cursor += range.len() as u32;
+                self.draw_instances(
+                    &instance_bindings.quads,
+                    &self.resources().pipelines.quads,
+                    instance_range(range),
+                    pass,
+                );
+            }
+            PrimitiveBatch::Shadows(range) => self.draw_instances(
+                &instance_bindings.shadows,
+                &self.resources().pipelines.shadows,
+                instance_range(range),
+                pass,
+            ),
+            PrimitiveBatch::Paths(range) => {
+                let tiles_start = *path_tile_cursor;
+                *path_tile_cursor += scene.paths[range]
+                    .iter()
+                    .map(PaintedPath::tile_count)
+                    .sum::<usize>();
+                self.draw_instances(
+                    &instance_bindings.path_tiles.tiles,
+                    &self.resources().pipelines.path_tiles,
+                    instance_range(tiles_start..*path_tile_cursor),
+                    pass,
+                );
+            }
+            PrimitiveBatch::Underlines(range) => self.draw_instances(
+                &instance_bindings.underlines,
+                &self.resources().pipelines.underlines,
+                instance_range(range),
+                pass,
+            ),
+            PrimitiveBatch::MonochromeSprites { texture_id, range } => {
+                self.draw_sprites(
+                    &instance_bindings.monochrome_sprites,
+                    texture_id,
+                    &self.resources().pipelines.mono_sprites,
+                    instance_range(range),
+                    pass,
+                )?;
+            }
+            PrimitiveBatch::SubpixelSprites { texture_id, range } => {
+                let resources = self.resources();
+                self.draw_sprites(
+                    &instance_bindings.subpixel_sprites,
+                    texture_id,
+                    resources
+                        .pipelines
+                        .subpixel_sprites
+                        .as_ref()
+                        .unwrap_or(&resources.pipelines.mono_sprites),
+                    instance_range(range),
+                    pass,
+                )?;
+            }
+            PrimitiveBatch::PolychromeSprites { texture_id, range } => {
+                self.draw_sprites(
+                    &instance_bindings.polychrome_sprites,
+                    texture_id,
+                    &self.resources().pipelines.poly_sprites,
+                    instance_range(range),
+                    pass,
+                )?;
+            }
+            // Surfaces are macOS-only for video playback and are not
+            // implemented by the WGPU renderer.
+            PrimitiveBatch::Surfaces(_surfaces) => {}
+        }
+        Ok(())
+    }
+
+    fn ensure_backdrop_blur_targets(
+        &mut self,
+        size: Size<DevicePixels>,
+        required_slots: usize,
+    ) {
+        if required_slots > self.resources.backdrop_blur_slot_capacity {
+            let new_capacity = required_slots.next_power_of_two().max(32);
+            self.resources.backdrop_blur_buffer =
+                self.resources.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("backdrop_blur_buffer"),
+                    size: self.backdrop_blur_stride * (new_capacity as u64),
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+            self.resources.backdrop_blur_slot_capacity = new_capacity;
+            self.resources.backdrop_blur_buffer_generation += 1;
+        }
+
+        let buf_gen = self.resources.backdrop_blur_buffer_generation;
+        if let Some(targets) = &self.backdrop_blur_targets
+            && targets.size == size
+            && targets.buffer_generation == buf_gen
+        {
+            return;
+        }
+
+        let half_size = Size {
+            width: DevicePixels((size.width.0 / 2).max(1)),
+            height: DevicePixels((size.height.0 / 2).max(1)),
+        };
+        let quarter_size = Size {
+            width: DevicePixels((size.width.0 / 4).max(1)),
+            height: DevicePixels((size.height.0 / 4).max(1)),
+        };
+        let scene_tex = self.create_transition_texture("backdrop_blur_scene", size);
+        let half_tex = self.create_transition_texture("backdrop_blur_half", half_size);
+        let quarter_tex = self.create_transition_texture("backdrop_blur_quarter", quarter_size);
+
+        let depth_tex = self
+            .resources
+            .device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("backdrop_blur_depth"),
+                size: wgpu::Extent3d {
+                    width: size.width.0 as u32,
+                    height: size.height.0 as u32,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: DEPTH_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            });
+        let depth_view = depth_tex.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let make_bg = |label: &str, view: &wgpu::TextureView| {
+            self.resources
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some(label),
+                    layout: &self.resources.bind_group_layouts.backdrop_blur,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                buffer: &self.resources.backdrop_blur_buffer,
+                                offset: 0,
+                                size: NonZeroU64::new(
+                                    std::mem::size_of::<BackdropBlurParams>() as u64,
+                                ),
+                            }),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Sampler(
+                                &self.resources.atlas_sampler,
+                            ),
+                        },
+                    ],
+                })
+        };
+
+        let scene_bind_group = make_bg("backdrop_blur_scene_bg", &scene_tex.view);
+        let half_bind_group = make_bg("backdrop_blur_half_bg", &half_tex.view);
+        let quarter_bind_group = make_bg("backdrop_blur_quarter_bg", &quarter_tex.view);
+
+        self.backdrop_blur_targets = Some(BackdropBlurTargets {
+            size,
+            buffer_generation: buf_gen,
+            scene: scene_tex,
+            half: half_tex,
+            quarter: quarter_tex,
+            depth: DepthTexture {
+                texture: depth_tex,
+                view: depth_view,
+            },
+            scene_bind_group,
+            half_bind_group,
+            quarter_bind_group,
+        });
+    }
+
+    fn record_frame_with_backdrop_blurs(
+        &mut self,
+        scene: &Scene,
+        instance_bindings: &InstanceBindings,
+        frame_view: &wgpu::TextureView,
+        size: Size<DevicePixels>,
+        clear_color: wgpu::Color,
+        depth_scale: f32,
+    ) -> Result<wgpu::SubmissionIndex> {
+        let batches: Vec<PrimitiveBatch> = scene.batches().collect();
+        let mut blur_batch_count = 0usize;
+        let mut total_blurs = 0usize;
+        for batch in &batches {
+            if let PrimitiveBatch::BackdropBlurs(range) = batch {
+                blur_batch_count += 1;
+                total_blurs += range.len();
+            }
+        }
+        // Slot 0 = final blit; each blur batch uses 3 Kawase slots + `range.len()` composite slots.
+        let required_slots = 1 + blur_batch_count * 3 + total_blurs;
+        self.ensure_backdrop_blur_targets(size, required_slots);
+
+        let viewport_width = size.width.0 as f32;
+        let viewport_height = size.height.0 as f32;
+        let half_w = (size.width.0 / 2).max(1) as f32;
+        let half_h = (size.height.0 / 2).max(1) as f32;
+        let quarter_w = (size.width.0 / 4).max(1) as f32;
+        let quarter_h = (size.height.0 / 4).max(1) as f32;
+        let premultiplied_alpha = self.resources.pipelines.premultiplied_alpha as u32;
+        let stride = self.backdrop_blur_stride;
+
+        // Write slot 0 (bit-exact final blit params).
+        let zero_params = BackdropBlurParams::zeroed();
+        self.resources.queue.write_buffer(
+            &self.resources.backdrop_blur_buffer,
+            0,
+            bytemuck::bytes_of(&zero_params),
+        );
+
+        let mut next_slot: u32 = 1;
+        let slot_offset = |slot: u32| -> u32 { (u64::from(slot) * stride) as u32 };
+
+        let mut encoder =
+            self.resources
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("backdrop_blur_main_encoder"),
+                });
+
+        let targets = self
+            .backdrop_blur_targets
+            .as_ref()
+            .expect("backdrop_blur_targets initialized");
+
+        let mut quad_cursor: u32 = 0;
+        let mut path_tile_cursor = 0usize;
+        let mut first_segment = true;
+        let mut batch_idx = 0usize;
+
+        while batch_idx < batches.len() {
+            // Find end of current non-blur segment and how many quads it contains.
+            let seg_start = batch_idx;
+            let mut seg_quad_count = 0u32;
+            while batch_idx < batches.len() {
+                match &batches[batch_idx] {
+                    PrimitiveBatch::BackdropBlurs(_) => break,
+                    PrimitiveBatch::Quads(range) => {
+                        seg_quad_count += range.len() as u32;
+                        batch_idx += 1;
+                    }
+                    _ => batch_idx += 1,
+                }
+            }
+            let seg_end = batch_idx;
+
+            if seg_start < seg_end || first_segment {
+                let color_load = if first_segment {
+                    wgpu::LoadOp::Clear(clear_color)
+                } else {
+                    wgpu::LoadOp::Load
+                };
+                let depth_load = if first_segment {
+                    wgpu::LoadOp::Clear(0.0)
+                } else {
+                    wgpu::LoadOp::Load
+                };
+                first_segment = false;
+
+                let seg_quad_start = quad_cursor as usize;
+                let seg_quad_end = seg_quad_start + seg_quad_count as usize;
+
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("backdrop_segment_pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &targets.scene.view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: color_load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &targets.depth.view,
+                        depth_ops: Some(wgpu::Operations {
+                            load: depth_load,
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    ..Default::default()
+                });
+                pass.set_bind_group(0, &self.resources.globals_bind_group, &[]);
+
+                if seg_quad_start < seg_quad_end {
+                    // `vs_opaque_quad` indexes `scene.quads` in reverse (`quad_id = quad_count - 1 - instance_id`)
+                    // for front-to-back early-Z culling, so map `[seg_quad_start, seg_quad_end)` accordingly.
+                    let total_quads = scene.quads.len();
+                    let rev_start = total_quads - seg_quad_end;
+                    let rev_end = total_quads - seg_quad_start;
+                    self.draw_instances(
+                        &instance_bindings.quads,
+                        &self.resources.pipelines.opaque_quads,
+                        instance_range(rev_start..rev_end),
+                        &mut pass,
+                    );
+                }
+
+                for b in &batches[seg_start..seg_end] {
+                    self.draw_batch(
+                        scene,
+                        instance_bindings,
+                        match b {
+                            PrimitiveBatch::BackdropBlurs(r) => {
+                                PrimitiveBatch::BackdropBlurs(r.clone())
+                            }
+                            PrimitiveBatch::Shadows(r) => PrimitiveBatch::Shadows(r.clone()),
+                            PrimitiveBatch::Quads(r) => PrimitiveBatch::Quads(r.clone()),
+                            PrimitiveBatch::Paths(r) => PrimitiveBatch::Paths(r.clone()),
+                            PrimitiveBatch::Underlines(r) => PrimitiveBatch::Underlines(r.clone()),
+                            PrimitiveBatch::MonochromeSprites { texture_id, range } => {
+                                PrimitiveBatch::MonochromeSprites {
+                                    texture_id: *texture_id,
+                                    range: range.clone(),
+                                }
+                            }
+                            PrimitiveBatch::SubpixelSprites { texture_id, range } => {
+                                PrimitiveBatch::SubpixelSprites {
+                                    texture_id: *texture_id,
+                                    range: range.clone(),
+                                }
+                            }
+                            PrimitiveBatch::PolychromeSprites { texture_id, range } => {
+                                PrimitiveBatch::PolychromeSprites {
+                                    texture_id: *texture_id,
+                                    range: range.clone(),
+                                }
+                            }
+                            PrimitiveBatch::Surfaces(r) => PrimitiveBatch::Surfaces(r.clone()),
+                        },
+                        &mut quad_cursor,
+                        &mut path_tile_cursor,
+                        viewport_width,
+                        viewport_height,
+                        depth_scale,
+                        &mut pass,
+                    )?;
+                }
+            }
+
+            if batch_idx < batches.len()
+                && let PrimitiveBatch::BackdropBlurs(ref blur_range) = batches[batch_idx]
+            {
+                let blur_range = blur_range.clone();
+                batch_idx += 1;
+
+                let max_radius = scene.backdrop_blurs[blur_range.clone()]
+                    .iter()
+                    .map(|b| b.blur_radius.0)
+                    .fold(0.0f32, f32::max);
+                let kawase_offset = (max_radius / 5.0).clamp(0.75, 4.0);
+
+                // Downsample 1: full -> half
+                let d1_slot = next_slot;
+                next_slot += 1;
+                let d1_params = BackdropBlurParams {
+                    texel_size: [1.0 / viewport_width, 1.0 / viewport_height],
+                    kawase_offset,
+                    ..zero_params
+                };
+                self.resources.queue.write_buffer(
+                    &self.resources.backdrop_blur_buffer,
+                    u64::from(d1_slot) * stride,
+                    bytemuck::bytes_of(&d1_params),
+                );
+                {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("kawase_downsample_half"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &targets.half.view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                store: wgpu::StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        })],
+                        depth_stencil_attachment: None,
+                        ..Default::default()
+                    });
+                    pass.set_pipeline(&self.resources.pipelines.kawase_downsample);
+                    pass.set_bind_group(0, &targets.scene_bind_group, &[slot_offset(d1_slot)]);
+                    pass.draw(0..3, 0..1);
+                }
+
+                // Downsample 2: half -> quarter
+                let d2_slot = next_slot;
+                next_slot += 1;
+                let d2_params = BackdropBlurParams {
+                    texel_size: [1.0 / half_w, 1.0 / half_h],
+                    kawase_offset,
+                    ..zero_params
+                };
+                self.resources.queue.write_buffer(
+                    &self.resources.backdrop_blur_buffer,
+                    u64::from(d2_slot) * stride,
+                    bytemuck::bytes_of(&d2_params),
+                );
+                {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("kawase_downsample_quarter"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &targets.quarter.view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                store: wgpu::StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        })],
+                        depth_stencil_attachment: None,
+                        ..Default::default()
+                    });
+                    pass.set_pipeline(&self.resources.pipelines.kawase_downsample);
+                    pass.set_bind_group(0, &targets.half_bind_group, &[slot_offset(d2_slot)]);
+                    pass.draw(0..3, 0..1);
+                }
+
+                // Upsample: quarter -> half
+                let u1_slot = next_slot;
+                next_slot += 1;
+                let u1_params = BackdropBlurParams {
+                    texel_size: [1.0 / quarter_w, 1.0 / quarter_h],
+                    kawase_offset,
+                    ..zero_params
+                };
+                self.resources.queue.write_buffer(
+                    &self.resources.backdrop_blur_buffer,
+                    u64::from(u1_slot) * stride,
+                    bytemuck::bytes_of(&u1_params),
+                );
+                {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("kawase_upsample_half"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &targets.half.view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                store: wgpu::StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        })],
+                        depth_stencil_attachment: None,
+                        ..Default::default()
+                    });
+                    pass.set_pipeline(&self.resources.pipelines.kawase_upsample);
+                    pass.set_bind_group(0, &targets.quarter_bind_group, &[slot_offset(u1_slot)]);
+                    pass.draw(0..3, 0..1);
+                }
+
+                // Composite each rounded BackdropBlur region onto targets.scene
+                {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("backdrop_blur_composite_pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &targets.scene.view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        })],
+                        depth_stencil_attachment: None,
+                        ..Default::default()
+                    });
+                    pass.set_pipeline(&self.resources.pipelines.backdrop_blur_composite);
+                    for blur in &scene.backdrop_blurs[blur_range] {
+                        let c_slot = next_slot;
+                        next_slot += 1;
+                        let comp_params = BackdropBlurParams {
+                            viewport_size: [viewport_width, viewport_height],
+                            texel_size: [1.0 / half_w, 1.0 / half_h],
+                            blur_radius: blur.blur_radius.0,
+                            kawase_offset,
+                            premultiplied_alpha,
+                            _pad: 0,
+                            bounds_origin: [blur.bounds.origin.x.0, blur.bounds.origin.y.0],
+                            bounds_size: [blur.bounds.size.width.0, blur.bounds.size.height.0],
+                            corner_radii: [
+                                blur.corner_radii.top_left.0,
+                                blur.corner_radii.top_right.0,
+                                blur.corner_radii.bottom_right.0,
+                                blur.corner_radii.bottom_left.0,
+                            ],
+                            mask_origin: [
+                                blur.content_mask.bounds.origin.x.0,
+                                blur.content_mask.bounds.origin.y.0,
+                            ],
+                            mask_size: [
+                                blur.content_mask.bounds.size.width.0,
+                                blur.content_mask.bounds.size.height.0,
+                            ],
+                        };
+                        self.resources.queue.write_buffer(
+                            &self.resources.backdrop_blur_buffer,
+                            u64::from(c_slot) * stride,
+                            bytemuck::bytes_of(&comp_params),
+                        );
+                        pass.set_bind_group(0, &targets.half_bind_group, &[slot_offset(c_slot)]);
+                        pass.draw(0..4, 0..1);
+                    }
+                }
+            }
+        }
+
+        // Bit-exact blit from offscreen targets.scene to frame_view.
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("backdrop_blur_blit_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: frame_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+            pass.set_pipeline(&self.resources.pipelines.backdrop_blit);
+            pass.set_bind_group(0, &targets.scene_bind_group, &[0]);
+            pass.draw(0..3, 0..1);
+        }
+
+        let submission = self
+            .resources
+            .queue
+            .submit(std::iter::once(encoder.finish()));
+        Ok(submission)
+    }
+
+    fn record_frame(
+        &mut self,
+        scene: &Scene,
+        frame_view: &wgpu::TextureView,
+        size: Size<DevicePixels>,
+        clear_color: wgpu::Color,
+    ) -> Result<wgpu::SubmissionIndex> {
+        let instance_bindings = self.prepare_instances(scene)?;
         let depth_scale = quad_depth_scale(scene.quads.len());
         let globals = GlobalParams {
             viewport_size: [size.width.0 as f32, size.height.0 as f32],
@@ -1757,16 +2598,28 @@ impl WgpuRendererCore {
             bytemuck::bytes_of(&globals),
         );
         self.prepare_texture_bind_groups(scene);
+        // Quads are written first, so their instance indices are their
+        // indices in `scene.quads` on both transports, which the quad depths
+        // rely on.
+        debug_assert_eq!(instance_bindings.quads.first_instance, 0);
+
+        if !scene.backdrop_blurs.is_empty() {
+            return self.record_frame_with_backdrop_blurs(
+                scene,
+                &instance_bindings,
+                frame_view,
+                size,
+                clear_color,
+                depth_scale,
+            );
+        }
+
         self.ensure_depth_texture(size);
         let depth_view = &self
             .depth_texture
             .as_ref()
             .context("depth texture missing")?
             .view;
-        // Quads are written first, so their instance indices are their
-        // indices in `scene.quads` on both transports, which the quad depths
-        // rely on.
-        debug_assert_eq!(instance_bindings.quads.first_instance, 0);
 
         let mut encoder =
             self.resources()
@@ -1811,94 +2664,17 @@ impl WgpuRendererCore {
             let mut quad_cursor: u32 = 0;
             let mut path_tile_cursor = 0;
             for batch in scene.batches() {
-                // Quad shaders assign each quad its own depth.
-                // In every other batch type, the depth is fixed to the position of the quad cursor.
-                let (minimum_depth, maximum_depth) = if matches!(&batch, PrimitiveBatch::Quads(_)) {
-                    (0.0, 1.0)
-                } else {
-                    let depth = quad_depth(quad_cursor, depth_scale);
-                    (depth, depth)
-                };
-                pass.set_viewport(
-                    0.0,
-                    0.0,
+                self.draw_batch(
+                    scene,
+                    &instance_bindings,
+                    batch,
+                    &mut quad_cursor,
+                    &mut path_tile_cursor,
                     viewport_width,
                     viewport_height,
-                    minimum_depth,
-                    maximum_depth,
-                );
-
-                match batch {
-                    PrimitiveBatch::Quads(range) => {
-                        quad_cursor += range.len() as u32;
-                        self.draw_instances(
-                            &instance_bindings.quads,
-                            &self.resources().pipelines.quads,
-                            instance_range(range),
-                            &mut pass,
-                        )
-                    }
-                    PrimitiveBatch::Shadows(range) => self.draw_instances(
-                        &instance_bindings.shadows,
-                        &self.resources().pipelines.shadows,
-                        instance_range(range),
-                        &mut pass,
-                    ),
-                    PrimitiveBatch::Paths(range) => {
-                        let tiles_start = path_tile_cursor;
-                        path_tile_cursor += scene.paths[range]
-                            .iter()
-                            .map(PaintedPath::tile_count)
-                            .sum::<usize>();
-                        self.draw_instances(
-                            &instance_bindings.path_tiles.tiles,
-                            &self.resources().pipelines.path_tiles,
-                            instance_range(tiles_start..path_tile_cursor),
-                            &mut pass,
-                        )
-                    }
-                    PrimitiveBatch::Underlines(range) => self.draw_instances(
-                        &instance_bindings.underlines,
-                        &self.resources().pipelines.underlines,
-                        instance_range(range),
-                        &mut pass,
-                    ),
-                    PrimitiveBatch::MonochromeSprites { texture_id, range } => {
-                        self.draw_sprites(
-                            &instance_bindings.monochrome_sprites,
-                            texture_id,
-                            &self.resources().pipelines.mono_sprites,
-                            instance_range(range),
-                            &mut pass,
-                        )?;
-                    }
-                    PrimitiveBatch::SubpixelSprites { texture_id, range } => {
-                        let resources = self.resources();
-                        self.draw_sprites(
-                            &instance_bindings.subpixel_sprites,
-                            texture_id,
-                            resources
-                                .pipelines
-                                .subpixel_sprites
-                                .as_ref()
-                                .unwrap_or(&resources.pipelines.mono_sprites),
-                            instance_range(range),
-                            &mut pass,
-                        )?;
-                    }
-                    PrimitiveBatch::PolychromeSprites { texture_id, range } => {
-                        self.draw_sprites(
-                            &instance_bindings.polychrome_sprites,
-                            texture_id,
-                            &self.resources().pipelines.poly_sprites,
-                            instance_range(range),
-                            &mut pass,
-                        )?;
-                    }
-                    // Surfaces are macOS-only for video playback and are not
-                    // implemented by the WGPU renderer.
-                    PrimitiveBatch::Surfaces(_surfaces) => {}
-                }
+                    depth_scale,
+                    &mut pass,
+                )?;
             }
         }
 
@@ -1948,40 +2724,51 @@ impl WgpuRendererCore {
         &mut self,
         scene: &Scene,
         instance_offset: &mut u64,
-    ) -> Result<InstanceBindings> {
-        Ok(InstanceBindings {
-            quads: self.write_instance_binding(
-                "quads_bind_group",
-                instance_offset,
-                &scene.quads,
-            )?,
-            shadows: self.write_instance_binding(
-                "shadows_bind_group",
-                instance_offset,
-                &scene.shadows,
-            )?,
-            path_tiles: self.write_path_tiles(scene, instance_offset)?,
-            underlines: self.write_instance_binding(
-                "underlines_bind_group",
-                instance_offset,
-                &scene.underlines,
-            )?,
-            monochrome_sprites: self.write_instance_binding(
-                "monochrome_sprites_bind_group",
-                instance_offset,
-                &scene.monochrome_sprites,
-            )?,
-            subpixel_sprites: self.write_instance_binding(
-                "subpixel_sprites_bind_group",
-                instance_offset,
-                &scene.subpixel_sprites,
-            )?,
-            polychrome_sprites: self.write_instance_binding(
-                "polychrome_sprites_bind_group",
-                instance_offset,
-                &scene.polychrome_sprites,
-            )?,
-        })
+    ) -> Result<(InstanceBindings, u64, u64)> {
+        let (quads, quads_offset) = self.write_instance_binding_with_offset(
+            "quads_bind_group",
+            instance_offset,
+            &scene.quads,
+        )?;
+        let shadows = self.write_instance_binding(
+            "shadows_bind_group",
+            instance_offset,
+            &scene.shadows,
+        )?;
+        let path_tiles = self.write_path_tiles(scene, instance_offset)?;
+        let underlines = self.write_instance_binding(
+            "underlines_bind_group",
+            instance_offset,
+            &scene.underlines,
+        )?;
+        let (monochrome_sprites, mono_sprites_offset) = self.write_instance_binding_with_offset(
+            "monochrome_sprites_bind_group",
+            instance_offset,
+            &scene.monochrome_sprites,
+        )?;
+        let subpixel_sprites = self.write_instance_binding(
+            "subpixel_sprites_bind_group",
+            instance_offset,
+            &scene.subpixel_sprites,
+        )?;
+        let polychrome_sprites = self.write_instance_binding(
+            "polychrome_sprites_bind_group",
+            instance_offset,
+            &scene.polychrome_sprites,
+        )?;
+        Ok((
+            InstanceBindings {
+                quads,
+                shadows,
+                path_tiles,
+                underlines,
+                monochrome_sprites,
+                subpixel_sprites,
+                polychrome_sprites,
+            },
+            quads_offset,
+            mono_sprites_offset,
+        ))
     }
 
     fn create_texture_bind_group(
@@ -2206,6 +2993,17 @@ impl WgpuRendererCore {
         instance_offset: &mut u64,
         instances: &[T],
     ) -> Result<InstanceBinding> {
+        let (binding, _) =
+            self.write_instance_binding_with_offset(label, instance_offset, instances)?;
+        Ok(binding)
+    }
+
+    fn write_instance_binding_with_offset<T>(
+        &mut self,
+        label: &str,
+        instance_offset: &mut u64,
+        instances: &[T],
+    ) -> Result<(InstanceBinding, u64)> {
         let allocation = self.write_instance_data(instance_offset, instances)?;
         let resources = self.resources();
         let bind_group = resources
@@ -2218,10 +3016,13 @@ impl WgpuRendererCore {
                     resource: self.instance_binding_resource(&allocation),
                 }],
             });
-        Ok(InstanceBinding {
-            bind_group,
-            first_instance: allocation.first_instance,
-        })
+        Ok((
+            InstanceBinding {
+                bind_group,
+                first_instance: allocation.first_instance,
+            },
+            allocation.offset,
+        ))
     }
 
     fn write_path_tiles(
@@ -2397,6 +3198,8 @@ impl WgpuRendererCore {
         // Bind groups created earlier in the frame keep the previous buffer or
         // texture alive, so allocations written before the grow remain valid;
         // only subsequent writes land in the new allocation.
+        self.cached_instances = None;
+        self.instance_buffer_generation += 1;
         let uses_webgl_instance_data = self.uses_webgl_instance_data;
         let resources = self.resources_mut();
         if uses_webgl_instance_data {
@@ -3463,6 +4266,441 @@ mod tests {
         let total_ms = frame_times.iter().map(Duration::as_secs_f64).sum::<f64>() * 1_000.0;
         println!(
             "[PERF] WGPU ViewTransition (1280x800, 2500q+250s) | capture={capture_ms:.2} ms | frame1={first_ms:.2} ms | steady_median={steady_median_ms:.2} ms | steady_mean={steady_mean_ms:.2} ms | total_30f={total_ms:.2} ms"
+        );
+    }
+
+    #[test]
+    fn backdrop_blur_shader_is_valid_wgsl() {
+        validate_wgsl(BACKDROP_BLUR_SHADER, naga::valid::Capabilities::empty());
+    }
+
+    #[test]
+    fn backdrop_blur_renders_softened_glass_pixels_on_wgpu() {
+        use gpui::{
+            BackdropBlur, BorderStyle, Bounds, ContentMask, Corners, Edges, Hsla, Point, Quad,
+            ScaledPixels, Size,
+        };
+
+        let Ok(mut headless) = WgpuHeadlessRenderer::new() else {
+            return;
+        };
+        let size = Size {
+            width: DevicePixels(320),
+            height: DevicePixels(200),
+        };
+        headless.ensure_render_target(size).expect("render target");
+        let target_view = headless.render_target.as_ref().unwrap().view.clone();
+
+        let full_mask = ContentMask {
+            bounds: Bounds {
+                origin: Point {
+                    x: ScaledPixels(0.0),
+                    y: ScaledPixels(0.0),
+                },
+                size: Size {
+                    width: ScaledPixels(320.0),
+                    height: ScaledPixels(200.0),
+                },
+            },
+        };
+        let red = Hsla { h: 0.0, s: 1.0, l: 0.5, a: 1.0 };
+        let blue = Hsla { h: 240.0 / 360.0, s: 1.0, l: 0.5, a: 1.0 };
+
+        let mut scene = Scene::default();
+        // Left half red (0..160), right half blue (160..320)
+        scene.insert_primitive(Quad {
+            order: 0,
+            border_style: BorderStyle::Solid,
+            bounds: Bounds {
+                origin: Point { x: ScaledPixels(0.0), y: ScaledPixels(0.0) },
+                size: Size { width: ScaledPixels(160.0), height: ScaledPixels(200.0) },
+            },
+            content_mask: full_mask,
+            background: red.into(),
+            border_color: red,
+            corner_radii: Corners::default(),
+            border_widths: Edges::default(),
+        });
+        scene.insert_primitive(Quad {
+            order: 0,
+            border_style: BorderStyle::Solid,
+            bounds: Bounds {
+                origin: Point { x: ScaledPixels(160.0), y: ScaledPixels(0.0) },
+                size: Size { width: ScaledPixels(160.0), height: ScaledPixels(200.0) },
+            },
+            content_mask: full_mask,
+            background: blue.into(),
+            border_color: blue,
+            corner_radii: Corners::default(),
+            border_widths: Edges::default(),
+        });
+        // Frosted glass panel straddling the sharp red|blue seam
+        scene.insert_primitive(BackdropBlur {
+            order: 0,
+            blur_radius: ScaledPixels(14.0),
+            bounds: Bounds {
+                origin: Point { x: ScaledPixels(100.0), y: ScaledPixels(40.0) },
+                size: Size { width: ScaledPixels(120.0), height: ScaledPixels(120.0) },
+            },
+            corner_radii: Corners::all(ScaledPixels(16.0)),
+            content_mask: full_mask,
+        });
+        // Opaque green badge painted AFTER the BackdropBlur (must stay razor-sharp, never blurred
+        // into Segment 0, and must never overwrite Segment 0's earlier opaque rectangles!)
+        let green = Hsla { h: 120.0 / 360.0, s: 1.0, l: 0.5, a: 1.0 };
+        scene.insert_primitive(Quad {
+            order: 0,
+            border_style: BorderStyle::Solid,
+            bounds: Bounds {
+                origin: Point { x: ScaledPixels(145.0), y: ScaledPixels(120.0) },
+                size: Size { width: ScaledPixels(30.0), height: ScaledPixels(24.0) },
+            },
+            content_mask: full_mask,
+            background: green.into(),
+            border_color: green,
+            corner_radii: Corners::default(),
+            border_widths: Edges::default(),
+        });
+        scene.finish();
+
+        headless
+            .core
+            .render_frame(&scene, &target_view, size, wgpu::Color::BLACK)
+            .expect("backdrop blur frame");
+        let img = headless.read_image().expect("readback");
+
+        // Outside glass (y = 10): razor-sharp red on left, razor-sharp blue on right
+        let sharp_left = img.get_pixel(156, 10);
+        let sharp_right = img.get_pixel(164, 10);
+        assert!(
+            sharp_left[0] > 220 && sharp_left[2] < 20,
+            "outside glass left of seam must stay pure red, got {sharp_left:?}"
+        );
+        assert!(
+            sharp_right[2] > 220 && sharp_right[0] < 20,
+            "outside glass right of seam must stay pure blue, got {sharp_right:?}"
+        );
+
+        // Inside glass above green box (x = 160, y = 75): Dual-Kawase blur blends red+blue into purple
+        let blurred_seam = img.get_pixel(160, 75);
+        assert!(
+            blurred_seam[0] > 70 && blurred_seam[2] > 70 && blurred_seam[1] < 40,
+            "inside frosted glass at seam should blend red+blue without leaking post-blur green, got {blurred_seam:?}"
+        );
+
+        // Post-blur opaque green rectangle (x = 160, y = 132): must stay razor-sharp green on top!
+        let post_blur_green = img.get_pixel(160, 132);
+        assert!(
+            post_blur_green[1] > 220 && post_blur_green[0] < 20 && post_blur_green[2] < 20,
+            "opaque quad painted after BackdropBlur must remain crisp green on top, got {post_blur_green:?}"
+        );
+    }
+
+    #[test]
+    fn scene_animation_delta_upload_updates_pixels_with_cache_hits() {
+        use gpui::{
+            BorderStyle, Bounds, ContentMask, Corners, Edges, Hsla, Point, Quad, QuadAnimation,
+            QuadAnimationCurve, ScaledPixels, Size,
+        };
+        use std::time::{Duration, Instant};
+
+        let Ok(mut headless) = WgpuHeadlessRenderer::new() else {
+            return;
+        };
+        let size = Size {
+            width: DevicePixels(320),
+            height: DevicePixels(120),
+        };
+        headless.ensure_render_target(size).expect("render target");
+        let target_view = headless.render_target.as_ref().unwrap().view.clone();
+
+        let full_mask = ContentMask {
+            bounds: Bounds {
+                origin: Point { x: ScaledPixels(0.0), y: ScaledPixels(0.0) },
+                size: Size { width: ScaledPixels(320.0), height: ScaledPixels(120.0) },
+            },
+        };
+        let dark = Hsla { h: 0.0, s: 0.0, l: 0.05, a: 1.0 };
+        let green = Hsla { h: 120.0 / 360.0, s: 1.0, l: 0.5, a: 1.0 };
+
+        let mut scene = Scene::default();
+        scene.insert_primitive(Quad {
+            order: 0,
+            border_style: BorderStyle::Solid,
+            bounds: full_mask.bounds,
+            content_mask: full_mask,
+            background: dark.into(),
+            border_color: dark,
+            corner_radii: Corners::default(),
+            border_widths: Edges::default(),
+        });
+        let start_bounds = Bounds {
+            origin: Point { x: ScaledPixels(20.0), y: ScaledPixels(40.0) },
+            size: Size { width: ScaledPixels(40.0), height: ScaledPixels(40.0) },
+        };
+        let end_bounds = Bounds {
+            origin: Point { x: ScaledPixels(220.0), y: ScaledPixels(40.0) },
+            size: Size { width: ScaledPixels(40.0), height: ScaledPixels(40.0) },
+        };
+        let started = Instant::now();
+        scene.insert_animated_quad(
+            Quad {
+                order: 0,
+                border_style: BorderStyle::Solid,
+                bounds: start_bounds,
+                content_mask: full_mask,
+                background: green.into(),
+                border_color: green,
+                corner_radii: Corners::all(ScaledPixels(8.0)),
+                border_widths: Edges::default(),
+            },
+            QuadAnimation::oneshot(
+                started,
+                Duration::from_millis(200),
+                QuadAnimationCurve::EaseOutQuint,
+                start_bounds,
+                end_bounds,
+                green,
+                green,
+                green,
+                green,
+            ),
+        );
+        scene.finish();
+        let range = scene.animated_quad_range().expect("animated quad range");
+        assert_eq!(range.len(), 1);
+
+        // Frame 1: full upload (at start_bounds x=20..60)
+        headless
+            .core
+            .render_frame(&scene, &target_view, size, wgpu::Color::BLACK)
+            .expect("frame 1");
+        assert_eq!(headless.core.full_upload_count, 1);
+        assert_eq!(headless.core.delta_upload_hits, 0);
+        let img1 = headless.read_image().expect("readback 1");
+        assert!(img1.get_pixel(40, 60)[1] > 200, "quad starts at x=40");
+        assert!(img1.get_pixel(240, 60)[1] < 40, "x=240 initially empty");
+
+        // Mutate animated quad in place (same base_generation -> GPU delta-only upload!)
+        scene.quads[range.start].bounds = end_bounds;
+        headless
+            .core
+            .render_frame(&scene, &target_view, size, wgpu::Color::BLACK)
+            .expect("frame 2");
+        assert_eq!(
+            headless.core.delta_upload_hits, 1,
+            "same base_generation must hit GPU persistent buffer delta upload"
+        );
+        assert_eq!(headless.core.full_upload_count, 1);
+        let img2 = headless.read_image().expect("readback 2");
+        assert!(img2.get_pixel(40, 60)[1] < 40, "quad moved away from x=40");
+        assert!(img2.get_pixel(240, 60)[1] > 200, "quad arrived at x=240 via delta upload");
+    }
+
+    #[test]
+    #[ignore]
+    fn gpu_offloading_perf_benchmarks() {
+        use gpui::{
+            BackdropBlur, BorderStyle, Bounds, ContentMask, Corners, Edges, Hsla, PaddedBool32,
+            Point, Quad, QuadAnimation, QuadAnimationCurve, ScaledPixels, Shadow, Size,
+        };
+        use std::time::{Duration, Instant};
+
+        let mut headless = WgpuHeadlessRenderer::new().expect("headless wgpu renderer");
+        let size = Size {
+            width: DevicePixels(1280),
+            height: DevicePixels(800),
+        };
+        headless.ensure_render_target(size).expect("render target");
+        let target_view = headless.render_target.as_ref().unwrap().view.clone();
+        let wait_gpu = |core: &WgpuRendererCore| {
+            let _ = core.resources.device.poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(Duration::from_secs(30)),
+            });
+        };
+
+        let full_mask = ContentMask {
+            bounds: Bounds {
+                origin: Point { x: ScaledPixels(0.0), y: ScaledPixels(0.0) },
+                size: Size { width: ScaledPixels(1280.0), height: ScaledPixels(800.0) },
+            },
+        };
+        let bg = Hsla { h: 0.62, s: 0.35, l: 0.08, a: 1.0 };
+        let card = Hsla { h: 0.62, s: 0.25, l: 0.14, a: 1.0 };
+        let accent = Hsla { h: 0.66, s: 0.80, l: 0.58, a: 1.0 };
+
+        let build_dense_scene = |with_blur: bool| {
+            let mut scene = Scene::default();
+            scene.insert_primitive(Quad {
+                order: 0,
+                border_style: BorderStyle::Solid,
+                bounds: full_mask.bounds,
+                content_mask: full_mask,
+                background: bg.into(),
+                border_color: bg,
+                corner_radii: Corners::default(),
+                border_widths: Edges::default(),
+            });
+            for i in 0..400u32 {
+                let x = ((i % 25) as f32) * 50.0 + 10.0;
+                let y = ((i / 25) as f32) * 48.0 + 12.0;
+                let rect = Bounds {
+                    origin: Point { x: ScaledPixels(x), y: ScaledPixels(y) },
+                    size: Size { width: ScaledPixels(44.0), height: ScaledPixels(40.0) },
+                };
+                scene.insert_primitive(Shadow {
+                    order: 0,
+                    blur_radius: ScaledPixels(6.0),
+                    bounds: rect,
+                    corner_radii: Corners::all(ScaledPixels(8.0)),
+                    content_mask: full_mask,
+                    color: Hsla { h: 0.0, s: 0.0, l: 0.0, a: 0.18 },
+                    shape_bounds: rect,
+                    shape_corner_radii: Corners::all(ScaledPixels(8.0)),
+                    inset: PaddedBool32::from(false),
+                    pad: 0,
+                });
+                scene.insert_primitive(Quad {
+                    order: 0,
+                    border_style: BorderStyle::Solid,
+                    bounds: rect,
+                    content_mask: full_mask,
+                    background: card.into(),
+                    border_color: accent,
+                    corner_radii: Corners::all(ScaledPixels(8.0)),
+                    border_widths: Edges::all(ScaledPixels(1.0)),
+                });
+                for bar in 0..9u32 {
+                    scene.insert_primitive(Quad {
+                        order: 0,
+                        border_style: BorderStyle::Solid,
+                        bounds: Bounds {
+                            origin: Point { x: ScaledPixels(x + 4.0 + (bar as f32) * 4.0), y: ScaledPixels(y + 10.0) },
+                            size: Size { width: ScaledPixels(3.0), height: ScaledPixels(22.0) },
+                        },
+                        content_mask: full_mask,
+                        background: accent.into(),
+                        border_color: accent,
+                        corner_radii: Corners::all(ScaledPixels(1.5)),
+                        border_widths: Edges::default(),
+                    });
+                }
+            }
+            let anim_bounds = Bounds {
+                origin: Point { x: ScaledPixels(40.0), y: ScaledPixels(40.0) },
+                size: Size { width: ScaledPixels(24.0), height: ScaledPixels(24.0) },
+            };
+            let end_bounds = Bounds {
+                origin: Point { x: ScaledPixels(100.0), y: ScaledPixels(40.0) },
+                size: Size { width: ScaledPixels(24.0), height: ScaledPixels(24.0) },
+            };
+            scene.insert_animated_quad(
+                Quad {
+                    order: 0,
+                    border_style: BorderStyle::Solid,
+                    bounds: anim_bounds,
+                    content_mask: full_mask,
+                    background: accent.into(),
+                    border_color: accent,
+                    corner_radii: Corners::all(ScaledPixels(12.0)),
+                    border_widths: Edges::default(),
+                },
+                QuadAnimation::oneshot(
+                    Instant::now(),
+                    Duration::from_millis(300),
+                    QuadAnimationCurve::EaseOutQuint,
+                    anim_bounds,
+                    end_bounds,
+                    accent,
+                    accent,
+                    accent,
+                    accent,
+                ),
+            );
+            if with_blur {
+                scene.insert_primitive(BackdropBlur {
+                    order: 0,
+                    blur_radius: ScaledPixels(12.0),
+                    bounds: Bounds {
+                        origin: Point { x: ScaledPixels(280.0), y: ScaledPixels(160.0) },
+                        size: Size { width: ScaledPixels(720.0), height: ScaledPixels(480.0) },
+                    },
+                    corner_radii: Corners::all(ScaledPixels(16.0)),
+                    content_mask: full_mask,
+                });
+            }
+            scene.finish();
+            scene
+        };
+
+        // 1. Compare 60 frames of GPU upload + draw: Full re-upload vs Persistent Delta Upload
+        let mut scene = build_dense_scene(false);
+        let anim_idx = scene.animated_quad_range().unwrap().start;
+
+        // Warm up
+        headless.core.render_frame(&scene, &target_view, size, wgpu::Color::BLACK).unwrap();
+        wait_gpu(&headless.core);
+
+        let frames = 60usize;
+        let t_full = Instant::now();
+        for i in 0..frames {
+            headless.core.cached_instances = None; // simulate full upload every frame
+            scene.quads[anim_idx].bounds.origin.x = ScaledPixels(40.0 + (i as f32));
+            headless.core.render_frame(&scene, &target_view, size, wgpu::Color::BLACK).unwrap();
+            wait_gpu(&headless.core);
+        }
+        let full_ms = t_full.elapsed().as_secs_f64() * 1_000.0;
+
+        // Prime cache
+        headless.core.render_frame(&scene, &target_view, size, wgpu::Color::BLACK).unwrap();
+        wait_gpu(&headless.core);
+        headless.core.delta_upload_hits = 0;
+
+        let t_delta = Instant::now();
+        for i in 0..frames {
+            scene.quads[anim_idx].bounds.origin.x = ScaledPixels(40.0 + (i as f32));
+            headless.core.render_frame(&scene, &target_view, size, wgpu::Color::BLACK).unwrap();
+            wait_gpu(&headless.core);
+        }
+        let delta_ms = t_delta.elapsed().as_secs_f64() * 1_000.0;
+        assert_eq!(headless.core.delta_upload_hits, frames as u64);
+
+        // Also isolate pure CPU-side prepare_instances upload cost (excluding Lavapipe rasterization)
+        let t_prep_full = Instant::now();
+        for _ in 0..500 {
+            headless.core.cached_instances = None;
+            let _ = headless.core.prepare_instances(&scene).unwrap();
+        }
+        let prep_full_us = t_prep_full.elapsed().as_secs_f64() * 1e6 / 500.0;
+
+        let _ = headless.core.prepare_instances(&scene).unwrap();
+        let t_prep_delta = Instant::now();
+        for _ in 0..500 {
+            let _ = headless.core.prepare_instances(&scene).unwrap();
+        }
+        let prep_delta_us = t_prep_delta.elapsed().as_secs_f64() * 1e6 / 500.0;
+
+        // 2. Benchmark Dual-Kawase Frosted Glass Backdrop Blur (30 frames, 1280x800)
+        let blur_scene = build_dense_scene(true);
+        headless.core.render_frame(&blur_scene, &target_view, size, wgpu::Color::BLACK).unwrap();
+        wait_gpu(&headless.core);
+        let t_blur = Instant::now();
+        for _ in 0..30 {
+            headless.core.render_frame(&blur_scene, &target_view, size, wgpu::Color::BLACK).unwrap();
+            wait_gpu(&headless.core);
+        }
+        let blur_ms_per_frame = t_blur.elapsed().as_secs_f64() * 1_000.0 / 30.0;
+
+        println!(
+            "[PERF] GPU prepare_instances (4000q+400s) | full={prep_full_us:.1} µs | delta={prep_delta_us:.1} µs ({:.1}x faster)",
+            prep_full_us / prep_delta_us.max(0.01)
+        );
+        println!(
+            "[PERF] WGPU 60f dense scene | full_upload={full_ms:.2} ms | delta_upload={delta_ms:.2} ms"
+        );
+        println!(
+            "[PERF] WGPU Dual-Kawase BackdropBlur (1280x800, 4000q+400s) | {blur_ms_per_frame:.2} ms/frame (Lavapipe software Vulkan)"
         );
     }
 }

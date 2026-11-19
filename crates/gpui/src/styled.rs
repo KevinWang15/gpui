@@ -748,6 +748,13 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Applies a GPU frosted-glass backdrop blur (`backdrop-filter: blur(radius)`) behind this
+    /// element's background and children.
+    fn backdrop_blur(mut self, radius: impl Into<crate::Pixels>) -> Self {
+        self.style().backdrop_blur = Some(radius.into());
+        self
+    }
+
     /// Sets the grid columns of this element.
     fn grid_cols(mut self, cols: u16) -> Self {
         self.style().grid_cols = Some(GridTemplate {

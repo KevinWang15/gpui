@@ -5,15 +5,18 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use crate::{
-    AnimationExt, App, Bounds, ClickEvent, ElementId, FontWeight, IntoElement, ParentElement,
-    Pixels, Point, RenderOnce, SharedString, SpringAnimation, StyleRefinement, Styled, Window,
-    canvas, div, prelude::*, px,
+    App, BorderStyle, Bounds, ClickEvent, Corners, Edges, ElementId, FontWeight, IntoElement,
+    ParentElement, Pixels, Point, QuadAnimationCurve, QuadAnimationMode, RenderOnce, SharedString,
+    Size, StyleRefinement, Styled, Window, canvas, div, prelude::*, px, quad,
 };
 use crate::icons::{Icon, IconSize, LucideIcon};
 
 use super::theme::{ActiveTheme, ComponentSize, SPRING_SNAPPY};
+
+const SEG_PILL_MAX_MS: u64 = 520;
 
 /// One selectable option inside a [`SegmentedControl`].
 #[derive(Clone, Debug)]
@@ -66,6 +69,9 @@ impl SegmentedItem {
 struct SegmentedLayoutCache {
     container: Option<Bounds<Pixels>>,
     items: Vec<Option<Bounds<Pixels>>>,
+    last_pill: Option<(Pixels, Pixels)>,
+    anim_from: Option<(Pixels, Pixels)>,
+    anim_started_at: Option<Instant>,
 }
 
 /// Compact pill-track segmented switcher with a spring-animated sliding indicator.
@@ -220,31 +226,84 @@ impl RenderOnce for SegmentedControl {
             );
 
         if let Some((target_x, target_w)) = measured_pill {
-            let x_anim_id = (self.id.clone(), "seg-pill-x");
-            let w_anim_id = (self.id.clone(), "seg-pill-w");
-            let pill_body = div()
-                .h_full()
-                .rounded(radius)
-                .bg(theme.surface)
-                .border_1()
-                .border_color(theme.border.opacity(0.65))
-                .shadow_xs()
-                .with_spring(
-                    w_anim_id,
-                    SpringAnimation::new(SPRING_SNAPPY).to(target_w),
-                    |el, w| el.w(w),
-                );
-            let pill = div()
-                .absolute()
-                .top(pad)
-                .h(inner_h)
-                .child(pill_body)
-                .with_spring(
-                    x_anim_id,
-                    SpringAnimation::new(SPRING_SNAPPY).to(target_x),
-                    |el, x| el.left(x),
-                );
-            track = track.child(pill);
+            let now = cx.background_executor().now();
+            let reduce_motion = cx.reduce_motion();
+            let max_dur = Duration::from_millis(SEG_PILL_MAX_MS);
+            let curve = QuadAnimationCurve::from(SPRING_SNAPPY);
+
+            let (from_pill, active_start) = {
+                let mut cache = layout_cache.borrow_mut();
+                match cache.last_pill {
+                    Some((prev_x, prev_w))
+                        if (prev_x.0 - target_x.0).abs() > 0.5
+                            || (prev_w.0 - target_w.0).abs() > 0.5 =>
+                    {
+                        let (cur_x, cur_w) = if let (Some(started), Some((fx, fw))) =
+                            (cache.anim_started_at, cache.anim_from)
+                        {
+                            let elapsed = now.saturating_duration_since(started).as_secs_f32();
+                            let (pos, _) = curve.evaluate(elapsed, max_dur.as_secs_f32());
+                            (
+                                px(fx.0 + (prev_x.0 - fx.0) * pos),
+                                px((fw.0 + (prev_w.0 - fw.0) * pos).max(0.0)),
+                            )
+                        } else {
+                            (prev_x, prev_w)
+                        };
+                        cache.anim_from = Some((cur_x, cur_w));
+                        cache.anim_started_at = (!reduce_motion).then_some(now);
+                        cache.last_pill = Some((target_x, target_w));
+                    }
+                    None => {
+                        cache.last_pill = Some((target_x, target_w));
+                    }
+                    _ => {}
+                }
+                let active = cache.anim_started_at.filter(|started| {
+                    !reduce_motion && now.saturating_duration_since(*started) < max_dur
+                });
+                (cache.anim_from.unwrap_or((target_x, target_w)), active)
+            };
+
+            let pill_bg = theme.surface;
+            let pill_border = theme.border.opacity(0.65);
+            let pill_canvas = canvas(
+                |_, _, _| {},
+                move |track_bounds, _, window, _| {
+                    let make_bounds = |x: Pixels, w: Pixels| Bounds {
+                        origin: Point::new(track_bounds.origin.x + x, track_bounds.origin.y + pad),
+                        size: Size::new(w, inner_h),
+                    };
+                    let to_bounds = make_bounds(target_x, target_w);
+                    let pill_quad = quad(
+                        to_bounds,
+                        Corners::all(radius),
+                        pill_bg,
+                        Edges::all(px(1.)),
+                        pill_border,
+                        BorderStyle::Solid,
+                    );
+                    if let Some(started_at) = active_start {
+                        let from_bounds = make_bounds(from_pill.0, from_pill.1);
+                        window.paint_animated_quad(
+                            pill_quad,
+                            QuadAnimationMode::Oneshot {
+                                started_at,
+                                duration: max_dur,
+                                curve,
+                            },
+                            from_bounds,
+                            pill_bg,
+                            pill_border,
+                        );
+                    } else {
+                        window.paint_quad(pill_quad);
+                    }
+                },
+            )
+            .absolute()
+            .inset_0();
+            track = track.child(pill_canvas);
         }
 
         let has_measured_pill = measured_pill.is_some();

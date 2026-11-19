@@ -801,6 +801,7 @@ impl MetalRenderer {
             });
 
             match batch {
+                PrimitiveBatch::BackdropBlurs(_) => {}
                 PrimitiveBatch::Shadows(range) => {
                     self.draw_shadows(range, instance_bindings, &command_encoder)
                 }

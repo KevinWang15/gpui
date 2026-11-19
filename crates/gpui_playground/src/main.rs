@@ -384,6 +384,7 @@ impl Render for PlaygroundApp {
             .child(
                 dialog("pg-global-dialog", self.dialog_open)
                     .size(self.dialog_size)
+                    .backdrop_blur(px(self.glass_blur_px))
                     .destructive(self.dialog_destructive)
                     .icon(if self.dialog_destructive {
                         LucideIcon::TriangleExclamationPoint

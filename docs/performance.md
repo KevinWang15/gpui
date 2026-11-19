@@ -25,7 +25,7 @@ cargo test --release -p gpui_wgpu --lib \
 # On headless Linux / CI with Lavapipe software Vulkan:
 VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json \
   cargo test --release -p gpui_wgpu --lib \
-  -- view_transition_perf_30_frames --ignored --nocapture --test-threads=1
+  -- view_transition_perf_30_frames gpu_offloading_perf_benchmarks --ignored --nocapture --test-threads=1
 ```
 
 ---
@@ -37,9 +37,12 @@ Measured in `--release` on Linux (x86_64, Rust 1.99, Lavapipe Vulkan ICD for WGP
 | Workload | Baseline (Before) | Optimized (After) | Improvement |
 | --- | --- | --- | --- |
 | **`LineChart` hover scrub** (4 series × 2,500 = 10,000 pts, 60 frames) | 1,209.7 µs med · 74.44 ms total | **103.5 µs med · 6.68 ms total** | **11.7× faster** (-91.4%) |
+| **GPU Scene `QuadAnimation` advance** (120-row settings page, 60 frames) | 2,674.9 µs med (full relayout) | **0.2 µs med · 0.02 ms total** | **Zero relayout (>10,000× CPU)** |
+| **WGPU `prepare_instances` upload** (4,000 quads + 400 shadows) | 242.2 µs/frame (full + 7 BindGroups) | **4.4 µs/frame (delta, 0 BindGroups)** | **55.4× faster** (~550 KB → ~128 B) |
 | **`FilterBar` open popover nav** (10 active chips, 120 facet opts, 40 frames) | 2,384.5 µs med · 99.60 ms total | **393.2 µs med · 16.09 ms total** | **6.06× faster** (-83.5%) |
 | **`StackedBarChart` 2 px drag-brush** (90d × 6 series, 60 moves) | 488.0 µs med · 29.88 ms (62 renders) | **0.4 µs med · 5.38 ms (16 renders)** | **5.55× faster** (-82.0%, -74% renders) |
 | **WGPU `ViewTransition` composite** (1280×800, 2,500 quads + 250 shadows, 30f) | 5.61 ms steady · 176.96 ms total | **1.13 ms steady · 45.09 ms total** | **5.0× faster steady** / **3.93× total** |
+| **WGPU Dual-Kawase `BackdropBlur`** (1280×800 over 4,000 quads + 400 shadows) | *(Previously flat scrim only)* | **9.40 ms/f (Lavapipe SW Vulkan)** | Hardware GPU frosted glass |
 | **`FilterClause::matches_value` (`Contains`)** (100,000 evaluations) | 0.082 µs/op · 8.25 ms total | **0.027 µs/op · 2.69 ms total** | **3.07× faster** (-67.4%) |
 | **`StackedBarChart` hover** (90d × 6 series, 60 frames) | 596.6 µs med · 37.81 ms total | **422.5 µs med · 26.61 ms total** | **1.41× faster** (-29.2%) |
 | **Settings parent re-render** (120 `SettingRow`s + 120 `Styled` `Input`s, 50f) | 3,684.4 µs med · 196.71 ms total | **2,615.0 µs med · 134.01 ms total** | **1.41× faster** (-29.0%) |
@@ -93,6 +96,18 @@ Measured in `--release` on Linux (x86_64, Rust 1.99, Lavapipe Vulkan ICD for WGP
 ### 6. Shared Zero-Allocation Primitives (`theme.rs`, `charts/core.rs`, `calendar.rs`, `segmented.rs`)
 - Replaced repeated per-tick and per-cell `FontFeatures(Arc::new(vec![("tnum".to_string(), 1)]))` heap allocations with a single `OnceLock`-backed `tabular_numerals()`.
 - Replaced per-child `format!("...-{}", idx)` `ElementId` string allocations with GPUI's native zero-allocation `(&'static str, usize)` scoped tuple IDs (`("leg", idx)`, `("seg", idx)`, `("day", offset)`, `("opt-val", idx)`, etc.) and static `DAY_LABELS` in `CalendarGrid`.
+
+### 7. GPU Offloading: Zero-Relayout `QuadAnimation`, Persistent Storage Buffer Delta Uploads & Dual-Kawase `BackdropBlur` (`scene.rs`, `window.rs`, `style.rs`, `wgpu_renderer.rs`, `shaders_backdrop_blur.wgsl`)
+- **Zero-Relayout Scene `QuadAnimation`**:
+  - Added `QuadAnimation` (`QuadAnimationMode::{Oneshot, SyncedPulse}` and analytical closed-form `QuadAnimationCurve::{EaseOutQuint, Spring}`) directly on `Scene` without altering `Quad`'s `#[repr(C)]` ABI across Metal, DirectX 11, WebGL2, or Vulkan.
+  - Upgraded `Skeleton` (synced 120 FPS shimmer pulse), `SegmentedControl` (sliding pill), `ProgressBar` (animated fill bar), and iconless `Toggle` (track color morph + sliding thumb) to `Window::paint_animated_quad(...)`.
+  - Subsequent animation frames skip `Window::draw()`, view `render()`, and Taffy layout completely (`2,674.9 µs` → `0.2 µs` median on a 120-row page), and automatically disarm `scene_animation_interval` once settled (`0%` idle cost).
+- **Persistent GPU Storage Buffer & Delta-Only Uploads (`gpui_wgpu`)**:
+  - Separated `Scene::base_generation()` (structural) from `Scene::generation()` (content) and tracked `animated_quad_range()` / `animated_monochrome_sprite_range()`.
+  - `WgpuRendererCore::prepare_instances` caches all 7 `wgpu::BindGroup`s per `base_generation` and uploads only the tiny mutated animated slice (`~128 B` instead of re-uploading hundreds of kilobytes of static quads, shadows, paths, and text sprites), reducing `prepare_instances` from `242.2 µs` to `4.4 µs` (**55.4× faster**, `0` BindGroup allocations/frame).
+- **Multi-Pass Dual-Kawase GPU Frosted-Glass `BackdropBlur` (`shaders_backdrop_blur.wgsl`)**:
+  - Added `Styled::backdrop_blur(Pixels)` and `Primitive::BackdropBlur`, backed on `gpui_wgpu` by a single-command-encoder Dual-Kawase pyramid (`full → half → quarter → half`) + rounded-rectangle SDF composite + bit-exact blit pass.
+  - Zero overhead on frames without backdrop blur; enabled by default on in-window `Dialog` backdrops (`10 px`) and demonstrated live in `gpui_playground`.
 
 ---
 

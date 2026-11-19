@@ -1444,3 +1444,158 @@ fn native_toast_manager_slots_eviction_and_dismiss(cx: &mut TestAppContext) {
     assert_eq!(manager.active_count(), 0);
     assert_eq!(cx.update(|cx| cx.windows().len()), 0);
 }
+
+#[gpui::test]
+fn gpu_offload_quad_animations_and_backdrop_blur(cx: &mut TestAppContext) {
+    cx.update(init_components);
+
+    // 1. Verify analytical closed-form damped spring curve starts at 0, overshoots, and settles
+    let snappy = crate::QuadAnimationCurve::from(SPRING_SNAPPY);
+    let (p0, s0) = snappy.evaluate(0.0, 0.5);
+    assert_eq!(p0, 0.0);
+    assert!(!s0);
+    let (p_mid, _) = snappy.evaluate(0.14, 0.5);
+    assert!(
+        p_mid > 0.85,
+        "SPRING_SNAPPY should rapidly approach/overshoot target by 140ms, got {p_mid}"
+    );
+    let (p_end, s_end) = snappy.evaluate(0.5, 0.5);
+    assert_eq!(p_end, 1.0);
+    assert!(s_end);
+
+    // 2. Verify Scene::insert_animated_quad keeps base_generation constant while advancing
+    let mut scene = crate::Scene::default();
+    let mask = crate::ContentMask {
+        bounds: crate::Bounds {
+            origin: crate::point(crate::ScaledPixels(0.0), crate::ScaledPixels(0.0)),
+            size: size(crate::ScaledPixels(800.0), crate::ScaledPixels(600.0)),
+        },
+    };
+    let start_b = crate::Bounds {
+        origin: crate::point(crate::ScaledPixels(10.0), crate::ScaledPixels(10.0)),
+        size: size(crate::ScaledPixels(20.0), crate::ScaledPixels(20.0)),
+    };
+    let end_b = crate::Bounds {
+        origin: crate::point(crate::ScaledPixels(110.0), crate::ScaledPixels(10.0)),
+        size: size(crate::ScaledPixels(20.0), crate::ScaledPixels(20.0)),
+    };
+    let c0 = crate::Hsla { h: 0.0, s: 0.0, l: 0.5, a: 1.0 };
+    let c1 = crate::Hsla { h: 0.6, s: 0.8, l: 0.5, a: 1.0 };
+    let t0 = std::time::Instant::now();
+    scene.insert_animated_quad(
+        crate::Quad {
+            order: 0,
+            border_style: crate::BorderStyle::Solid,
+            bounds: start_b,
+            content_mask: mask,
+            background: c0.into(),
+            border_color: c0,
+            corner_radii: crate::Corners::all(crate::ScaledPixels(10.0)),
+            border_widths: crate::Edges::default(),
+        },
+        crate::QuadAnimation::oneshot(
+            t0,
+            std::time::Duration::from_millis(300),
+            snappy,
+            start_b,
+            end_b,
+            c0,
+            c1,
+            c0,
+            c1,
+        ),
+    );
+    scene.finish();
+
+    let base_gen = scene.base_generation();
+    let gen0 = scene.generation();
+    assert_ne!(base_gen, 0);
+    assert!(scene.animated_quad_range().is_some());
+    assert!(scene.animation_frame_interval().is_some());
+
+    // Advance mid-flight: quad moves, generation bumps, base_generation stays constant!
+    scene.advance_animations(
+        t0 + std::time::Duration::from_millis(80),
+        std::time::Duration::from_millis(80),
+    );
+    assert_eq!(scene.base_generation(), base_gen);
+    assert_ne!(scene.generation(), gen0);
+    assert!(scene.quads[0].bounds.origin.x.0 > 20.0);
+    assert!(scene.animation_frame_interval().is_some());
+
+    // Advance past duration: quad snaps to exact target and animation disarms cleanly
+    scene.advance_animations(
+        t0 + std::time::Duration::from_millis(350),
+        std::time::Duration::from_millis(350),
+    );
+    assert_eq!(scene.quads[0].bounds, end_b);
+    assert!(
+        scene.animation_frame_interval().is_none(),
+        "settled oneshot QuadAnimation must disarm frame ticking"
+    );
+
+    // 3. Verify backdrop_blur + zero-relayout components (Skeleton, Toggle, ProgressBar, SegmentedControl)
+    struct GpuOffloadTestView {
+        checked: bool,
+        tab: SharedString,
+        progress: f32,
+        renders: Rc<std::cell::Cell<usize>>,
+    }
+    impl Render for GpuOffloadTestView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            v_stack()
+                .w(px(400.))
+                .p(px(16.))
+                .spacing(px(12.))
+                .child(
+                    crate::div()
+                        .w(px(200.))
+                        .h(px(80.))
+                        .rounded(px(12.))
+                        .backdrop_blur(px(12.))
+                        .bg(crate::Hsla::from(palette::SLATE_900).opacity(0.45)),
+                )
+                .child(toggle("gpu-tog", self.checked).label("GPU Toggle"))
+                .child(
+                    segmented_control("gpu-seg", self.tab.clone()).items([
+                        SegmentedItem::new("a", "Alpha"),
+                        SegmentedItem::new("b", "Beta"),
+                    ]),
+                )
+                .child(progress_bar(self.progress).animated("gpu-prog"))
+                .child(Skeleton::line(px(12.)))
+        }
+    }
+
+    let renders = Rc::new(std::cell::Cell::new(0));
+    let renders_ref = renders.clone();
+    let (view, cx) = cx.add_window_view(move |_, _| GpuOffloadTestView {
+        checked: false,
+        tab: "a".into(),
+        progress: 25.0,
+        renders: renders_ref,
+    });
+    cx.run_until_parked();
+
+    // Trigger state transitions on Toggle, SegmentedControl, and ProgressBar
+    view.update(cx, |v, cx| {
+        v.checked = true;
+        v.tab = "b".into();
+        v.progress = 85.0;
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let renders_after_flip = renders.get();
+
+    // Advance scene animations directly on the window: ZERO extra view renders should occur!
+    cx.update(|window, cx| {
+        window.advance_scene_animations(cx);
+        window.advance_scene_animations(cx);
+    });
+    assert_eq!(
+        renders.get(),
+        renders_after_flip,
+        "advancing GPU scene QuadAnimations must incur 0 view re-renders"
+    );
+}

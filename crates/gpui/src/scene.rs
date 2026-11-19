@@ -5,9 +5,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Path,
-    PathTiles, Pixels, Point, Radians, ScaledPixels, SceneTransition, Size, TimedTransformation,
-    bounds_tree::BoundsTree,
+    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Interpolate,
+    Path, PathTiles, Pixels, Point, Radians, ScaledPixels, SceneTransition, Size, SpringConfig,
+    TimedTransformation, bounds_tree::BoundsTree,
 };
 use smallvec::SmallVec;
 use std::{
@@ -20,7 +20,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 static NEXT_SCENE_GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -68,6 +68,7 @@ pub struct Scene {
     primitive_bounds: BoundsTree<ScaledPixels>,
     layer_stack: Vec<usize>,
     layers: VecDeque<Layer>,
+    pub backdrop_blurs: Vec<BackdropBlur>,
     pub shadows: Vec<Shadow>,
     pub quads: Vec<Quad>,
     pub paths: Vec<PaintedPath>,
@@ -77,10 +78,19 @@ pub struct Scene {
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
     animations: Vec<SpriteAnimation>,
-    /// Monotonic generation stamped in [`Scene::finish`] and whenever sprite animations mutate
-    /// primitives, allowing GPU backends to cache rendered offscreen textures across static frames
-    /// (e.g. during full-window [`SceneTransition`] composites).
+    quad_animations: Vec<QuadAnimation>,
+    /// Monotonic structural generation stamped only in [`Scene::finish`]. Remains unchanged
+    /// across zero-relayout [`Scene::advance_animations`] frames so GPU backends can reuse
+    /// persistent instance buffers and upload only animated primitive slices.
+    base_generation: u64,
+    /// Monotonic content generation stamped in [`Scene::finish`] and whenever scene animations
+    /// mutate primitives, allowing GPU backends to cache rendered offscreen textures across
+    /// static frames (e.g. during full-window [`SceneTransition`] composites).
     generation: u64,
+    /// Contiguous range in [`Self::quads`] covering every quad mutated by [`Self::quad_animations`].
+    animated_quad_range: Option<Range<usize>>,
+    /// Contiguous range in [`Self::monochrome_sprites`] covering every sprite mutated by [`Self::animations`].
+    animated_monochrome_sprite_range: Option<Range<usize>>,
     /// Optional active full-window GPU view transition evaluated for the current frame.
     pub transition: Option<SceneTransition>,
 }
@@ -92,6 +102,7 @@ impl Scene {
         self.primitive_bounds.clear();
         self.layer_stack.clear();
         self.layers.clear();
+        self.backdrop_blurs.clear();
         self.paths.clear();
         self.shadows.clear();
         self.quads.clear();
@@ -101,15 +112,38 @@ impl Scene {
         self.polychrome_sprites.clear();
         self.surfaces.clear();
         self.animations.clear();
+        self.quad_animations.clear();
+        self.base_generation = 0;
         self.generation = 0;
+        self.animated_quad_range = None;
+        self.animated_monochrome_sprite_range = None;
         self.transition = None;
+    }
+
+    /// Returns the structural scene generation stamped in [`Self::finish`] (`0` if not finished).
+    ///
+    /// Unlike [`Self::generation`], this does **not** change when zero-relayout scene animations
+    /// update quad or sprite instances in place, letting GPU renderers reuse cached storage
+    /// buffers and bind groups and upload only the animated delta slice.
+    pub fn base_generation(&self) -> u64 {
+        self.base_generation
     }
 
     /// Returns the monotonic content generation of this finished scene (`0` if not yet finished).
     ///
-    /// Changes whenever [`Self::finish`] completes a new scene or animated sprites advance.
+    /// Changes whenever [`Self::finish`] completes a new scene or animated primitives advance.
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// Bounding index range inside [`Self::quads`] mutated by zero-relayout quad animations.
+    pub fn animated_quad_range(&self) -> Option<Range<usize>> {
+        self.animated_quad_range.clone()
+    }
+
+    /// Bounding index range inside [`Self::monochrome_sprites`] mutated by sprite animations.
+    pub fn animated_monochrome_sprite_range(&self) -> Option<Range<usize>> {
+        self.animated_monochrome_sprite_range.clone()
     }
 
     /// Inserts a sprite that [`Self::advance_animations`] keeps moving. The
@@ -126,11 +160,58 @@ impl Scene {
         }
     }
 
+    /// Inserts a [`Quad`] whose geometry and colors are driven directly during scene
+    /// presentation without triggering view re-renders or Taffy layout.
+    pub fn insert_animated_quad(&mut self, quad: Quad, mut animation: QuadAnimation) {
+        let union_bounds = animation
+            .from_bounds
+            .union(&animation.to_bounds)
+            .union(&quad.bounds);
+        let clipped_bounds = union_bounds.intersect(&quad.content_mask.bounds);
+        if clipped_bounds.is_empty() {
+            return;
+        }
+
+        let anim_index = self.quad_animations.len();
+        animation.quad_index = usize::MAX;
+        self.quad_animations.push(animation);
+
+        let kind = PrimitiveKind::Quad;
+        if let Some(&layer) = self.layer_stack.last()
+            && let Some(layer) = self.layers.get_mut(layer)
+        {
+            layer.bounds = layer.bounds.join(&clipped_bounds);
+            layer.max_kind = layer.max_kind.max(kind);
+            layer.max_shared_kind = layer.max_shared_kind.min(kind.max_shared_kind());
+            let index = self.paint_operations.len();
+            match layer.primitives.last_mut() {
+                Some(range) if range.end == index => range.end += 1,
+                _ => layer.primitives.push(index..index + 1),
+            }
+        } else {
+            let order = self
+                .primitive_bounds
+                .insert(clipped_bounds, kind, kind.max_shared_kind());
+            self.push_animated_quad(quad, order, anim_index);
+        }
+        self.paint_operations
+            .push(PaintOperation::AnimatedQuad(quad, anim_index));
+    }
+
+    fn push_animated_quad(&mut self, quad: Quad, order: DrawOrder, anim_index: usize) {
+        let quad_index = self.quads.len();
+        self.quads.push(Quad { order, ..quad });
+        if let Some(anim) = self.quad_animations.get_mut(anim_index) {
+            anim.quad_index = quad_index;
+        }
+    }
+
     /// How long the window may wait between presents of this scene while only
     /// its animations need a frame: `None` when nothing in it animates, and
     /// zero when an animation wants every frame.
     pub(crate) fn animation_frame_interval(&self) -> Option<Duration> {
-        self.animations
+        let sprite_interval = self
+            .animations
             .iter()
             .map(|animation| {
                 animation
@@ -138,24 +219,54 @@ impl Scene {
                     .min_frame_interval()
                     .unwrap_or_default()
             })
-            .min()
+            .min();
+        let quad_interval = self
+            .quad_animations
+            .iter()
+            .any(|anim| !anim.finished)
+            .then_some(Duration::ZERO);
+        match (sprite_interval, quad_interval) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }
     }
 
-    /// Moves every animated sprite to its pose at `elapsed` time on the app's
-    /// synced animation clock, without the scene being rebuilt.
-    pub(crate) fn advance_animations(&mut self, elapsed: Duration) {
-        if self.animations.is_empty() {
-            return;
+    /// Moves every animated sprite and quad to its pose at `(now, elapsed)` without
+    /// rebuilding the scene or re-running layout.
+    pub(crate) fn advance_animations(&mut self, now: Instant, elapsed: Duration) {
+        let mut mutated = false;
+
+        if !self.animations.is_empty() {
+            for animation in &self.animations {
+                let Some(sprite) = self.monochrome_sprites.get_mut(animation.sprite_index) else {
+                    continue;
+                };
+                let pose = animation.transformation.at(elapsed);
+                sprite.transformation = pose.into_matrix(animation.center, animation.scale_factor);
+                sprite.color = animation.base_color.opacity(pose.alpha_factor());
+                mutated = true;
+            }
         }
-        for animation in &self.animations {
-            let Some(sprite) = self.monochrome_sprites.get_mut(animation.sprite_index) else {
-                continue;
-            };
-            let pose = animation.transformation.at(elapsed);
-            sprite.transformation = pose.into_matrix(animation.center, animation.scale_factor);
-            sprite.color = animation.base_color.opacity(pose.alpha_factor());
+
+        if !self.quad_animations.is_empty() {
+            for animation in &mut self.quad_animations {
+                if animation.finished {
+                    continue;
+                }
+                let Some(quad) = self.quads.get_mut(animation.quad_index) else {
+                    animation.finished = true;
+                    continue;
+                };
+                animation.apply(quad, now, elapsed);
+                mutated = true;
+            }
         }
-        self.generation = next_scene_generation();
+
+        if mutated {
+            self.generation = next_scene_generation();
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -167,7 +278,7 @@ impl Scene {
         self.layers.push_back(Layer {
             primitives: SmallVec::new(),
             bounds: Bounds::default(),
-            max_kind: PrimitiveKind::Shadow,
+            max_kind: PrimitiveKind::BackdropBlur,
             max_shared_kind: PrimitiveKind::Surface,
         });
         self.paint_operations.push(PaintOperation::StartLayer);
@@ -191,9 +302,17 @@ impl Scene {
             self.primitive_bounds
                 .insert(layer.bounds, layer.max_kind, layer.max_shared_kind);
         for index in layer.primitives.into_iter().flatten() {
-            if let PaintOperation::Primitive(primitive) = &self.paint_operations[index] {
-                let primitive = primitive.clone();
-                self.push_primitive(primitive, order);
+            match &self.paint_operations[index] {
+                PaintOperation::Primitive(primitive) => {
+                    let primitive = primitive.clone();
+                    self.push_primitive(primitive, order);
+                }
+                PaintOperation::AnimatedQuad(quad, anim_index) => {
+                    let quad = *quad;
+                    let anim_index = *anim_index;
+                    self.push_animated_quad(quad, order, anim_index);
+                }
+                PaintOperation::StartLayer | PaintOperation::EndLayer => {}
             }
         }
     }
@@ -234,6 +353,9 @@ impl Scene {
 
     fn push_primitive(&mut self, primitive: Primitive, order: DrawOrder) {
         match primitive {
+            Primitive::BackdropBlur(blur) => {
+                self.backdrop_blurs.push(BackdropBlur { order, ..blur })
+            }
             Primitive::Shadow(shadow) => self.shadows.push(Shadow { order, ..shadow }),
             Primitive::Quad(quad) => self.quads.push(Quad { order, ..quad }),
             Primitive::Path(mut path) => {
@@ -273,6 +395,13 @@ impl Scene {
                         self.insert_primitive(primitive.clone());
                     }
                 }
+                PaintOperation::AnimatedQuad(quad, anim_index) => {
+                    if let Some(animation) = prev_scene.quad_animations.get(*anim_index) {
+                        self.insert_animated_quad(*quad, *animation);
+                    } else {
+                        self.insert_primitive(*quad);
+                    }
+                }
                 PaintOperation::StartLayer => self.push_layer(),
                 PaintOperation::EndLayer => self.pop_layer(),
             }
@@ -282,8 +411,18 @@ impl Scene {
     pub fn finish(&mut self) {
         debug_assert!(self.layer_stack.is_empty(), "unbalanced scene layers");
         let keys = &mut Vec::new();
+        sort_in_place(&mut self.backdrop_blurs, keys, |blur| (blur.order, 0));
         sort_in_place(&mut self.shadows, keys, |shadow| (shadow.order, 0));
-        sort_in_place(&mut self.quads, keys, |quad| (quad.order, 0));
+        if self.quad_animations.is_empty() {
+            sort_in_place(&mut self.quads, keys, |quad| (quad.order, 0));
+        } else {
+            sort_in_place_tracking_indices(
+                &mut self.quads,
+                keys,
+                |quad| (quad.order, 0),
+                &mut self.quad_animations,
+            );
+        }
         self.paths.sort_by_key(|path| path.order);
         sort_in_place(&mut self.underlines, keys, |underline| (underline.order, 0));
         sort_in_place(&mut self.monochrome_sprites, keys, |sprite| {
@@ -298,14 +437,40 @@ impl Scene {
         self.surfaces.sort_by_key(|surface| surface.order);
 
         // Sorting moved the sprites, so animations learn where theirs ended up.
+        self.animated_monochrome_sprite_range = None;
         if !self.animations.is_empty() {
+            let mut min_idx = usize::MAX;
+            let mut max_idx = 0usize;
             for (index, sprite) in self.monochrome_sprites.iter().enumerate() {
                 if let Some(animation) = self.animations.get_mut(sprite.animation.0 as usize) {
                     animation.sprite_index = index;
+                    min_idx = min_idx.min(index);
+                    max_idx = max_idx.max(index);
                 }
             }
+            if min_idx <= max_idx && min_idx != usize::MAX {
+                self.animated_monochrome_sprite_range = Some(min_idx..max_idx + 1);
+            }
         }
-        self.generation = next_scene_generation();
+
+        self.animated_quad_range = None;
+        if !self.quad_animations.is_empty() {
+            let mut min_idx = usize::MAX;
+            let mut max_idx = 0usize;
+            for anim in &self.quad_animations {
+                if anim.quad_index < self.quads.len() {
+                    min_idx = min_idx.min(anim.quad_index);
+                    max_idx = max_idx.max(anim.quad_index);
+                }
+            }
+            if min_idx <= max_idx && min_idx != usize::MAX {
+                self.animated_quad_range = Some(min_idx..max_idx + 1);
+            }
+        }
+
+        let generation = next_scene_generation();
+        self.base_generation = generation;
+        self.generation = generation;
     }
 
     #[cfg_attr(
@@ -317,6 +482,8 @@ impl Scene {
     )]
     pub fn batches(&self) -> impl Iterator<Item = PrimitiveBatch> + '_ {
         BatchIterator {
+            backdrop_blurs_start: 0,
+            backdrop_blurs_iter: self.backdrop_blurs.iter().peekable(),
             shadows_start: 0,
             shadows_iter: self.shadows.iter().peekable(),
             quads_start: 0,
@@ -377,6 +544,52 @@ fn sort_in_place<T: Copy>(
     }
 }
 
+/// Like [`sort_in_place`], additionally remapping [`QuadAnimation::quad_index`] across the sort.
+fn sort_in_place_tracking_indices(
+    primitives: &mut [Quad],
+    keys: &mut Vec<(u64, u32)>,
+    key: impl Fn(&Quad) -> (u32, u32),
+    animations: &mut [QuadAnimation],
+) {
+    if primitives.is_sorted_by_key(&key) {
+        return;
+    }
+    keys.clear();
+    keys.extend(primitives.iter().enumerate().map(|(index, primitive)| {
+        let (major, minor) = key(primitive);
+        ((major as u64) << 32 | minor as u64, index as u32)
+    }));
+    keys.sort_unstable();
+
+    let mut old_to_new = vec![0usize; primitives.len()];
+    for (new_idx, &(_, old_idx)) in keys.iter().enumerate() {
+        old_to_new[old_idx as usize] = new_idx;
+    }
+    for anim in animations {
+        if anim.quad_index < old_to_new.len() {
+            anim.quad_index = old_to_new[anim.quad_index];
+        }
+    }
+
+    for start in 0..primitives.len() {
+        if keys[start].1 as usize == start {
+            continue;
+        }
+        let displaced = primitives[start];
+        let mut target = start;
+        loop {
+            let source = keys[target].1 as usize;
+            keys[target].1 = target as u32;
+            if source == start {
+                primitives[target] = displaced;
+                break;
+            }
+            primitives[target] = primitives[source];
+            target = source;
+        }
+    }
+}
+
 /// The depth step between consecutive quads in a frame with `quad_count` quads.
 pub fn quad_depth_scale(quad_count: usize) -> f32 {
     let denominator = (quad_count.min((1 << 24) - 1) + 1).next_power_of_two();
@@ -397,6 +610,7 @@ pub fn quad_depth(quad_id: u32, scale: f32) -> f32 {
     allow(dead_code)
 )]
 pub(crate) enum PrimitiveKind {
+    BackdropBlur,
     Shadow,
     #[default]
     Quad,
@@ -427,6 +641,7 @@ impl PrimitiveKind {
 
 pub(crate) enum PaintOperation {
     Primitive(Primitive),
+    AnimatedQuad(Quad, usize),
     StartLayer,
     EndLayer,
 }
@@ -434,6 +649,7 @@ pub(crate) enum PaintOperation {
 #[derive(Clone)]
 #[expect(missing_docs)]
 pub enum Primitive {
+    BackdropBlur(BackdropBlur),
     Shadow(Shadow),
     Quad(Quad),
     Path(PaintedPath),
@@ -448,6 +664,7 @@ pub enum Primitive {
 impl Primitive {
     pub(crate) fn kind(&self) -> PrimitiveKind {
         match self {
+            Primitive::BackdropBlur(_) => PrimitiveKind::BackdropBlur,
             Primitive::Shadow(_) => PrimitiveKind::Shadow,
             Primitive::Quad(_) => PrimitiveKind::Quad,
             Primitive::Path(_) => PrimitiveKind::Path,
@@ -461,6 +678,7 @@ impl Primitive {
 
     pub fn bounds(&self) -> &Bounds<ScaledPixels> {
         match self {
+            Primitive::BackdropBlur(blur) => &blur.bounds,
             Primitive::Shadow(shadow) => &shadow.bounds,
             Primitive::Quad(quad) => &quad.bounds,
             Primitive::Path(path) => &path.bounds,
@@ -488,6 +706,7 @@ impl Primitive {
 
     pub fn content_mask(&self) -> &ContentMask<ScaledPixels> {
         match self {
+            Primitive::BackdropBlur(blur) => &blur.content_mask,
             Primitive::Shadow(shadow) => &shadow.content_mask,
             Primitive::Quad(quad) => &quad.content_mask,
             Primitive::Path(path) => &path.paint.content_mask,
@@ -508,6 +727,8 @@ impl Primitive {
     allow(dead_code)
 )]
 struct BatchIterator<'a> {
+    backdrop_blurs_start: usize,
+    backdrop_blurs_iter: Peekable<slice::Iter<'a, BackdropBlur>>,
     shadows_start: usize,
     shadows_iter: Peekable<slice::Iter<'a, Shadow>>,
     quads_start: usize,
@@ -531,6 +752,10 @@ impl<'a> Iterator for BatchIterator<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let mut orders_and_kinds = [
+            (
+                self.backdrop_blurs_iter.peek().map(|b| b.order),
+                PrimitiveKind::BackdropBlur,
+            ),
             (
                 self.shadows_iter.peek().map(|s| s.order),
                 PrimitiveKind::Shadow,
@@ -572,6 +797,20 @@ impl<'a> Iterator for BatchIterator<'a> {
         };
 
         match batch_kind {
+            PrimitiveKind::BackdropBlur => {
+                let blurs_start = self.backdrop_blurs_start;
+                let mut blurs_end = blurs_start + 1;
+                self.backdrop_blurs_iter.next();
+                while self
+                    .backdrop_blurs_iter
+                    .next_if(|blur| (blur.order, batch_kind) < max_order_and_kind)
+                    .is_some()
+                {
+                    blurs_end += 1;
+                }
+                self.backdrop_blurs_start = blurs_end;
+                Some(PrimitiveBatch::BackdropBlurs(blurs_start..blurs_end))
+            }
             PrimitiveKind::Shadow => {
                 let shadows_start = self.shadows_start;
                 let mut shadows_end = shadows_start + 1;
@@ -719,6 +958,7 @@ impl<'a> Iterator for BatchIterator<'a> {
 )]
 #[allow(missing_docs)]
 pub enum PrimitiveBatch {
+    BackdropBlurs(Range<usize>),
     Shadows(Range<usize>),
     Quads(Range<usize>),
     Paths(Range<usize>),
@@ -743,6 +983,7 @@ impl PrimitiveBatch {
     #[expect(missing_docs)]
     pub fn label(&self) -> String {
         match self {
+            Self::BackdropBlurs(range) => format!("backdrop blurs ({})", range.len()),
             Self::Shadows(range) => format!("shadows ({})", range.len()),
             Self::Quads(range) => format!("quads ({})", range.len()),
             Self::Paths(range) => format!("paths ({})", range.len()),
@@ -769,6 +1010,273 @@ impl PrimitiveBatch {
                 )
             }
             Self::Surfaces(range) => format!("surfaces ({})", range.len()),
+        }
+    }
+}
+
+/// GPU frosted-glass backdrop blur primitive (`backdrop-filter: blur(...)`).
+///
+/// Backends with blur support (such as `gpui_wgpu` via Dual-Kawase downsample/upsample passes)
+/// blur everything already painted behind `bounds` and composite the rounded region in paint order.
+#[derive(Debug, Copy, Clone)]
+#[repr(C)]
+pub struct BackdropBlur {
+    /// Draw order assigned by [`Scene`].
+    pub order: DrawOrder,
+    /// Blur radius in scaled device pixels.
+    pub blur_radius: ScaledPixels,
+    /// Region bounds in scaled device pixels.
+    pub bounds: Bounds<ScaledPixels>,
+    /// Corner radii in scaled device pixels.
+    pub corner_radii: Corners<ScaledPixels>,
+    /// Clipping content mask in scaled device pixels.
+    pub content_mask: ContentMask<ScaledPixels>,
+}
+
+impl From<BackdropBlur> for Primitive {
+    fn from(blur: BackdropBlur) -> Self {
+        Primitive::BackdropBlur(blur)
+    }
+}
+
+/// Easing or closed-form spring curve evaluated per frame by [`QuadAnimation`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum QuadAnimationCurve {
+    /// Smooth quintic ease-out (`1 - (1 - t)^5`).
+    EaseOutQuint,
+    /// Analytical closed-form damped harmonic spring (`stiffness`, `damping`).
+    Spring {
+        /// Spring stiffness coefficient (`k`).
+        stiffness: f32,
+        /// Spring damping coefficient (`c`).
+        damping: f32,
+    },
+}
+
+impl From<SpringConfig> for QuadAnimationCurve {
+    fn from(config: SpringConfig) -> Self {
+        Self::Spring {
+            stiffness: config.stiffness,
+            damping: config.damping,
+        }
+    }
+}
+
+impl QuadAnimationCurve {
+    /// Evaluates `(position, settled)` at `elapsed_secs` within `max_duration_secs`.
+    pub fn evaluate(self, elapsed_secs: f32, max_duration_secs: f32) -> (f32, bool) {
+        if elapsed_secs <= 0.0 {
+            return (0.0, false);
+        }
+        if max_duration_secs <= 0.0 || elapsed_secs >= max_duration_secs {
+            return (1.0, true);
+        }
+        match self {
+            Self::EaseOutQuint => {
+                let inv = 1.0 - (elapsed_secs / max_duration_secs).clamp(0.0, 1.0);
+                let inv2 = inv * inv;
+                (1.0 - inv2 * inv2 * inv, false)
+            }
+            Self::Spring { stiffness, damping } => {
+                let k = stiffness.max(1.0);
+                let c = damping.max(0.1);
+                let w0 = k.sqrt();
+                let zeta = c / (2.0 * w0);
+                let t = elapsed_secs;
+                let (pos, vel) = if zeta < 0.9999 {
+                    let wd = w0 * (1.0 - zeta * zeta).sqrt();
+                    let decay = (-zeta * w0 * t).exp();
+                    let cos_t = (wd * t).cos();
+                    let sin_t = (wd * t).sin();
+                    let ratio = (zeta * w0) / wd;
+                    let pos = 1.0 - decay * (cos_t + ratio * sin_t);
+                    let vel = decay * ((w0 * w0) / wd) * sin_t;
+                    (pos, vel)
+                } else if zeta > 1.0001 {
+                    let disc = (zeta * zeta - 1.0).sqrt();
+                    let r1 = -w0 * (zeta - disc);
+                    let r2 = -w0 * (zeta + disc);
+                    let e1 = (r1 * t).exp();
+                    let e2 = (r2 * t).exp();
+                    let denom = r2 - r1;
+                    let pos = 1.0 - (r2 * e1 - r1 * e2) / denom;
+                    let vel = -(r1 * r2 * (e1 - e2)) / denom;
+                    (pos, vel)
+                } else {
+                    let decay = (-w0 * t).exp();
+                    let pos = 1.0 - decay * (1.0 + w0 * t);
+                    let vel = w0 * w0 * t * decay;
+                    (pos, vel)
+                };
+
+                let settled = t >= 0.04 && (1.0 - pos).abs() < 0.0015 && vel.abs() < 0.02;
+                if settled { (1.0, true) } else { (pos, false) }
+            }
+        }
+    }
+}
+
+/// Playback mode for a zero-relayout [`QuadAnimation`].
+#[derive(Clone, Copy, Debug)]
+pub enum QuadAnimationMode {
+    /// Oneshot spring or eased transition starting at `started_at`.
+    /// Stops requesting frames automatically once settled or `duration` elapses.
+    Oneshot {
+        /// Wall-clock start instant from `cx.background_executor().now()`.
+        started_at: Instant,
+        /// Hard upper bound on animation duration.
+        duration: Duration,
+        /// Curve evaluated on every vsync.
+        curve: QuadAnimationCurve,
+    },
+    /// Continuous smooth cosine alpha pulse phase-locked to the app's synced clock
+    /// (ideal for loading [`Skeleton`](crate::components::Skeleton) shimmer effects).
+    SyncedPulse {
+        /// Full pulse cycle period.
+        period: Duration,
+        /// Minimum alpha multiplier at the trough of the wave.
+        min_alpha: f32,
+        /// Maximum alpha multiplier at the crest of the wave.
+        max_alpha: f32,
+    },
+}
+
+/// Zero-relayout scene-level animation applied directly to a [`Quad`] inside [`Scene::quads`]
+/// before GPU presentation — avoiding view re-renders, Taffy layout, and full scene rebuilds.
+#[derive(Clone, Copy, Debug)]
+pub struct QuadAnimation {
+    /// Timing and curve specification.
+    pub mode: QuadAnimationMode,
+    /// Starting bounds in scaled device pixels.
+    pub from_bounds: Bounds<ScaledPixels>,
+    /// Target bounds in scaled device pixels.
+    pub to_bounds: Bounds<ScaledPixels>,
+    /// Starting solid background color (interpolated smoothly when solid).
+    pub from_background: Hsla,
+    /// Target solid background color.
+    pub to_background: Hsla,
+    /// Starting border color.
+    pub from_border_color: Hsla,
+    /// Target border color.
+    pub to_border_color: Hsla,
+    pub(crate) quad_index: usize,
+    pub(crate) finished: bool,
+}
+
+impl QuadAnimation {
+    /// Creates a oneshot spring/eased [`QuadAnimation`] from `from_bounds` to `to_bounds`.
+    pub fn oneshot(
+        started_at: Instant,
+        duration: Duration,
+        curve: impl Into<QuadAnimationCurve>,
+        from_bounds: Bounds<ScaledPixels>,
+        to_bounds: Bounds<ScaledPixels>,
+        from_background: Hsla,
+        to_background: Hsla,
+        from_border_color: Hsla,
+        to_border_color: Hsla,
+    ) -> Self {
+        Self {
+            mode: QuadAnimationMode::Oneshot {
+                started_at,
+                duration,
+                curve: curve.into(),
+            },
+            from_bounds,
+            to_bounds,
+            from_background,
+            to_background,
+            from_border_color,
+            to_border_color,
+            quad_index: usize::MAX,
+            finished: false,
+        }
+    }
+
+    /// Creates a continuous synced alpha pulse animation on a [`Quad`].
+    pub fn synced_pulse(
+        period: Duration,
+        min_alpha: f32,
+        max_alpha: f32,
+        bounds: Bounds<ScaledPixels>,
+        base_background: Hsla,
+        base_border_color: Hsla,
+    ) -> Self {
+        Self {
+            mode: QuadAnimationMode::SyncedPulse {
+                period,
+                min_alpha,
+                max_alpha,
+            },
+            from_bounds: bounds,
+            to_bounds: bounds,
+            from_background: base_background,
+            to_background: base_background,
+            from_border_color: base_border_color,
+            to_border_color: base_border_color,
+            quad_index: usize::MAX,
+            finished: false,
+        }
+    }
+
+    fn apply(&mut self, quad: &mut Quad, now: Instant, elapsed: Duration) {
+        match self.mode {
+            QuadAnimationMode::Oneshot {
+                started_at,
+                duration,
+                curve,
+            } => {
+                let elapsed_secs = now.saturating_duration_since(started_at).as_secs_f32();
+                let (pos, settled) = curve.evaluate(elapsed_secs, duration.as_secs_f32());
+                let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t;
+                quad.bounds = Bounds {
+                    origin: Point::new(
+                        ScaledPixels(lerp(self.from_bounds.origin.x.0, self.to_bounds.origin.x.0, pos)),
+                        ScaledPixels(lerp(self.from_bounds.origin.y.0, self.to_bounds.origin.y.0, pos)),
+                    ),
+                    size: Size::new(
+                        ScaledPixels(
+                            lerp(
+                                self.from_bounds.size.width.0,
+                                self.to_bounds.size.width.0,
+                                pos,
+                            )
+                            .max(0.0),
+                        ),
+                        ScaledPixels(
+                            lerp(
+                                self.from_bounds.size.height.0,
+                                self.to_bounds.size.height.0,
+                                pos,
+                            )
+                            .max(0.0),
+                        ),
+                    ),
+                };
+                let color_t = pos.clamp(0.0, 1.0);
+                quad.background =
+                    Hsla::interpolate(self.from_background, self.to_background, color_t).into();
+                quad.border_color =
+                    Hsla::interpolate(self.from_border_color, self.to_border_color, color_t);
+                if settled {
+                    quad.bounds = self.to_bounds;
+                    quad.background = self.to_background.into();
+                    quad.border_color = self.to_border_color;
+                    self.finished = true;
+                }
+            }
+            QuadAnimationMode::SyncedPulse {
+                period,
+                min_alpha,
+                max_alpha,
+            } => {
+                let period_secs = period.as_secs_f32().max(0.05);
+                let phase = (elapsed.as_secs_f32() / period_secs).fract();
+                let wave = 0.5 - 0.5 * (std::f32::consts::TAU * phase).cos();
+                let alpha = min_alpha + (max_alpha - min_alpha) * wave;
+                quad.background = self.to_background.opacity(alpha).into();
+                quad.border_color = self.to_border_color.opacity(alpha);
+            }
         }
     }
 }

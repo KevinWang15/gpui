@@ -9,7 +9,8 @@ use crate::taffy::TaffyLayoutEngine;
 use crate::{
     Action, ActiveViewTransition, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App,
     AppContext, Arena, Asset,
-    AsyncWindowContext, AtlasTile, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow,
+    AsyncWindowContext, AtlasTile, AvailableSpace, BackdropBlur, Background, BorderStyle, Bounds,
+    BoxShadow,
     Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
@@ -17,7 +18,8 @@ use crate::{
     Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
     MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, PaintedPath, Path,
     Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow,
-    Point, PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
+    Point, PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, QuadAnimation,
+    QuadAnimationMode, Render, RenderGlyphParams,
     RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
     SpriteAnimation, SpriteAnimationId, StrikethroughStyle, Style, SubpixelSprite, Subscription,
@@ -3136,7 +3138,7 @@ impl Window {
     pub(crate) fn advance_scene_animations(&mut self, cx: &App) {
         let now = cx.background_executor().now();
         let elapsed = now - cx.synced_animation_epoch;
-        self.rendered_frame.scene.advance_animations(elapsed);
+        self.rendered_frame.scene.advance_animations(now, elapsed);
 
         if let Some(active) = &self.active_view_transition {
             if let Some(scene_transition) =
@@ -3153,6 +3155,8 @@ impl Window {
             }
         } else {
             self.rendered_frame.scene.transition = None;
+            self.scene_animation_interval
+                .set(self.rendered_frame.scene.animation_frame_interval());
         }
     }
 
@@ -5155,6 +5159,81 @@ impl Window {
                 )
                 - antialias_inset,
         )
+    }
+
+    /// Paints a GPU frosted-glass backdrop blur region behind subsequent primitives.
+    ///
+    /// On GPU backends with backdrop-blur pipelines (`gpui_wgpu`), everything already painted
+    /// behind `bounds` is blurred via Dual-Kawase downsample/upsample passes and composited with
+    /// exact rounded-rectangle SDF antialiasing and the current content mask.
+    pub fn paint_backdrop_blur(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        blur_radius: Pixels,
+    ) {
+        self.invalidator.debug_assert_paint();
+        if blur_radius <= px(0.) {
+            return;
+        }
+        let scale_factor = self.scale_factor();
+        let blur = BackdropBlur {
+            order: 0,
+            blur_radius: ScaledPixels(blur_radius.0 * scale_factor),
+            bounds: self.snap_bounds(bounds),
+            corner_radii: corner_radii.scale(scale_factor),
+            content_mask: self.snapped_content_mask(),
+        };
+        self.next_frame.scene.insert_primitive(blur);
+    }
+
+    /// Paints a [`PaintQuad`] whose bounds and solid colors animate directly on the [`Scene`]
+    /// during presentation without re-running view `render()` or Taffy layout on subsequent frames.
+    ///
+    /// When [`App::reduce_motion`] is active, callers should paint the static final state via
+    /// [`Self::paint_quad`] instead.
+    pub fn paint_animated_quad(
+        &mut self,
+        quad: PaintQuad,
+        mode: QuadAnimationMode,
+        from_bounds: Bounds<Pixels>,
+        from_background: Hsla,
+        from_border_color: Hsla,
+    ) {
+        self.invalidator.debug_assert_paint();
+        let opacity = self.element_opacity();
+        let scale_factor = self.scale_factor();
+        let to_bounds = self.snap_bounds(quad.bounds);
+        let from_bounds = self.snap_bounds(from_bounds);
+        let to_bg = quad.background.solid.opacity(opacity);
+        let from_bg = from_background.opacity(opacity);
+        let to_border = quad.border_color.opacity(opacity);
+        let from_border = from_border_color.opacity(opacity);
+
+        let scene_quad = Quad {
+            order: 0,
+            bounds: from_bounds,
+            content_mask: self.snapped_content_mask(),
+            background: from_bg.into(),
+            border_color: from_border,
+            corner_radii: quad.corner_radii.scale(scale_factor),
+            border_widths: self.snap_border_widths(quad.border_widths),
+            border_style: quad.border_style,
+        };
+        let animation = QuadAnimation {
+            mode,
+            from_bounds,
+            to_bounds,
+            from_background: from_bg,
+            to_background: to_bg,
+            from_border_color: from_border,
+            to_border_color: to_border,
+            quad_index: usize::MAX,
+            finished: false,
+        };
+        self.next_frame
+            .scene
+            .insert_animated_quad(scene_quad, animation);
     }
 
     /// Paint one or more quads into the scene for the next frame at the current stacking context.

@@ -650,3 +650,52 @@ fn perf_full_analytics_dashboard_rerender(cx: &mut TestAppContext) {
         &summarize(&mut samples),
     );
 }
+
+// ============================================================================
+// 8. Zero-Relayout GPU Scene QuadAnimation vs. Full View Relayout (60 frames)
+// ============================================================================
+
+#[gpui::test]
+#[ignore]
+fn perf_zero_relayout_quad_animation_vs_full_rerender(cx: &mut TestAppContext) {
+    cx.update(init_components);
+    let (view, cx) = cx.add_window_view(|_, cx| {
+        let inputs = (0..120)
+            .map(|i| {
+                cx.new(|cx| {
+                    InputState::new(cx)
+                        .default_value(format!("{i}"))
+                        .size(ComponentSize::Sm)
+                })
+            })
+            .collect();
+        DenseSettingsView {
+            inputs,
+            toggle_flag: false,
+        }
+    });
+    cx.run_until_parked();
+
+    // Flip toggle once (single layout frame arms zero-relayout GPU QuadAnimation!)
+    view.update(cx, |v, cx| {
+        v.toggle_flag = true;
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    // Measure 60 zero-relayout scene animation frames (window.advance_scene_animations)
+    let frames = 60usize;
+    let mut anim_samples = Vec::with_capacity(frames);
+    for _ in 0..frames {
+        let t0 = Instant::now();
+        cx.update(|window, cx| {
+            window.advance_scene_animations(cx);
+        });
+        anim_samples.push(t0.elapsed());
+    }
+    print_stats(
+        "GPU Scene QuadAnimation advance (120-row page)",
+        frames,
+        &summarize(&mut anim_samples),
+    );
+}

@@ -196,6 +196,7 @@ pub struct Dialog {
     size: DialogSize,
     dismiss_on_backdrop: bool,
     show_close_button: bool,
+    backdrop_blur: Pixels,
     children: SmallVec<[AnyElement; 4]>,
     footer: SmallVec<[AnyElement; 3]>,
     on_close: Option<Rc<dyn Fn(&(), &mut Window, &mut App) + 'static>>,
@@ -220,6 +221,7 @@ impl Dialog {
             size: DialogSize::Md,
             dismiss_on_backdrop: true,
             show_close_button: true,
+            backdrop_blur: px(10.),
             children: SmallVec::new(),
             footer: SmallVec::new(),
             on_close: None,
@@ -266,6 +268,14 @@ impl Dialog {
     /// Controls visibility of the top-right `X` close button (default `true`).
     pub fn show_close_button(mut self, show: bool) -> Self {
         self.show_close_button = show;
+        self
+    }
+
+    /// Sets the GPU frosted-glass backdrop blur radius behind the modal overlay (default `10px`).
+    ///
+    /// Pass `px(0.)` to disable backdrop blur and render only the flat dimmed scrim.
+    pub fn backdrop_blur(mut self, radius: impl Into<Pixels>) -> Self {
+        self.backdrop_blur = radius.into();
         self
     }
 
@@ -370,6 +380,7 @@ impl RenderOnce for Dialog {
         let panel_anim_id = (self.id.clone(), "panel-anim");
         let backdrop_anim_id = (self.id.clone(), "backdrop-anim");
         let backdrop_color = theme.backdrop;
+        let backdrop_blur = self.backdrop_blur;
 
         let animated_panel = panel.with_animation(
             panel_anim_id,
@@ -402,7 +413,12 @@ impl RenderOnce for Dialog {
             .with_animation(
                 backdrop_anim_id,
                 Animation::new(ANIM_NORMAL).with_easing(ease_out_quint()),
-                move |el, delta| el.bg(backdrop_color.opacity(delta)),
+                move |el, delta| {
+                    el.bg(backdrop_color.opacity(delta))
+                        .when(backdrop_blur > px(0.), |el| {
+                            el.backdrop_blur(px(backdrop_blur.0 * delta))
+                        })
+                },
             );
 
         deferred(overlay).priority(50).into_any_element()

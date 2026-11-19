@@ -1,15 +1,29 @@
 //! Tailwind-inspired feedback & loading components: [`ProgressBar`], [`Spinner`],
 //! [`Skeleton`], and [`EmptyState`].
 
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::time::{Duration, Instant};
+
 use smallvec::SmallVec;
 
 use crate::{
-    AnimationExt, AnyElement, App, ElementId, FontWeight, Hsla, IntoElement, Pixels, RenderOnce,
-    SharedString, SpringAnimation, StyleRefinement, Styled, Window, div, prelude::*, px, relative,
+    AnyElement, App, BorderStyle, Bounds, Corners, Edges, ElementId, FontWeight, Hsla,
+    IntoElement, Pixels, QuadAnimationCurve, QuadAnimationMode, RenderOnce, SharedString, Size,
+    StyleRefinement, Styled, Window, canvas, div, prelude::*, px, quad, relative,
+    transparent_black,
 };
 use crate::icons::{Icon, IconSize, LucideIcon};
 
 use super::theme::{ActiveTheme, ComponentSize, SPRING_SMOOTH};
+
+struct ProgressAnimState {
+    last_ratio: f32,
+    from_ratio: f32,
+    started_at: Option<Instant>,
+}
+
+const PROGRESS_ANIM_MAX_MS: u64 = 650;
 
 /// Determinate progress bar with optional label, percentage readout, custom color,
 /// and optional smooth spring width animation via [`ProgressBar::animated`].
@@ -89,7 +103,7 @@ impl Styled for ProgressBar {
 }
 
 impl RenderOnce for ProgressBar {
-    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
         let ratio = (self.value / self.max).clamp(0.0, 1.0);
         let pct_int = (ratio * 100.0).round() as u32;
@@ -101,6 +115,92 @@ impl RenderOnce for ProgressBar {
             ComponentSize::Xl => px(16.),
         };
         let fill_color = self.color.unwrap_or(theme.primary);
+        let reduce_motion = cx.reduce_motion();
+
+        let fill_element = if let Some(anim_id) = self.id {
+            let state_entity = window.use_keyed_state(
+                (anim_id, "gpu-progress-anim"),
+                cx,
+                |_, _| {
+                    Rc::new(RefCell::new(ProgressAnimState {
+                        last_ratio: ratio,
+                        from_ratio: ratio,
+                        started_at: None,
+                    }))
+                },
+            );
+            let state_rc = state_entity.read(cx).clone();
+            let now = cx.background_executor().now();
+            let max_dur = Duration::from_millis(PROGRESS_ANIM_MAX_MS);
+            let curve = QuadAnimationCurve::from(SPRING_SMOOTH);
+
+            let (from_ratio, active_start) = {
+                let mut st = state_rc.borrow_mut();
+                if (st.last_ratio - ratio).abs() > 0.0005 {
+                    let current = if let Some(started) = st.started_at {
+                        let elapsed = now.saturating_duration_since(started).as_secs_f32();
+                        let (pos, _) = curve.evaluate(elapsed, max_dur.as_secs_f32());
+                        (st.from_ratio + (st.last_ratio - st.from_ratio) * pos).clamp(0.0, 1.0)
+                    } else {
+                        st.last_ratio
+                    };
+                    st.from_ratio = current;
+                    st.last_ratio = ratio;
+                    st.started_at = (!reduce_motion).then_some(now);
+                }
+                let active = st.started_at.filter(|started| {
+                    !reduce_motion
+                        && now.saturating_duration_since(*started) < max_dur
+                        && (st.from_ratio - ratio).abs() > 0.0005
+                });
+                (st.from_ratio, active)
+            };
+
+            canvas(
+                |_, _, _| {},
+                move |track_bounds, _, window, _| {
+                    let full_w = track_bounds.size.width;
+                    let radius = track_bounds.size.height * 0.5;
+                    let make_bounds = |r: f32| Bounds {
+                        origin: track_bounds.origin,
+                        size: Size::new(px(full_w.0 * r.clamp(0.0, 1.0)), track_bounds.size.height),
+                    };
+                    let to_bounds = make_bounds(ratio);
+                    let fill_quad = quad(
+                        to_bounds,
+                        Corners::all(radius),
+                        fill_color,
+                        Edges::default(),
+                        transparent_black(),
+                        BorderStyle::Solid,
+                    );
+                    if let Some(started_at) = active_start {
+                        window.paint_animated_quad(
+                            fill_quad,
+                            QuadAnimationMode::Oneshot {
+                                started_at,
+                                duration: max_dur,
+                                curve,
+                            },
+                            make_bounds(from_ratio),
+                            fill_color,
+                            transparent_black(),
+                        );
+                    } else if to_bounds.size.width > px(0.) {
+                        window.paint_quad(fill_quad);
+                    }
+                },
+            )
+            .size_full()
+            .into_any_element()
+        } else {
+            div()
+                .h_full()
+                .w(relative(ratio))
+                .rounded_full()
+                .bg(fill_color)
+                .into_any_element()
+        };
 
         let mut root = div()
             .flex()
@@ -138,25 +238,7 @@ impl RenderOnce for ProgressBar {
                     .rounded_full()
                     .bg(theme.surface_muted)
                     .overflow_hidden()
-                    .child(if let Some(anim_id) = self.id {
-                        div()
-                            .h_full()
-                            .rounded_full()
-                            .bg(fill_color)
-                            .with_spring(
-                                anim_id,
-                                SpringAnimation::new(SPRING_SMOOTH).to(ratio),
-                                |el, val| el.w(relative(val.clamp(0.0, 1.0))),
-                            )
-                            .into_any_element()
-                    } else {
-                        div()
-                            .h_full()
-                            .w(relative(ratio))
-                            .rounded_full()
-                            .bg(fill_color)
-                            .into_any_element()
-                    }),
+                    .child(fill_element),
             );
 
         crate::Refineable::refine(root.style(), &self.style);
@@ -249,9 +331,14 @@ impl RenderOnce for Spinner {
 }
 
 /// Placeholder shimmer-style loading block (rectangle, circle, or text line).
+///
+/// By default, animates smoothly at display refresh rate using a zero-relayout GPU scene
+/// [`QuadAnimationMode::SyncedPulse`] (skipping view `render()` and Taffy layout on every frame)
+/// and automatically respects [`App::reduce_motion`].
 #[derive(IntoElement)]
 pub struct Skeleton {
     rounded_full: bool,
+    shimmer: bool,
     style: StyleRefinement,
 }
 
@@ -271,6 +358,7 @@ impl Skeleton {
     pub fn new() -> Self {
         Self {
             rounded_full: false,
+            shimmer: true,
             style: StyleRefinement::default(),
         }
     }
@@ -279,6 +367,7 @@ impl Skeleton {
     pub fn circle(diameter: Pixels) -> Self {
         let mut s = Self {
             rounded_full: true,
+            shimmer: true,
             style: StyleRefinement::default(),
         };
         s.style.size.width = Some(diameter.into());
@@ -293,6 +382,12 @@ impl Skeleton {
         s.style.size.height = Some(height.into());
         s
     }
+
+    /// Enables or disables the zero-relayout GPU loading pulse animation (default `true`).
+    pub fn shimmer(mut self, enabled: bool) -> Self {
+        self.shimmer = enabled;
+        self
+    }
 }
 
 impl Styled for Skeleton {
@@ -304,14 +399,61 @@ impl Styled for Skeleton {
 impl RenderOnce for Skeleton {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
-        let mut el = div()
-            .h(px(16.))
-            .w_full()
-            .bg(theme.surface_muted)
-            .when(self.rounded_full, |el| el.rounded_full())
-            .when(!self.rounded_full, |el| el.rounded(theme.radius_md));
-        crate::Refineable::refine(el.style(), &self.style);
-        el
+        let base_color = theme.surface_muted;
+        let rounded_full = self.rounded_full;
+        let default_radius = theme.radius_md;
+
+        if self.shimmer && !cx.reduce_motion() {
+            let mut el = div()
+                .h(px(16.))
+                .w_full()
+                .when(rounded_full, |el| el.rounded_full())
+                .when(!rounded_full, |el| el.rounded(default_radius))
+                .overflow_hidden()
+                .child(
+                    canvas(
+                        |_, _, _| {},
+                        move |bounds, _, window, _| {
+                            let radius = if rounded_full {
+                                px(bounds.size.width.0.min(bounds.size.height.0) * 0.5)
+                            } else {
+                                default_radius
+                            };
+                            let fill_quad = quad(
+                                bounds,
+                                Corners::all(radius),
+                                base_color,
+                                Edges::default(),
+                                transparent_black(),
+                                BorderStyle::Solid,
+                            );
+                            window.paint_animated_quad(
+                                fill_quad,
+                                QuadAnimationMode::SyncedPulse {
+                                    period: Duration::from_millis(1600),
+                                    min_alpha: 0.42,
+                                    max_alpha: 1.0,
+                                },
+                                bounds,
+                                base_color,
+                                transparent_black(),
+                            );
+                        },
+                    )
+                    .size_full(),
+                );
+            crate::Refineable::refine(el.style(), &self.style);
+            el
+        } else {
+            let mut el = div()
+                .h(px(16.))
+                .w_full()
+                .bg(base_color)
+                .when(rounded_full, |el| el.rounded_full())
+                .when(!rounded_full, |el| el.rounded(default_radius));
+            crate::Refineable::refine(el.style(), &self.style);
+            el
+        }
     }
 }
 

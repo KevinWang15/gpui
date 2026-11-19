@@ -1,15 +1,28 @@
 //! Tailwind-inspired [`Toggle`] / [`Switch`], [`ToggleButton`], and [`ToggleGroup`] components.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::time::{Duration, Instant};
+
 use smallvec::SmallVec;
 
 use crate::{
-    AnimationExt, AnyElement, App, ClickEvent, ElementId, FontWeight, Hsla, IntoElement,
-    KeyDownEvent, ParentElement, RenderOnce, SharedString, SpringAnimation, StyleRefinement,
-    Styled, Window, div, prelude::*, px,
+    AnimationExt, AnyElement, App, BorderStyle, Bounds, ClickEvent, Corners, Edges, ElementId,
+    FontWeight, Hsla, Interpolate, IntoElement, KeyDownEvent, ParentElement, Point,
+    QuadAnimationCurve, QuadAnimationMode, RenderOnce, SharedString, Size, SpringAnimation,
+    StyleRefinement, Styled, Window, canvas, div, prelude::*, px, quad, transparent_black,
 };
 use crate::icons::{Icon, IconSize, LucideIcon};
 
 use super::theme::{ActiveTheme, ComponentSize, SPRING_SNAPPY};
+
+struct ToggleAnimState {
+    last_checked: bool,
+    from_phase: f32,
+    started_at: Option<Instant>,
+}
+
+const TOGGLE_ANIM_MAX_MS: u64 = 520;
 
 /// Alias for [`Toggle`].
 pub type Switch = Toggle;
@@ -134,7 +147,7 @@ impl Styled for Toggle {
 }
 
 impl RenderOnce for Toggle {
-    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
         let (track_w, track_h, thumb_size, pad) = match self.size {
             ComponentSize::Xs | ComponentSize::Sm => (px(34.), px(20.), px(16.), px(2.)),
@@ -148,51 +161,169 @@ impl RenderOnce for Toggle {
         let travel_end = track_w - thumb_size - pad;
         let checked = self.checked;
         let with_icons = self.with_icons;
-        let track_id = (self.id.clone(), "track");
-        let thumb_id = (self.id.clone(), "thumb");
 
-        let thumb = div()
-            .absolute()
-            .top(pad)
-            .flex()
-            .items_center()
-            .justify_center()
-            .w(thumb_size)
-            .h(thumb_size)
-            .rounded_full()
-            .bg(thumb_bg)
-            .when(theme.elevation_shadows, |el| el.shadow_xs())
-            .when(with_icons, |el| {
-                let icon = if checked {
-                    LucideIcon::Check
-                } else {
-                    LucideIcon::X
-                };
-                let color = if checked {
-                    on_bg
-                } else {
-                    theme.muted_foreground
-                };
-                el.child(Icon::new(icon).size(IconSize::Xs).color(color))
-            })
-            .with_spring(
-                thumb_id,
-                SpringAnimation::new(SPRING_SNAPPY).to(checked),
-                move |el, phase| el.left(phase.interpolate(pad, travel_end)),
+        let track = if !with_icons {
+            // Zero-relayout GPU scene-animated track color + sliding thumb.
+            let target_phase = if checked { 1.0f32 } else { 0.0f32 };
+            let state_entity = window.use_keyed_state(
+                (self.id.clone(), "gpu-toggle-anim"),
+                cx,
+                |_, _| {
+                    Rc::new(RefCell::new(ToggleAnimState {
+                        last_checked: checked,
+                        from_phase: target_phase,
+                        started_at: None,
+                    }))
+                },
             );
+            let state_rc = state_entity.read(cx).clone();
+            let now = cx.background_executor().now();
+            let reduce_motion = cx.reduce_motion();
+            let max_dur = Duration::from_millis(TOGGLE_ANIM_MAX_MS);
+            let curve = QuadAnimationCurve::from(SPRING_SNAPPY);
 
-        let track = div()
-            .relative()
-            .flex_shrink_0()
-            .w(track_w)
-            .h(track_h)
-            .rounded_full()
-            .child(thumb)
-            .with_spring(
-                track_id,
-                SpringAnimation::new(SPRING_SNAPPY).to(checked),
-                move |el, phase| el.bg(phase.interpolate_clamped(off_bg, on_bg)),
-            );
+            let (from_phase, active_start) = {
+                let mut st = state_rc.borrow_mut();
+                if st.last_checked != checked {
+                    let prev_target = if st.last_checked { 1.0f32 } else { 0.0f32 };
+                    let current = if let Some(started) = st.started_at {
+                        let elapsed = now.saturating_duration_since(started).as_secs_f32();
+                        let (pos, _) = curve.evaluate(elapsed, max_dur.as_secs_f32());
+                        st.from_phase + (prev_target - st.from_phase) * pos
+                    } else {
+                        prev_target
+                    };
+                    st.from_phase = current;
+                    st.last_checked = checked;
+                    st.started_at = (!reduce_motion).then_some(now);
+                }
+                let active = st.started_at.filter(|started| {
+                    !reduce_motion && now.saturating_duration_since(*started) < max_dur
+                });
+                (st.from_phase, active)
+            };
+
+            let from_bg = Hsla::interpolate(off_bg, on_bg, from_phase.clamp(0.0, 1.0));
+            let to_bg = if checked { on_bg } else { off_bg };
+            let from_thumb_x = px(pad.0 + (travel_end.0 - pad.0) * from_phase);
+            let to_thumb_x = if checked { travel_end } else { pad };
+
+            div()
+                .relative()
+                .flex_shrink_0()
+                .w(track_w)
+                .h(track_h)
+                .child(
+                    canvas(
+                        |_, _, _| {},
+                        move |bounds, _, window, _| {
+                            let track_radius = bounds.size.height * 0.5;
+                            let thumb_radius = thumb_size * 0.5;
+                            let track_quad = quad(
+                                bounds,
+                                Corners::all(track_radius),
+                                to_bg,
+                                Edges::default(),
+                                transparent_black(),
+                                BorderStyle::Solid,
+                            );
+                            let to_thumb = Bounds {
+                                origin: Point::new(bounds.origin.x + to_thumb_x, bounds.origin.y + pad),
+                                size: Size::new(thumb_size, thumb_size),
+                            };
+                            let thumb_quad = quad(
+                                to_thumb,
+                                Corners::all(thumb_radius),
+                                thumb_bg,
+                                Edges::default(),
+                                transparent_black(),
+                                BorderStyle::Solid,
+                            );
+
+                            if let Some(started_at) = active_start {
+                                let mode = QuadAnimationMode::Oneshot {
+                                    started_at,
+                                    duration: max_dur,
+                                    curve,
+                                };
+                                window.paint_animated_quad(
+                                    track_quad,
+                                    mode,
+                                    bounds,
+                                    from_bg,
+                                    transparent_black(),
+                                );
+                                let from_thumb = Bounds {
+                                    origin: Point::new(
+                                        bounds.origin.x + from_thumb_x,
+                                        bounds.origin.y + pad,
+                                    ),
+                                    size: Size::new(thumb_size, thumb_size),
+                                };
+                                window.paint_animated_quad(
+                                    thumb_quad,
+                                    mode,
+                                    from_thumb,
+                                    thumb_bg,
+                                    transparent_black(),
+                                );
+                            } else {
+                                window.paint_quad(track_quad);
+                                window.paint_quad(thumb_quad);
+                            }
+                        },
+                    )
+                    .size_full(),
+                )
+                .into_any_element()
+        } else {
+            let track_id = (self.id.clone(), "track");
+            let thumb_id = (self.id.clone(), "thumb");
+
+            let thumb = div()
+                .absolute()
+                .top(pad)
+                .flex()
+                .items_center()
+                .justify_center()
+                .w(thumb_size)
+                .h(thumb_size)
+                .rounded_full()
+                .bg(thumb_bg)
+                .when(theme.elevation_shadows, |el| el.shadow_xs())
+                .child({
+                    let icon = if checked {
+                        LucideIcon::Check
+                    } else {
+                        LucideIcon::X
+                    };
+                    let color = if checked {
+                        on_bg
+                    } else {
+                        theme.muted_foreground
+                    };
+                    Icon::new(icon).size(IconSize::Xs).color(color)
+                })
+                .with_spring(
+                    thumb_id,
+                    SpringAnimation::new(SPRING_SNAPPY).to(checked),
+                    move |el, phase| el.left(phase.interpolate(pad, travel_end)),
+                );
+
+            div()
+                .relative()
+                .flex_shrink_0()
+                .w(track_w)
+                .h(track_h)
+                .rounded_full()
+                .child(thumb)
+                .with_spring(
+                    track_id,
+                    SpringAnimation::new(SPRING_SNAPPY).to(checked),
+                    move |el, phase| el.bg(phase.interpolate_clamped(off_bg, on_bg)),
+                )
+                .into_any_element()
+        };
 
         let has_text = self.label.is_some() || self.description.is_some();
         let text_block = if has_text {

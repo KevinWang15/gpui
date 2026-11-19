@@ -701,8 +701,155 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
                         )),
                 ),
         )
-        // DropdownMenu + Popover + Tooltips
+        // DropdownMenu + Popover + Tooltips & GPU Frosted Glass Showcase
         .child(
+            grid(2)
+                .spacing(px(16.))
+                .child(
+                    card()
+                        .child(
+                            card_header().bordered().child(
+                                h_stack()
+                                    .justify_between()
+                                    .flex_wrap()
+                                    .spacing(px(8.))
+                                    .child(
+                                        h_stack()
+                                            .spacing(px(8.))
+                                            .child(card_title("GPU Frosted Glass"))
+                                            .child(
+                                                badge("Dual-Kawase")
+                                                    .color(BadgeColor::Purple)
+                                                    .pill(true),
+                                            ),
+                                    )
+                                    .child(
+                                        h_stack().spacing(px(4.)).children(
+                                            [
+                                                (0.0f32, "Off"),
+                                                (6.0, "6px"),
+                                                (12.0, "12px"),
+                                                (20.0, "20px"),
+                                            ]
+                                            .into_iter()
+                                            .enumerate()
+                                            .map(|(i, (r, lbl))| {
+                                                button(("glass-r", i))
+                                                    .size(ComponentSize::Xs)
+                                                    .outline()
+                                                    .selected((app.glass_blur_px - r).abs() < 0.1)
+                                                    .label(lbl)
+                                                    .on_click(cx.listener(
+                                                        move |this, _, _, cx| {
+                                                            this.glass_blur_px = r;
+                                                            this.log_event(
+                                                                "GPU BackdropBlur",
+                                                                format!("radius -> {r:.0}px"),
+                                                                cx,
+                                                            );
+                                                        },
+                                                    ))
+                                            }),
+                                        ),
+                                    ),
+                            ),
+                        )
+                        .child(
+                            card_content().child(
+                                div()
+                                    .relative()
+                                    .w_full()
+                                    .h(px(148.))
+                                    .rounded(theme.radius_lg)
+                                    .overflow_hidden()
+                                    .bg(theme.surface_muted)
+                                    .border_1()
+                                    .border_color(theme.border)
+                                    // Colorful sharp geometric backdrop so GPU blur is immediately visible
+                                    .child(
+                                        div()
+                                            .absolute()
+                                            .inset_0()
+                                            .flex()
+                                            .flex_row()
+                                            .items_center()
+                                            .justify_around()
+                                            .px(px(16.))
+                                            .child(
+                                                div()
+                                                    .w(px(74.))
+                                                    .h(px(74.))
+                                                    .rounded_full()
+                                                    .bg(palette::INDIGO_500),
+                                            )
+                                            .child(
+                                                div()
+                                                    .w(px(88.))
+                                                    .h(px(56.))
+                                                    .rounded(px(12.))
+                                                    .bg(palette::EMERALD_500),
+                                            )
+                                            .child(
+                                                div()
+                                                    .w(px(70.))
+                                                    .h(px(70.))
+                                                    .rounded_full()
+                                                    .bg(palette::ROSE_500),
+                                            )
+                                            .child(
+                                                div()
+                                                    .w(px(64.))
+                                                    .h(px(86.))
+                                                    .rounded(px(10.))
+                                                    .bg(palette::AMBER_400),
+                                            ),
+                                    )
+                                    // Centered frosted-glass overlay using .backdrop_blur(...)
+                                    .child(
+                                        div()
+                                            .absolute()
+                                            .inset_0()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .p(px(16.))
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .flex_col()
+                                                    .gap(px(4.))
+                                                    .w(px(300.))
+                                                    .px(px(18.))
+                                                    .py(px(14.))
+                                                    .rounded(theme.radius_xl)
+                                                    .backdrop_blur(px(app.glass_blur_px))
+                                                    .bg(theme.popover.opacity(0.52))
+                                                    .border_1()
+                                                    .border_color(theme.border.opacity(0.85))
+                                                    .child(
+                                                        div()
+                                                            .text_size(px(13.5))
+                                                            .font_weight(FontWeight::SEMIBOLD)
+                                                            .text_color(theme.popover_foreground)
+                                                            .child(format!(
+                                                                "backdrop_blur({:.0}px)",
+                                                                app.glass_blur_px
+                                                            )),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_size(px(12.))
+                                                            .text_color(theme.foreground.opacity(0.82))
+                                                            .child(
+                                                                "Multi-pass Dual-Kawase blur + rounded SDF shader; also drives In-Window Dialog backdrops.",
+                                                            ),
+                                                    ),
+                                            ),
+                                    ),
+                            ),
+                        ),
+                )
+                .child(
             card()
                 .child(
                     card_header()
@@ -870,6 +1017,7 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
                                 .child(kbd("⌘K"))
                                 .child(kbd("Esc")),
                         ),
+                ),
                 ),
         )
         // Sortable Data Table
