@@ -260,6 +260,8 @@ struct WgpuRendererCore {
     depth_texture: Option<DepthTexture>,
     transition_old: Option<TransitionTexture>,
     transition_new: Option<TransitionTexture>,
+    transition_new_generation: Option<u64>,
+    transition_bind_group: Option<wgpu::BindGroup>,
     target_format: wgpu::TextureFormat,
     max_texture_size: u32,
 }
@@ -1457,6 +1459,8 @@ impl WgpuRendererCore {
             depth_texture: None,
             transition_old: None,
             transition_new: None,
+            transition_new_generation: None,
+            transition_bind_group: None,
             target_format,
             max_texture_size,
         }
@@ -1523,6 +1527,8 @@ impl WgpuRendererCore {
     fn clear_transition_snapshot(&mut self) {
         self.transition_old = None;
         self.transition_new = None;
+        self.transition_new_generation = None;
+        self.transition_bind_group = None;
     }
 
     fn capture_transition_snapshot(
@@ -1538,6 +1544,8 @@ impl WgpuRendererCore {
             let captured = self.create_transition_texture("view_transition_captured", size);
             self.render_frame_with_transition(scene, active_transition, &captured.view, size)?;
             self.transition_old = Some(captured);
+            self.transition_bind_group = None;
+            self.transition_new_generation = None;
             return Ok(());
         }
 
@@ -1547,7 +1555,9 @@ impl WgpuRendererCore {
             .is_none_or(|tex| tex.size != size);
         if needs_alloc {
             self.transition_old = Some(self.create_transition_texture("view_transition_old", size));
+            self.transition_bind_group = None;
         }
+        self.transition_new_generation = None;
         let old_tex = self.transition_old.take().expect("just initialized");
         let result = self.render_frame(scene, &old_tex.view, size, wgpu::Color::TRANSPARENT);
         self.transition_old = Some(old_tex);
@@ -1568,22 +1578,59 @@ impl WgpuRendererCore {
             .is_none_or(|tex| tex.size != size);
         if needs_alloc {
             self.transition_new = Some(self.create_transition_texture("view_transition_new", size));
+            self.transition_new_generation = None;
+            self.transition_bind_group = None;
         }
-        let new_tex = self.transition_new.take().expect("just initialized");
-        let render_result = self.render_frame(scene, &new_tex.view, size, wgpu::Color::TRANSPARENT);
-        self.transition_new = Some(new_tex);
-        render_result?;
 
-        let old_view = &self
-            .transition_old
-            .as_ref()
-            .expect("transition_old checked before composite")
-            .view;
-        let new_view = &self
-            .transition_new
-            .as_ref()
-            .expect("transition_new initialized")
-            .view;
+        // Only re-rasterize `scene` into `transition_new` when the scene generation changed
+        // (new Window::draw or animated sprites). On static transition frames this reduces
+        // GPU work to a single 3-vertex fullscreen composite pass.
+        let scene_gen = scene.generation();
+        let needs_render_new =
+            scene_gen == 0 || self.transition_new_generation != Some(scene_gen);
+        if needs_render_new {
+            let new_tex = self.transition_new.take().expect("just initialized");
+            let render_result =
+                self.render_frame(scene, &new_tex.view, size, wgpu::Color::TRANSPARENT);
+            self.transition_new = Some(new_tex);
+            render_result?;
+            self.transition_new_generation = (scene_gen != 0).then_some(scene_gen);
+        }
+
+        if self.transition_bind_group.is_none() {
+            let old_view = &self
+                .transition_old
+                .as_ref()
+                .expect("transition_old checked before composite")
+                .view;
+            let new_view = &self
+                .transition_new
+                .as_ref()
+                .expect("transition_new initialized")
+                .view;
+            self.transition_bind_group = Some(
+                self.resources
+                    .device
+                    .create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("view_transition_bind_group"),
+                        layout: &self.resources.bind_group_layouts.view_transition,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: self.resources.view_transition_buffer.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::TextureView(old_view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: wgpu::BindingResource::TextureView(new_view),
+                            },
+                        ],
+                    }),
+            );
+        }
 
         let params = ViewTransitionParams::from(transition);
         self.resources.queue.write_buffer(
@@ -1593,26 +1640,9 @@ impl WgpuRendererCore {
         );
 
         let bind_group = self
-            .resources
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("view_transition_bind_group"),
-                layout: &self.resources.bind_group_layouts.view_transition,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: self.resources.view_transition_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(old_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::TextureView(new_view),
-                    },
-                ],
-            });
+            .transition_bind_group
+            .as_ref()
+            .expect("transition_bind_group initialized");
 
         let mut encoder =
             self.resources
@@ -1636,7 +1666,7 @@ impl WgpuRendererCore {
                 ..Default::default()
             });
             pass.set_pipeline(&self.resources.pipelines.view_transition);
-            pass.set_bind_group(0, &bind_group, &[]);
+            pass.set_bind_group(0, bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
         self.resources
@@ -3207,6 +3237,232 @@ mod tests {
                 32.0_f32.to_bits(),
                 33.0_f32.to_bits(),
             ]
+        );
+    }
+
+    #[test]
+    fn view_transition_shader_is_valid_wgsl() {
+        validate_wgsl(VIEW_TRANSITION_SHADER, naga::valid::Capabilities::empty());
+    }
+
+    #[test]
+    #[ignore]
+    fn view_transition_perf_30_frames() {
+        use gpui::{
+            BorderStyle, Bounds, ContentMask, Corners, Edges, Hsla, PaddedBool32, Point, Quad,
+            ScaledPixels, SceneTransition, SceneTransitionKind, Shadow, Size,
+        };
+        use std::time::{Duration, Instant};
+
+        let mut headless = WgpuHeadlessRenderer::new().expect("headless wgpu renderer");
+        let size = Size {
+            width: DevicePixels(1280),
+            height: DevicePixels(800),
+        };
+        headless.ensure_render_target(size).expect("render target");
+        let target_view = headless
+            .render_target
+            .as_ref()
+            .expect("target")
+            .view
+            .clone();
+
+        let build_scene = |bg: Hsla, card_bg: Hsla, accent: Hsla| {
+            let mut scene = Scene::default();
+            let full_mask = ContentMask {
+                bounds: Bounds {
+                    origin: Point {
+                        x: ScaledPixels(0.0),
+                        y: ScaledPixels(0.0),
+                    },
+                    size: Size {
+                        width: ScaledPixels(1280.0),
+                        height: ScaledPixels(800.0),
+                    },
+                },
+            };
+            // Backdrop
+            scene.insert_primitive(Quad {
+                order: 0,
+                border_style: BorderStyle::Solid,
+                bounds: full_mask.bounds,
+                content_mask: full_mask,
+                background: bg.into(),
+                border_color: bg,
+                corner_radii: Corners::default(),
+                border_widths: Edges::default(),
+            });
+            // 250 shadowed cards + 2,500 chart/UI quads (dense dashboard scene)
+            for i in 0..250u32 {
+                let x = ((i % 25) as f32) * 50.0 + 10.0;
+                let y = ((i / 25) as f32) * 76.0 + 12.0;
+                let rect = Bounds {
+                    origin: Point {
+                        x: ScaledPixels(x),
+                        y: ScaledPixels(y),
+                    },
+                    size: Size {
+                        width: ScaledPixels(44.0),
+                        height: ScaledPixels(66.0),
+                    },
+                };
+                scene.insert_primitive(Shadow {
+                    order: 0,
+                    blur_radius: ScaledPixels(6.0),
+                    bounds: rect,
+                    corner_radii: Corners::all(ScaledPixels(8.0)),
+                    content_mask: full_mask,
+                    color: Hsla {
+                        h: 0.0,
+                        s: 0.0,
+                        l: 0.0,
+                        a: 0.14,
+                    },
+                    shape_bounds: rect,
+                    shape_corner_radii: Corners::all(ScaledPixels(8.0)),
+                    inset: PaddedBool32::from(false),
+                    pad: 0,
+                });
+                scene.insert_primitive(Quad {
+                    order: 0,
+                    border_style: BorderStyle::Solid,
+                    bounds: rect,
+                    content_mask: full_mask,
+                    background: card_bg.into(),
+                    border_color: accent,
+                    corner_radii: Corners::all(ScaledPixels(8.0)),
+                    border_widths: Edges::all(ScaledPixels(1.0)),
+                });
+                for bar in 0..9u32 {
+                    scene.insert_primitive(Quad {
+                        order: 0,
+                        border_style: BorderStyle::Solid,
+                        bounds: Bounds {
+                            origin: Point {
+                                x: ScaledPixels(x + 4.0 + (bar as f32) * 4.0),
+                                y: ScaledPixels(y + 18.0),
+                            },
+                            size: Size {
+                                width: ScaledPixels(3.0),
+                                height: ScaledPixels(36.0),
+                            },
+                        },
+                        content_mask: full_mask,
+                        background: accent.into(),
+                        border_color: accent,
+                        corner_radii: Corners::all(ScaledPixels(1.5)),
+                        border_widths: Edges::default(),
+                    });
+                }
+            }
+            scene.finish();
+            scene
+        };
+
+        let light_scene = build_scene(
+            Hsla { h: 0.6, s: 0.15, l: 0.98, a: 1.0 },
+            Hsla { h: 0.0, s: 0.0, l: 1.0, a: 1.0 },
+            Hsla { h: 0.66, s: 0.80, l: 0.56, a: 1.0 },
+        );
+        let dark_scene = build_scene(
+            Hsla { h: 0.62, s: 0.40, l: 0.06, a: 1.0 },
+            Hsla { h: 0.62, s: 0.30, l: 0.12, a: 1.0 },
+            Hsla { h: 0.44, s: 0.75, l: 0.50, a: 1.0 },
+        );
+
+        let wait_gpu = |core: &WgpuRendererCore| {
+            let _ = core.resources.device.poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(Duration::from_secs(30)),
+            });
+        };
+
+        // Capture old scene snapshot
+        let cap_t0 = Instant::now();
+        headless
+            .core
+            .capture_transition_snapshot(&light_scene, size)
+            .expect("capture");
+        wait_gpu(&headless.core);
+        let capture_ms = cap_t0.elapsed().as_secs_f64() * 1_000.0;
+
+        // Render 30 consecutive radial-reveal frames (static dark_scene)
+        let frames = 30usize;
+        let mut frame_times = Vec::with_capacity(frames);
+        for i in 0..frames {
+            let progress = (i as f32 + 1.0) / (frames as f32);
+            let transition = SceneTransition {
+                kind: SceneTransitionKind::RadialExpand,
+                origin: Point {
+                    x: ScaledPixels(1200.0),
+                    y: ScaledPixels(28.0),
+                },
+                radius: ScaledPixels(1500.0 * progress),
+                feather: ScaledPixels(1.5),
+                progress,
+            };
+            let t0 = Instant::now();
+            headless
+                .core
+                .render_frame_with_transition(&dark_scene, transition, &target_view, size)
+                .expect("transition frame");
+            wait_gpu(&headless.core);
+            frame_times.push(t0.elapsed());
+        }
+
+        // Verify mid-frame pixel correctness (read back last frame at radius ~750)
+        let mid_transition = SceneTransition {
+            kind: SceneTransitionKind::RadialExpand,
+            origin: Point {
+                x: ScaledPixels(1200.0),
+                y: ScaledPixels(28.0),
+            },
+            radius: ScaledPixels(400.0),
+            feather: ScaledPixels(1.5),
+            progress: 0.25,
+        };
+        headless
+            .core
+            .render_frame_with_transition(&dark_scene, mid_transition, &target_view, size)
+            .expect("mid check");
+        let img = headless.read_image().expect("readback");
+        let inside_px = img.get_pixel(1195, 28);
+        let outside_px = img.get_pixel(5, 795);
+        assert!(
+            (inside_px[0] as u32 + inside_px[1] as u32 + inside_px[2] as u32)
+                < (outside_px[0] as u32 + outside_px[1] as u32 + outside_px[2] as u32),
+            "inside circle ({inside_px:?}) should be dark_scene while outside ({outside_px:?}) is light_scene"
+        );
+
+        // Verify cache invalidation: when a new scene generation is finished, `transition_new`
+        // must re-rasterize immediately so mid-transition live updates are never stale.
+        let bright_red_scene = build_scene(
+            Hsla { h: 0.0, s: 1.0, l: 0.5, a: 1.0 },
+            Hsla { h: 0.0, s: 1.0, l: 0.5, a: 1.0 },
+            Hsla { h: 0.0, s: 1.0, l: 0.5, a: 1.0 },
+        );
+        assert_ne!(bright_red_scene.generation(), dark_scene.generation());
+        headless
+            .core
+            .render_frame_with_transition(&bright_red_scene, mid_transition, &target_view, size)
+            .expect("invalidated frame");
+        let img2 = headless.read_image().expect("readback invalidated");
+        let updated_inside = img2.get_pixel(1195, 28);
+        assert!(
+            updated_inside[0] > 180 && updated_inside[1] < 80,
+            "cache should invalidate on new scene generation; got inside pixel {updated_inside:?}"
+        );
+
+        let first_ms = frame_times[0].as_secs_f64() * 1_000.0;
+        let mut steady: Vec<Duration> = frame_times[1..].to_vec();
+        steady.sort_unstable();
+        let steady_median_ms = steady[steady.len() / 2].as_secs_f64() * 1_000.0;
+        let steady_mean_ms = steady.iter().map(Duration::as_secs_f64).sum::<f64>()
+            / (steady.len() as f64)
+            * 1_000.0;
+        let total_ms = frame_times.iter().map(Duration::as_secs_f64).sum::<f64>() * 1_000.0;
+        println!(
+            "[PERF] WGPU ViewTransition (1280x800, 2500q+250s) | capture={capture_ms:.2} ms | frame1={first_ms:.2} ms | steady_median={steady_median_ms:.2} ms | steady_mean={steady_mean_ms:.2} ms | total_30f={total_ms:.2} ms"
         );
     }
 }

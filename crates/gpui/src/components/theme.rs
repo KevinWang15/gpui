@@ -1,14 +1,25 @@
 //! Semantic design tokens, light/dark Tailwind themes, sizing tokens, and component initialization.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use crate::{
-    App, Global, Hsla, Pixels, Point, SharedString, SpringConfig, Subscription, ViewTransition,
-    Window, WindowAppearance, px,
+    App, FontFeatures, Global, Hsla, Pixels, Point, SharedString, SpringConfig, Subscription,
+    ViewTransition, Window, WindowAppearance, px,
 };
 
 use super::palette as tw;
+
+/// Returns a shared [`FontFeatures`] instance enabling OpenType tabular numerals (`tnum`).
+///
+/// Backed by a [`OnceLock`] so every call performs a cheap [`Arc`] refcount increment with
+/// zero heap allocations, avoiding per-tick and per-cell allocations in charts, KPI strips,
+/// and facet counters.
+pub fn tabular_numerals() -> FontFeatures {
+    static TNUM: OnceLock<FontFeatures> = OnceLock::new();
+    TNUM.get_or_init(|| FontFeatures(Arc::new(vec![("tnum".to_string(), 1)])))
+        .clone()
+}
 
 /// Snappy, tactile spring preset for micro-interactions (toggle thumb slide, checkbox/radio pop, chevron rotation).
 ///

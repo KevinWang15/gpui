@@ -258,7 +258,7 @@ impl<T: Clone + PartialEq + 'static> SelectState<T> {
         }
     }
 
-    /// Clears the current selection and emits [`SelectEvent::Change(None)`].
+    /// Clears the current selection and emits [`SelectEvent::Change`] with `None`.
     pub fn clear(&mut self, cx: &mut Context<Self>) {
         if self.selected_index.is_none() {
             return;
@@ -714,12 +714,12 @@ impl<T: Clone + PartialEq + 'static> Styled for Select<T> {
 
 impl<T: Clone + PartialEq + 'static> RenderOnce for Select<T> {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
-        self.state.update(cx, |state, cx| {
-            if state.frame_style != self.style {
+        if self.state.read(cx).frame_style != self.style {
+            self.state.update(cx, |state, cx| {
                 state.frame_style = self.style;
                 cx.notify();
-            }
-        });
+            });
+        }
         self.state
     }
 }

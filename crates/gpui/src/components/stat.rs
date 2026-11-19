@@ -1,13 +1,11 @@
 //! Divided KPI metric strip ([`StatGroup`]) with OpenType tabular numerals and polarity-aware deltas.
 
-use std::sync::Arc;
-
 use crate::{
-    App, ElementId, FontFeatures, FontWeight, Hsla, IntoElement, ParentElement, RenderOnce,
-    SharedString, StyleRefinement, Styled, Window, div, prelude::*, px,
+    App, ElementId, FontWeight, Hsla, IntoElement, ParentElement, RenderOnce, SharedString,
+    StyleRefinement, Styled, Window, div, prelude::*, px,
 };
 
-use super::theme::{ActiveTheme, Theme};
+use super::theme::{ActiveTheme, Theme, tabular_numerals};
 
 /// Whether an increase in a KPI metric is favorable, unfavorable, or neutral.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -187,7 +185,7 @@ impl Styled for StatGroup {
 impl RenderOnce for StatGroup {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
-        let tnum = FontFeatures(Arc::new(vec![("tnum".to_string(), 1)]));
+        let tnum = tabular_numerals();
 
         let mut row = div()
             .id(self.id)

@@ -13,6 +13,11 @@ use crate::components::theme::ActiveTheme;
 
 const WEEKDAYS_MON_FIRST: [&str; 7] = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"];
 
+const DAY_LABELS: [&str; 31] = [
+    "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17",
+    "18", "19", "20", "21", "22", "23", "24", "25", "26", "27", "28", "29", "30", "31",
+];
+
 /// Interactive single-month calendar grid (`Mo..Su`) with month navigation, `min_date`/`max_date`
 /// bounds, single-day highlight, and optional range tinting.
 #[derive(IntoElement)]
@@ -250,9 +255,9 @@ impl RenderOnce for CalendarGrid {
                     None
                 };
 
-                let on_select = self.on_select.clone();
+                let day_label = DAY_LABELS[(date.day.clamp(1, 31) - 1) as usize];
                 let cell = div()
-                    .id((self.id.clone(), format!("day-{offset}")))
+                    .id(("day", offset as usize))
                     .w(px(34.))
                     .h(px(32.))
                     .flex()
@@ -271,13 +276,14 @@ impl RenderOnce for CalendarGrid {
                         el.cursor_pointer().hover(move |s| s.bg(hover_bg))
                     })
                     .when(!is_disabled, |el| {
+                        let on_select = self.on_select.clone();
                         el.cursor_pointer().when_some(on_select, |el, cb| {
                             el.on_click(move |_: &ClickEvent, window, cx| {
                                 cb(date, window, cx);
                             })
                         })
                     })
-                    .child(format!("{}", date.day));
+                    .child(day_label);
 
                 row = row.child(cell);
             }

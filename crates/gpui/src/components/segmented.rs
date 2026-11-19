@@ -266,7 +266,7 @@ impl RenderOnce for SegmentedControl {
             };
 
             let mut seg = div()
-                .id((self.id.clone(), format!("seg-{index}")))
+                .id(("seg", index))
                 .relative()
                 .flex()
                 .items_center()

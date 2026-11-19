@@ -342,12 +342,12 @@ impl Styled for Slider {
 
 impl RenderOnce for Slider {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
-        self.state.update(cx, |state, cx| {
-            if state.frame_style != self.style {
+        if self.state.read(cx).frame_style != self.style {
+            self.state.update(cx, |state, cx| {
                 state.frame_style = self.style;
                 cx.notify();
-            }
-        });
+            });
+        }
         self.state
     }
 }

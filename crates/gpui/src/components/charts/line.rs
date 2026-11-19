@@ -2,24 +2,36 @@
 //! [`PathBuilder`], optional area gradient fills, endpoint callout annotations, interactive
 //! hover crosshairs, and optional horizontal drag-to-select brushing.
 
+use std::borrow::Cow;
 use std::cell::RefCell;
+use std::hash::{Hash, Hasher};
 use std::rc::Rc;
-use std::sync::Arc;
+
+use collections::FxHasher;
 
 use crate::{
-    App, Bounds, Corners, CursorStyle, Edges, ElementId, FontFeatures, FontWeight, Hsla,
-    IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement,
+    App, BorderStyle, Bounds, Corners, CursorStyle, Edges, ElementId, FontWeight, Hsla,
+    IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Path,
     PathBuilder, Pixels, RenderOnce, SharedString, StyleRefinement, Styled, TextAlign, Window,
     canvas, div, fill, linear_color_stop, linear_gradient, point, prelude::*, px, quad, size,
 };
 
 use super::core::{
-    ChartLegendItem, ChartPalette, ChartValueFormat, LinearScale, nice_ticks, paint_chart_text,
+    ChartLegendItem, ChartMargins, ChartPalette, ChartTooltipRow, ChartValueFormat, LinearScale,
+    PlotRect, nice_ticks, paint_brush_band, paint_chart_marker, paint_chart_text, paint_y_gridlines,
+    render_brush_pill, render_chart_tooltip,
 };
 use crate::components::theme::ActiveTheme;
 
+const LINE_CHART_MARGINS: ChartMargins = ChartMargins {
+    left: 54.0,
+    right: 16.0,
+    top: 14.0,
+    bottom: 26.0,
+};
+
 /// Line stroke pattern for a [`LineSeries`].
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum LineStyle {
     /// Continuous solid stroke.
     #[default]
@@ -39,7 +51,7 @@ pub struct LineSeries {
     pub style: LineStyle,
     /// Optional explicit stroke color (defaults to [`ChartPalette`] for solid, `palette.baseline` for dashed).
     pub color: Option<Hsla>,
-    /// Stroke thickness in pixels (default `2.2` for solid, `1.75` for dashed).
+    /// Stroke thickness in pixels (default `2.25` for solid, `1.75` for dashed).
     pub stroke_width: Option<f32>,
     /// Whether to draw a soft vertical gradient fill beneath this series.
     pub fill_area: bool,
@@ -90,6 +102,46 @@ impl LineSeries {
         self.endpoint_callout = Some(prefix.into());
         self
     }
+
+    /// Linearly interpolates the series' `y` value at `target_x` in `O(log N)` time.
+    ///
+    /// Assumes `self.points` are sorted in non-decreasing `x` order. Returns `None` when
+    /// `self.points` is empty or `target_x` falls outside the series' `[first.x, last.x]` domain.
+    pub fn sample_at(&self, target_x: f64) -> Option<f64> {
+        let points = &self.points;
+        if points.is_empty() {
+            return None;
+        }
+        let first = points[0];
+        let last = *points.last()?;
+        if target_x < first.0 - 1e-6 || target_x > last.0 + 1e-6 {
+            return None;
+        }
+        if points.len() == 1 || target_x <= first.0 {
+            return Some(first.1);
+        }
+        if target_x >= last.0 {
+            return Some(last.1);
+        }
+        let idx = points.partition_point(|&(x, _)| x < target_x);
+        if idx == 0 {
+            return Some(first.1);
+        }
+        let (x0, y0) = points[idx - 1];
+        let (x1, y1) = points[idx];
+        let span = x1 - x0;
+        if span.abs() < 1e-9 {
+            return Some(y1);
+        }
+        let t = ((target_x - x0) / span).clamp(0.0, 1.0);
+        Some(y0 + (y1 - y0) * t)
+    }
+}
+
+struct CachedLineGeometry {
+    key: u64,
+    areas: Vec<(usize, Path)>,
+    strokes: Vec<(usize, Path)>,
 }
 
 #[derive(Default)]
@@ -98,6 +150,7 @@ struct LineChartInteractionState {
     plot_bounds: Option<Bounds<Pixels>>,
     drag_anchor_x: Option<f32>,
     drag_current_x: Option<f32>,
+    cached_geometry: Option<CachedLineGeometry>,
 }
 
 impl LineChartInteractionState {
@@ -108,26 +161,170 @@ impl LineChartInteractionState {
         }
     }
 
-    fn brushed_domain(
-        &self,
-        margin_left: f32,
-        margin_right: f32,
-        x_min: f64,
-        x_max: f64,
-    ) -> Option<(f64, f64)> {
+    fn brushed_domain(&self, x_min: f64, x_max: f64) -> Option<(f64, f64)> {
         if !self.is_brushing() {
             return None;
         }
-        let bounds = self.plot_bounds?;
-        let plot_left = bounds.origin.x.0 + margin_left;
-        let plot_right =
-            (bounds.origin.x.0 + bounds.size.width.0 - margin_right).max(plot_left + 1.0);
-        let scale = LinearScale::new(x_min, x_max, plot_left, plot_right);
-        let a = self.drag_anchor_x?.clamp(plot_left, plot_right);
-        let b = self.drag_current_x?.clamp(plot_left, plot_right);
+        let plot = PlotRect::from_bounds(self.plot_bounds?, LINE_CHART_MARGINS);
+        let scale = LinearScale::new(x_min, x_max, plot.left, plot.right);
+        let a = self.drag_anchor_x?.clamp(plot.left, plot.right);
+        let b = self.drag_current_x?.clamp(plot.left, plot.right);
         let x0 = scale.invert(a.min(b)).clamp(x_min, x_max);
         let x1 = scale.invert(a.max(b)).clamp(x_min, x_max);
         Some((x0, x1))
+    }
+}
+
+/// Computes an exact content + geometry cache key for tessellated line/area [`Path`]s.
+fn compute_geometry_key(
+    plot: PlotRect,
+    x_min: f64,
+    x_max: f64,
+    nice_max: f64,
+    series: &[LineSeries],
+) -> u64 {
+    let mut hasher = FxHasher::default();
+    plot.left.to_bits().hash(&mut hasher);
+    plot.right.to_bits().hash(&mut hasher);
+    plot.top.to_bits().hash(&mut hasher);
+    plot.bottom.to_bits().hash(&mut hasher);
+    x_min.to_bits().hash(&mut hasher);
+    x_max.to_bits().hash(&mut hasher);
+    nice_max.to_bits().hash(&mut hasher);
+    series.len().hash(&mut hasher);
+    for s in series {
+        s.style.hash(&mut hasher);
+        s.fill_area.hash(&mut hasher);
+        s.stroke_width.map(f32::to_bits).hash(&mut hasher);
+        s.points.len().hash(&mut hasher);
+        for &(x, y) in &s.points {
+            x.to_bits().hash(&mut hasher);
+            y.to_bits().hash(&mut hasher);
+        }
+    }
+    hasher.finish()
+}
+
+/// Preserves exact per-pixel-column min/max envelope for dense monotonic-X series so
+/// Lyon tessellation and curve tile-binning stay `O(plot_width)` without missing spikes.
+fn decimate_monotonic_points<'a>(points: &'a [(f64, f64)], max_buckets: usize) -> Cow<'a, [(f64, f64)]> {
+    let buckets = max_buckets.max(64);
+    if points.len() <= buckets.saturating_mul(2) || points.len() < 4 {
+        return Cow::Borrowed(points);
+    }
+    let x_start = points[0].0;
+    let x_end = points[points.len() - 1].0;
+    let x_span = x_end - x_start;
+    if x_span <= f64::EPSILON || !points.windows(2).all(|w| w[1].0 >= w[0].0) {
+        return Cow::Borrowed(points);
+    }
+
+    let mut out = Vec::with_capacity(buckets * 2 + 2);
+    let inv_bucket = (buckets as f64) / x_span;
+    let mut i = 0;
+    while i < points.len() {
+        let bucket = (((points[i].0 - x_start) * inv_bucket).floor() as usize).min(buckets);
+        let first_idx = i;
+        let mut min_idx = i;
+        let mut max_idx = i;
+        let mut min_y = points[i].1;
+        let mut max_y = points[i].1;
+        let mut last_idx = i;
+        i += 1;
+        while i < points.len() {
+            let b = (((points[i].0 - x_start) * inv_bucket).floor() as usize).min(buckets);
+            if b != bucket {
+                break;
+            }
+            let y = points[i].1;
+            if y < min_y {
+                min_y = y;
+                min_idx = i;
+            }
+            if y > max_y {
+                max_y = y;
+                max_idx = i;
+            }
+            last_idx = i;
+            i += 1;
+        }
+
+        // Emit up to 4 deduplicated indices in chronological order to preserve exact column envelope.
+        let mut indices = [first_idx, min_idx, max_idx, last_idx];
+        indices.sort_unstable();
+        let mut prev = usize::MAX;
+        for idx in indices {
+            if idx != prev {
+                out.push(points[idx]);
+                prev = idx;
+            }
+        }
+    }
+    Cow::Owned(out)
+}
+
+fn build_line_geometry(
+    key: u64,
+    series: &[LineSeries],
+    x_scale: LinearScale,
+    y_scale: LinearScale,
+    plot: PlotRect,
+) -> CachedLineGeometry {
+    let max_buckets = (plot.width().ceil() as usize).clamp(128, 1200);
+    let mut areas = Vec::new();
+    let mut strokes = Vec::with_capacity(series.len());
+
+    // 1. Area fill paths
+    for (idx, s) in series.iter().enumerate() {
+        if !s.fill_area || s.points.len() < 2 {
+            continue;
+        }
+        let pts = decimate_monotonic_points(&s.points, max_buckets);
+        let first = pts[0];
+        let last = pts[pts.len() - 1];
+        let mut pb = PathBuilder::fill();
+        pb.move_to(point(px(x_scale.map(first.0)), px(plot.bottom)));
+        for &(x, y) in pts.iter() {
+            pb.line_to(point(px(x_scale.map(x)), px(y_scale.map(y))));
+        }
+        pb.line_to(point(px(x_scale.map(last.0)), px(plot.bottom)));
+        pb.close();
+        if let Ok(path) = pb.build() {
+            areas.push((idx, path));
+        }
+    }
+
+    // 2. Dashed series first, then solid series on top
+    for pass_dashed in [true, false] {
+        for (idx, s) in series.iter().enumerate() {
+            let is_dashed = s.style == LineStyle::Dashed;
+            if is_dashed != pass_dashed || s.points.len() < 2 {
+                continue;
+            }
+            let pts = decimate_monotonic_points(&s.points, max_buckets);
+            let width = s.stroke_width.unwrap_or(if is_dashed { 1.75 } else { 2.25 });
+            let mut pb = PathBuilder::stroke(px(width));
+            if is_dashed {
+                pb = pb.dash_array(&[px(5.0), px(4.0)]);
+            }
+            for (p_idx, &(x, y)) in pts.iter().enumerate() {
+                let pt = point(px(x_scale.map(x)), px(y_scale.map(y)));
+                if p_idx == 0 {
+                    pb.move_to(pt);
+                } else {
+                    pb.line_to(pt);
+                }
+            }
+            if let Ok(path) = pb.build() {
+                strokes.push((idx, path));
+            }
+        }
+    }
+
+    CachedLineGeometry {
+        key,
+        areas,
+        strokes,
     }
 }
 
@@ -285,37 +482,12 @@ impl Styled for LineChart {
     }
 }
 
-fn interpolate_series_y(points: &[(f64, f64)], target_x: f64) -> Option<f64> {
-    if points.is_empty() {
-        return None;
-    }
-    let first = points[0];
-    let last = *points.last()?;
-    if target_x < first.0 - 1e-6 || target_x > last.0 + 1e-6 {
-        return None;
-    }
-    for pair in points.windows(2) {
-        let (x0, y0) = pair[0];
-        let (x1, y1) = pair[1];
-        if target_x >= x0 - 1e-6 && target_x <= x1 + 1e-6 {
-            let span = x1 - x0;
-            if span.abs() < 1e-9 {
-                return Some(y1);
-            }
-            let t = ((target_x - x0) / span).clamp(0.0, 1.0);
-            return Some(y0 + (y1 - y0) * t);
-        }
-    }
-    Some(last.1)
-}
-
 impl RenderOnce for LineChart {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
         let palette = self
             .palette
             .unwrap_or_else(|| ChartPalette::from_theme(&theme));
-        let tnum = FontFeatures(Arc::new(vec![("tnum".to_string(), 1)]));
 
         let interaction_entity = window.use_keyed_state(
             (self.id.clone(), "line-chart-interaction"),
@@ -340,17 +512,12 @@ impl RenderOnce for LineChart {
             }
         });
 
-        let margin_left = 54.0_f32;
-        let margin_right = 16.0_f32;
-        let margin_top = 14.0_f32;
-        let margin_bottom = 26.0_f32;
-
         let (hover_x, live_brush) = {
             let state = interaction_rc.borrow();
             (
                 state.hover_x,
                 if self.selectable {
-                    state.brushed_domain(margin_left, margin_right, x_min, x_max)
+                    state.brushed_domain(x_min, x_max)
                 } else {
                     None
                 },
@@ -367,7 +534,7 @@ impl RenderOnce for LineChart {
         let (nice_max, y_ticks) = nice_ticks(max_y, 5);
 
         let mut solid_idx = 0usize;
-        let resolved_colors: Vec<Hsla> = self
+        let resolved_colors: Rc<[Hsla]> = self
             .series
             .iter()
             .map(|s| {
@@ -382,140 +549,100 @@ impl RenderOnce for LineChart {
             })
             .collect();
 
-        let series_paint = self.series.clone();
+        // Share series & colors by Rc slice to avoid cloning thousands of points per hover frame.
+        let series_rc: Rc<[LineSeries]> = Rc::from(self.series);
+        let series_paint = series_rc.clone();
         let colors_paint = resolved_colors.clone();
         let y_ticks_paint = y_ticks;
-        let x_ticks_paint = self.x_ticks.clone();
+        let x_ticks_paint = self.x_ticks;
         let format_paint = self.value_format.clone();
         let palette_paint = palette;
         let surface_bg = theme.surface;
         let accent_color = theme.primary;
+        let interaction_prepaint = interaction_rc.clone();
         let interaction_paint = interaction_rc.clone();
         let is_live_brushing = live_brush.is_some();
 
         let plot_canvas = canvas(
             move |bounds, _, _| {
-                interaction_paint.borrow_mut().plot_bounds = Some(bounds);
+                interaction_prepaint.borrow_mut().plot_bounds = Some(bounds);
                 bounds
             },
             move |bounds, _, window, cx| {
-                let plot_left = bounds.origin.x.0 + margin_left;
-                let plot_right = (bounds.origin.x.0 + bounds.size.width.0 - margin_right)
-                    .max(plot_left + 10.0);
-                let plot_top = bounds.origin.y.0 + margin_top;
-                let plot_bottom = (bounds.origin.y.0 + bounds.size.height.0 - margin_bottom)
-                    .max(plot_top + 10.0);
-                let plot_width = plot_right - plot_left;
-
-                let x_scale = LinearScale::new(x_min, x_max, plot_left, plot_right);
-                let y_scale = LinearScale::new(0.0, nice_max, plot_bottom, plot_top);
+                let plot = PlotRect::from_bounds(bounds, LINE_CHART_MARGINS);
+                let x_scale = LinearScale::new(x_min, x_max, plot.left, plot.right);
+                let y_scale = LinearScale::new(0.0, nice_max, plot.bottom, plot.top);
 
                 // 1. Horizontal gridlines & Y-axis labels
-                for &tick in &y_ticks_paint {
-                    let y = y_scale.map(tick).round();
-                    window.paint_quad(fill(
-                        Bounds::new(point(px(plot_left), px(y)), size(px(plot_width), px(1.))),
-                        palette_paint.gridline,
-                    ));
-                    paint_chart_text(
-                        format_paint.format_tick(tick),
-                        point(px(bounds.origin.x.0), px(y - 7.0)),
-                        px(11.),
-                        palette_paint.axis_label,
-                        FontWeight::NORMAL,
-                        TextAlign::Right,
-                        Some(px(margin_left - 10.0)),
-                        window,
-                        cx,
-                    );
-                }
+                paint_y_gridlines(
+                    &y_ticks_paint,
+                    y_scale,
+                    plot,
+                    bounds.origin.x.0,
+                    LINE_CHART_MARGINS.left - 10.0,
+                    &format_paint,
+                    &palette_paint,
+                    window,
+                    cx,
+                );
 
                 // 2. Highlighted brush/selected X-domain band
                 if let Some((a, b)) = active_selection {
-                    let sx0 = x_scale.map(a.min(b)).clamp(plot_left, plot_right);
-                    let sx1 = x_scale.map(a.max(b)).clamp(plot_left, plot_right);
-                    let sel_w = (sx1 - sx0).max(2.0);
-                    let sel_h = plot_bottom - plot_top;
-                    window.paint_quad(fill(
-                        Bounds::new(point(px(sx0), px(plot_top)), size(px(sel_w), px(sel_h))),
-                        accent_color.opacity(if is_live_brushing { 0.16 } else { 0.11 }),
-                    ));
-                    window.paint_quad(fill(
-                        Bounds::new(point(px(sx0), px(plot_top)), size(px(1.5), px(sel_h))),
-                        accent_color.opacity(0.85),
-                    ));
-                    window.paint_quad(fill(
-                        Bounds::new(
-                            point(px((sx1 - 1.5).max(sx0)), px(plot_top)),
-                            size(px(1.5), px(sel_h)),
-                        ),
-                        accent_color.opacity(0.85),
-                    ));
+                    paint_brush_band(
+                        x_scale.map(a),
+                        x_scale.map(b),
+                        plot,
+                        accent_color,
+                        is_live_brushing,
+                        window,
+                    );
                 }
 
                 // 3. Vertical crosshair line if hovered (hidden while actively brushing)
                 if !is_live_brushing
                     && let Some(hx) = hover_x
                 {
-                    let x_px = x_scale.map(hx).clamp(plot_left, plot_right);
+                    let x_px = x_scale.map(hx).clamp(plot.left, plot.right);
                     window.paint_quad(fill(
                         Bounds::new(
-                            point(px(x_px), px(plot_top)),
-                            size(px(1.), px(plot_bottom - plot_top)),
+                            point(px(x_px), px(plot.top)),
+                            size(px(1.), px(plot.height())),
                         ),
                         palette_paint.gridline.opacity(1.0),
                     ));
                 }
 
-                // 4. Area fills first, then dashed series, then solid series on top
-                for (idx, s) in series_paint.iter().enumerate() {
-                    if !s.fill_area || s.points.len() < 2 {
-                        continue;
+                // 4. Cached tessellated area & stroke paths (O(1) Arc clone on hover/brush frames)
+                let geom_key = compute_geometry_key(plot, x_min, x_max, nice_max, &series_paint);
+                {
+                    let mut state = interaction_paint.borrow_mut();
+                    let cache_hit = state
+                        .cached_geometry
+                        .as_ref()
+                        .is_some_and(|g| g.key == geom_key);
+                    if !cache_hit {
+                        state.cached_geometry = Some(build_line_geometry(
+                            geom_key,
+                            &series_paint,
+                            x_scale,
+                            y_scale,
+                            plot,
+                        ));
                     }
-                    let color = colors_paint[idx];
-                    let mut pb = PathBuilder::fill();
-                    let first = s.points[0];
-                    let last = *s.points.last().unwrap();
-                    pb.move_to(point(px(x_scale.map(first.0)), px(plot_bottom)));
-                    for &(x, y) in &s.points {
-                        pb.line_to(point(px(x_scale.map(x)), px(y_scale.map(y))));
-                    }
-                    pb.line_to(point(px(x_scale.map(last.0)), px(plot_bottom)));
-                    pb.close();
-                    if let Ok(path) = pb.build() {
-                        window.paint_path(
-                            path,
-                            linear_gradient(
-                                180.0,
-                                linear_color_stop(color.opacity(0.16), 0.0),
-                                linear_color_stop(color.opacity(0.0), 1.0),
-                            ),
-                        );
-                    }
-                }
-
-                for pass_dashed in [true, false] {
-                    for (idx, s) in series_paint.iter().enumerate() {
-                        let is_dashed = s.style == LineStyle::Dashed;
-                        if is_dashed != pass_dashed || s.points.len() < 2 {
-                            continue;
+                    if let Some(geom) = &state.cached_geometry {
+                        for (idx, path) in &geom.areas {
+                            let color = colors_paint[*idx];
+                            window.paint_path(
+                                path.clone(),
+                                linear_gradient(
+                                    180.0,
+                                    linear_color_stop(color.opacity(0.16), 0.0),
+                                    linear_color_stop(color.opacity(0.0), 1.0),
+                                ),
+                            );
                         }
-                        let color = colors_paint[idx];
-                        let width = s.stroke_width.unwrap_or(if is_dashed { 1.75 } else { 2.25 });
-                        let mut pb = PathBuilder::stroke(px(width));
-                        if is_dashed {
-                            pb = pb.dash_array(&[px(5.0), px(4.0)]);
-                        }
-                        for (p_idx, &(x, y)) in s.points.iter().enumerate() {
-                            let pt = point(px(x_scale.map(x)), px(y_scale.map(y)));
-                            if p_idx == 0 {
-                                pb.move_to(pt);
-                            } else {
-                                pb.line_to(pt);
-                            }
-                        }
-                        if let Ok(path) = pb.build() {
-                            window.paint_path(path, color);
+                        for (idx, path) in &geom.strokes {
+                            window.paint_path(path.clone(), colors_paint[*idx]);
                         }
                     }
                 }
@@ -531,36 +658,14 @@ impl RenderOnce for LineChart {
                     let color = colors_paint[idx];
                     let ex = x_scale.map(lx);
                     let ey = y_scale.map(ly);
-                    let dot_r = 4.0_f32;
-                    window.paint_quad(quad(
-                        Bounds::new(
-                            point(px(ex - dot_r - 1.5), px(ey - dot_r - 1.5)),
-                            size(px((dot_r + 1.5) * 2.0), px((dot_r + 1.5) * 2.0)),
-                        ),
-                        Corners::all(px(dot_r + 1.5)),
-                        surface_bg,
-                        Edges::default(),
-                        surface_bg,
-                        crate::BorderStyle::Solid,
-                    ));
-                    window.paint_quad(quad(
-                        Bounds::new(
-                            point(px(ex - dot_r), px(ey - dot_r)),
-                            size(px(dot_r * 2.0), px(dot_r * 2.0)),
-                        ),
-                        Corners::all(px(dot_r)),
-                        color,
-                        Edges::default(),
-                        color,
-                        crate::BorderStyle::Solid,
-                    ));
+                    paint_chart_marker(ex, ey, 4.0, color, surface_bg, window);
 
                     let callout_text = format!("{prefix}: {}", format_paint.format_detail(ly));
                     let callout_w = (callout_text.len() as f32 * 6.8 + 14.0).clamp(84.0, 148.0);
                     let callout_h = 18.0_f32;
                     let callout_x = (ex - callout_w * 0.5)
-                        .clamp(plot_left + 4.0, (plot_right - callout_w).max(plot_left));
-                    let callout_y = (ey - 26.0).max(plot_top);
+                        .clamp(plot.left + 4.0, (plot.right - callout_w).max(plot.left));
+                    let callout_y = (ey - 26.0).max(plot.top);
                     window.paint_quad(quad(
                         Bounds::new(
                             point(px(callout_x), px(callout_y)),
@@ -570,7 +675,7 @@ impl RenderOnce for LineChart {
                         surface_bg.opacity(0.92),
                         Edges::all(px(1.)),
                         color.opacity(0.35),
-                        crate::BorderStyle::Solid,
+                        BorderStyle::Solid,
                     ));
                     paint_chart_text(
                         callout_text,
@@ -589,34 +694,17 @@ impl RenderOnce for LineChart {
                 if !is_live_brushing
                     && let Some(hx) = hover_x
                 {
-                    let x_px = x_scale.map(hx).clamp(plot_left, plot_right);
+                    let x_px = x_scale.map(hx).clamp(plot.left, plot.right);
                     for (idx, s) in series_paint.iter().enumerate() {
-                        if let Some(hy) = interpolate_series_y(&s.points, hx) {
-                            let y_px = y_scale.map(hy);
-                            let color = colors_paint[idx];
-                            let r = 3.5_f32;
-                            window.paint_quad(quad(
-                                Bounds::new(
-                                    point(px(x_px - r - 1.5), px(y_px - r - 1.5)),
-                                    size(px((r + 1.5) * 2.0), px((r + 1.5) * 2.0)),
-                                ),
-                                Corners::all(px(r + 1.5)),
+                        if let Some(hy) = s.sample_at(hx) {
+                            paint_chart_marker(
+                                x_px,
+                                y_scale.map(hy),
+                                3.5,
+                                colors_paint[idx],
                                 surface_bg,
-                                Edges::default(),
-                                surface_bg,
-                                crate::BorderStyle::Solid,
-                            ));
-                            window.paint_quad(quad(
-                                Bounds::new(
-                                    point(px(x_px - r), px(y_px - r)),
-                                    size(px(r * 2.0), px(r * 2.0)),
-                                ),
-                                Corners::all(px(r)),
-                                color,
-                                Edges::default(),
-                                color,
-                                crate::BorderStyle::Solid,
-                            ));
+                                window,
+                            );
                         }
                     }
                 }
@@ -629,13 +717,13 @@ impl RenderOnce for LineChart {
                     let (align, label_x) = if t_idx == 0 {
                         (TextAlign::Left, x_px)
                     } else if t_idx + 1 == tick_count {
-                        (TextAlign::Right, (x_px - label_w).max(plot_left))
+                        (TextAlign::Right, (x_px - label_w).max(plot.left))
                     } else {
                         (TextAlign::Center, x_px - label_w * 0.5)
                     };
                     paint_chart_text(
                         label.clone(),
-                        point(px(label_x), px(plot_bottom + 7.0)),
+                        point(px(label_x), px(plot.bottom + 7.0)),
                         px(11.),
                         palette_paint.axis_label,
                         FontWeight::NORMAL,
@@ -662,7 +750,7 @@ impl RenderOnce for LineChart {
         let leave_entity = interaction_entity;
 
         let mut container = div()
-            .id(self.id.clone())
+            .id(self.id)
             .relative()
             .w_full()
             .h(self.height)
@@ -675,11 +763,9 @@ impl RenderOnce for LineChart {
                 let Some(bounds) = state.plot_bounds else {
                     return;
                 };
-                let plot_left = bounds.origin.x.0 + margin_left;
-                let plot_right =
-                    (bounds.origin.x.0 + bounds.size.width.0 - margin_right).max(plot_left + 1.0);
+                let plot = PlotRect::from_bounds(bounds, LINE_CHART_MARGINS);
                 let mx = event.position.x.0;
-                if mx >= plot_left && mx <= plot_right {
+                if plot.contains_x(mx) {
                     state.drag_anchor_x = Some(mx);
                     state.drag_current_x = Some(mx);
                     drop(state);
@@ -692,28 +778,33 @@ impl RenderOnce for LineChart {
                     let Some(bounds) = state.plot_bounds else {
                         return;
                     };
-                    let plot_left = bounds.origin.x.0 + margin_left;
-                    let plot_right = (bounds.origin.x.0 + bounds.size.width.0 - margin_right)
-                        .max(plot_left + 1.0);
+                    let plot = PlotRect::from_bounds(bounds, LINE_CHART_MARGINS);
                     let mx = event.position.x.0;
-                    let next_x = if mx >= plot_left && mx <= plot_right {
-                        let scale = LinearScale::new(x_min, x_max, plot_left, plot_right);
-                        Some(scale.invert(mx).clamp(x_min, x_max))
-                    } else {
-                        None
-                    };
-                    let mut dirty = match (state.hover_x, next_x) {
-                        (Some(a), Some(b)) => (a - b).abs() > (x_max - x_min) * 0.005,
-                        (None, None) => false,
-                        _ => true,
-                    };
-                    if dirty {
-                        state.hover_x = next_x;
-                    }
+                    let mut dirty = false;
+
                     if selectable && state.drag_anchor_x.is_some() {
-                        let clamped = mx.clamp(plot_left, plot_right);
-                        if state.drag_current_x != Some(clamped) {
+                        let clamped = mx.clamp(plot.left, plot.right);
+                        if state
+                            .drag_current_x
+                            .is_none_or(|prev| (prev - clamped).abs() >= 1.0)
+                        {
                             state.drag_current_x = Some(clamped);
+                            dirty = true;
+                        }
+                    } else {
+                        let next_x = if plot.contains_x(mx) {
+                            let scale = LinearScale::new(x_min, x_max, plot.left, plot.right);
+                            Some(scale.invert(mx).clamp(x_min, x_max))
+                        } else {
+                            None
+                        };
+                        let hover_changed = match (state.hover_x, next_x) {
+                            (Some(a), Some(b)) => (a - b).abs() > (x_max - x_min) * 0.005,
+                            (None, None) => false,
+                            _ => true,
+                        };
+                        if hover_changed {
+                            state.hover_x = next_x;
                             dirty = true;
                         }
                     }
@@ -728,7 +819,7 @@ impl RenderOnce for LineChart {
                     let mut state = up_entity.read(cx).borrow_mut();
                     let had = state.drag_anchor_x.is_some();
                     let brushed = if selectable {
-                        state.brushed_domain(margin_left, margin_right, x_min, x_max)
+                        state.brushed_domain(x_min, x_max)
                     } else {
                         None
                     };
@@ -755,7 +846,7 @@ impl RenderOnce for LineChart {
                     let mut state = up_out_entity.read(cx).borrow_mut();
                     let had = state.drag_anchor_x.is_some();
                     let brushed = if selectable {
-                        state.brushed_domain(margin_left, margin_right, x_min, x_max)
+                        state.brushed_domain(x_min, x_max)
                     } else {
                         None
                     };
@@ -785,22 +876,25 @@ impl RenderOnce for LineChart {
             })
             .child(plot_canvas);
 
-        // Live drag-selection pill
+        let fmt_x = |v: f64| match &self.x_formatter {
+            Some(f) => f(v),
+            None => format!("{v:.1}"),
+        };
+
+        // Live drag-selection pill or floating crosshair tooltip
         if let Some((a, b)) = live_brush
             && let Some(bounds) = interaction_rc.borrow().plot_bounds
         {
-            let plot_left = margin_left;
-            let plot_right = (bounds.size.width.0 - margin_right).max(plot_left + 1.0);
-            let x_scale = LinearScale::new(x_min, x_max, plot_left, plot_right);
+            let local = PlotRect::from_local_bounds(bounds, LINE_CHART_MARGINS);
+            let x_scale = LinearScale::new(x_min, x_max, local.left, local.right);
             let mid_x = (x_scale.map(a) + x_scale.map(b)) * 0.5;
-            let fmt_x = |v: f64| match &self.x_formatter {
-                Some(f) => f(v),
-                None => format!("{v:.1}"),
-            };
-            let delta_suffix = self.series.first().and_then(|primary| {
-                let y0 = interpolate_series_y(&primary.points, a)?;
-                let y1 = interpolate_series_y(&primary.points, b)?;
-                Some(format!(" · Δ {}", self.value_format.format_detail((y1 - y0).max(0.0))))
+            let delta_suffix = series_rc.first().and_then(|primary| {
+                let y0 = primary.sample_at(a)?;
+                let y1 = primary.sample_at(b)?;
+                Some(format!(
+                    " · Δ {}",
+                    self.value_format.format_detail((y1 - y0).max(0.0))
+                ))
             });
             let summary = format!(
                 "{} – {}{}",
@@ -808,109 +902,39 @@ impl RenderOnce for LineChart {
                 fmt_x(b),
                 delta_suffix.unwrap_or_default()
             );
-            let pill_w = ((summary.len() as f32) * 6.8 + 20.0).clamp(124.0, 260.0);
-            let left_x = (mid_x - pill_w * 0.5)
-                .clamp(plot_left, (bounds.size.width.0 - pill_w - 4.0).max(plot_left));
-
-            container = container.child(
-                div()
-                    .absolute()
-                    .top(px(6.))
-                    .left(px(left_x))
-                    .w(px(pill_w))
-                    .px(px(10.))
-                    .py(px(5.))
-                    .rounded(theme.radius_md)
-                    .bg(theme.primary)
-                    .text_color(theme.primary_foreground)
-                    .text_size(px(11.5))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .font_features(tnum)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .when(theme.elevation_shadows, |el| el.shadow_md())
-                    .child(summary),
-            );
+            container = container.child(render_brush_pill(
+                summary,
+                mid_x,
+                local.left,
+                bounds.size.width.0,
+                124.0,
+                260.0,
+                &theme,
+            ));
         } else if let Some(hx) = hover_x
             && let Some(bounds) = interaction_rc.borrow().plot_bounds
         {
-            // Floating crosshair tooltip
-            let plot_left = margin_left;
-            let plot_right = (bounds.size.width.0 - margin_right).max(plot_left + 1.0);
-            let x_scale = LinearScale::new(x_min, x_max, plot_left, plot_right);
-            let cursor_x = x_scale.map(hx);
-            let tooltip_w = 210.0_f32;
-            let place_left = cursor_x + tooltip_w + 18.0 > bounds.size.width.0;
-            let left_x = if place_left {
-                (cursor_x - tooltip_w - 10.0).max(plot_left)
-            } else {
-                (cursor_x + 10.0).min((bounds.size.width.0 - tooltip_w - 4.0).max(0.0))
-            };
-            let header_label = match &self.x_formatter {
-                Some(fmt) => fmt(hx),
-                None => format!("{hx:.1}"),
-            };
-
-            let mut tooltip = div()
-                .absolute()
-                .top(px(10.))
-                .left(px(left_x))
-                .w(px(tooltip_w))
-                .p(px(10.))
-                .rounded(theme.radius_lg)
-                .bg(theme.popover)
-                .border_1()
-                .border_color(theme.border)
-                .when(theme.elevation_shadows, |el| el.shadow_lg())
-                .flex()
-                .flex_col()
-                .gap(px(5.))
-                .font_features(tnum)
-                .child(
-                    div()
-                        .text_size(px(11.5))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme.foreground)
-                        .child(header_label),
-                )
-                .child(div().w_full().h(px(1.)).bg(theme.border));
-
-            for (idx, s) in self.series.iter().enumerate() {
-                if let Some(val) = interpolate_series_y(&s.points, hx) {
-                    let color = resolved_colors[idx];
-                    tooltip = tooltip.child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .gap(px(8.))
-                            .text_size(px(11.5))
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(6.))
-                                    .min_w_0()
-                                    .child(div().w(px(7.)).h(px(7.)).rounded_full().bg(color))
-                                    .child(
-                                        div()
-                                            .text_color(theme.muted_foreground)
-                                            .truncate()
-                                            .child(s.label.clone()),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(theme.foreground)
-                                    .child(self.value_format.format_detail(val)),
-                            ),
-                    );
-                }
-            }
-
-            container = container.child(tooltip);
+            let local = PlotRect::from_local_bounds(bounds, LINE_CHART_MARGINS);
+            let x_scale = LinearScale::new(x_min, x_max, local.left, local.right);
+            let rows = series_rc.iter().enumerate().filter_map(|(idx, s)| {
+                let val = s.sample_at(hx)?;
+                Some(ChartTooltipRow {
+                    color: resolved_colors[idx],
+                    label: s.label.clone(),
+                    value: self.value_format.format_detail(val),
+                })
+            });
+            container = container.child(render_chart_tooltip(
+                fmt_x(hx),
+                None,
+                rows,
+                x_scale.map(hx),
+                local.left,
+                bounds.size.width.0,
+                210.0,
+                px(10.),
+                &theme,
+            ));
         }
 
         crate::Refineable::refine(container.style(), &self.style);

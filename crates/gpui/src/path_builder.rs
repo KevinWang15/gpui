@@ -388,6 +388,9 @@ pub struct Path {
     /// Closed contours of monotone curves, in logical pixels.
     curves: Arc<[PathCurve]>,
     even_odd: bool,
+    /// Lazily cached tile-binning result for the last painted display scale factor,
+    /// so repainted cached paths (e.g. charts during hover/brush scrubs) skip CPU re-binning.
+    binned_tiles: Arc<parking_lot::Mutex<Option<(u32, Arc<PathTiles>)>>>,
 }
 
 impl Path {
@@ -395,6 +398,7 @@ impl Path {
         Self {
             curves: curves.into(),
             even_odd: matches!(fill_rule, FillRule::EvenOdd),
+            binned_tiles: Arc::new(parking_lot::Mutex::new(None)),
         }
     }
 
@@ -404,8 +408,23 @@ impl Path {
 
     /// Bin the curves into tiles in device pixels, for painting at the given
     /// display scale.
+    #[cfg(test)]
     pub(crate) fn bin(&self, scale: f32) -> PathTiles {
         crate::path_winding::bin(&self.curves, self.even_odd, scale)
+    }
+
+    /// Bins the curves into tiles in device pixels, caching the result for `scale`.
+    pub(crate) fn bin_cached(&self, scale: f32) -> Arc<PathTiles> {
+        let scale_bits = scale.to_bits();
+        let mut slot = self.binned_tiles.lock();
+        if let Some((cached_bits, tiles)) = slot.as_ref()
+            && *cached_bits == scale_bits
+        {
+            return Arc::clone(tiles);
+        }
+        let tiles = Arc::new(crate::path_winding::bin(&self.curves, self.even_odd, scale));
+        *slot = Some((scale_bits, Arc::clone(&tiles)));
+        tiles
     }
 }
 

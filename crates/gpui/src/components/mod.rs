@@ -83,7 +83,7 @@ pub use textbox::{
 };
 pub use theme::{
     ANIM_FAST, ANIM_NORMAL, ActiveTheme, ComponentSize, GlobalTheme, SPRING_SMOOTH, SPRING_SNAPPY,
-    Theme, ThemeMode, ThemePreference, init_components,
+    Theme, ThemeMode, ThemePreference, init_components, tabular_numerals,
 };
 pub use theme_switcher::{ThemeSwitcher, theme_switcher};
 pub use time_range::{
@@ -94,5 +94,7 @@ pub use toast::{Toast, ToastHost, ToastItem, ToastVariant, toast_host};
 pub use toggle::{Switch, Toggle, ToggleButton, ToggleGroup, switch, toggle, toggle_group};
 pub use tooltip::Tooltip;
 
+#[cfg(test)]
+mod perf_tests;
 #[cfg(test)]
 mod tests;

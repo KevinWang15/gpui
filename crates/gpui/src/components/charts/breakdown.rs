@@ -2,16 +2,15 @@
 //! bar widths, and `"click to narrow"` cross-filtering support.
 
 use std::rc::Rc;
-use std::sync::Arc;
 
 use crate::{
-    AnimationExt, App, ClickEvent, ElementId, FontFeatures, FontWeight, Hsla, IntoElement,
-    ParentElement, RenderOnce, SharedString, SpringAnimation, StyleRefinement, Styled, Window,
-    div, prelude::*, px, relative,
+    AnimationExt, App, ClickEvent, ElementId, FontWeight, Hsla, IntoElement, ParentElement,
+    RenderOnce, SharedString, SpringAnimation, StyleRefinement, Styled, Window, div, prelude::*,
+    px, relative,
 };
 
 use super::core::{ChartPalette, ChartValueFormat};
-use crate::components::theme::{ActiveTheme, SPRING_SMOOTH};
+use crate::components::theme::{ActiveTheme, SPRING_SMOOTH, tabular_numerals};
 
 /// One ranked row inside a [`BreakdownList`].
 #[derive(Clone, Debug)]
@@ -137,7 +136,7 @@ impl RenderOnce for BreakdownList {
         let palette = self
             .palette
             .unwrap_or_else(|| ChartPalette::from_theme(&theme));
-        let tnum = FontFeatures(Arc::new(vec![("tnum".to_string(), 1)]));
+        let tnum = tabular_numerals();
         let total: f64 = self.items.iter().map(|i| i.value).sum();
         let max_val = self
             .items
@@ -146,7 +145,7 @@ impl RenderOnce for BreakdownList {
             .fold(0.0_f64, f64::max)
             .max(f64::EPSILON);
 
-        let mut list = div().id(self.id.clone()).w_full().flex().flex_col().gap(px(12.));
+        let mut list = div().id(self.id).w_full().flex().flex_col().gap(px(12.));
 
         for (index, item) in self.items.into_iter().enumerate() {
             let color = item.color.unwrap_or_else(|| palette.color(index));
@@ -171,13 +170,13 @@ impl RenderOnce for BreakdownList {
                 .rounded_full()
                 .bg(color)
                 .with_spring(
-                    (self.id.clone(), format!("bar-{index}")),
+                    ("bar", index),
                     SpringAnimation::new(SPRING_SMOOTH).to(bar_fraction),
                     |el, frac| el.w(relative(frac.clamp(0.02, 1.0))),
                 );
 
             let row = div()
-                .id((self.id.clone(), format!("row-{index}")))
+                .id(("row", index))
                 .w_full()
                 .px(px(8.))
                 .py(px(6.))

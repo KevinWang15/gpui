@@ -59,7 +59,7 @@ impl FastFloat for f32 {
 }
 
 /// A path's curves binned into tiles for one display scale.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct PathTiles {
     bounds: Bounds<ScaledPixels>,
     tiles: Vec<PathTile>,
@@ -85,6 +85,27 @@ impl PathTiles {
 
     pub(crate) fn curves(&self) -> &[PathCurve] {
         &self.curves
+    }
+
+    /// Returns `true` when every binned tile already intersects `mask`, so
+    /// [`Self::retain_visible`] would be a no-op and the tile buffer can be shared zero-copy.
+    pub(crate) fn all_tiles_visible(&self, mask: Bounds<ScaledPixels>) -> bool {
+        if self.tiles.is_empty() {
+            return true;
+        }
+        if self.bounds.origin.x >= mask.origin.x
+            && self.bounds.origin.y >= mask.origin.y
+            && self.bounds.right() <= mask.right()
+            && self.bounds.bottom() <= mask.bottom()
+        {
+            return true;
+        }
+        self.tiles.iter().all(|tile| {
+            tile.top_left.x < mask.right().0
+                && tile.top_left.y < mask.bottom().0
+                && tile.bottom_right.x > mask.origin.x.0
+                && tile.bottom_right.y > mask.origin.y.0
+        })
     }
 
     /// Drops the tiles that lie entirely outside `mask`.

@@ -2,17 +2,16 @@
 //! and [`ChartCard`] framing for `gpui::components::charts`.
 
 use std::rc::Rc;
-use std::sync::Arc;
 
 use crate::{
-    AnyElement, App, ClickEvent, ElementId, FontFeatures, FontWeight, Hsla, IntoElement,
-    ParentElement, Pixels, Point, RenderOnce, SharedString, StyleRefinement, Styled, TextAlign,
-    TextRun, Window, div, prelude::*, px,
+    AnyElement, App, BorderStyle, Bounds, ClickEvent, Corners, Edges, ElementId, FontWeight, Hsla,
+    IntoElement, ParentElement, Pixels, Point, RenderOnce, SharedString, StyleRefinement, Styled,
+    TextAlign, TextRun, Window, div, fill, point, prelude::*, px, quad, size,
 };
 use crate::icons::{Icon, IconSize, LucideIcon};
 
 use crate::components::palette as tw;
-use crate::components::theme::{ActiveTheme, Theme, ThemeMode};
+use crate::components::theme::{ActiveTheme, Theme, ThemeMode, tabular_numerals};
 
 /// Categorical series color palette automatically tuned for Light and Dark themes.
 #[derive(Clone, Debug)]
@@ -287,7 +286,7 @@ pub fn paint_chart_text(
     }
     let mut style = window.text_style();
     style.font_weight = weight;
-    style.font_features = FontFeatures(Arc::new(vec![("tnum".to_string(), 1)]));
+    style.font_features = tabular_numerals();
     let run = TextRun {
         len: text.len(),
         font: style.font(),
@@ -300,6 +299,292 @@ pub fn paint_chart_text(
         .text_system()
         .shape_line(text, font_size, &[run], None);
     let _ = line.paint(origin, font_size * 1.25, align, align_width, window, cx);
+}
+
+/// Inner plot margins (in logical pixels) shared by Cartesian chart renderers.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ChartMargins {
+    pub left: f32,
+    pub right: f32,
+    pub top: f32,
+    pub bottom: f32,
+}
+
+/// Resolved Cartesian plot rectangle computed from element bounds and [`ChartMargins`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PlotRect {
+    pub left: f32,
+    pub right: f32,
+    pub top: f32,
+    pub bottom: f32,
+}
+
+impl PlotRect {
+    /// Computes window-space plot coordinates from painted `bounds` and `margins`.
+    #[inline]
+    pub fn from_bounds(bounds: Bounds<Pixels>, margins: ChartMargins) -> Self {
+        let left = bounds.origin.x.0 + margins.left;
+        let right = (bounds.origin.x.0 + bounds.size.width.0 - margins.right).max(left + 10.0);
+        let top = bounds.origin.y.0 + margins.top;
+        let bottom = (bounds.origin.y.0 + bounds.size.height.0 - margins.bottom).max(top + 10.0);
+        Self {
+            left,
+            right,
+            top,
+            bottom,
+        }
+    }
+
+    /// Computes element-local plot coordinates (origin at `0, 0`) for floating overlays.
+    #[inline]
+    pub fn from_local_bounds(bounds: Bounds<Pixels>, margins: ChartMargins) -> Self {
+        let left = margins.left;
+        let right = (bounds.size.width.0 - margins.right).max(left + 1.0);
+        let top = margins.top;
+        let bottom = (bounds.size.height.0 - margins.bottom).max(top + 1.0);
+        Self {
+            left,
+            right,
+            top,
+            bottom,
+        }
+    }
+
+    #[inline]
+    pub fn width(self) -> f32 {
+        self.right - self.left
+    }
+
+    #[inline]
+    pub fn height(self) -> f32 {
+        self.bottom - self.top
+    }
+
+    #[inline]
+    pub fn contains_x(self, x: f32) -> bool {
+        x >= self.left && x <= self.right
+    }
+}
+
+/// Paints horizontal 1px gridlines and right-aligned Y-axis tick labels.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn paint_y_gridlines(
+    ticks: &[f64],
+    y_scale: LinearScale,
+    plot: PlotRect,
+    label_origin_x: f32,
+    label_width: f32,
+    format: &ChartValueFormat,
+    palette: &ChartPalette,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let width = plot.width();
+    for &tick in ticks {
+        let y = y_scale.map(tick).round();
+        window.paint_quad(fill(
+            Bounds::new(point(px(plot.left), px(y)), size(px(width), px(1.))),
+            palette.gridline,
+        ));
+        paint_chart_text(
+            format.format_tick(tick),
+            point(px(label_origin_x), px(y - 7.0)),
+            px(11.),
+            palette.axis_label,
+            FontWeight::NORMAL,
+            TextAlign::Right,
+            Some(px(label_width)),
+            window,
+            cx,
+        );
+    }
+}
+
+/// Paints a translucent horizontal brush/selection band with crisp 1.5px accent vertical edge guides.
+pub(crate) fn paint_brush_band(
+    x0: f32,
+    x1: f32,
+    plot: PlotRect,
+    accent: Hsla,
+    is_live_brushing: bool,
+    window: &mut Window,
+) {
+    let sel_left = x0.min(x1).clamp(plot.left, plot.right);
+    let sel_right = x0.max(x1).clamp(plot.left, plot.right);
+    let sel_w = (sel_right - sel_left).max(2.0);
+    let sel_h = plot.height();
+    window.paint_quad(fill(
+        Bounds::new(point(px(sel_left), px(plot.top)), size(px(sel_w), px(sel_h))),
+        accent.opacity(if is_live_brushing { 0.16 } else { 0.11 }),
+    ));
+    window.paint_quad(fill(
+        Bounds::new(point(px(sel_left), px(plot.top)), size(px(1.5), px(sel_h))),
+        accent.opacity(0.85),
+    ));
+    window.paint_quad(fill(
+        Bounds::new(
+            point(px((sel_right - 1.5).max(sel_left)), px(plot.top)),
+            size(px(1.5), px(sel_h)),
+        ),
+        accent.opacity(0.85),
+    ));
+}
+
+/// Paints a circular series marker dot surrounded by a subtle surface-colored halo ring.
+pub(crate) fn paint_chart_marker(
+    cx_px: f32,
+    cy_px: f32,
+    radius: f32,
+    color: Hsla,
+    halo_bg: Hsla,
+    window: &mut Window,
+) {
+    let halo_r = radius + 1.5;
+    window.paint_quad(quad(
+        Bounds::new(
+            point(px(cx_px - halo_r), px(cy_px - halo_r)),
+            size(px(halo_r * 2.0), px(halo_r * 2.0)),
+        ),
+        Corners::all(px(halo_r)),
+        halo_bg,
+        Edges::default(),
+        halo_bg,
+        BorderStyle::Solid,
+    ));
+    window.paint_quad(quad(
+        Bounds::new(
+            point(px(cx_px - radius), px(cy_px - radius)),
+            size(px(radius * 2.0), px(radius * 2.0)),
+        ),
+        Corners::all(px(radius)),
+        color,
+        Edges::default(),
+        color,
+        BorderStyle::Solid,
+    ));
+}
+
+/// Renders the floating accent summary pill centered above an active horizontal brush selection.
+pub(crate) fn render_brush_pill(
+    summary: String,
+    mid_x: f32,
+    min_x: f32,
+    container_width: f32,
+    min_w: f32,
+    max_w: f32,
+    theme: &Theme,
+) -> impl IntoElement {
+    let pill_w = ((summary.len() as f32) * 6.8 + 20.0).clamp(min_w, max_w);
+    let left_x = (mid_x - pill_w * 0.5).clamp(min_x, (container_width - pill_w - 4.0).max(min_x));
+    div()
+        .absolute()
+        .top(px(6.))
+        .left(px(left_x))
+        .w(px(pill_w))
+        .px(px(10.))
+        .py(px(5.))
+        .rounded(theme.radius_md)
+        .bg(theme.primary)
+        .text_color(theme.primary_foreground)
+        .text_size(px(11.5))
+        .font_weight(FontWeight::SEMIBOLD)
+        .font_features(tabular_numerals())
+        .flex()
+        .items_center()
+        .justify_center()
+        .when(theme.elevation_shadows, |el| el.shadow_md())
+        .child(summary)
+}
+
+/// One swatch + label + value row displayed inside a floating chart hover tooltip.
+pub(crate) struct ChartTooltipRow {
+    pub color: Hsla,
+    pub label: SharedString,
+    pub value: String,
+}
+
+/// Renders a floating edge-flipping hover tooltip card anchored near `anchor_x`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_chart_tooltip(
+    header_left: impl Into<SharedString>,
+    header_right: Option<String>,
+    rows: impl IntoIterator<Item = ChartTooltipRow>,
+    anchor_x: f32,
+    min_left_x: f32,
+    container_width: f32,
+    tooltip_w: f32,
+    top_offset: Pixels,
+    theme: &Theme,
+) -> impl IntoElement {
+    let place_left = anchor_x + tooltip_w + 18.0 > container_width;
+    let left_x = if place_left {
+        (anchor_x - tooltip_w - 10.0).max(min_left_x)
+    } else {
+        (anchor_x + 10.0).min((container_width - tooltip_w - 4.0).max(0.0))
+    };
+
+    let mut header = div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .text_size(px(11.5))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(theme.foreground)
+        .child(header_left.into());
+    if let Some(right) = header_right {
+        header = header.child(right);
+    }
+
+    let mut tooltip = div()
+        .absolute()
+        .top(top_offset)
+        .left(px(left_x))
+        .w(px(tooltip_w))
+        .p(px(10.))
+        .rounded(theme.radius_lg)
+        .bg(theme.popover)
+        .border_1()
+        .border_color(theme.border)
+        .when(theme.elevation_shadows, |el| el.shadow_lg())
+        .flex()
+        .flex_col()
+        .gap(px(5.))
+        .font_features(tabular_numerals())
+        .child(header)
+        .child(div().w_full().h(px(1.)).bg(theme.border));
+
+    for row in rows {
+        tooltip = tooltip.child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(8.))
+                .text_size(px(11.5))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .min_w_0()
+                        .child(div().w(px(7.)).h(px(7.)).rounded_full().bg(row.color))
+                        .child(
+                            div()
+                                .text_color(theme.muted_foreground)
+                                .truncate()
+                                .child(row.label),
+                        ),
+                )
+                .child(
+                    div()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(theme.foreground)
+                        .child(row.value),
+                ),
+        );
+    }
+
+    tooltip
 }
 
 /// Swatch indicator style used inside a [`ChartLegendItem`].
@@ -378,6 +663,7 @@ fn render_interactive_chart_legend(
     let base_id = id.into();
     let hover_bg = theme.surface_hover;
     let mut row = div()
+        .id(base_id)
         .flex()
         .flex_wrap()
         .items_center()
@@ -413,7 +699,7 @@ fn render_interactive_chart_legend(
         };
 
         let mut pill = div()
-            .id((base_id.clone(), format!("leg-{idx}")))
+            .id(("leg", idx))
             .flex()
             .items_center()
             .gap(px(6.))

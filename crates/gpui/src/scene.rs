@@ -11,8 +11,24 @@ use crate::{
 };
 use smallvec::SmallVec;
 use std::{
-    collections::VecDeque, fmt::Debug, iter::Peekable, ops::Range, rc::Rc, slice, time::Duration,
+    collections::VecDeque,
+    fmt::Debug,
+    iter::Peekable,
+    ops::Range,
+    slice,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
 };
+
+static NEXT_SCENE_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+#[inline]
+fn next_scene_generation() -> u64 {
+    NEXT_SCENE_GENERATION.fetch_add(1, Ordering::Relaxed)
+}
 
 #[expect(missing_docs)]
 pub type DrawOrder = u32;
@@ -61,6 +77,10 @@ pub struct Scene {
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
     animations: Vec<SpriteAnimation>,
+    /// Monotonic generation stamped in [`Scene::finish`] and whenever sprite animations mutate
+    /// primitives, allowing GPU backends to cache rendered offscreen textures across static frames
+    /// (e.g. during full-window [`SceneTransition`] composites).
+    generation: u64,
     /// Optional active full-window GPU view transition evaluated for the current frame.
     pub transition: Option<SceneTransition>,
 }
@@ -81,7 +101,15 @@ impl Scene {
         self.polychrome_sprites.clear();
         self.surfaces.clear();
         self.animations.clear();
+        self.generation = 0;
         self.transition = None;
+    }
+
+    /// Returns the monotonic content generation of this finished scene (`0` if not yet finished).
+    ///
+    /// Changes whenever [`Self::finish`] completes a new scene or animated sprites advance.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Inserts a sprite that [`Self::advance_animations`] keeps moving. The
@@ -116,6 +144,9 @@ impl Scene {
     /// Moves every animated sprite to its pose at `elapsed` time on the app's
     /// synced animation clock, without the scene being rebuilt.
     pub(crate) fn advance_animations(&mut self, elapsed: Duration) {
+        if self.animations.is_empty() {
+            return;
+        }
         for animation in &self.animations {
             let Some(sprite) = self.monochrome_sprites.get_mut(animation.sprite_index) else {
                 continue;
@@ -124,6 +155,7 @@ impl Scene {
             sprite.transformation = pose.into_matrix(animation.center, animation.scale_factor);
             sprite.color = animation.base_color.opacity(pose.alpha_factor());
         }
+        self.generation = next_scene_generation();
     }
 
     pub fn len(&self) -> usize {
@@ -273,6 +305,7 @@ impl Scene {
                 }
             }
         }
+        self.generation = next_scene_generation();
     }
 
     #[cfg_attr(
@@ -1104,7 +1137,7 @@ pub struct PathTile {
 pub struct PaintedPath {
     order: DrawOrder,
     bounds: Bounds<ScaledPixels>,
-    tiles: Rc<PathTiles>,
+    tiles: Arc<PathTiles>,
     paint: PathPaint,
 }
 
@@ -1118,8 +1151,14 @@ impl PaintedPath {
         color: Background,
     ) -> Self {
         let content_mask = content_mask.scale(scale_factor);
-        let mut tiles = path.bin(scale_factor);
-        tiles.retain_visible(content_mask.bounds);
+        let binned = path.bin_cached(scale_factor);
+        let tiles = if binned.all_tiles_visible(content_mask.bounds) {
+            binned
+        } else {
+            let mut clipped = (*binned).clone();
+            clipped.retain_visible(content_mask.bounds);
+            Arc::new(clipped)
+        };
         let paint = PathPaint {
             bounds: tiles.bounds(),
             content_mask,
@@ -1130,7 +1169,7 @@ impl PaintedPath {
         Self {
             order: 0,
             bounds: tiles.painted_bounds(),
-            tiles: Rc::new(tiles),
+            tiles,
             paint,
         }
     }

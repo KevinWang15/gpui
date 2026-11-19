@@ -1,20 +1,49 @@
 //! Structured faceted [`FilterBar`] with segmented pill chips, single- & multi-value
 //! facet popovers with live counts, and full keyboard grammar.
 
+use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::Arc;
 
 use smallvec::SmallVec;
 
 use crate::{
-    Animation, AnimationExt, App, ClickEvent, Context, ElementId, Entity, EventEmitter,
-    FocusHandle, Focusable, FontFeatures, FontWeight, IntoElement, KeyDownEvent, ParentElement,
-    RenderOnce, SharedString, StyleRefinement, Styled, Window, anchored, deferred, div,
-    ease_out_quint, prelude::*, px,
+    Animation, AnimationExt, AnyElement, App, ClickEvent, Context, ElementId, Entity, EventEmitter,
+    FocusHandle, Focusable, FontWeight, IntoElement, KeyDownEvent, ParentElement, RenderOnce,
+    ScrollStrategy, SharedString, StyleRefinement, Styled, UniformListScrollHandle, Window,
+    anchored, deferred, div, ease_out_quint, prelude::*, px, uniform_list,
 };
 use crate::icons::{Icon, IconSize, LucideIcon};
 
-use super::theme::{ANIM_FAST, ActiveTheme};
+use super::theme::{ANIM_FAST, ActiveTheme, Theme, tabular_numerals};
+
+/// Allocation-free ASCII case-insensitive substring check with Unicode fallback.
+#[inline]
+fn contains_case_insensitive(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if haystack.is_ascii() && needle.is_ascii() {
+        let h = haystack.as_bytes();
+        let n = needle.as_bytes();
+        if n.len() > h.len() {
+            return false;
+        }
+        let first_lo = n[0].to_ascii_lowercase();
+        let first_hi = n[0].to_ascii_uppercase();
+        let last_start = h.len() - n.len();
+        let mut i = 0;
+        while i <= last_start {
+            let b = h[i];
+            if (b == first_lo || b == first_hi) && h[i..i + n.len()].eq_ignore_ascii_case(n) {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    } else {
+        haystack.to_lowercase().contains(&needle.to_lowercase())
+    }
+}
 
 /// Comparison operator inside a [`FilterClause`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -150,12 +179,10 @@ impl FilterClause {
             FilterOperator::Neq => self.values.iter().all(|v| v.as_ref() != candidate),
             FilterOperator::OneOf => self.values.iter().any(|v| v.as_ref() == candidate),
             FilterOperator::NotOneOf => self.values.iter().all(|v| v.as_ref() != candidate),
-            FilterOperator::Contains => {
-                let lower = candidate.to_lowercase();
-                self.values
-                    .iter()
-                    .any(|v| lower.contains(&v.to_lowercase()))
-            }
+            FilterOperator::Contains => self
+                .values
+                .iter()
+                .any(|v| contains_case_insensitive(candidate, v.as_ref())),
         }
     }
 }
@@ -195,6 +222,12 @@ enum FilterDraft {
     },
 }
 
+struct CachedFacets {
+    field: SharedString,
+    query: String,
+    options: Rc<[FilterFacetOption]>,
+}
+
 /// Interactive state entity backing a [`FilterBar`].
 pub struct FilterBarState {
     fields: Vec<FilterFieldDef>,
@@ -205,6 +238,8 @@ pub struct FilterBarState {
     highlighted: usize,
     placeholder: SharedString,
     facet_provider: FacetProvider,
+    cached_facets: RefCell<Option<CachedFacets>>,
+    scroll_handle: UniformListScrollHandle,
     focus_handle: FocusHandle,
 }
 
@@ -232,6 +267,8 @@ impl FilterBarState {
             highlighted: 0,
             placeholder: "Filter by field, operator, value...".into(),
             facet_provider: Rc::new(facet_provider),
+            cached_facets: RefCell::new(None),
+            scroll_handle: UniformListScrollHandle::new(),
             focus_handle: cx.focus_handle(),
         }
     }
@@ -251,6 +288,10 @@ impl FilterBarState {
     /// Returns the currently committed [`FilterClause`]s.
     pub fn clauses(&self) -> &[FilterClause] {
         &self.clauses
+    }
+
+    fn invalidate_facet_cache(&self) {
+        *self.cached_facets.borrow_mut() = None;
     }
 
     /// Returns `true` if any clause matches `(field, value)` with `=` or `is one of`.
@@ -294,6 +335,7 @@ impl FilterBarState {
                 values: smallvec::smallvec![value],
             });
         }
+        self.invalidate_facet_cache();
         cx.emit(FilterBarEvent::Change(self.clauses.clone()));
         cx.notify();
     }
@@ -324,6 +366,7 @@ impl FilterBarState {
             operator,
             values,
         });
+        self.invalidate_facet_cache();
         cx.emit(FilterBarEvent::Change(self.clauses.clone()));
         cx.notify();
     }
@@ -332,6 +375,7 @@ impl FilterBarState {
     pub fn remove_clause(&mut self, index: usize, cx: &mut Context<Self>) {
         if index < self.clauses.len() {
             self.clauses.remove(index);
+            self.invalidate_facet_cache();
             cx.emit(FilterBarEvent::Change(self.clauses.clone()));
             cx.notify();
         }
@@ -344,6 +388,7 @@ impl FilterBarState {
         self.draft = FilterDraft::Field;
         self.query.clear();
         self.highlighted = 0;
+        self.invalidate_facet_cache();
         if changed {
             cx.emit(FilterBarEvent::Change(self.clauses.clone()));
         }
@@ -353,6 +398,7 @@ impl FilterBarState {
     fn open_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.open = true;
         self.highlighted = 0;
+        self.invalidate_facet_cache();
         window.focus(&self.focus_handle, cx);
         cx.notify();
     }
@@ -360,6 +406,7 @@ impl FilterBarState {
     fn close_menu(&mut self, cx: &mut Context<Self>) {
         if self.open {
             self.open = false;
+            self.invalidate_facet_cache();
             cx.notify();
         }
     }
@@ -376,6 +423,7 @@ impl FilterBarState {
         self.query.clear();
         self.highlighted = 0;
         self.open = true;
+        self.invalidate_facet_cache();
         window.focus(&self.focus_handle, cx);
         cx.emit(FilterBarEvent::Change(self.clauses.clone()));
         cx.notify();
@@ -403,19 +451,20 @@ impl FilterBarState {
         self.query.clear();
         self.highlighted = 0;
         self.open = true;
+        self.invalidate_facet_cache();
         window.focus(&self.focus_handle, cx);
         cx.emit(FilterBarEvent::Change(self.clauses.clone()));
         cx.notify();
     }
 
     fn matching_fields(&self) -> Vec<FilterFieldDef> {
-        let q = self.query.trim().to_lowercase();
+        let q = self.query.trim();
         self.fields
             .iter()
             .filter(|f| {
                 q.is_empty()
-                    || f.label.to_lowercase().contains(&q)
-                    || f.key.to_lowercase().contains(&q)
+                    || contains_case_insensitive(f.label.as_ref(), q)
+                    || contains_case_insensitive(f.key.as_ref(), q)
             })
             .cloned()
             .collect()
@@ -426,21 +475,39 @@ impl FilterBarState {
             .fields
             .iter()
             .find(|f| f.key.as_ref() == field_key)
-            .map(|f| f.operators.clone())
-            .unwrap_or_else(|| vec![FilterOperator::Eq, FilterOperator::OneOf]);
-        let q = self.query.trim().to_lowercase();
-        ops.into_iter()
-            .filter(|op| q.is_empty() || op.label().to_lowercase().contains(&q))
+            .map(|f| f.operators.as_slice())
+            .unwrap_or(&[FilterOperator::Eq, FilterOperator::OneOf]);
+        let q = self.query.trim();
+        ops.iter()
+            .copied()
+            .filter(|op| q.is_empty() || contains_case_insensitive(op.label(), q))
             .collect()
     }
 
-    fn matching_facets(&self, field_key: &str) -> Vec<FilterFacetOption> {
-        (self.facet_provider)(&self.clauses, field_key, self.query.trim())
+    /// Returns cached facet suggestions for `(field_key, query)`, avoiding repeated
+    /// `facet_provider` calls across arrow-key navigation, checkbox toggles, and renders.
+    fn matching_facets(&self, field_key: &str) -> Rc<[FilterFacetOption]> {
+        let q = self.query.trim();
+        if let Some(cached) = self.cached_facets.borrow().as_ref()
+            && cached.field.as_ref() == field_key
+            && cached.query == q
+        {
+            return cached.options.clone();
+        }
+        let options: Rc<[FilterFacetOption]> =
+            Rc::from((self.facet_provider)(&self.clauses, field_key, q));
+        *self.cached_facets.borrow_mut() = Some(CachedFacets {
+            field: SharedString::from(field_key.to_owned()),
+            query: q.to_owned(),
+            options: options.clone(),
+        });
+        options
     }
 
     fn choose_field(&mut self, field: &FilterFieldDef, cx: &mut Context<Self>) {
         self.query.clear();
         self.highlighted = 0;
+        self.invalidate_facet_cache();
         if field.operators.len() == 1 {
             let op = field.operators[0];
             self.draft = if op.is_multi() {
@@ -474,6 +541,7 @@ impl FilterBarState {
         };
         self.query.clear();
         self.highlighted = 0;
+        self.invalidate_facet_cache();
         self.draft = if op.is_multi() {
             FilterDraft::MultiValue {
                 field,
@@ -510,6 +578,7 @@ impl FilterBarState {
         self.draft = FilterDraft::Field;
         self.query.clear();
         self.highlighted = 0;
+        self.invalidate_facet_cache();
         cx.emit(FilterBarEvent::Change(self.clauses.clone()));
         cx.notify();
     }
@@ -559,6 +628,7 @@ impl FilterBarState {
         self.draft = FilterDraft::Field;
         self.query.clear();
         self.highlighted = 0;
+        self.invalidate_facet_cache();
         cx.emit(FilterBarEvent::Change(self.clauses.clone()));
         cx.notify();
     }
@@ -606,6 +676,7 @@ impl FilterBarState {
             FilterDraft::Field => {
                 if !self.clauses.is_empty() {
                     self.clauses.pop();
+                    self.invalidate_facet_cache();
                     cx.emit(FilterBarEvent::Change(self.clauses.clone()));
                     cx.notify();
                 }
@@ -631,6 +702,7 @@ impl FilterBarState {
                 self.draft = FilterDraft::Field;
                 self.query.clear();
                 self.highlighted = 0;
+                self.invalidate_facet_cache();
                 cx.notify();
             }
             "down" => {
@@ -638,6 +710,8 @@ impl FilterBarState {
                 let count = self.current_option_count();
                 if count > 0 {
                     self.highlighted = (self.highlighted + 1) % count;
+                    self.scroll_handle
+                        .scroll_to_item(self.highlighted, ScrollStrategy::Nearest);
                 }
                 cx.notify();
             }
@@ -646,6 +720,8 @@ impl FilterBarState {
                 let count = self.current_option_count();
                 if count > 0 {
                     self.highlighted = (self.highlighted + count - 1) % count;
+                    self.scroll_handle
+                        .scroll_to_item(self.highlighted, ScrollStrategy::Nearest);
                 }
                 cx.notify();
             }
@@ -723,280 +799,176 @@ impl FilterBar {
             style: StyleRefinement::default(),
         }
     }
-}
 
-impl Styled for FilterBar {
-    fn style(&mut self) -> &mut StyleRefinement {
-        &mut self.style
-    }
-}
-
-impl RenderOnce for FilterBar {
-    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let theme = cx.theme();
-        let tnum = FontFeatures(Arc::new(vec![("tnum".to_string(), 1)]));
-
-        let snap = self.state.read(cx);
-        let clauses = snap.clauses.clone();
-        let draft = snap.draft.clone();
-        let query = snap.query.clone();
-        let open = snap.open;
-        let highlighted = snap.highlighted;
-        let placeholder = snap.placeholder.clone();
-        let focus_handle = snap.focus_handle.clone();
-        let focused = focus_handle.is_focused(window);
-        let has_content = !clauses.is_empty()
-            || !matches!(draft, FilterDraft::Field)
-            || !query.is_empty();
-
-        // Snapshot popover suggestions up front so we don't re-borrow `state`.
-        let field_options = if open && matches!(draft, FilterDraft::Field) {
-            snap.matching_fields()
-        } else {
-            Vec::new()
-        };
-        let operator_options = if open
-            && let FilterDraft::Operator { field, .. } = &draft
-        {
-            snap.matching_operators(field.as_ref())
-        } else {
-            Vec::new()
-        };
-        let facet_options = if open {
-            match &draft {
-                FilterDraft::SingleValue { field, .. } | FilterDraft::MultiValue { field, .. } => {
-                    snap.matching_facets(field.as_ref())
-                }
-                _ => Vec::new(),
-            }
-        } else {
-            Vec::new()
-        };
-
+    fn render_committed_chip(
+        &self,
+        idx: usize,
+        clause: &FilterClause,
+        theme: &Theme,
+    ) -> impl IntoElement {
         let hover_bg = theme.surface_hover;
-        let border_color = if focused || open {
-            theme.ring
-        } else {
-            theme.input_border
-        };
+        let state_op = self.state.clone();
+        let state_val = self.state.clone();
+        let state_rm = self.state.clone();
 
-        let mut tokens_row = div()
-            .flex_1()
-            .min_w_0()
+        div()
+            .id(("clause", idx))
             .flex()
-            .flex_wrap()
             .items_center()
-            .gap(px(6.));
+            .h(px(26.))
+            .rounded(theme.radius_md)
+            .bg(theme.surface_muted)
+            .border_1()
+            .border_color(theme.border)
+            .overflow_hidden()
+            .text_size(px(12.))
+            .child(
+                div()
+                    .px(px(7.))
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(theme.muted_foreground)
+                    .child(clause.field_label.clone()),
+            )
+            .child(div().w(px(1.)).h_full().bg(theme.border))
+            .child(
+                div()
+                    .id(("clause-op", idx))
+                    .px(px(7.))
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .cursor_pointer()
+                    .text_color(theme.muted_foreground)
+                    .hover(move |s| s.bg(hover_bg))
+                    .on_click(move |_: &ClickEvent, window, cx| {
+                        state_op.update(cx, |s, cx| s.edit_clause_operator(idx, window, cx));
+                    })
+                    .child(clause.operator.label()),
+            )
+            .child(div().w(px(1.)).h_full().bg(theme.border))
+            .child(
+                div()
+                    .id(("clause-val", idx))
+                    .px(px(7.))
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .cursor_pointer()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.foreground)
+                    .hover(move |s| s.bg(hover_bg))
+                    .on_click(move |_: &ClickEvent, window, cx| {
+                        state_val.update(cx, |s, cx| s.edit_clause_value(idx, window, cx));
+                    })
+                    .child(clause.values_summary()),
+            )
+            .child(div().w(px(1.)).h_full().bg(theme.border))
+            .child(
+                div()
+                    .id(("clause-rm", idx))
+                    .px(px(5.))
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(hover_bg))
+                    .on_click(move |_: &ClickEvent, _, cx| {
+                        state_rm.update(cx, |s, cx| s.remove_clause(idx, cx));
+                    })
+                    .child(
+                        Icon::new(LucideIcon::X)
+                            .size(IconSize::Xs)
+                            .color(theme.muted_foreground),
+                    ),
+            )
+    }
 
-        // 1. Committed filter chips: [ Provider | = | anthropic | × ]
-        for (idx, clause) in clauses.iter().enumerate() {
-            let state_op = self.state.clone();
-            let state_val = self.state.clone();
-            let state_rm = self.state.clone();
-
-            let chip = div()
-                .id((self.id.clone(), format!("clause-{idx}")))
-                .flex()
-                .items_center()
-                .h(px(26.))
-                .rounded(theme.radius_md)
-                .bg(theme.surface_muted)
-                .border_1()
-                .border_color(theme.border)
-                .overflow_hidden()
-                .text_size(px(12.))
-                .child(
-                    div()
-                        .px(px(7.))
-                        .h_full()
-                        .flex()
-                        .items_center()
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(theme.muted_foreground)
-                        .child(clause.field_label.clone()),
-                )
-                .child(div().w(px(1.)).h_full().bg(theme.border))
-                .child(
-                    div()
-                        .id((self.id.clone(), format!("clause-op-{idx}")))
-                        .px(px(7.))
-                        .h_full()
-                        .flex()
-                        .items_center()
-                        .cursor_pointer()
-                        .text_color(theme.muted_foreground)
-                        .hover(move |s| s.bg(hover_bg))
-                        .on_click(move |_: &ClickEvent, window, cx| {
-                            state_op.update(cx, |s, cx| s.edit_clause_operator(idx, window, cx));
-                        })
-                        .child(clause.operator.label()),
-                )
-                .child(div().w(px(1.)).h_full().bg(theme.border))
-                .child(
-                    div()
-                        .id((self.id.clone(), format!("clause-val-{idx}")))
-                        .px(px(7.))
-                        .h_full()
-                        .flex()
-                        .items_center()
-                        .cursor_pointer()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme.foreground)
-                        .hover(move |s| s.bg(hover_bg))
-                        .on_click(move |_: &ClickEvent, window, cx| {
-                            state_val.update(cx, |s, cx| s.edit_clause_value(idx, window, cx));
-                        })
-                        .child(clause.values_summary()),
-                )
-                .child(div().w(px(1.)).h_full().bg(theme.border))
-                .child(
-                    div()
-                        .id((self.id.clone(), format!("clause-rm-{idx}")))
-                        .px(px(5.))
-                        .h_full()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .cursor_pointer()
-                        .hover(move |s| s.bg(hover_bg))
-                        .on_click(move |_: &ClickEvent, _, cx| {
-                            state_rm.update(cx, |s, cx| s.remove_clause(idx, cx));
-                        })
-                        .child(
-                            Icon::new(LucideIcon::X)
-                                .size(IconSize::Xs)
-                                .color(theme.muted_foreground),
-                        ),
-                );
-            tokens_row = tokens_row.child(chip);
-        }
-
-        // 2. Active draft chip (when mid-construction)
-        match &draft {
-            FilterDraft::Field => {}
-            FilterDraft::Operator { field_label, .. } => {
-                tokens_row = tokens_row.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .h(px(26.))
-                        .rounded(theme.radius_md)
-                        .bg(theme.primary_soft)
-                        .border_1()
-                        .border_color(theme.ring.opacity(0.45))
-                        .text_size(px(12.))
-                        .child(
-                            div()
-                                .px(px(8.))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(theme.primary_soft_foreground)
-                                .child(field_label.clone()),
-                        ),
-                );
-            }
+    fn render_draft_chip(draft: &FilterDraft, theme: &Theme) -> Option<AnyElement> {
+        let (field_label, operator, pending_summary) = match draft {
+            FilterDraft::Field => return None,
+            FilterDraft::Operator { field_label, .. } => (field_label.clone(), None, None),
             FilterDraft::SingleValue {
                 field_label,
                 operator,
                 ..
-            } => {
-                tokens_row = tokens_row.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .h(px(26.))
-                        .rounded(theme.radius_md)
-                        .bg(theme.primary_soft)
-                        .border_1()
-                        .border_color(theme.ring.opacity(0.45))
-                        .overflow_hidden()
-                        .text_size(px(12.))
-                        .child(
-                            div()
-                                .px(px(8.))
-                                .h_full()
-                                .flex()
-                                .items_center()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(theme.primary_soft_foreground)
-                                .child(field_label.clone()),
-                        )
-                        .child(div().w(px(1.)).h_full().bg(theme.ring.opacity(0.3)))
-                        .child(
-                            div()
-                                .px(px(8.))
-                                .h_full()
-                                .flex()
-                                .items_center()
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(theme.primary_soft_foreground)
-                                .child(operator.label()),
-                        ),
-                );
-            }
+            } => (field_label.clone(), Some(*operator), None),
             FilterDraft::MultiValue {
                 field_label,
                 operator,
                 pending,
                 ..
             } => {
-                let pending_text = if pending.is_empty() {
-                    None
-                } else if pending.len() == 1 {
-                    Some(pending[0].to_string())
-                } else {
-                    Some(format!("{}, +{}", pending[0], pending.len() - 1))
+                let summary = match pending.len() {
+                    0 => None,
+                    1 => Some(pending[0].to_string()),
+                    n => Some(format!("{}, +{}", pending[0], n - 1)),
                 };
-                tokens_row = tokens_row.child(
+                (field_label.clone(), Some(*operator), summary)
+            }
+        };
+
+        let sep = || div().w(px(1.)).h_full().bg(theme.ring.opacity(0.3));
+        Some(
+            div()
+                .flex()
+                .items_center()
+                .h(px(26.))
+                .rounded(theme.radius_md)
+                .bg(theme.primary_soft)
+                .border_1()
+                .border_color(theme.ring.opacity(0.45))
+                .overflow_hidden()
+                .text_size(px(12.))
+                .child(
                     div()
+                        .px(px(8.))
+                        .h_full()
                         .flex()
                         .items_center()
-                        .h(px(26.))
-                        .rounded(theme.radius_md)
-                        .bg(theme.primary_soft)
-                        .border_1()
-                        .border_color(theme.ring.opacity(0.45))
-                        .overflow_hidden()
-                        .text_size(px(12.))
-                        .child(
-                            div()
-                                .px(px(8.))
-                                .h_full()
-                                .flex()
-                                .items_center()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(theme.primary_soft_foreground)
-                                .child(field_label.clone()),
-                        )
-                        .child(div().w(px(1.)).h_full().bg(theme.ring.opacity(0.3)))
-                        .child(
-                            div()
-                                .px(px(8.))
-                                .h_full()
-                                .flex()
-                                .items_center()
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(theme.primary_soft_foreground)
-                                .child(operator.label()),
-                        )
-                        .when_some(pending_text, |el, summary| {
-                            el.child(div().w(px(1.)).h_full().bg(theme.ring.opacity(0.3)))
-                                .child(
-                                    div()
-                                        .px(px(8.))
-                                        .h_full()
-                                        .flex()
-                                        .items_center()
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(theme.foreground)
-                                        .child(summary),
-                                )
-                        }),
-                );
-            }
-        }
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme.primary_soft_foreground)
+                        .child(field_label),
+                )
+                .when_some(operator, |el, op| {
+                    el.child(sep()).child(
+                        div()
+                            .px(px(8.))
+                            .h_full()
+                            .flex()
+                            .items_center()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme.primary_soft_foreground)
+                            .child(op.label()),
+                    )
+                })
+                .when_some(pending_summary, |el, summary| {
+                    el.child(sep()).child(
+                        div()
+                            .px(px(8.))
+                            .h_full()
+                            .flex()
+                            .items_center()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme.foreground)
+                            .child(summary),
+                    )
+                })
+                .into_any_element(),
+        )
+    }
 
-        // 3. Inline query text + caret / placeholder
-        let inline_input = if !query.is_empty() {
+    fn render_inline_input(
+        query: String,
+        focused: bool,
+        has_content: bool,
+        placeholder: SharedString,
+        theme: &Theme,
+    ) -> impl IntoElement {
+        if !query.is_empty() {
             div()
                 .flex()
                 .items_center()
@@ -1027,11 +999,515 @@ impl RenderOnce for FilterBar {
                 .child(placeholder)
         } else {
             div().w(px(4.))
+        }
+    }
+
+    fn render_empty_notice(theme: &Theme) -> impl IntoElement {
+        div()
+            .px(px(10.))
+            .py(px(8.))
+            .text_size(px(12.5))
+            .text_color(theme.muted_foreground)
+            .child("No matching values")
+    }
+
+    fn render_single_facet_row(
+        idx: usize,
+        opt: &FilterFacetOption,
+        active: bool,
+        state: Entity<FilterBarState>,
+        theme: &Theme,
+    ) -> impl IntoElement + use<> {
+        let hover_bg = theme.surface_hover;
+        let val = opt.value.clone();
+        div()
+            .id(("opt-val", idx))
+            .w_full()
+            .h(px(32.))
+            .px(px(10.))
+            .rounded(theme.radius_md)
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(px(16.))
+            .cursor_pointer()
+            .text_size(px(13.))
+            .when(active, |el| el.bg(theme.primary_soft))
+            .when(!active, |el| el.hover(move |s| s.bg(hover_bg)))
+            .on_click(move |_: &ClickEvent, _, cx| {
+                state.update(cx, |s, cx| {
+                    s.commit_single_value(val.clone(), cx);
+                });
+            })
+            .child(
+                div()
+                    .font_weight(if active {
+                        FontWeight::SEMIBOLD
+                    } else {
+                        FontWeight::MEDIUM
+                    })
+                    .text_color(if active {
+                        theme.primary_soft_foreground
+                    } else {
+                        theme.foreground
+                    })
+                    .truncate()
+                    .child(opt.label.clone()),
+            )
+            .when_some(opt.count, |el, count| {
+                el.child(
+                    div()
+                        .flex_shrink_0()
+                        .text_size(px(12.))
+                        .font_features(tabular_numerals())
+                        .text_color(theme.muted_foreground)
+                        .child(format!("{count}")),
+                )
+            })
+    }
+
+    fn render_multi_facet_row(
+        idx: usize,
+        opt: &FilterFacetOption,
+        active: bool,
+        checked: bool,
+        state: Entity<FilterBarState>,
+        theme: &Theme,
+    ) -> impl IntoElement + use<> {
+        let hover_bg = theme.surface_hover;
+        let val = opt.value.clone();
+        let checkbox_box = div()
+            .w(px(16.))
+            .h(px(16.))
+            .flex_shrink_0()
+            .rounded(px(4.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .border_1()
+            .when(checked, |el| {
+                el.bg(theme.primary)
+                    .border_color(theme.primary)
+                    .child(
+                        Icon::new(LucideIcon::Check)
+                            .size(IconSize::Xs)
+                            .color(theme.primary_foreground),
+                    )
+            })
+            .when(!checked, |el| {
+                el.bg(theme.surface).border_color(theme.input_border)
+            });
+
+        div()
+            .id(("opt-mval", idx))
+            .w_full()
+            .h(px(32.))
+            .px(px(10.))
+            .rounded(theme.radius_md)
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(px(16.))
+            .cursor_pointer()
+            .text_size(px(13.))
+            .when(active, |el| el.bg(theme.primary_soft))
+            .when(!active, |el| el.hover(move |s| s.bg(hover_bg)))
+            .on_click(move |_: &ClickEvent, _, cx| {
+                state.update(cx, |s, cx| {
+                    s.toggle_multi_value(val.clone(), cx);
+                });
+            })
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .min_w_0()
+                    .child(checkbox_box)
+                    .child(
+                        div()
+                            .font_weight(if checked || active {
+                                FontWeight::SEMIBOLD
+                            } else {
+                                FontWeight::MEDIUM
+                            })
+                            .text_color(if active {
+                                theme.primary_soft_foreground
+                            } else {
+                                theme.foreground
+                            })
+                            .truncate()
+                            .child(opt.label.clone()),
+                    ),
+            )
+            .when_some(opt.count, |el, count| {
+                el.child(
+                    div()
+                        .flex_shrink_0()
+                        .text_size(px(12.))
+                        .font_features(tabular_numerals())
+                        .text_color(theme.muted_foreground)
+                        .child(format!("{count}")),
+                )
+            })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_popover(
+        &self,
+        draft: &FilterDraft,
+        highlighted: usize,
+        field_options: &[FilterFieldDef],
+        operator_options: &[FilterOperator],
+        facet_options: &Rc<[FilterFacetOption]>,
+        scroll_handle: &UniformListScrollHandle,
+        theme: &std::sync::Arc<Theme>,
+    ) -> AnyElement {
+        let hover_bg = theme.surface_hover;
+        let state_out = self.state.clone();
+
+        let header_hint: Option<&'static str> = match draft {
+            FilterDraft::Field => Some("Filter by field"),
+            FilterDraft::Operator { .. } => Some("Choose operator"),
+            FilterDraft::SingleValue { .. } => None,
+            FilterDraft::MultiValue { .. } => Some("Choose any values, then Enter"),
         };
-        tokens_row = tokens_row.child(inline_input);
+
+        let list_body: AnyElement = match draft {
+            FilterDraft::Field => {
+                let mut list = div().flex().flex_col().gap(px(2.));
+                for (idx, field) in field_options.iter().enumerate() {
+                    let active = idx == highlighted;
+                    let field_clone = field.clone();
+                    let state = self.state.clone();
+                    list = list.child(
+                        div()
+                            .id(("opt-field", idx))
+                            .px(px(10.))
+                            .py(px(7.))
+                            .rounded(theme.radius_md)
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(12.))
+                            .cursor_pointer()
+                            .text_size(px(13.))
+                            .when(active, |el| el.bg(theme.primary_soft))
+                            .when(!active, |el| el.hover(move |s| s.bg(hover_bg)))
+                            .on_click(move |_: &ClickEvent, _, cx| {
+                                state.update(cx, |s, cx| s.choose_field(&field_clone, cx));
+                            })
+                            .child(
+                                div()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(if active {
+                                        theme.primary_soft_foreground
+                                    } else {
+                                        theme.foreground
+                                    })
+                                    .child(field.label.clone()),
+                            )
+                            .when_some(field.hint.clone(), |el, hint| {
+                                el.child(
+                                    div()
+                                        .text_size(px(11.5))
+                                        .text_color(theme.muted_foreground)
+                                        .child(hint),
+                                )
+                            }),
+                    );
+                }
+                list.into_any_element()
+            }
+            FilterDraft::Operator { .. } => {
+                let mut list = div().flex().flex_col().gap(px(2.));
+                for (idx, &op) in operator_options.iter().enumerate() {
+                    let active = idx == highlighted;
+                    let state = self.state.clone();
+                    list = list.child(
+                        div()
+                            .id(("opt-op", idx))
+                            .px(px(10.))
+                            .py(px(7.))
+                            .rounded(theme.radius_md)
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .cursor_pointer()
+                            .text_size(px(13.))
+                            .when(active, |el| el.bg(theme.primary_soft))
+                            .when(!active, |el| el.hover(move |s| s.bg(hover_bg)))
+                            .on_click(move |_: &ClickEvent, _, cx| {
+                                state.update(cx, |s, cx| s.choose_operator(op, cx));
+                            })
+                            .child(
+                                div()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(if active {
+                                        theme.primary_soft_foreground
+                                    } else {
+                                        theme.foreground
+                                    })
+                                    .child(op.label()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.5))
+                                    .text_color(theme.muted_foreground)
+                                    .child(if op.is_multi() { "multi" } else { "single" }),
+                            ),
+                    );
+                }
+                list.into_any_element()
+            }
+            FilterDraft::SingleValue { .. } => {
+                if facet_options.is_empty() {
+                    Self::render_empty_notice(theme).into_any_element()
+                } else if facet_options.len() <= 10 {
+                    let mut list = div().flex().flex_col().gap(px(2.));
+                    for (idx, opt) in facet_options.iter().enumerate() {
+                        list = list.child(Self::render_single_facet_row(
+                            idx,
+                            opt,
+                            idx == highlighted,
+                            self.state.clone(),
+                            theme,
+                        ));
+                    }
+                    list.into_any_element()
+                } else {
+                    let options = facet_options.clone();
+                    let state = self.state.clone();
+                    let theme_cloned = theme.clone();
+                    uniform_list("filter-single-vlist", options.len(), move |range, _, _| {
+                        range
+                            .map(|idx| {
+                                Self::render_single_facet_row(
+                                    idx,
+                                    &options[idx],
+                                    idx == highlighted,
+                                    state.clone(),
+                                    &theme_cloned,
+                                )
+                            })
+                            .collect()
+                    })
+                    .track_scroll(scroll_handle)
+                    .w_full()
+                    .h(px(280.))
+                    .into_any_element()
+                }
+            }
+            FilterDraft::MultiValue { pending, .. } => {
+                if facet_options.is_empty() {
+                    Self::render_empty_notice(theme).into_any_element()
+                } else if facet_options.len() <= 10 {
+                    let mut list = div().flex().flex_col().gap(px(2.));
+                    for (idx, opt) in facet_options.iter().enumerate() {
+                        let checked = pending.iter().any(|v| v == &opt.value);
+                        list = list.child(Self::render_multi_facet_row(
+                            idx,
+                            opt,
+                            idx == highlighted,
+                            checked,
+                            self.state.clone(),
+                            theme,
+                        ));
+                    }
+                    list.into_any_element()
+                } else {
+                    let options = facet_options.clone();
+                    let pending_rc: Rc<[SharedString]> = Rc::from(pending.as_slice());
+                    let state = self.state.clone();
+                    let theme_cloned = theme.clone();
+                    uniform_list("filter-multi-vlist", options.len(), move |range, _, _| {
+                        range
+                            .map(|idx| {
+                                let opt = &options[idx];
+                                let checked = pending_rc.iter().any(|v| v == &opt.value);
+                                Self::render_multi_facet_row(
+                                    idx,
+                                    opt,
+                                    idx == highlighted,
+                                    checked,
+                                    state.clone(),
+                                    &theme_cloned,
+                                )
+                            })
+                            .collect()
+                    })
+                    .track_scroll(scroll_handle)
+                    .w_full()
+                    .h(px(280.))
+                    .into_any_element()
+                }
+            }
+        };
+
+        let multi_footer = match draft {
+            FilterDraft::MultiValue { pending, .. } if !pending.is_empty() => {
+                let state_commit = self.state.clone();
+                Some(
+                    div()
+                        .mt(px(4.))
+                        .pt(px(6.))
+                        .px(px(6.))
+                        .border_t_1()
+                        .border_color(theme.border)
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_size(px(11.5))
+                                .text_color(theme.muted_foreground)
+                                .child(format!("{} selected", pending.len())),
+                        )
+                        .child(
+                            div()
+                                .id("multi-commit")
+                                .px(px(10.))
+                                .py(px(4.))
+                                .rounded(theme.radius_md)
+                                .bg(theme.primary)
+                                .text_size(px(12.))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(theme.primary_foreground)
+                                .cursor_pointer()
+                                .on_click(move |_: &ClickEvent, _, cx| {
+                                    state_commit.update(cx, |s, cx| s.commit_multi_values(cx));
+                                })
+                                .child("Apply (Enter)"),
+                        ),
+                )
+            }
+            _ => None,
+        };
+
+        let popover = div()
+            .id((self.id.clone(), "filter-popover"))
+            .min_w(px(260.))
+            .max_w(px(340.))
+            .mt(px(6.))
+            .p(px(6.))
+            .rounded(theme.radius_xl)
+            .bg(theme.popover)
+            .border_1()
+            .border_color(theme.border)
+            .shadow_lg()
+            .flex()
+            .flex_col()
+            .on_mouse_down_out(move |_, _, cx| {
+                state_out.update(cx, |s, cx| s.close_menu(cx));
+            })
+            .when_some(header_hint, |el, hint| {
+                el.child(
+                    div()
+                        .px(px(10.))
+                        .pt(px(4.))
+                        .pb(px(6.))
+                        .text_size(px(11.5))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(theme.muted_foreground)
+                        .child(hint),
+                )
+            })
+            .child(list_body)
+            .when_some(multi_footer, |el, footer| el.child(footer))
+            .with_animation(
+                (self.id.clone(), "filter-pop-enter"),
+                Animation::new(ANIM_FAST).with_easing(ease_out_quint()),
+                |el, delta| el.opacity(delta).mt(px(2. + (1. - delta) * 6.)),
+            );
+
+        deferred(
+            anchored()
+                .snap_to_window_with_margin(px(8.))
+                .child(popover),
+        )
+        .with_priority(2)
+        .into_any_element()
+    }
+}
+
+impl Styled for FilterBar {
+    fn style(&mut self) -> &mut StyleRefinement {
+        &mut self.style
+    }
+}
+
+impl RenderOnce for FilterBar {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let theme = cx.theme();
+        let snap = self.state.read(cx);
+        let clauses = snap.clauses.clone();
+        let draft = snap.draft.clone();
+        let query = snap.query.clone();
+        let open = snap.open;
+        let highlighted = snap.highlighted;
+        let placeholder = snap.placeholder.clone();
+        let focus_handle = snap.focus_handle.clone();
+        let scroll_handle = snap.scroll_handle.clone();
+        let focused = focus_handle.is_focused(window);
+        let has_content = !clauses.is_empty()
+            || !matches!(draft, FilterDraft::Field)
+            || !query.is_empty();
+
+        // Snapshot popover suggestions up front so we don't re-borrow `state`.
+        let field_options = if open && matches!(draft, FilterDraft::Field) {
+            snap.matching_fields()
+        } else {
+            Vec::new()
+        };
+        let operator_options = if open
+            && let FilterDraft::Operator { field, .. } = &draft
+        {
+            snap.matching_operators(field.as_ref())
+        } else {
+            Vec::new()
+        };
+        let facet_options: Rc<[FilterFacetOption]> = if open {
+            match &draft {
+                FilterDraft::SingleValue { field, .. } | FilterDraft::MultiValue { field, .. } => {
+                    snap.matching_facets(field.as_ref())
+                }
+                _ => Rc::from([]),
+            }
+        } else {
+            Rc::from([])
+        };
+
+        let hover_bg = theme.surface_hover;
+        let border_color = if focused || open {
+            theme.ring
+        } else {
+            theme.input_border
+        };
+
+        let mut tokens_row = div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(px(6.));
+
+        for (idx, clause) in clauses.iter().enumerate() {
+            tokens_row = tokens_row.child(self.render_committed_chip(idx, clause, &theme));
+        }
+        if let Some(draft_chip) = Self::render_draft_chip(&draft, &theme) {
+            tokens_row = tokens_row.child(draft_chip);
+        }
+        tokens_row = tokens_row.child(Self::render_inline_input(
+            query,
+            focused,
+            has_content,
+            placeholder,
+            &theme,
+        ));
 
         let mut bar = div()
-            .id((self.id.clone(), "bar"))
+            .id("bar")
             .track_focus(&focus_handle)
             .on_key_down({
                 let state = self.state.clone();
@@ -1068,7 +1544,7 @@ impl RenderOnce for FilterBar {
                 let state = self.state.clone();
                 el.child(
                     div()
-                        .id((self.id.clone(), "clear-all"))
+                        .id("clear-all")
                         .w(px(22.))
                         .h(px(22.))
                         .flex()
@@ -1089,335 +1565,25 @@ impl RenderOnce for FilterBar {
             });
 
         crate::Refineable::refine(bar.style(), &self.style);
-        let mut root = div().id(self.id.clone()).relative().w_full().flex_shrink_0().child(bar);
 
-        // 4. Anchored Suggestion Popover
-        if open {
-            let state_out = self.state.clone();
-            let mut list = div().flex().flex_col().gap(px(2.));
+        let popover = open.then(|| {
+            self.render_popover(
+                &draft,
+                highlighted,
+                &field_options,
+                &operator_options,
+                &facet_options,
+                &scroll_handle,
+                &theme,
+            )
+        });
 
-            let header_hint: Option<&'static str> = match &draft {
-                FilterDraft::Field => Some("Filter by field"),
-                FilterDraft::Operator { .. } => Some("Choose operator"),
-                FilterDraft::SingleValue { .. } => None,
-                FilterDraft::MultiValue { .. } => Some("Choose any values, then Enter"),
-            };
-
-            if let Some(hint) = header_hint {
-                list = list.child(
-                    div()
-                        .px(px(10.))
-                        .pt(px(4.))
-                        .pb(px(6.))
-                        .text_size(px(11.5))
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(theme.muted_foreground)
-                        .child(hint),
-                );
-            }
-
-            match &draft {
-                FilterDraft::Field => {
-                    for (idx, field) in field_options.iter().enumerate() {
-                        let active = idx == highlighted;
-                        let field_clone = field.clone();
-                        let state = self.state.clone();
-                        list = list.child(
-                            div()
-                                .id((self.id.clone(), format!("opt-field-{idx}")))
-                                .px(px(10.))
-                                .py(px(7.))
-                                .rounded(theme.radius_md)
-                                .flex()
-                                .items_center()
-                                .justify_between()
-                                .gap(px(12.))
-                                .cursor_pointer()
-                                .text_size(px(13.))
-                                .when(active, |el| el.bg(theme.primary_soft))
-                                .when(!active, |el| el.hover(move |s| s.bg(hover_bg)))
-                                .on_click(move |_: &ClickEvent, _, cx| {
-                                    state.update(cx, |s, cx| s.choose_field(&field_clone, cx));
-                                })
-                                .child(
-                                    div()
-                                        .font_weight(FontWeight::MEDIUM)
-                                        .text_color(if active {
-                                            theme.primary_soft_foreground
-                                        } else {
-                                            theme.foreground
-                                        })
-                                        .child(field.label.clone()),
-                                )
-                                .when_some(field.hint.clone(), |el, hint| {
-                                    el.child(
-                                        div()
-                                            .text_size(px(11.5))
-                                            .text_color(theme.muted_foreground)
-                                            .child(hint),
-                                    )
-                                }),
-                        );
-                    }
-                }
-                FilterDraft::Operator { .. } => {
-                    for (idx, &op) in operator_options.iter().enumerate() {
-                        let active = idx == highlighted;
-                        let state = self.state.clone();
-                        list = list.child(
-                            div()
-                                .id((self.id.clone(), format!("opt-op-{idx}")))
-                                .px(px(10.))
-                                .py(px(7.))
-                                .rounded(theme.radius_md)
-                                .flex()
-                                .items_center()
-                                .justify_between()
-                                .cursor_pointer()
-                                .text_size(px(13.))
-                                .when(active, |el| el.bg(theme.primary_soft))
-                                .when(!active, |el| el.hover(move |s| s.bg(hover_bg)))
-                                .on_click(move |_: &ClickEvent, _, cx| {
-                                    state.update(cx, |s, cx| s.choose_operator(op, cx));
-                                })
-                                .child(
-                                    div()
-                                        .font_weight(FontWeight::MEDIUM)
-                                        .text_color(if active {
-                                            theme.primary_soft_foreground
-                                        } else {
-                                            theme.foreground
-                                        })
-                                        .child(op.label()),
-                                )
-                                .child(
-                                    div()
-                                        .text_size(px(11.5))
-                                        .text_color(theme.muted_foreground)
-                                        .child(if op.is_multi() { "multi" } else { "single" }),
-                                ),
-                        );
-                    }
-                }
-                FilterDraft::SingleValue { .. } => {
-                    if facet_options.is_empty() {
-                        list = list.child(
-                            div()
-                                .px(px(10.))
-                                .py(px(8.))
-                                .text_size(px(12.5))
-                                .text_color(theme.muted_foreground)
-                                .child("No matching values"),
-                        );
-                    }
-                    for (idx, opt) in facet_options.iter().enumerate() {
-                        let active = idx == highlighted;
-                        let val = opt.value.clone();
-                        let state = self.state.clone();
-                        list = list.child(
-                            div()
-                                .id((self.id.clone(), format!("opt-val-{idx}")))
-                                .px(px(10.))
-                                .py(px(7.))
-                                .rounded(theme.radius_md)
-                                .flex()
-                                .items_center()
-                                .justify_between()
-                                .gap(px(16.))
-                                .cursor_pointer()
-                                .text_size(px(13.))
-                                .when(active, |el| el.bg(theme.primary_soft))
-                                .when(!active, |el| el.hover(move |s| s.bg(hover_bg)))
-                                .on_click(move |_: &ClickEvent, _, cx| {
-                                    state.update(cx, |s, cx| {
-                                        s.commit_single_value(val.clone(), cx);
-                                    });
-                                })
-                                .child(
-                                    div()
-                                        .font_weight(if active {
-                                            FontWeight::SEMIBOLD
-                                        } else {
-                                            FontWeight::MEDIUM
-                                        })
-                                        .text_color(if active {
-                                            theme.primary_soft_foreground
-                                        } else {
-                                            theme.foreground
-                                        })
-                                        .child(opt.label.clone()),
-                                )
-                                .when_some(opt.count, |el, count| {
-                                    el.child(
-                                        div()
-                                            .text_size(px(12.))
-                                            .font_features(tnum.clone())
-                                            .text_color(theme.muted_foreground)
-                                            .child(format!("{count}")),
-                                    )
-                                }),
-                        );
-                    }
-                }
-                FilterDraft::MultiValue { pending, .. } => {
-                    if facet_options.is_empty() {
-                        list = list.child(
-                            div()
-                                .px(px(10.))
-                                .py(px(8.))
-                                .text_size(px(12.5))
-                                .text_color(theme.muted_foreground)
-                                .child("No matching values"),
-                        );
-                    }
-                    for (idx, opt) in facet_options.iter().enumerate() {
-                        let active = idx == highlighted;
-                        let checked = pending.iter().any(|v| v == &opt.value);
-                        let val = opt.value.clone();
-                        let state = self.state.clone();
-                        let checkbox_box = div()
-                            .w(px(16.))
-                            .h(px(16.))
-                            .rounded(px(4.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .border_1()
-                            .when(checked, |el| {
-                                el.bg(theme.primary)
-                                    .border_color(theme.primary)
-                                    .child(
-                                        Icon::new(LucideIcon::Check)
-                                            .size(IconSize::Xs)
-                                            .color(theme.primary_foreground),
-                                    )
-                            })
-                            .when(!checked, |el| {
-                                el.bg(theme.surface).border_color(theme.input_border)
-                            });
-
-                        list = list.child(
-                            div()
-                                .id((self.id.clone(), format!("opt-mval-{idx}")))
-                                .px(px(10.))
-                                .py(px(7.))
-                                .rounded(theme.radius_md)
-                                .flex()
-                                .items_center()
-                                .justify_between()
-                                .gap(px(16.))
-                                .cursor_pointer()
-                                .text_size(px(13.))
-                                .when(active, |el| el.bg(theme.primary_soft))
-                                .when(!active, |el| el.hover(move |s| s.bg(hover_bg)))
-                                .on_click(move |_: &ClickEvent, _, cx| {
-                                    state.update(cx, |s, cx| {
-                                        s.toggle_multi_value(val.clone(), cx);
-                                    });
-                                })
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap(px(8.))
-                                        .child(checkbox_box)
-                                        .child(
-                                            div()
-                                                .font_weight(if checked || active {
-                                                    FontWeight::SEMIBOLD
-                                                } else {
-                                                    FontWeight::MEDIUM
-                                                })
-                                                .text_color(if active {
-                                                    theme.primary_soft_foreground
-                                                } else {
-                                                    theme.foreground
-                                                })
-                                                .child(opt.label.clone()),
-                                        ),
-                                )
-                                .when_some(opt.count, |el, count| {
-                                    el.child(
-                                        div()
-                                            .text_size(px(12.))
-                                            .font_features(tnum.clone())
-                                            .text_color(theme.muted_foreground)
-                                            .child(format!("{count}")),
-                                    )
-                                }),
-                        );
-                    }
-                    if !pending.is_empty() {
-                        let state_commit = self.state.clone();
-                        list = list.child(
-                            div()
-                                .mt(px(4.))
-                                .pt(px(6.))
-                                .px(px(6.))
-                                .border_t_1()
-                                .border_color(theme.border)
-                                .flex()
-                                .items_center()
-                                .justify_between()
-                                .child(
-                                    div()
-                                        .text_size(px(11.5))
-                                        .text_color(theme.muted_foreground)
-                                        .child(format!("{} selected", pending.len())),
-                                )
-                                .child(
-                                    div()
-                                        .id((self.id.clone(), "multi-commit"))
-                                        .px(px(10.))
-                                        .py(px(4.))
-                                        .rounded(theme.radius_md)
-                                        .bg(theme.primary)
-                                        .text_size(px(12.))
-                                        .font_weight(FontWeight::MEDIUM)
-                                        .text_color(theme.primary_foreground)
-                                        .cursor_pointer()
-                                        .on_click(move |_: &ClickEvent, _, cx| {
-                                            state_commit
-                                                .update(cx, |s, cx| s.commit_multi_values(cx));
-                                        })
-                                        .child("Apply (Enter)"),
-                                ),
-                        );
-                    }
-                }
-            }
-
-            let popover = div()
-                .id((self.id.clone(), "filter-popover"))
-                .min_w(px(260.))
-                .max_w(px(340.))
-                .mt(px(6.))
-                .p(px(6.))
-                .rounded(theme.radius_xl)
-                .bg(theme.popover)
-                .border_1()
-                .border_color(theme.border)
-                .shadow_lg()
-                .on_mouse_down_out(move |_, _, cx| {
-                    state_out.update(cx, |s, cx| s.close_menu(cx));
-                })
-                .child(list)
-                .with_animation(
-                    (self.id.clone(), "filter-pop-enter"),
-                    Animation::new(ANIM_FAST).with_easing(ease_out_quint()),
-                    |el, delta| el.opacity(delta).mt(px(2. + (1. - delta) * 6.)),
-                );
-
-            root = root.child(
-                deferred(
-                    anchored()
-                        .snap_to_window_with_margin(px(8.))
-                        .child(popover),
-                )
-                .with_priority(2),
-            );
-        }
-
-        root
+        div()
+            .id(self.id)
+            .relative()
+            .w_full()
+            .flex_shrink_0()
+            .child(bar)
+            .when_some(popover, |el, p| el.child(p))
     }
 }

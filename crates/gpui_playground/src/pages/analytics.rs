@@ -256,11 +256,11 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
 
     // Line chart series & legend
     let line_series = vec![
-        LineSeries::new("Today", today_points.clone())
+        LineSeries::new("Today", today_points)
             .color(palette.color(0))
             .fill_area(true)
             .endpoint_callout("Today"),
-        LineSeries::new("Previous 5 workdays, average", baseline_points.clone())
+        LineSeries::new("Previous 5 workdays, average", baseline_points)
             .line_style(LineStyle::Dashed)
             .color(palette.baseline),
     ];
@@ -317,15 +317,13 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
     let hourly_table_rows: Vec<TableRow> = [0.0, 6.0, 12.0, 17.5, 24.0]
         .into_iter()
         .map(|hr| {
-            let base = baseline_points
-                .iter()
-                .find(|&&(x, _)| (x - hr).abs() < 0.01)
-                .map(|&(_, y)| value_format.format_detail(y))
+            let td = line_series[0]
+                .sample_at(hr)
+                .map(|y| value_format.format_detail(y))
                 .unwrap_or_else(|| "—".into());
-            let td = today_points
-                .iter()
-                .find(|&&(x, _)| (x - hr).abs() < 0.01)
-                .map(|&(_, y)| value_format.format_detail(y))
+            let base = line_series[1]
+                .sample_at(hr)
+                .map(|y| value_format.format_detail(y))
                 .unwrap_or_else(|| "—".into());
             TableRow::new()
                 .text(format!(
@@ -568,25 +566,11 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
     };
 
     let line_subtitle = if let Some((a, b)) = line_selection {
-        let sample = |pts: &[(f64, f64)], x: f64| -> Option<f64> {
-            let first = pts.first()?;
-            let last = pts.last()?;
-            if x < first.0 - 1e-6 || x > last.0 + 1e-6 {
-                return None;
-            }
-            for w in pts.windows(2) {
-                if x >= w[0].0 - 1e-6 && x <= w[1].0 + 1e-6 {
-                    let span = (w[1].0 - w[0].0).max(1e-9);
-                    let t = ((x - w[0].0) / span).clamp(0.0, 1.0);
-                    return Some(w[0].1 + (w[1].1 - w[0].1) * t);
-                }
-            }
-            Some(last.1)
-        };
-        let delta_str = match (sample(&today_points, a), sample(&today_points, b)) {
-            (Some(y0), Some(y1)) => format!(" · Δ {}", value_format.format_detail((y1 - y0).max(0.0))),
-            _ => String::new(),
-        };
+        let delta_str = line_series
+            .first()
+            .and_then(|today| Some((today.sample_at(a)?, today.sample_at(b)?)))
+            .map(|(y0, y1)| format!(" · Δ {}", value_format.format_detail((y1 - y0).max(0.0))))
+            .unwrap_or_default();
         format!("Window {} – {}{delta_str}", fmt_hour(a), fmt_hour(b))
     } else if drag_zoom_enabled {
         format!("{metric_title} · cumulative · drag to measure window")

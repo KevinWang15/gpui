@@ -725,6 +725,53 @@ fn chart_scales_and_nice_ticks_are_well_behaved() {
     assert_eq!(band.index_at_x(10.0), None);
     assert_eq!(format_compact(36_800_000.0), "36.8M");
     assert_eq!(format_compact(19_700.0), "19.7K");
+
+    // Binary-search LineSeries::sample_at edge cases
+    let empty = LineSeries::new("empty", vec![]);
+    assert_eq!(empty.sample_at(0.0), None);
+    let single = LineSeries::new("single", vec![(5.0, 42.0)]);
+    assert_eq!(single.sample_at(5.0), Some(42.0));
+    assert_eq!(single.sample_at(4.0), None);
+    let curve = LineSeries::new("curve", vec![(0.0, 0.0), (10.0, 20.0), (20.0, 60.0)]);
+    assert!((curve.sample_at(5.0).unwrap() - 10.0).abs() < 1e-6);
+    assert!((curve.sample_at(15.0).unwrap() - 40.0).abs() < 1e-6);
+    assert_eq!(curve.sample_at(-1.0), None);
+    assert_eq!(curve.sample_at(21.0), None);
+
+    // FilterClause case-insensitive ASCII & Unicode Contains matching
+    let ascii_clause = FilterClause {
+        field: "model".into(),
+        field_label: "Model".into(),
+        operator: FilterOperator::Contains,
+        values: smallvec::smallvec!["SoNnEt".into()],
+    };
+    assert!(ascii_clause.matches_value("claude-sonnet-5-5"));
+    assert!(!ascii_clause.matches_value("gpt-6.2"));
+    let unicode_clause = FilterClause {
+        field: "city".into(),
+        field_label: "City".into(),
+        operator: FilterOperator::Contains,
+        values: smallvec::smallvec!["MÜNCHEN".into()],
+    };
+    assert!(unicode_clause.matches_value("region-münchen-1"));
+
+    // TimeRangePreset::from_days_ending_today maps standard spans back to named presets
+    assert_eq!(
+        TimeRangePreset::from_days_ending_today(7),
+        TimeRangePreset::Last7Days
+    );
+    assert_eq!(
+        TimeRangePreset::from_days_ending_today(30),
+        TimeRangePreset::Last30Days
+    );
+    assert_eq!(
+        TimeRangePreset::from_days_ending_today(90),
+        TimeRangePreset::Last90Days
+    );
+    assert_eq!(
+        TimeRangePreset::from_days_ending_today(14),
+        TimeRangePreset::QuickRelative(14, TimeRangeUnit::Days)
+    );
 }
 
 #[test]

@@ -2,13 +2,15 @@
 //! selection, clipboard, undo/redo, word navigation, horizontal scrolling, password masking,
 //! clear button, and prefix/suffix icons & addons.
 
+use std::cell::RefCell;
 use std::ops::Range;
+use std::rc::Rc;
 
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
     App, Bounds, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler,
-    Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId,
+    Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, Font, GlobalElementId, Hsla,
     InspectorElementId, IntoElement, KeyBinding, LayoutId, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, Render, RenderOnce, ShapedLine,
     SharedString, Style, StyleRefinement, Styled, TextAlign, TextRun, UTF16Selection,
@@ -119,6 +121,23 @@ struct UndoEntry {
     selection_reversed: bool,
 }
 
+#[derive(PartialEq)]
+struct ShapedLineCacheKey {
+    text: SharedString,
+    font: Font,
+    font_size: Pixels,
+    color: Hsla,
+    scale_factor_bits: u32,
+}
+
+#[derive(Default)]
+struct InputPaintCache {
+    last_layout: Option<Rc<ShapedLine>>,
+    last_bounds: Option<Bounds<Pixels>>,
+    scroll_offset: Pixels,
+    shaped_key: Option<ShapedLineCacheKey>,
+}
+
 /// Entity state backing a Tailwind-style single-line [`Input`].
 pub struct InputState {
     focus_handle: FocusHandle,
@@ -127,9 +146,7 @@ pub struct InputState {
     selected_range: Range<usize>,
     selection_reversed: bool,
     marked_range: Option<Range<usize>>,
-    last_layout: Option<ShapedLine>,
-    last_bounds: Option<Bounds<Pixels>>,
-    scroll_offset: Pixels,
+    paint_cache: Rc<RefCell<InputPaintCache>>,
     is_selecting: bool,
     masked: bool,
     mask_revealed: bool,
@@ -167,9 +184,7 @@ impl InputState {
             selected_range: 0..0,
             selection_reversed: false,
             marked_range: None,
-            last_layout: None,
-            last_bounds: None,
-            scroll_offset: px(0.),
+            paint_cache: Rc::new(RefCell::new(InputPaintCache::default())),
             is_selecting: false,
             masked: false,
             mask_revealed: false,
@@ -291,7 +306,7 @@ impl InputState {
         self.selected_range = len..len;
         self.selection_reversed = false;
         self.marked_range = None;
-        self.scroll_offset = px(0.);
+        self.paint_cache.borrow_mut().scroll_offset = px(0.);
         cx.emit(InputEvent::Change(SharedString::from(self.content.clone())));
         cx.notify();
     }
@@ -487,7 +502,8 @@ impl InputState {
         if self.content.is_empty() {
             return 0;
         }
-        let (Some(bounds), Some(line)) = (self.last_bounds.as_ref(), self.last_layout.as_ref())
+        let cache = self.paint_cache.borrow();
+        let (Some(bounds), Some(line)) = (cache.last_bounds.as_ref(), cache.last_layout.as_ref())
         else {
             return 0;
         };
@@ -497,7 +513,9 @@ impl InputState {
         if position.y > bounds.bottom() {
             return self.content.len();
         }
-        let display_idx = line.closest_index_for_x(position.x - bounds.left() + self.scroll_offset);
+        let display_idx =
+            line.closest_index_for_x(position.x - bounds.left() + cache.scroll_offset);
+        drop(cache);
         self.display_offset_to_content(display_idx)
     }
 
@@ -930,17 +948,19 @@ impl EntityInputHandler for InputState {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        let last_layout = self.last_layout.as_ref()?;
         let range = self.range_from_utf16(&range_utf16);
         let start = self.content_offset_to_display(range.start);
         let end = self.content_offset_to_display(range.end);
+        let cache = self.paint_cache.borrow();
+        let last_layout = cache.last_layout.as_ref()?;
+        let scroll_offset = cache.scroll_offset;
         Some(Bounds::from_corners(
             point(
-                bounds.left() + last_layout.x_for_index(start) - self.scroll_offset,
+                bounds.left() + last_layout.x_for_index(start) - scroll_offset,
                 bounds.top(),
             ),
             point(
-                bounds.left() + last_layout.x_for_index(end) - self.scroll_offset,
+                bounds.left() + last_layout.x_for_index(end) - scroll_offset,
                 bounds.bottom(),
             ),
         ))
@@ -964,9 +984,12 @@ impl EntityInputHandler for InputState {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
-        let line_point = self.last_bounds?.localize(&point)?;
-        let last_layout = self.last_layout.as_ref()?;
-        let display_idx = last_layout.closest_index_for_x(line_point.x + self.scroll_offset);
+        let display_idx = {
+            let cache = self.paint_cache.borrow();
+            let line_point = cache.last_bounds?.localize(&point)?;
+            let last_layout = cache.last_layout.as_ref()?;
+            last_layout.closest_index_for_x(line_point.x + cache.scroll_offset)
+        };
         let utf8_idx = self.display_offset_to_content(display_idx);
         Some(self.offset_to_utf16(utf8_idx))
     }
@@ -977,10 +1000,12 @@ struct InputTextElement {
 }
 
 struct InputPrepaintState {
-    line: Option<ShapedLine>,
+    line: Option<Rc<ShapedLine>>,
+    shaped_key: Option<ShapedLineCacheKey>,
     cursor: Option<PaintQuad>,
     selection: Option<PaintQuad>,
     scroll_offset: Pixels,
+    paint_cache: Rc<RefCell<InputPaintCache>>,
 }
 
 impl Element for InputTextElement {
@@ -1027,7 +1052,8 @@ impl Element for InputTextElement {
         let marked_display = input.marked_range.as_ref().map(|r| {
             input.content_offset_to_display(r.start)..input.content_offset_to_display(r.end)
         });
-        let mut scroll_offset = input.scroll_offset;
+        let paint_cache = input.paint_cache.clone();
+        let mut scroll_offset = paint_cache.borrow().scroll_offset;
 
         let style = window.text_style();
         let (display_text, text_color) = if is_empty {
@@ -1035,19 +1061,22 @@ impl Element for InputTextElement {
         } else {
             (input.display_string(), style.color)
         };
+        let font = style.font();
+        let font_size = style.font_size.to_pixels(window.rem_size());
+        let scale_factor_bits = window.scale_factor().to_bits();
 
-        let run = TextRun {
-            len: display_text.len(),
-            font: style.font(),
-            color: text_color,
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-        };
-        let runs = if !is_empty
+        let (line, shaped_key) = if !is_empty
             && let Some(marked_range) = marked_display
         {
-            vec![
+            let run = TextRun {
+                len: display_text.len(),
+                font,
+                color: text_color,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            let runs: Vec<TextRun> = vec![
                 TextRun {
                     len: marked_range.start,
                     ..run.clone()
@@ -1068,15 +1097,48 @@ impl Element for InputTextElement {
             ]
             .into_iter()
             .filter(|r| r.len > 0)
-            .collect()
+            .collect();
+            let shaped = window
+                .text_system()
+                .shape_line(display_text, font_size, &runs, None);
+            (Rc::new(shaped), None)
         } else {
-            vec![run]
+            let key = ShapedLineCacheKey {
+                text: display_text.clone(),
+                font: font.clone(),
+                font_size,
+                color: text_color,
+                scale_factor_bits,
+            };
+            let cached = {
+                let cache = paint_cache.borrow();
+                if cache.shaped_key.as_ref() == Some(&key) {
+                    cache.last_layout.clone()
+                } else {
+                    None
+                }
+            };
+            let line = match cached {
+                Some(line) => line,
+                None => {
+                    let run = TextRun {
+                        len: display_text.len(),
+                        font,
+                        color: text_color,
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    };
+                    Rc::new(window.text_system().shape_line(
+                        display_text,
+                        font_size,
+                        std::slice::from_ref(&run),
+                        None,
+                    ))
+                }
+            };
+            (line, Some(key))
         };
-
-        let font_size = style.font_size.to_pixels(window.rem_size());
-        let line = window
-            .text_system()
-            .shape_line(display_text, font_size, &runs, None);
 
         let cursor_x = if is_empty {
             px(0.)
@@ -1123,9 +1185,11 @@ impl Element for InputTextElement {
 
         InputPrepaintState {
             line: Some(line),
+            shaped_key,
             cursor,
             selection,
             scroll_offset,
+            paint_cache,
         }
     }
 
@@ -1139,9 +1203,12 @@ impl Element for InputTextElement {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let focus_handle = self.state.read(cx).focus_handle.clone();
-        let disabled = self.state.read(cx).disabled;
-        if !disabled {
+        let (focus_handle, disabled) = {
+            let input = self.state.read(cx);
+            (input.focus_handle.clone(), input.disabled)
+        };
+        let focused = !disabled && focus_handle.is_focused(window);
+        if focused {
             window.handle_input(
                 &focus_handle,
                 ElementInputHandler::new(bounds, self.state.clone()),
@@ -1164,18 +1231,19 @@ impl Element for InputTextElement {
             cx,
         );
 
-        if focus_handle.is_focused(window)
-            && !disabled
+        if focused
             && let Some(cursor) = prepaint.cursor.take()
         {
             window.paint_quad(cursor);
         }
 
-        self.state.update(cx, |input, _cx| {
-            input.last_layout = Some(line);
-            input.last_bounds = Some(bounds);
-            input.scroll_offset = prepaint.scroll_offset;
-        });
+        // Write layout/bounds back via RefCell cache instead of taking a mutable entity lease
+        // during paint (saves N Entity::update + flush_effects passes per frame on large forms).
+        let mut cache = prepaint.paint_cache.borrow_mut();
+        cache.last_layout = Some(line);
+        cache.last_bounds = Some(bounds);
+        cache.scroll_offset = prepaint.scroll_offset;
+        cache.shaped_key = prepaint.shaped_key.take();
     }
 }
 
@@ -1278,7 +1346,10 @@ impl Render for InputState {
             .text_color(text_color)
             .when(!self.disabled, |el| {
                 el.cursor(CursorStyle::IBeam)
-                    .on_action(cx.listener(Self::backspace))
+                    .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            })
+            .when(!self.disabled && focused, |el| {
+                el.on_action(cx.listener(Self::backspace))
                     .on_action(cx.listener(Self::delete))
                     .on_action(cx.listener(Self::delete_word_left))
                     .on_action(cx.listener(Self::left))
@@ -1300,8 +1371,9 @@ impl Render for InputState {
                     .on_action(cx.listener(Self::undo))
                     .on_action(cx.listener(Self::redo))
                     .on_action(cx.listener(Self::submit))
-                    .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
-                    .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
+            })
+            .when(!self.disabled && (focused || self.is_selecting), |el| {
+                el.on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
                     .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
                     .on_mouse_move(cx.listener(Self::on_mouse_move))
             })
@@ -1449,12 +1521,12 @@ impl Styled for Input {
 
 impl RenderOnce for Input {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
-        self.state.update(cx, |state, cx| {
-            if state.frame_style != self.style {
+        if self.state.read(cx).frame_style != self.style {
+            self.state.update(cx, |state, cx| {
                 state.frame_style = self.style;
                 cx.notify();
-            }
-        });
+            });
+        }
         self.state
     }
 }

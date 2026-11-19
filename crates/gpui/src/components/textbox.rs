@@ -1156,9 +1156,12 @@ impl Element for MultiLineTextElement {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let focus_handle = self.state.read(cx).focus_handle.clone();
-        let disabled = self.state.read(cx).disabled;
-        if !disabled {
+        let (focus_handle, disabled) = {
+            let state = self.state.read(cx);
+            (state.focus_handle.clone(), state.disabled)
+        };
+        let focused = !disabled && focus_handle.is_focused(window);
+        if focused {
             window.handle_input(
                 &focus_handle,
                 ElementInputHandler::new(bounds, self.state.clone()),
@@ -1297,7 +1300,11 @@ impl Render for TextBoxState {
                     .text_color(text_color)
                     .when(!self.disabled, |el| {
                         el.cursor(CursorStyle::IBeam)
-                            .on_action(cx.listener(Self::backspace))
+                            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+                            .on_scroll(cx.listener(Self::on_scroll_wheel))
+                    })
+                    .when(!self.disabled && focused, |el| {
+                        el.on_action(cx.listener(Self::backspace))
                             .on_action(cx.listener(Self::delete))
                             .on_action(cx.listener(Self::delete_word_left))
                             .on_action(cx.listener(Self::left))
@@ -1320,11 +1327,11 @@ impl Render for TextBoxState {
                             .on_action(cx.listener(Self::copy))
                             .on_action(cx.listener(Self::undo))
                             .on_action(cx.listener(Self::redo))
-                            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
-                            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
+                    })
+                    .when(!self.disabled && (focused || self.is_selecting), |el| {
+                        el.on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
                             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
                             .on_mouse_move(cx.listener(Self::on_mouse_move))
-                            .on_scroll(cx.listener(Self::on_scroll_wheel))
                     })
                     .when(self.disabled, |el| el.cursor_not_allowed())
                     .child(MultiLineTextElement { state: cx.entity() }),
@@ -1397,12 +1404,12 @@ impl Styled for TextBox {
 
 impl RenderOnce for TextBox {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
-        self.state.update(cx, |state, cx| {
-            if state.frame_style != self.style {
+        if self.state.read(cx).frame_style != self.style {
+            self.state.update(cx, |state, cx| {
                 state.frame_style = self.style;
                 cx.notify();
-            }
-        });
+            });
+        }
         if let Some(footer) = self.footer {
             div()
                 .flex()

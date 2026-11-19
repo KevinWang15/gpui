@@ -351,6 +351,17 @@ impl TimeRangePreset {
         }
     }
 
+    /// Maps a day span ending on `today` back to a named preset (`Last7Days`, `Last30Days`,
+    /// `Last90Days`) when it matches one, or [`Self::QuickRelative`] otherwise.
+    pub fn from_days_ending_today(span_days: u32) -> Self {
+        match span_days {
+            7 => Self::Last7Days,
+            30 => Self::Last30Days,
+            90 => Self::Last90Days,
+            n => Self::QuickRelative(n.max(1), TimeRangeUnit::Days),
+        }
+    }
+
     /// Resolves this preset into a concrete [`DateRange`] anchored at `today`, clamped to `max_span_days`.
     pub fn resolve(self, today: CalendarDate, max_span_days: u32) -> DateRange {
         let max_span = max_span_days.max(1);
