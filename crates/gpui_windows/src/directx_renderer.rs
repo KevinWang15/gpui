@@ -46,6 +46,8 @@ pub(crate) struct DirectXRenderer {
     font_info: &'static FontInfo,
     /// The frames of a running view transition, once one is captured.
     transition: Option<TransitionFrames>,
+    /// Lazy-allocated half/quarter resolution targets for Dual-Kawase backdrop blur.
+    backdrop_blur: Option<BackdropBlurTargets>,
 
     width: u32,
     height: u32,
@@ -93,6 +95,7 @@ struct DirectXRenderPipelines {
     subpixel_sprites: PipelineState<SubpixelSprite>,
     poly_sprites: PipelineState<PolychromeSprite>,
     view_transition: ViewTransitionPipeline,
+    backdrop_blur: BackdropBlurPipeline,
 }
 
 /// The two frames a view transition blends, as copies of the render target:
@@ -123,6 +126,53 @@ struct ViewTransitionParams {
     progress: f32,
     kind: u32,
     _pad: [u32; 2],
+}
+
+/// Lazy offscreen textures for Dual-Kawase backdrop blur (`scene` snapshot, `half`, `quarter`).
+struct BackdropBlurTargets {
+    width: u32,
+    height: u32,
+    half_width: u32,
+    half_height: u32,
+    quarter_width: u32,
+    quarter_height: u32,
+    scene: ID3D11Texture2D,
+    scene_srv: Option<ID3D11ShaderResourceView>,
+    _half: ID3D11Texture2D,
+    half_rtv: Option<ID3D11RenderTargetView>,
+    half_srv: Option<ID3D11ShaderResourceView>,
+    _quarter: ID3D11Texture2D,
+    quarter_rtv: Option<ID3D11RenderTargetView>,
+    quarter_srv: Option<ID3D11ShaderResourceView>,
+}
+
+/// Shaders, constant buffer, clamp sampler, and blend state for Dual-Kawase backdrop blur.
+struct BackdropBlurPipeline {
+    downsample_vs: ID3D11VertexShader,
+    downsample_ps: ID3D11PixelShader,
+    upsample_vs: ID3D11VertexShader,
+    upsample_ps: ID3D11PixelShader,
+    composite_vs: ID3D11VertexShader,
+    composite_ps: ID3D11PixelShader,
+    params: Option<ID3D11Buffer>,
+    clamp_sampler: Option<ID3D11SamplerState>,
+    blend_state: ID3D11BlendState,
+}
+
+/// `BackdropBlurParams` in shaders.hlsl (80 bytes, 16-byte aligned).
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+struct BackdropBlurParams {
+    viewport_size: [f32; 2],
+    texel_size: [f32; 2],
+    blur_radius: f32,
+    kawase_offset: f32,
+    _pad: [u32; 2],
+    bounds_origin: [f32; 2],
+    bounds_size: [f32; 2],
+    corner_radii: [f32; 4],
+    mask_origin: [f32; 2],
+    mask_size: [f32; 2],
 }
 
 struct DirectXGlobalElements {
@@ -225,6 +275,7 @@ impl DirectXRenderer {
             direct_composition,
             font_info: Self::get_font_info(),
             transition: None,
+            backdrop_blur: None,
             width: 1,
             height: 1,
             skip_draws: false,
@@ -326,6 +377,7 @@ impl DirectXRenderer {
 
             self.resources.take();
             self.transition.take();
+            self.backdrop_blur.take();
             if let Some(devices) = &self.devices {
                 devices.device_context.OMSetRenderTargets(None, None);
                 devices.device_context.ClearState();
@@ -507,75 +559,359 @@ impl DirectXRenderer {
             .and_then(|devices| devices.annotation.clone())
             .filter(|annotation| unsafe { annotation.GetStatus().as_bool() });
 
-        if !scene.quads.is_empty() {
-            let _annotation = annotation.as_ref().map(|annotation| {
-                Annotation::new(
-                    annotation,
-                    HSTRING::from(format!("opaque quads ({})", scene.quads.len())),
-                )
-            });
-            self.draw_opaque_quads(scene.quads.len())?;
-        }
-
         let mut quad_cursor: u32 = 0;
         let mut path_tile_cursor = 0;
-        for batch in scene.batches() {
-            let _annotation = annotation
-                .as_ref()
-                .map(|annotation| Annotation::new(annotation, HSTRING::from(batch.label())));
 
-            // Quad shaders assign each quad its own depth.
-            // In every other batch type, the depth is fixed to the position of the quad cursor.
-            if matches!(&batch, PrimitiveBatch::Quads(_)) {
-                self.set_viewport_depth_range(0.0, 1.0)?;
-            } else {
-                let depth = quad_depth(quad_cursor, depth_scale);
-                self.set_viewport_depth_range(depth, depth)?;
+        if scene.backdrop_blurs.is_empty() {
+            if !scene.quads.is_empty() {
+                let _annotation = annotation.as_ref().map(|annotation| {
+                    Annotation::new(
+                        annotation,
+                        HSTRING::from(format!("opaque quads ({})", scene.quads.len())),
+                    )
+                });
+                self.draw_opaque_quads(scene.quads.len())?;
             }
 
-            match batch {
-                PrimitiveBatch::BackdropBlurs(_) => Ok(()),
-                PrimitiveBatch::Shadows(range) => self.draw_shadows(range.start, range.len()),
-                PrimitiveBatch::Quads(range) => {
-                    quad_cursor += range.len() as u32;
-                    self.draw_quads(range.start, range.len())
-                }
-                PrimitiveBatch::Paths(range) => {
-                    let tiles_start = path_tile_cursor;
-                    path_tile_cursor += scene.paths[range]
-                        .iter()
-                        .map(PaintedPath::tile_count)
-                        .sum::<usize>();
-                    self.draw_paths(tiles_start..path_tile_cursor)
-                }
-                PrimitiveBatch::Underlines(range) => self.draw_underlines(range.start, range.len()),
-                PrimitiveBatch::MonochromeSprites { texture_id, range } => {
-                    self.draw_monochrome_sprites(texture_id, range.start, range.len())
-                }
-                PrimitiveBatch::SubpixelSprites { texture_id, range } => {
-                    self.draw_subpixel_sprites(texture_id, range.start, range.len())
-                }
-                PrimitiveBatch::PolychromeSprites { texture_id, range } => {
-                    self.draw_polychrome_sprites(texture_id, range.start, range.len())
-                }
-                PrimitiveBatch::Surfaces(range) => self.draw_surfaces(&scene.surfaces[range]),
+            for batch in scene.batches() {
+                let _annotation = annotation
+                    .as_ref()
+                    .map(|annotation| Annotation::new(annotation, HSTRING::from(batch.label())));
+                self.draw_scene_batch(
+                    scene,
+                    batch,
+                    depth_scale,
+                    &mut quad_cursor,
+                    &mut path_tile_cursor,
+                )?;
             }
-            .with_context(|| {
-                format!(
-                    "scene too large:\
-                    {} paths, {} shadows, {} quads, {} underlines, {} mono, {} subpixel, {} poly, {} surfaces",
-                    scene.paths.len(),
-                    scene.shadows.len(),
-                    scene.quads.len(),
-                    scene.underlines.len(),
-                    scene.monochrome_sprites.len(),
-                    scene.subpixel_sprites.len(),
-                    scene.polychrome_sprites.len(),
-                    scene.surfaces.len(),
-                )
-            })?;
+        } else {
+            let batches: Vec<PrimitiveBatch> = scene.batches().collect();
+            let mut batch_idx = 0;
+            while batch_idx < batches.len() {
+                let seg_start = batch_idx;
+                let seg_quad_start = quad_cursor as usize;
+                let mut seg_quad_end = seg_quad_start;
+                while batch_idx < batches.len()
+                    && !matches!(batches[batch_idx], PrimitiveBatch::BackdropBlurs(_))
+                {
+                    if let PrimitiveBatch::Quads(ref range) = batches[batch_idx] {
+                        seg_quad_end = range.end;
+                    }
+                    batch_idx += 1;
+                }
+                let seg_end = batch_idx;
+
+                if seg_quad_end > seg_quad_start {
+                    self.set_viewport_depth_range(0.0, 1.0)?;
+                    self.draw_opaque_quads_range(seg_quad_start, seg_quad_end - seg_quad_start)?;
+                }
+
+                for batch in &batches[seg_start..seg_end] {
+                    let _annotation = annotation
+                        .as_ref()
+                        .map(|annotation| Annotation::new(annotation, HSTRING::from(batch.label())));
+                    let owned_batch = match batch {
+                        PrimitiveBatch::BackdropBlurs(r) => PrimitiveBatch::BackdropBlurs(r.clone()),
+                        PrimitiveBatch::Shadows(r) => PrimitiveBatch::Shadows(r.clone()),
+                        PrimitiveBatch::Quads(r) => PrimitiveBatch::Quads(r.clone()),
+                        PrimitiveBatch::Paths(r) => PrimitiveBatch::Paths(r.clone()),
+                        PrimitiveBatch::Underlines(r) => PrimitiveBatch::Underlines(r.clone()),
+                        PrimitiveBatch::MonochromeSprites { texture_id, range } => {
+                            PrimitiveBatch::MonochromeSprites {
+                                texture_id: *texture_id,
+                                range: range.clone(),
+                            }
+                        }
+                        PrimitiveBatch::SubpixelSprites { texture_id, range } => {
+                            PrimitiveBatch::SubpixelSprites {
+                                texture_id: *texture_id,
+                                range: range.clone(),
+                            }
+                        }
+                        PrimitiveBatch::PolychromeSprites { texture_id, range } => {
+                            PrimitiveBatch::PolychromeSprites {
+                                texture_id: *texture_id,
+                                range: range.clone(),
+                            }
+                        }
+                        PrimitiveBatch::Surfaces(r) => PrimitiveBatch::Surfaces(r.clone()),
+                    };
+                    self.draw_scene_batch(
+                        scene,
+                        owned_batch,
+                        depth_scale,
+                        &mut quad_cursor,
+                        &mut path_tile_cursor,
+                    )?;
+                }
+
+                if batch_idx < batches.len()
+                    && let PrimitiveBatch::BackdropBlurs(ref blur_range) = batches[batch_idx]
+                {
+                    let blur_range = blur_range.clone();
+                    batch_idx += 1;
+                    self.apply_backdrop_blurs(&scene.backdrop_blurs[blur_range], !scene.paths.is_empty())?;
+                }
+            }
         }
         self.discard_depth_buffer();
+        Ok(())
+    }
+
+    fn draw_scene_batch(
+        &mut self,
+        scene: &Scene,
+        batch: PrimitiveBatch,
+        depth_scale: f32,
+        quad_cursor: &mut u32,
+        path_tile_cursor: &mut usize,
+    ) -> Result<()> {
+        // Quad shaders assign each quad its own depth.
+        // In every other batch type, the depth is fixed to the position of the quad cursor.
+        if matches!(&batch, PrimitiveBatch::Quads(_)) {
+            self.set_viewport_depth_range(0.0, 1.0)?;
+        } else {
+            let depth = quad_depth(*quad_cursor, depth_scale);
+            self.set_viewport_depth_range(depth, depth)?;
+        }
+
+        match batch {
+            PrimitiveBatch::BackdropBlurs(_) => Ok(()),
+            PrimitiveBatch::Shadows(range) => self.draw_shadows(range.start, range.len()),
+            PrimitiveBatch::Quads(range) => {
+                *quad_cursor += range.len() as u32;
+                self.draw_quads(range.start, range.len())
+            }
+            PrimitiveBatch::Paths(range) => {
+                let tiles_start = *path_tile_cursor;
+                *path_tile_cursor += scene.paths[range]
+                    .iter()
+                    .map(PaintedPath::tile_count)
+                    .sum::<usize>();
+                self.draw_paths(tiles_start..*path_tile_cursor)
+            }
+            PrimitiveBatch::Underlines(range) => self.draw_underlines(range.start, range.len()),
+            PrimitiveBatch::MonochromeSprites { texture_id, range } => {
+                self.draw_monochrome_sprites(texture_id, range.start, range.len())
+            }
+            PrimitiveBatch::SubpixelSprites { texture_id, range } => {
+                self.draw_subpixel_sprites(texture_id, range.start, range.len())
+            }
+            PrimitiveBatch::PolychromeSprites { texture_id, range } => {
+                self.draw_polychrome_sprites(texture_id, range.start, range.len())
+            }
+            PrimitiveBatch::Surfaces(range) => self.draw_surfaces(&scene.surfaces[range]),
+        }
+        .with_context(|| {
+            format!(
+                "scene too large:\
+                {} paths, {} shadows, {} quads, {} underlines, {} mono, {} subpixel, {} poly, {} surfaces",
+                scene.paths.len(),
+                scene.shadows.len(),
+                scene.quads.len(),
+                scene.underlines.len(),
+                scene.monochrome_sprites.len(),
+                scene.subpixel_sprites.len(),
+                scene.polychrome_sprites.len(),
+                scene.surfaces.len(),
+            )
+        })
+    }
+
+    fn apply_backdrop_blurs(&mut self, blurs: &[BackdropBlur], restore_paths: bool) -> Result<()> {
+        if blurs.is_empty() {
+            return Ok(());
+        }
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let resources = self.resources.as_ref().context("resources missing")?;
+        let render_target = resources
+            .render_target
+            .as_ref()
+            .context("render target missing")?;
+
+        if !self
+            .backdrop_blur
+            .as_ref()
+            .is_some_and(|t| t.width == self.width && t.height == self.height)
+        {
+            self.backdrop_blur = Some(BackdropBlurTargets::new(&devices.device, render_target)?);
+        }
+
+        let targets = self
+            .backdrop_blur
+            .as_ref()
+            .context("backdrop blur targets missing")?;
+        let pipeline = &self.pipelines.backdrop_blur;
+        let params_buf = pipeline
+            .params
+            .as_ref()
+            .context("backdrop blur params missing")?;
+        let context = &devices.device_context;
+
+        let max_radius = blurs
+            .iter()
+            .map(|b| b.blur_radius.0)
+            .fold(0.0f32, f32::max);
+        let kawase_offset = (max_radius / 5.0).clamp(0.75, 4.0);
+        let vw = targets.width as f32;
+        let vh = targets.height as f32;
+        let hw = targets.half_width as f32;
+        let hh = targets.half_height as f32;
+        let qw = targets.quarter_width as f32;
+        let qh = targets.quarter_height as f32;
+
+        let half_viewport = D3D11_VIEWPORT {
+            TopLeftX: 0.0,
+            TopLeftY: 0.0,
+            Width: hw,
+            Height: hh,
+            MinDepth: 0.0,
+            MaxDepth: 1.0,
+        };
+        let quarter_viewport = D3D11_VIEWPORT {
+            TopLeftX: 0.0,
+            TopLeftY: 0.0,
+            Width: qw,
+            Height: qh,
+            MinDepth: 0.0,
+            MaxDepth: 1.0,
+        };
+
+        unsafe {
+            // Snapshot everything drawn into the render target before this blur batch.
+            context.CopyResource(&targets.scene, render_target);
+
+            // Common state for Kawase downsample/upsample passes (no blend, no depth).
+            context.OMSetBlendState(None, None, 0xFFFFFFFF);
+            context.OMSetDepthStencilState(None, 0);
+            context.IASetInputLayout(None);
+            context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            context.VSSetConstantBuffers(2, Some(slice::from_ref(&pipeline.params)));
+            context.PSSetConstantBuffers(2, Some(slice::from_ref(&pipeline.params)));
+            context.PSSetSamplers(0, Some(slice::from_ref(&pipeline.clamp_sampler)));
+            context.PSSetShaderResources(0, Some(&[None]));
+
+            // Pass 1: Downsample full -> half
+            update_buffer(
+                context,
+                params_buf,
+                &[BackdropBlurParams {
+                    texel_size: [1.0 / vw, 1.0 / vh],
+                    kawase_offset,
+                    ..Default::default()
+                }],
+            )?;
+            context.OMSetRenderTargets(Some(slice::from_ref(&targets.half_rtv)), None);
+            context.RSSetViewports(Some(slice::from_ref(&half_viewport)));
+            context.VSSetShader(&pipeline.downsample_vs, None);
+            context.PSSetShader(&pipeline.downsample_ps, None);
+            context.PSSetShaderResources(0, Some(slice::from_ref(&targets.scene_srv)));
+            context.Draw(3, 0);
+            context.PSSetShaderResources(0, Some(&[None]));
+
+            // Pass 2: Downsample half -> quarter
+            update_buffer(
+                context,
+                params_buf,
+                &[BackdropBlurParams {
+                    texel_size: [1.0 / hw, 1.0 / hh],
+                    kawase_offset,
+                    ..Default::default()
+                }],
+            )?;
+            context.OMSetRenderTargets(Some(slice::from_ref(&targets.quarter_rtv)), None);
+            context.RSSetViewports(Some(slice::from_ref(&quarter_viewport)));
+            context.PSSetShaderResources(0, Some(slice::from_ref(&targets.half_srv)));
+            context.Draw(3, 0);
+            context.PSSetShaderResources(0, Some(&[None]));
+
+            // Pass 3: Upsample quarter -> half
+            update_buffer(
+                context,
+                params_buf,
+                &[BackdropBlurParams {
+                    texel_size: [1.0 / qw, 1.0 / qh],
+                    kawase_offset,
+                    ..Default::default()
+                }],
+            )?;
+            context.OMSetRenderTargets(Some(slice::from_ref(&targets.half_rtv)), None);
+            context.RSSetViewports(Some(slice::from_ref(&half_viewport)));
+            context.VSSetShader(&pipeline.upsample_vs, None);
+            context.PSSetShader(&pipeline.upsample_ps, None);
+            context.PSSetShaderResources(0, Some(slice::from_ref(&targets.quarter_srv)));
+            context.Draw(3, 0);
+            context.PSSetShaderResources(0, Some(&[None]));
+
+            // Pass 4: Composite each rounded BackdropBlur region back onto render_target.
+            context.OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
+            context.RSSetViewports(Some(slice::from_ref(&resources.viewport)));
+            context.OMSetBlendState(&pipeline.blend_state, None, 0xFFFFFFFF);
+            context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+            context.VSSetShader(&pipeline.composite_vs, None);
+            context.PSSetShader(&pipeline.composite_ps, None);
+            context.PSSetShaderResources(0, Some(slice::from_ref(&targets.half_srv)));
+
+            for blur in blurs {
+                update_buffer(
+                    context,
+                    params_buf,
+                    &[BackdropBlurParams {
+                        viewport_size: [vw, vh],
+                        texel_size: [1.0 / hw, 1.0 / hh],
+                        blur_radius: blur.blur_radius.0,
+                        kawase_offset,
+                        _pad: [0; 2],
+                        bounds_origin: [blur.bounds.origin.x.0, blur.bounds.origin.y.0],
+                        bounds_size: [blur.bounds.size.width.0, blur.bounds.size.height.0],
+                        corner_radii: [
+                            blur.corner_radii.top_left.0,
+                            blur.corner_radii.top_right.0,
+                            blur.corner_radii.bottom_right.0,
+                            blur.corner_radii.bottom_left.0,
+                        ],
+                        mask_origin: [
+                            blur.content_mask.bounds.origin.x.0,
+                            blur.content_mask.bounds.origin.y.0,
+                        ],
+                        mask_size: [
+                            blur.content_mask.bounds.size.width.0,
+                            blur.content_mask.bounds.size.height.0,
+                        ],
+                    }],
+                )?;
+                context.Draw(4, 0);
+            }
+
+            // Unbind blur SRV and restore main scene render targets, depth buffer, and constant buffers.
+            context.PSSetShaderResources(0, Some(&[None]));
+            context.OMSetRenderTargets(
+                Some(slice::from_ref(&resources.render_target_view)),
+                resources.depth_stencil_view.as_ref(),
+            );
+            context.RSSetViewports(Some(slice::from_ref(&resources.viewport)));
+            context.VSSetConstantBuffers(
+                0,
+                Some(slice::from_ref(&self.globals.global_params_buffer)),
+            );
+            context.VSSetConstantBuffers(
+                1,
+                Some(slice::from_ref(&self.globals.batch_params_buffer)),
+            );
+            context.PSSetConstantBuffers(
+                0,
+                Some(slice::from_ref(&self.globals.global_params_buffer)),
+            );
+            if restore_paths {
+                let buffers = [
+                    self.pipelines.path_curves.view.clone(),
+                    self.pipelines.path_paints.view.clone(),
+                ];
+                context.VSSetShaderResources(2, Some(&buffers));
+                context.PSSetShaderResources(2, Some(&buffers));
+            }
+        }
         Ok(())
     }
 
@@ -675,14 +1011,19 @@ impl DirectXRenderer {
     }
 
     fn draw_opaque_quads(&self, quad_count: usize) -> Result<()> {
+        self.draw_opaque_quads_range(0, quad_count)
+    }
+
+    fn draw_opaque_quads_range(&self, start: usize, quad_count: usize) -> Result<()> {
         let devices = self.devices.as_ref().context("devices missing")?;
-        self.pipelines.opaque_quad_pipeline.draw(
+        self.pipelines.opaque_quad_pipeline.draw_range(
             &devices.device_context,
             &self.pipelines.quad_pipeline,
             self.globals
                 .batch_params_buffer
                 .as_ref()
                 .context("batch params buffer missing")?,
+            start as u32,
             quad_count as u32,
         )
     }
@@ -696,6 +1037,7 @@ impl DirectXRenderer {
         self.width = width;
         self.height = height;
         self.transition = None;
+        self.backdrop_blur = None;
 
         // Clear the render target before resizing
         let devices = self.devices.as_ref().context("devices missing")?;
@@ -1135,6 +1477,7 @@ impl DirectXRenderPipelines {
         )?;
         let opaque_quad_pipeline = OpaqueQuadPipeline::new(device)?;
         let view_transition = ViewTransitionPipeline::new(device)?;
+        let backdrop_blur = BackdropBlurPipeline::new(device)?;
 
         Ok(Self {
             shadow_pipeline,
@@ -1148,6 +1491,129 @@ impl DirectXRenderPipelines {
             subpixel_sprites,
             poly_sprites,
             view_transition,
+            backdrop_blur,
+        })
+    }
+}
+
+impl BackdropBlurPipeline {
+    fn new(device: &ID3D11Device) -> Result<Self> {
+        let load_pair = |module: ShaderModule| -> Result<(ID3D11VertexShader, ID3D11PixelShader)> {
+            let vs = {
+                let raw = RawShaderBytes::new(module, ShaderTarget::Vertex)?;
+                create_vertex_shader(device, raw.as_bytes())?
+            };
+            let ps = {
+                let raw = RawShaderBytes::new(module, ShaderTarget::Fragment)?;
+                create_fragment_shader(device, raw.as_bytes())?
+            };
+            Ok((vs, ps))
+        };
+        let (downsample_vs, downsample_ps) = load_pair(ShaderModule::KawaseDownsample)?;
+        let (upsample_vs, upsample_ps) = load_pair(ShaderModule::KawaseUpsample)?;
+        let (composite_vs, composite_ps) = load_pair(ShaderModule::BackdropBlur)?;
+        let clamp_sampler = unsafe {
+            let desc = D3D11_SAMPLER_DESC {
+                Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+                AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressV: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressW: D3D11_TEXTURE_ADDRESS_CLAMP,
+                MipLODBias: 0.0,
+                MaxAnisotropy: 1,
+                ComparisonFunc: D3D11_COMPARISON_ALWAYS,
+                BorderColor: [0.0; 4],
+                MinLOD: 0.0,
+                MaxLOD: D3D11_FLOAT32_MAX,
+            };
+            let mut output = None;
+            device.CreateSamplerState(&desc, Some(&mut output))?;
+            output
+        };
+        Ok(Self {
+            downsample_vs,
+            downsample_ps,
+            upsample_vs,
+            upsample_ps,
+            composite_vs,
+            composite_ps,
+            params: create_constant_buffer::<BackdropBlurParams>(device)?,
+            clamp_sampler,
+            blend_state: create_blend_state(device)?,
+        })
+    }
+}
+
+impl BackdropBlurTargets {
+    fn new(device: &ID3D11Device, render_target: &ID3D11Texture2D) -> Result<Self> {
+        let mut base_desc = D3D11_TEXTURE2D_DESC::default();
+        unsafe { render_target.GetDesc(&mut base_desc) };
+        let width = base_desc.Width.max(1);
+        let height = base_desc.Height.max(1);
+        let half_width = (width / 2).max(1);
+        let half_height = (height / 2).max(1);
+        let quarter_width = (width / 4).max(1);
+        let quarter_height = (height / 4).max(1);
+
+        let scene_desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+            ..base_desc
+        };
+        let mut scene = None;
+        unsafe { device.CreateTexture2D(&scene_desc, None, Some(&mut scene))? };
+        let scene = scene.context("creating backdrop blur scene snapshot texture")?;
+        let mut scene_srv = None;
+        unsafe { device.CreateShaderResourceView(&scene, None, Some(&mut scene_srv))? };
+
+        let make_rt = |w: u32, h: u32| -> Result<(
+            ID3D11Texture2D,
+            Option<ID3D11RenderTargetView>,
+            Option<ID3D11ShaderResourceView>,
+        )> {
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: w,
+                Height: h,
+                BindFlags: (D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE).0 as u32,
+                ..scene_desc
+            };
+            let mut tex = None;
+            unsafe { device.CreateTexture2D(&desc, None, Some(&mut tex))? };
+            let tex = tex.context("creating backdrop blur mip texture")?;
+            let mut rtv = None;
+            unsafe { device.CreateRenderTargetView(&tex, None, Some(&mut rtv))? };
+            let mut srv = None;
+            unsafe { device.CreateShaderResourceView(&tex, None, Some(&mut srv))? };
+            Ok((tex, rtv, srv))
+        };
+
+        let (half, half_rtv, half_srv) = make_rt(half_width, half_height)?;
+        let (quarter, quarter_rtv, quarter_srv) = make_rt(quarter_width, quarter_height)?;
+
+        Ok(Self {
+            width,
+            height,
+            half_width,
+            half_height,
+            quarter_width,
+            quarter_height,
+            scene,
+            scene_srv,
+            _half: half,
+            half_rtv,
+            half_srv,
+            _quarter: quarter,
+            quarter_rtv,
+            quarter_srv,
         })
     }
 }
@@ -1474,22 +1940,23 @@ impl OpaqueQuadPipeline {
         })
     }
 
-    /// Draws every quad, last first. The vertex shader drops all but opaque
-    /// rectangles.
-    fn draw(
+    /// Draws a contiguous range of quads (`start..start + quad_count`), last first.
+    /// The vertex shader drops all but opaque rectangles.
+    fn draw_range(
         &self,
         device_context: &ID3D11DeviceContext,
         quad_pipeline: &PipelineState<Quad>,
         batch_params_buffer: &ID3D11Buffer,
+        start: u32,
         quad_count: u32,
     ) -> Result<()> {
         if quad_count == 0 {
             return Ok(());
         }
-        quad_pipeline.ensure_range(0, quad_count)?;
+        quad_pipeline.ensure_range(start, quad_count)?;
         // Drawing front to back lets the depth test skip pixels that a later
         // quad already covers.
-        update_batch_start(device_context, batch_params_buffer, quad_count - 1)?;
+        update_batch_start(device_context, batch_params_buffer, start + quad_count - 1)?;
         set_pipeline_state(
             device_context,
             slice::from_ref(&quad_pipeline.instances.view),
@@ -1921,6 +2388,9 @@ pub(crate) mod shader_resources {
         SubpixelSprite,
         PolychromeSprite,
         ViewTransition,
+        KawaseDownsample,
+        KawaseUpsample,
+        BackdropBlur,
     }
 
     #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -1997,6 +2467,18 @@ pub(crate) mod shader_resources {
                 ShaderModule::ViewTransition => match target {
                     ShaderTarget::Vertex => VIEW_TRANSITION_VERTEX_BYTES,
                     ShaderTarget::Fragment => VIEW_TRANSITION_FRAGMENT_BYTES,
+                },
+                ShaderModule::KawaseDownsample => match target {
+                    ShaderTarget::Vertex => KAWASE_DOWNSAMPLE_VERTEX_BYTES,
+                    ShaderTarget::Fragment => KAWASE_DOWNSAMPLE_FRAGMENT_BYTES,
+                },
+                ShaderModule::KawaseUpsample => match target {
+                    ShaderTarget::Vertex => KAWASE_UPSAMPLE_VERTEX_BYTES,
+                    ShaderTarget::Fragment => KAWASE_UPSAMPLE_FRAGMENT_BYTES,
+                },
+                ShaderModule::BackdropBlur => match target {
+                    ShaderTarget::Vertex => BACKDROP_BLUR_VERTEX_BYTES,
+                    ShaderTarget::Fragment => BACKDROP_BLUR_FRAGMENT_BYTES,
                 },
             };
             Self { inner: bytes }
@@ -2079,6 +2561,9 @@ pub(crate) mod shader_resources {
                 ShaderModule::SubpixelSprite => "subpixel_sprite",
                 ShaderModule::PolychromeSprite => "polychrome_sprite",
                 ShaderModule::ViewTransition => "view_transition",
+                ShaderModule::KawaseDownsample => "kawase_downsample",
+                ShaderModule::KawaseUpsample => "kawase_upsample",
+                ShaderModule::BackdropBlur => "backdrop_blur",
             }
         }
     }

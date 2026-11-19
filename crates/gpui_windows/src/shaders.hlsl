@@ -1414,3 +1414,116 @@ float4 view_transition_fragment(float4 position: SV_Position): SV_Target {
     }
     return lerp(new_color, old_color, show_old);
 }
+
+/*
+**
+**              Backdrop blur (Dual-Kawase)
+**
+*/
+
+cbuffer BackdropBlurParams: register(b2) {
+    float2 blur_viewport_size;
+    float2 blur_texel_size;
+    float blur_radius;
+    float blur_kawase_offset;
+    uint2 blur_pad;
+    float2 blur_bounds_origin;
+    float2 blur_bounds_size;
+    float4 blur_corner_radii; // (top_left, top_right, bottom_right, bottom_left)
+    float2 blur_mask_origin;
+    float2 blur_mask_size;
+};
+
+Texture2D<float4> t_blur_src: register(t0);
+SamplerState s_blur: register(s0);
+
+struct BlurFullscreenInput {
+    float4 position : SV_Position;
+    float2 uv : TEXCOORD0;
+};
+
+BlurFullscreenInput blur_fullscreen_vertex_impl(uint vertex_id) {
+    float2 p = float2((vertex_id << 1) & 2, vertex_id & 2);
+    BlurFullscreenInput output;
+    output.position = float4(p.x * 2.0 - 1.0, 1.0 - p.y * 2.0, 0.0, 1.0);
+    output.uv = p;
+    return output;
+}
+
+BlurFullscreenInput kawase_downsample_vertex(uint vertex_id: SV_VertexID) {
+    return blur_fullscreen_vertex_impl(vertex_id);
+}
+
+// 5-tap Dual-Kawase downsample (2x resolution reduction per pass).
+float4 kawase_downsample_fragment(BlurFullscreenInput input): SV_Target {
+    float2 hp = blur_texel_size * blur_kawase_offset;
+    float4 sum = t_blur_src.Sample(s_blur, input.uv) * 4.0;
+    sum += t_blur_src.Sample(s_blur, input.uv + float2(-hp.x, -hp.y));
+    sum += t_blur_src.Sample(s_blur, input.uv + float2(hp.x, -hp.y));
+    sum += t_blur_src.Sample(s_blur, input.uv + float2(-hp.x, hp.y));
+    sum += t_blur_src.Sample(s_blur, input.uv + float2(hp.x, hp.y));
+    return sum / 8.0;
+}
+
+BlurFullscreenInput kawase_upsample_vertex(uint vertex_id: SV_VertexID) {
+    return blur_fullscreen_vertex_impl(vertex_id);
+}
+
+// 8-tap Dual-Kawase tent-filter upsample.
+float4 kawase_upsample_fragment(BlurFullscreenInput input): SV_Target {
+    float2 hp = blur_texel_size * blur_kawase_offset;
+    float4 sum = t_blur_src.Sample(s_blur, input.uv + float2(-hp.x * 2.0, 0.0));
+    sum += t_blur_src.Sample(s_blur, input.uv + float2(-hp.x, hp.y)) * 2.0;
+    sum += t_blur_src.Sample(s_blur, input.uv + float2(0.0, hp.y * 2.0));
+    sum += t_blur_src.Sample(s_blur, input.uv + float2(hp.x, hp.y)) * 2.0;
+    sum += t_blur_src.Sample(s_blur, input.uv + float2(hp.x * 2.0, 0.0));
+    sum += t_blur_src.Sample(s_blur, input.uv + float2(hp.x, -hp.y)) * 2.0;
+    sum += t_blur_src.Sample(s_blur, input.uv + float2(0.0, -hp.y * 2.0));
+    sum += t_blur_src.Sample(s_blur, input.uv + float2(-hp.x, -hp.y)) * 2.0;
+    return sum / 12.0;
+}
+
+BlurFullscreenInput backdrop_blur_vertex(uint vertex_id: SV_VertexID) {
+    float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+    float2 clip_min = max(blur_bounds_origin, blur_mask_origin);
+    float2 clip_max = min(blur_bounds_origin + blur_bounds_size, blur_mask_origin + blur_mask_size);
+    float2 clipped_size = max(clip_max - clip_min, float2(0.0, 0.0));
+    float2 px_pos = clip_min + unit_vertex * clipped_size;
+    float2 ndc = float2(
+        (px_pos.x / blur_viewport_size.x) * 2.0 - 1.0,
+        1.0 - (px_pos.y / blur_viewport_size.y) * 2.0
+    );
+    BlurFullscreenInput output;
+    output.position = float4(ndc, 0.0, 1.0);
+    output.uv = px_pos / blur_viewport_size;
+    return output;
+}
+
+float pick_blur_corner_radius(float2 pos, float4 radii) {
+    if (pos.x < 0.0) {
+        return pos.y < 0.0 ? radii.x : radii.w;
+    } else {
+        return pos.y < 0.0 ? radii.y : radii.z;
+    }
+}
+
+float4 backdrop_blur_fragment(BlurFullscreenInput input): SV_Target {
+    float2 frag_px = input.position.xy;
+    float2 half_size = blur_bounds_size * 0.5;
+    float2 center = blur_bounds_origin + half_size;
+    float2 rel = frag_px - center;
+    float radius = min(pick_blur_corner_radius(rel, blur_corner_radii), min(half_size.x, half_size.y));
+
+    float2 q = abs(rel) - (half_size - float2(radius, radius));
+    float dist = length(max(q, float2(0.0, 0.0))) + min(max(q.x, q.y), 0.0) - radius;
+
+    float edge_alpha = saturate(0.5 - dist);
+    float strength = saturate(blur_radius / 3.0);
+    float alpha = edge_alpha * strength;
+    if (alpha <= 0.001) {
+        discard;
+    }
+
+    float4 blurred = t_blur_src.Sample(s_blur, saturate(input.uv));
+    return float4(blurred.rgb, alpha);
+}
