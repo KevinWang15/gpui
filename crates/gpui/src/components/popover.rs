@@ -321,130 +321,147 @@ impl DropdownMenu {
     }
 }
 
+pub(crate) fn render_menu_entries(
+    id: ElementId,
+    entries: Vec<MenuEntry>,
+    min_width: Pixels,
+    on_close: Option<Rc<dyn Fn(&(), &mut Window, &mut App) + 'static>>,
+    theme: &super::theme::Theme,
+) -> crate::Div {
+    let mut menu_list = div()
+        .flex()
+        .flex_col()
+        .gap(px(2.))
+        .min_w(min_width);
+
+    for (index, entry) in entries.into_iter().enumerate() {
+        match entry {
+            MenuEntry::Separator => {
+                menu_list = menu_list.child(
+                    div()
+                        .w_full()
+                        .h(px(1.))
+                        .my(px(4.))
+                        .bg(theme.border),
+                );
+            }
+            MenuEntry::Label(label) => {
+                menu_list = menu_list.child(
+                    div()
+                        .px(px(10.))
+                        .pt(px(6.))
+                        .pb(px(3.))
+                        .text_size(px(11.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme.muted_foreground)
+                        .child(label),
+                );
+            }
+            MenuEntry::Item {
+                label,
+                icon,
+                shortcut,
+                checked,
+                destructive,
+                disabled,
+                on_select,
+            } => {
+                let fg = if destructive {
+                    theme.destructive
+                } else {
+                    theme.popover_foreground
+                };
+                let icon_fg = if destructive {
+                    theme.destructive
+                } else {
+                    theme.muted_foreground
+                };
+                let hover_bg = if destructive {
+                    theme.destructive_soft
+                } else {
+                    theme.surface_hover
+                };
+                let on_close = on_close.clone();
+
+                menu_list = menu_list.child(
+                    div()
+                        .id((id.clone(), format!("item-{index}")))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(12.))
+                        .w_full()
+                        .px(px(10.))
+                        .py(px(7.))
+                        .rounded(theme.radius_sm)
+                        .text_size(px(13.5))
+                        .text_color(fg)
+                        .when(!disabled, |el| {
+                            el.cursor_pointer()
+                                .hover(move |s| s.bg(hover_bg))
+                                .on_click(move |ev, window, cx| {
+                                    if let Some(ref handler) = on_select {
+                                        handler(ev, window, cx);
+                                    }
+                                    if let Some(ref close) = on_close {
+                                        close(&(), window, cx);
+                                    }
+                                })
+                        })
+                        .when(disabled, |el| el.opacity(0.45).cursor_not_allowed())
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(8.))
+                                .when_some(checked, |el, is_checked| {
+                                    el.child(
+                                        div()
+                                            .w(px(16.))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .when(is_checked, |el| {
+                                                el.child(
+                                                    Icon::new(LucideIcon::Check)
+                                                        .size(IconSize::Sm)
+                                                        .color(theme.primary),
+                                                )
+                                            }),
+                                    )
+                                })
+                                .when_some(icon, |el, ic| {
+                                    el.child(Icon::new(ic).size(IconSize::Sm).color(icon_fg))
+                                })
+                                .child(label),
+                        )
+                        .when_some(shortcut, |el, sc| {
+                            el.child(
+                                div()
+                                    .text_size(px(11.5))
+                                    .text_color(theme.muted_foreground)
+                                    .child(sc),
+                            )
+                        }),
+                );
+            }
+        }
+    }
+    menu_list
+}
+
 impl RenderOnce for DropdownMenu {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
-        let mut menu_list = div()
-            .flex()
-            .flex_col()
-            .gap(px(2.))
-            .min_w(self.min_width);
-
-        for (index, entry) in self.entries.into_iter().enumerate() {
-            match entry {
-                MenuEntry::Separator => {
-                    menu_list = menu_list.child(
-                        div()
-                            .w_full()
-                            .h(px(1.))
-                            .my(px(4.))
-                            .bg(theme.border),
-                    );
-                }
-                MenuEntry::Label(label) => {
-                    menu_list = menu_list.child(
-                        div()
-                            .px(px(10.))
-                            .pt(px(6.))
-                            .pb(px(3.))
-                            .text_size(px(11.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.muted_foreground)
-                            .child(label),
-                    );
-                }
-                MenuEntry::Item {
-                    label,
-                    icon,
-                    shortcut,
-                    checked,
-                    destructive,
-                    disabled,
-                    on_select,
-                } => {
-                    let fg = if destructive {
-                        theme.destructive
-                    } else {
-                        theme.popover_foreground
-                    };
-                    let icon_fg = if destructive {
-                        theme.destructive
-                    } else {
-                        theme.muted_foreground
-                    };
-                    let hover_bg = if destructive {
-                        theme.destructive_soft
-                    } else {
-                        theme.surface_hover
-                    };
-                    let on_close = self.on_close.clone();
-
-                    menu_list = menu_list.child(
-                        div()
-                            .id((self.id.clone(), format!("item-{index}")))
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .justify_between()
-                            .gap(px(12.))
-                            .w_full()
-                            .px(px(10.))
-                            .py(px(7.))
-                            .rounded(theme.radius_sm)
-                            .text_size(px(13.5))
-                            .text_color(fg)
-                            .when(!disabled, |el| {
-                                el.cursor_pointer()
-                                    .hover(move |s| s.bg(hover_bg))
-                                    .on_click(move |ev, window, cx| {
-                                        if let Some(ref handler) = on_select {
-                                            handler(ev, window, cx);
-                                        }
-                                        if let Some(ref close) = on_close {
-                                            close(&(), window, cx);
-                                        }
-                                    })
-                            })
-                            .when(disabled, |el| el.opacity(0.45).cursor_not_allowed())
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .gap(px(8.))
-                                    .when_some(checked, |el, is_checked| {
-                                        el.child(
-                                            div()
-                                                .w(px(16.))
-                                                .flex()
-                                                .items_center()
-                                                .justify_center()
-                                                .when(is_checked, |el| {
-                                                    el.child(
-                                                        Icon::new(LucideIcon::Check)
-                                                            .size(IconSize::Sm)
-                                                            .color(theme.primary),
-                                                    )
-                                                }),
-                                        )
-                                    })
-                                    .when_some(icon, |el, ic| {
-                                        el.child(Icon::new(ic).size(IconSize::Sm).color(icon_fg))
-                                    })
-                                    .child(label),
-                            )
-                            .when_some(shortcut, |el, sc| {
-                                el.child(
-                                    div()
-                                        .text_size(px(11.5))
-                                        .text_color(theme.muted_foreground)
-                                        .child(sc),
-                                )
-                            }),
-                    );
-                }
-            }
-        }
+        let menu_list = render_menu_entries(
+            self.id.clone(),
+            self.entries,
+            self.min_width,
+            self.on_close.clone(),
+            &theme,
+        );
 
         let mut pop = Popover::new(self.id, self.open).p(px(4.));
         if let Some(trigger) = self.trigger {

@@ -16,20 +16,28 @@ pub mod button;
 pub mod charts;
 pub mod checkbox;
 pub mod combobox;
+pub mod command_palette;
+pub mod context_menu;
 pub mod dialog;
+pub mod drawer;
 pub mod feedback;
 pub mod field;
 pub mod filter_bar;
 pub mod input;
+pub mod interactive;
 pub mod layout;
+pub mod loading_overlay;
 pub mod navigation;
+pub mod number_input;
 pub mod palette;
 pub mod popover;
 pub mod radio;
 pub mod segmented;
 pub mod select;
 pub mod slider;
+pub mod split_pane;
 pub mod stat;
+pub mod stepper;
 pub mod table;
 pub mod tabs;
 pub mod textbox;
@@ -53,17 +61,28 @@ pub use charts::{
 };
 pub use checkbox::{CheckState, Checkbox, CheckboxGroup, checkbox, checkbox_group};
 pub use combobox::{ComboBox, ComboBoxEvent, ComboBoxOption, ComboBoxState, combo_box};
+pub use command_palette::{
+    CommandItem, CommandPalette, CommandPaletteEvent, CommandPaletteState, command_palette,
+};
+pub use context_menu::{ContextMenu, context_menu};
 pub use dialog::{
     Dialog, DialogSize, DialogWindow, DialogWindowAction, DialogWindowView, OverlayPresentation,
     dialog, dialog_window,
 };
-pub use feedback::{EmptyState, ProgressBar, Skeleton, Spinner, empty_state, progress_bar, skeleton, spinner};
+pub use drawer::{Drawer, DrawerSide, DrawerSize, drawer};
+pub use feedback::{
+    EmptyState, ProgressBar, ProgressRing, Skeleton, Spinner, SpinnerVariant, empty_state,
+    progress_bar, progress_ring, skeleton, spinner,
+};
 pub use field::{Field, Kbd, Label, field, kbd, label};
 pub use filter_bar::{
     FacetProvider, FilterBar, FilterBarEvent, FilterBarState, FilterClause, FilterFacetOption,
     FilterFieldDef, FilterOperator, filter_bar,
 };
 pub use input::{Input, InputEvent, InputState, bind_input_keys, input};
+pub use interactive::{
+    CopyButton, PinInput, PinInputEvent, PinInputState, Rating, copy_button, pin_input, rating,
+};
 pub use layout::{
     AppShell, Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle, Container,
     Divider, Grid, HStack, MaxWidth, Navbar, PageHeader, ScrollArea, Section, SettingRow, Sidebar,
@@ -71,13 +90,17 @@ pub use layout::{
     card_footer, card_header, card_title, container, divider, grid, h_stack, navbar, page_header,
     section, setting_row, v_stack,
 };
+pub use loading_overlay::{BlurContainer, LoadingOverlay, blur_container, loading_overlay};
 pub use navigation::{Breadcrumb, BreadcrumbItem, Pagination, breadcrumb, pagination};
+pub use number_input::{NumberInput, NumberInputEvent, NumberInputState, number_input};
 pub use popover::{DropdownMenu, MenuEntry, Popover, dropdown_menu, popover};
 pub use radio::{RadioGroup, RadioOption, RadioVariant, radio_group};
 pub use segmented::{SegmentedControl, SegmentedItem, segmented_control};
 pub use select::{Select, SelectEvent, SelectOption, SelectState, select};
 pub use slider::{Slider, SliderEvent, SliderState, slider};
+pub use split_pane::{SplitDirection, SplitPane, SplitPaneEvent, SplitPaneState, split_pane};
 pub use stat::{StatDelta, StatDeltaTone, StatGroup, StatItem, TrendPolarity, stat_group};
+pub use stepper::{StepItem, StepStatus, Stepper, StepperOrientation, stepper};
 pub use table::{SortDirection, Table, TableAlign, TableColumn, TableRow, table};
 pub use tabs::{TabItem, Tabs, TabsVariant, tabs};
 pub use textbox::{

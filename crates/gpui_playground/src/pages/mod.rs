@@ -5,6 +5,7 @@ pub mod buttons;
 pub mod controls;
 pub mod icons_palette;
 pub mod inputs;
+pub mod interactive_blur;
 pub mod layout_page;
 pub mod overlays_data;
 pub mod overview;

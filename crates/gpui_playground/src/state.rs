@@ -12,6 +12,7 @@ use crate::accent::AccentPreset;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Page {
     Overview,
+    InteractiveBlur,
     Analytics,
     Buttons,
     Inputs,
@@ -27,6 +28,7 @@ impl Page {
     pub const fn title(self) -> &'static str {
         match self {
             Self::Overview => "Overview",
+            Self::InteractiveBlur => "Interactive & Blur",
             Self::Analytics => "Analytics & Charts",
             Self::Buttons => "Buttons & Groups",
             Self::Inputs => "Input & TextBox",
@@ -42,6 +44,9 @@ impl Page {
     pub const fn keywords(self) -> &'static str {
         match self {
             Self::Overview => "overview home welcome playground dashboard",
+            Self::InteractiveBlur => {
+                "blur container loading overlay spinner dots bars pulse progress ring command palette drawer sheet context menu right click split pane resizable number input stepper wizard rating stars copy clipboard pin otp"
+            }
             Self::Analytics => {
                 "analytics charts stacked bar line breakdown filter bar time date range picker calendar kpi stat segmented theme switcher radial"
             }
@@ -202,6 +207,35 @@ pub struct PlaygroundApp {
     pub analytics_drag_zoom_enabled: bool,
     pub analytics_line_selection: Option<(f64, f64)>,
     pub analytics_hidden_models: Vec<SharedString>,
+
+    // Interactive & Blur showcase state
+    pub command_palette: Entity<CommandPaletteState>,
+    pub drawer_open: bool,
+    pub drawer_side: DrawerSide,
+    pub drawer_size: DrawerSize,
+    pub loading_demo_active: bool,
+    pub loading_demo_blur_px: f32,
+    pub loading_demo_variant: SpinnerVariant,
+    pub loading_demo_card: bool,
+    pub loading_demo_show_progress: bool,
+    pub loading_demo_progress: f32,
+    pub loading_demo_clicks_behind: usize,
+    pub privacy_blurred: bool,
+    pub ctx_pin_enabled: bool,
+    pub ctx_wrap_lines: bool,
+    pub split_horizontal: Entity<SplitPaneState>,
+    pub split_vertical: Entity<SplitPaneState>,
+    pub num_price: Entity<NumberInputState>,
+    pub num_scale: Entity<NumberInputState>,
+    pub num_budget: Entity<NumberInputState>,
+    pub stepper_active: usize,
+    pub stepper_error: bool,
+    pub stepper_vertical: bool,
+    pub rating_stars: usize,
+    pub rating_hearts: usize,
+    pub otp_input: Entity<PinInputState>,
+    pub otp_masked: bool,
+    pub ring_slider: Entity<SliderState>,
 }
 
 impl PlaygroundApp {
@@ -510,8 +544,214 @@ impl PlaygroundApp {
             });
         }
 
+        let command_items = vec![
+            CommandItem::new("nav-interactive", "Interactive & Blur Components")
+                .group("Navigation")
+                .subtitle("LoadingOverlay, BlurContainer, Drawer, SplitPane, PinInput & more")
+                .icon(LucideIcon::Sparkles)
+                .shortcut(&["G", "I"])
+                .keywords("blur spin loading drawer split rating copy otp stepper"),
+            CommandItem::new("nav-analytics", "Analytics & Charts")
+                .group("Navigation")
+                .subtitle("Stacked bars, line charts, drag zoom & KPI strips")
+                .icon(LucideIcon::ChartColumnStacked)
+                .shortcut(&["G", "A"]),
+            CommandItem::new("nav-buttons", "Buttons & Groups")
+                .group("Navigation")
+                .subtitle("Variants, loading states, pill buttons & toggle groups")
+                .icon(LucideIcon::MousePointerClick),
+            CommandItem::new("nav-inputs", "Input & TextBox")
+                .group("Navigation")
+                .subtitle("Single-line inputs, IME, validation & multi-line text areas")
+                .icon(LucideIcon::TextCursorInput),
+            CommandItem::new("nav-overlays", "Overlays, Table & Feedback")
+                .group("Navigation")
+                .subtitle("Dialogs, native OS windows, toasts, popovers & sortable tables")
+                .icon(LucideIcon::Layers),
+            CommandItem::new("nav-icons", "Lucide Icons Gallery")
+                .group("Navigation")
+                .subtitle("Browse all 2,092 bundled Lucide SVG icons")
+                .icon(LucideIcon::Shapes),
+            CommandItem::new("act-toggle-loading", "Toggle Blurred Loading Overlay")
+                .group("Actions")
+                .subtitle("Jump to Interactive & Blur and toggle the GPU blur overlay")
+                .icon(LucideIcon::LoaderCircle)
+                .keywords("spin blur frost glass"),
+            CommandItem::new("act-open-drawer", "Open Slide-Over Drawer")
+                .group("Actions")
+                .subtitle("Inspect properties in a blurred slide-over sheet")
+                .icon(LucideIcon::PanelRightOpen),
+            CommandItem::new("act-toggle-events", "Toggle Live Event Inspector")
+                .group("Actions")
+                .subtitle("Show or hide the bottom GPUI event stream drawer")
+                .icon(LucideIcon::Terminal),
+            CommandItem::new("theme-light", "Switch to Light Theme")
+                .group("Appearance")
+                .icon(LucideIcon::Sun)
+                .keywords("bright day mode"),
+            CommandItem::new("theme-dark", "Switch to Dark Theme")
+                .group("Appearance")
+                .icon(LucideIcon::Moon)
+                .keywords("night mode"),
+            CommandItem::new("accent-emerald", "Accent: Emerald")
+                .group("Appearance")
+                .icon(LucideIcon::Palette),
+            CommandItem::new("accent-rose", "Accent: Rose")
+                .group("Appearance")
+                .icon(LucideIcon::Palette),
+            CommandItem::new("accent-indigo", "Accent: Indigo")
+                .group("Appearance")
+                .icon(LucideIcon::Palette),
+        ];
+        let command_palette = cx.new(|cx| CommandPaletteState::new(command_items, cx));
+        cx.subscribe(
+            &command_palette,
+            |this, _, ev: &CommandPaletteEvent, cx| match ev {
+                CommandPaletteEvent::Execute(id) => {
+                    this.log_event("CommandPalette", format!("Execute(\"{id}\")"), cx);
+                    match id.as_ref() {
+                        "nav-interactive" => this.page = Page::InteractiveBlur,
+                        "nav-analytics" => this.page = Page::Analytics,
+                        "nav-buttons" => this.page = Page::Buttons,
+                        "nav-inputs" => this.page = Page::Inputs,
+                        "nav-overlays" => this.page = Page::OverlaysData,
+                        "nav-icons" => this.page = Page::LucideIcons,
+                        "act-toggle-loading" => {
+                            this.page = Page::InteractiveBlur;
+                            this.loading_demo_active = !this.loading_demo_active;
+                        }
+                        "act-open-drawer" => this.drawer_open = true,
+                        "act-toggle-events" => this.show_event_log = !this.show_event_log,
+                        "theme-light" => this.apply_theme(ThemeMode::Light, cx),
+                        "theme-dark" => this.apply_theme(ThemeMode::Dark, cx),
+                        "accent-emerald" => {
+                            this.accent = AccentPreset::Emerald;
+                            let mode = cx.theme().mode;
+                            this.apply_theme(mode, cx);
+                        }
+                        "accent-rose" => {
+                            this.accent = AccentPreset::Rose;
+                            let mode = cx.theme().mode;
+                            this.apply_theme(mode, cx);
+                        }
+                        "accent-indigo" => {
+                            this.accent = AccentPreset::Indigo;
+                            let mode = cx.theme().mode;
+                            this.apply_theme(mode, cx);
+                        }
+                        _ => {}
+                    }
+                    cx.notify();
+                }
+                CommandPaletteEvent::Open => this.log_event("CommandPalette", "opened", cx),
+                CommandPaletteEvent::Close => this.log_event("CommandPalette", "closed", cx),
+            },
+        )
+        .detach();
+
+        let split_horizontal = cx.new(|cx| {
+            SplitPaneState::new(cx)
+                .direction(SplitDirection::Horizontal)
+                .clamp_range(0.20, 0.80)
+                .default_ratio(0.42)
+        });
+        cx.subscribe(&split_horizontal, |this, _, ev: &SplitPaneEvent, cx| {
+            let SplitPaneEvent::Resize(r) = ev;
+            this.log_event("SplitPane(H)", format!("ratio -> {:.0}%", r * 100.0), cx);
+        })
+        .detach();
+
+        let split_vertical = cx.new(|cx| {
+            SplitPaneState::new(cx)
+                .direction(SplitDirection::Vertical)
+                .clamp_range(0.25, 0.75)
+                .default_ratio(0.55)
+        });
+        cx.subscribe(&split_vertical, |this, _, ev: &SplitPaneEvent, cx| {
+            let SplitPaneEvent::Resize(r) = ev;
+            this.log_event("SplitPane(V)", format!("ratio -> {:.0}%", r * 100.0), cx);
+        })
+        .detach();
+
+        let num_price = cx.new(|cx| {
+            NumberInputState::new(cx)
+                .range(0.0, 9999.0, cx)
+                .step(5.0)
+                .precision(2, cx)
+                .default_value(49.0, cx)
+                .prefix("$")
+        });
+        cx.subscribe(&num_price, |this, _, ev: &NumberInputEvent, cx| {
+            if let NumberInputEvent::Change(v) = ev {
+                this.log_event("NumberInput($)", format!("${v:.2}"), cx);
+            }
+        })
+        .detach();
+
+        let num_scale = cx.new(|cx| {
+            NumberInputState::new(cx)
+                .range(0.5, 4.0, cx)
+                .step(0.25)
+                .precision(2, cx)
+                .default_value(1.5, cx)
+                .suffix("×")
+        });
+        cx.subscribe(&num_scale, |this, _, ev: &NumberInputEvent, cx| {
+            if let NumberInputEvent::Change(v) = ev {
+                this.log_event("NumberInput(Scale)", format!("{v:.2}×"), cx);
+            }
+        })
+        .detach();
+
+        let num_budget = cx.new(|cx| {
+            NumberInputState::new(cx)
+                .range(0.0, 100.0, cx)
+                .step(5.0)
+                .default_value(72.0, cx)
+                .suffix("%")
+        });
+        cx.subscribe(&num_budget, |this, _, ev: &NumberInputEvent, cx| {
+            if let NumberInputEvent::Change(v) = ev {
+                this.loading_demo_progress = *v as f32;
+                this.log_event("NumberInput(%)", format!("{v:.0}%"), cx);
+            }
+        })
+        .detach();
+
+        let otp_input = cx.new(|cx| PinInputState::new(6, cx));
+        cx.subscribe(&otp_input, |this, _, ev: &PinInputEvent, cx| match ev {
+            PinInputEvent::Change(val) => {
+                this.log_event("PinInput", format!("Change(\"{val}\")"), cx);
+            }
+            PinInputEvent::Complete(code) => {
+                this.log_event("PinInput", format!("Complete(\"{code}\")"), cx);
+                this.push_toast(
+                    ToastVariant::Success,
+                    "Verification code entered",
+                    Some(code.as_ref()),
+                    cx,
+                );
+            }
+        })
+        .detach();
+
+        let ring_slider = cx.new(|cx| {
+            SliderState::new(cx)
+                .range(0.0, 100.0)
+                .step(1.0)
+                .default_value(72.0)
+                .label("ProgressRing & Loading Overlay Progress")
+        });
+        cx.subscribe(&ring_slider, |this, _, ev: &SliderEvent, cx| {
+            let SliderEvent::Change(v) = ev;
+            this.loading_demo_progress = *v;
+            this.num_budget.update(cx, |n, cx| n.set_value(*v as f64, cx));
+            cx.notify();
+        })
+        .detach();
+
         let mut app = Self {
-            page: Page::Analytics,
+            page: Page::InteractiveBlur,
             accent: AccentPreset::Indigo,
             show_event_log: false,
             event_log: Vec::new(),
@@ -626,6 +866,34 @@ impl PlaygroundApp {
             analytics_drag_zoom_enabled: true,
             analytics_line_selection: None,
             analytics_hidden_models: Vec::new(),
+
+            command_palette,
+            drawer_open: false,
+            drawer_side: DrawerSide::Right,
+            drawer_size: DrawerSize::Md,
+            loading_demo_active: true,
+            loading_demo_blur_px: 8.0,
+            loading_demo_variant: SpinnerVariant::Ring,
+            loading_demo_card: true,
+            loading_demo_show_progress: true,
+            loading_demo_progress: 72.0,
+            loading_demo_clicks_behind: 0,
+            privacy_blurred: true,
+            ctx_pin_enabled: true,
+            ctx_wrap_lines: false,
+            split_horizontal,
+            split_vertical,
+            num_price,
+            num_scale,
+            num_budget,
+            stepper_active: 1,
+            stepper_error: false,
+            stepper_vertical: false,
+            rating_stars: 4,
+            rating_hearts: 3,
+            otp_input,
+            otp_masked: false,
+            ring_slider,
         };
 
         app.log_event(

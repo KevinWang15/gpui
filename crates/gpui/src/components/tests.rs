@@ -1599,3 +1599,395 @@ fn gpu_offload_quad_animations_and_backdrop_blur(cx: &mut TestAppContext) {
         "advancing GPU scene QuadAnimations must incur 0 view re-renders"
     );
 }
+
+#[gpui::test]
+fn blur_container_loading_overlay_spinners_and_progress_ring(cx: &mut TestAppContext) {
+    cx.update(init_components);
+
+    // 1. Verify QuadAnimationMode::SyncedWave oscillates bounds & alpha without mutating base_generation
+    let mut scene = crate::Scene::default();
+    let mask = crate::ContentMask {
+        bounds: crate::Bounds {
+            origin: crate::point(crate::ScaledPixels(0.0), crate::ScaledPixels(0.0)),
+            size: size(crate::ScaledPixels(400.0), crate::ScaledPixels(200.0)),
+        },
+    };
+    let low_b = crate::Bounds {
+        origin: crate::point(crate::ScaledPixels(10.0), crate::ScaledPixels(30.0)),
+        size: size(crate::ScaledPixels(6.0), crate::ScaledPixels(10.0)),
+    };
+    let high_b = crate::Bounds {
+        origin: crate::point(crate::ScaledPixels(10.0), crate::ScaledPixels(10.0)),
+        size: size(crate::ScaledPixels(6.0), crate::ScaledPixels(30.0)),
+    };
+    let base_color = crate::Hsla { h: 0.65, s: 0.8, l: 0.55, a: 1.0 };
+    scene.insert_animated_quad(
+        crate::Quad {
+            order: 0,
+            border_style: crate::BorderStyle::Solid,
+            bounds: high_b,
+            content_mask: mask,
+            background: base_color.into(),
+            border_color: crate::transparent_black(),
+            corner_radii: crate::Corners::all(crate::ScaledPixels(3.0)),
+            border_widths: crate::Edges::default(),
+        },
+        crate::QuadAnimation {
+            mode: crate::QuadAnimationMode::SyncedWave {
+                period: std::time::Duration::from_millis(1000),
+                phase_offset: 0.0,
+                min_alpha: 0.3,
+                max_alpha: 1.0,
+            },
+            from_bounds: low_b,
+            to_bounds: high_b,
+            from_background: base_color,
+            to_background: base_color,
+            from_border_color: crate::transparent_black(),
+            to_border_color: crate::transparent_black(),
+            quad_index: usize::MAX,
+            finished: false,
+        },
+    );
+    scene.finish();
+    let base_gen = scene.base_generation();
+    let t0 = std::time::Instant::now();
+    // At t = 0.0s, cos(0) = 1 => wave = 0.0 => low_b
+    scene.advance_animations(t0, std::time::Duration::from_millis(0));
+    assert!((scene.quads[0].bounds.size.height.0 - 10.0).abs() < 0.01);
+    // At t = 0.5s, cos(pi) = -1 => wave = 1.0 => high_b
+    scene.advance_animations(
+        t0 + std::time::Duration::from_millis(500),
+        std::time::Duration::from_millis(500),
+    );
+    assert!((scene.quads[0].bounds.size.height.0 - 30.0).abs() < 0.01);
+    assert_eq!(scene.base_generation(), base_gen);
+
+    // 2. Render BlurContainer, LoadingOverlay, all 5 SpinnerVariants & ProgressRing in a window
+    struct BlurLoadingView {
+        loading: bool,
+        renders: Rc<std::cell::Cell<usize>>,
+    }
+    impl Render for BlurLoadingView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            v_stack()
+                .w(px(520.))
+                .p(px(16.))
+                .spacing(px(12.))
+                .child(
+                    loading_overlay(self.loading)
+                        .animated("test-loader")
+                        .blur(px(8.))
+                        .spinner_variant(SpinnerVariant::Bars)
+                        .card(true)
+                        .label("Syncing...")
+                        .description("Please wait")
+                        .progress(65.0)
+                        .on_cancel(|_, _, _| {})
+                        .child(card().padded().child("Underlying content")),
+                )
+                .child(
+                    blur_container()
+                        .active(self.loading)
+                        .blur(px(10.))
+                        .overlay(button("unblur-cta").primary().label("Reveal"))
+                        .child(card().padded().child("Blurred secret")),
+                )
+                .child(
+                    h_stack()
+                        .spacing(px(10.))
+                        .child(spinner().variant(SpinnerVariant::Ring))
+                        .child(spinner().variant(SpinnerVariant::Loader))
+                        .child(spinner().variant(SpinnerVariant::Dots))
+                        .child(spinner().variant(SpinnerVariant::Bars))
+                        .child(spinner().variant(SpinnerVariant::Pulse))
+                        .child(progress_ring(72.0).size(ComponentSize::Md)),
+                )
+        }
+    }
+
+    let renders = Rc::new(std::cell::Cell::new(0));
+    let renders_ref = renders.clone();
+    let (view, cx) = cx.add_window_view(move |_, _| BlurLoadingView {
+        loading: true,
+        renders: renders_ref,
+    });
+    cx.run_until_parked();
+    let renders_loaded = renders.get();
+
+    // Advancing SyncedWave spinner quads incurs 0 extra view re-renders
+    cx.update(|window, cx| {
+        window.advance_scene_animations(cx);
+        window.advance_scene_animations(cx);
+    });
+    assert_eq!(renders.get(), renders_loaded);
+
+    // Turning loading off cleanly removes overlay
+    view.update(cx, |v, cx| {
+        v.loading = false;
+        cx.notify();
+    });
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+fn command_palette_fuzzy_search_and_execution(cx: &mut TestAppContext) {
+    cx.update(init_components);
+
+    // Fuzzy score ranking sanity checks
+    let prefix = super::command_palette::fuzzy_match_score("theme", "Theme Switcher").unwrap();
+    let subseq = super::command_palette::fuzzy_match_score("tsw", "Theme Switcher").unwrap();
+    assert!(prefix > subseq);
+    assert!(super::command_palette::fuzzy_match_score("zzz", "Theme Switcher").is_none());
+
+    let executed: Rc<std::cell::RefCell<Vec<SharedString>>> = Rc::new(Default::default());
+    let exec_ref = executed.clone();
+
+    struct PaletteHost {
+        palette: Entity<CommandPaletteState>,
+    }
+    impl Render for PaletteHost {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            crate::div().size_full().child(command_palette(&self.palette))
+        }
+    }
+
+    let (view, cx) = cx.add_window_view(move |_, cx| {
+        let items = vec![
+            CommandItem::new("open-settings", "Open Settings")
+                .group("App")
+                .icon(LucideIcon::Settings)
+                .shortcut(&["⌘", ","]),
+            CommandItem::new("toggle-dark", "Toggle Dark Mode")
+                .group("Appearance")
+                .keywords("night theme"),
+            CommandItem::new("disabled-cmd", "Disabled Action").disabled(true),
+        ];
+        let palette = cx.new(|cx| CommandPaletteState::new(items, cx));
+        cx.subscribe(&palette, move |_, _, ev: &CommandPaletteEvent, _| {
+            if let CommandPaletteEvent::Execute(id) = ev {
+                exec_ref.borrow_mut().push(id.clone());
+            }
+        })
+        .detach();
+        PaletteHost { palette }
+    });
+    cx.run_until_parked();
+
+    let palette = view.read_with(cx, |v, _| v.palette.clone());
+    assert!(!palette.read_with(cx, |p, _| p.is_open()));
+
+    cx.update(|window, cx| {
+        palette.update(cx, |p, cx| p.open(window, cx));
+    });
+    cx.run_until_parked();
+    assert!(palette.read_with(cx, |p, _| p.is_open()));
+    assert_eq!(palette.read_with(cx, |p, cx| p.filtered_indices(cx).len()), 3);
+
+    // Close cleanly
+    cx.update(|_, cx| {
+        palette.update(cx, |p, cx| p.close(cx));
+    });
+    cx.run_until_parked();
+    assert!(!palette.read_with(cx, |p, _| p.is_open()));
+    assert!(executed.borrow().is_empty());
+}
+
+#[gpui::test]
+fn drawer_context_menu_and_stepper_render(cx: &mut TestAppContext) {
+    cx.update(init_components);
+
+    struct OverlayStepperView {
+        side: DrawerSide,
+        step: usize,
+        vertical: bool,
+    }
+    impl Render for OverlayStepperView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let steps = vec![
+                StepItem::new("Configure").description("Select cluster"),
+                StepItem::new("Build").icon(LucideIcon::Hammer),
+                StepItem::new("Verify").status(StepStatus::Error),
+                StepItem::new("Deploy"),
+            ];
+            crate::div()
+                .size_full()
+                .p(px(16.))
+                .child(
+                    v_stack()
+                        .spacing(px(16.))
+                        .child(
+                            stepper("test-stepper", steps, self.step)
+                                .orientation(if self.vertical {
+                                    StepperOrientation::Vertical
+                                } else {
+                                    StepperOrientation::Horizontal
+                                })
+                                .on_step_click(|_, _, _| {}),
+                        )
+                        .child(
+                            context_menu("test-ctx", card().padded().child("Right click me"))
+                                .entry(MenuEntry::Label("Actions".into()))
+                                .entry(MenuEntry::item("Inspect", |_, _, _| {}))
+                                .entry(MenuEntry::Separator)
+                                .entry(MenuEntry::destructive_item("Delete", None, |_, _, _| {})),
+                        ),
+                )
+                .child(
+                    drawer("test-drawer", true)
+                        .side(self.side)
+                        .size(DrawerSize::Sm)
+                        .icon(LucideIcon::SlidersHorizontal)
+                        .title("Inspector")
+                        .description("Details panel")
+                        .child("Drawer content")
+                        .footer(button("drw-ok").primary().label("OK"))
+                        .on_close(|_, _, _| {}),
+                )
+        }
+    }
+
+    let (view, cx) = cx.add_window_view(|_, _| OverlayStepperView {
+        side: DrawerSide::Right,
+        step: 1,
+        vertical: false,
+    });
+    cx.run_until_parked();
+
+    for (side, vertical) in [
+        (DrawerSide::Left, true),
+        (DrawerSide::Top, false),
+        (DrawerSide::Bottom, true),
+    ] {
+        view.update(cx, |v, cx| {
+            v.side = side;
+            v.vertical = vertical;
+            cx.notify();
+        });
+        cx.run_until_parked();
+    }
+}
+
+#[gpui::test]
+fn split_pane_number_input_pin_input_rating_and_copy_button(cx: &mut TestAppContext) {
+    cx.update(init_components);
+
+    struct ControlsHost {
+        split: Entity<SplitPaneState>,
+        num: Entity<NumberInputState>,
+        pin: Entity<PinInputState>,
+        completed_pin: Rc<std::cell::RefCell<Option<SharedString>>>,
+        rating_val: usize,
+    }
+    impl Render for ControlsHost {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            v_stack()
+                .w(px(600.))
+                .h(px(480.))
+                .p(px(16.))
+                .spacing(px(12.))
+                .child(
+                    crate::div().w_full().h(px(160.)).child(
+                        split_pane("test-split", &self.split)
+                            .first(crate::div().child("Pane A"))
+                            .second(crate::div().child("Pane B")),
+                    ),
+                )
+                .child(number_input(&self.num))
+                .child(pin_input(&self.pin))
+                .child(
+                    h_stack()
+                        .spacing(px(12.))
+                        .child(
+                            rating("test-rating", self.rating_val)
+                                .show_value(true)
+                                .on_change(|_, _, _| {}),
+                        )
+                        .child(copy_button("test-copy", "hello-gpui"))
+                        .child(copy_button("test-copy-icon", "hello").icon_only()),
+                )
+        }
+    }
+
+    let (view, cx) = cx.add_window_view(|_, cx| {
+        let split = cx.new(|cx| {
+            SplitPaneState::new(cx)
+                .direction(SplitDirection::Horizontal)
+                .clamp_range(0.2, 0.8)
+                .default_ratio(0.4)
+        });
+        let num = cx.new(|cx| {
+            NumberInputState::new(cx)
+                .range(0.0, 100.0, cx)
+                .step(2.5)
+                .precision(1, cx)
+                .default_value(10.0, cx)
+                .prefix("$")
+                .suffix("USD")
+        });
+        let pin = cx.new(|cx| PinInputState::new(6, cx));
+        let completed_pin: Rc<std::cell::RefCell<Option<SharedString>>> = Rc::new(Default::default());
+        let pin_ref = completed_pin.clone();
+        cx.subscribe(&pin, move |_, _, ev: &PinInputEvent, _| {
+            if let PinInputEvent::Complete(code) = ev {
+                *pin_ref.borrow_mut() = Some(code.clone());
+            }
+        })
+        .detach();
+        ControlsHost {
+            split,
+            num,
+            pin,
+            completed_pin,
+            rating_val: 4,
+        }
+    });
+    cx.run_until_parked();
+
+    let (split, num, pin, completed_pin) = view.read_with(cx, |v, _| {
+        (
+            v.split.clone(),
+            v.num.clone(),
+            v.pin.clone(),
+            v.completed_pin.clone(),
+        )
+    });
+
+    // SplitPane clamping & reset
+    cx.update(|_, cx| {
+        split.update(cx, |s, cx| s.set_ratio(0.95, cx));
+    });
+    assert!((split.read_with(cx, |s, _| s.ratio()) - 0.8).abs() < 1e-4);
+    cx.update(|_, cx| {
+        split.update(cx, |s, cx| s.reset(cx));
+    });
+    assert!((split.read_with(cx, |s, _| s.ratio()) - 0.4).abs() < 1e-4);
+
+    // NumberInput stepping & bounds clamping
+    cx.update(|_, cx| {
+        num.update(cx, |n, cx| n.increment(2.0, cx));
+    });
+    assert!((num.read_with(cx, |n, _| n.value()) - 15.0).abs() < 1e-6);
+    cx.update(|_, cx| {
+        num.update(cx, |n, cx| n.decrement(100.0, cx));
+    });
+    assert!((num.read_with(cx, |n, _| n.value()) - 0.0).abs() < 1e-6);
+
+    // PinInput filtering, completion event & clear
+    cx.update(|_, cx| {
+        pin.update(cx, |p, cx| p.set_value("12ab34-56", cx));
+    });
+    assert_eq!(pin.read_with(cx, |p, _| p.value()), "123456");
+    assert!(pin.read_with(cx, |p, _| p.is_complete()));
+    assert_eq!(
+        completed_pin.borrow().as_deref(),
+        Some("123456")
+    );
+    cx.update(|_, cx| {
+        pin.update(cx, |p, cx| p.clear(cx));
+    });
+    assert_eq!(pin.read_with(cx, |p, _| p.value()), "");
+    assert!(!pin.read_with(cx, |p, _| p.is_complete()));
+    cx.run_until_parked();
+}

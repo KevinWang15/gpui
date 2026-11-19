@@ -1139,6 +1139,19 @@ pub enum QuadAnimationMode {
         /// Maximum alpha multiplier at the crest of the wave.
         max_alpha: f32,
     },
+    /// Continuous phase-shifted cosine wave that interpolates both `from_bounds -> to_bounds`
+    /// and alpha (`min_alpha -> max_alpha`) without triggering layout or view re-renders
+    /// (ideal for staggered loading dots, equalizer bars, and pulsing beacons).
+    SyncedWave {
+        /// Full oscillation cycle period.
+        period: Duration,
+        /// Normalized phase offset in `0.0..1.0` used to stagger sibling elements.
+        phase_offset: f32,
+        /// Minimum alpha multiplier at the trough (`wave == 0.0`).
+        min_alpha: f32,
+        /// Maximum alpha multiplier at the crest (`wave == 1.0`).
+        max_alpha: f32,
+    },
 }
 
 /// Zero-relayout scene-level animation applied directly to a [`Quad`] inside [`Scene::quads`]
@@ -1273,6 +1286,44 @@ impl QuadAnimation {
                 let period_secs = period.as_secs_f32().max(0.05);
                 let phase = (elapsed.as_secs_f32() / period_secs).fract();
                 let wave = 0.5 - 0.5 * (std::f32::consts::TAU * phase).cos();
+                let alpha = min_alpha + (max_alpha - min_alpha) * wave;
+                quad.background = self.to_background.opacity(alpha).into();
+                quad.border_color = self.to_border_color.opacity(alpha);
+            }
+            QuadAnimationMode::SyncedWave {
+                period,
+                phase_offset,
+                min_alpha,
+                max_alpha,
+            } => {
+                let period_secs = period.as_secs_f32().max(0.05);
+                let phase = (elapsed.as_secs_f32() / period_secs - phase_offset).rem_euclid(1.0);
+                let wave = 0.5 - 0.5 * (std::f32::consts::TAU * phase).cos();
+                let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t;
+                quad.bounds = Bounds {
+                    origin: Point::new(
+                        ScaledPixels(lerp(self.from_bounds.origin.x.0, self.to_bounds.origin.x.0, wave)),
+                        ScaledPixels(lerp(self.from_bounds.origin.y.0, self.to_bounds.origin.y.0, wave)),
+                    ),
+                    size: Size::new(
+                        ScaledPixels(
+                            lerp(
+                                self.from_bounds.size.width.0,
+                                self.to_bounds.size.width.0,
+                                wave,
+                            )
+                            .max(0.0),
+                        ),
+                        ScaledPixels(
+                            lerp(
+                                self.from_bounds.size.height.0,
+                                self.to_bounds.size.height.0,
+                                wave,
+                            )
+                            .max(0.0),
+                        ),
+                    ),
+                };
                 let alpha = min_alpha + (max_alpha - min_alpha) * wave;
                 quad.background = self.to_background.opacity(alpha).into();
                 quad.border_color = self.to_border_color.opacity(alpha);

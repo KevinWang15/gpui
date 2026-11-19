@@ -12,8 +12,8 @@ use std::borrow::Cow;
 use gpui::components::*;
 use gpui::icons::{Icon, IconSize, LucideAssetSource, LucideIcon};
 use gpui::{
-    App, Bounds, Context, Focusable, FontWeight, KeyBinding, Render, Window, WindowBounds,
-    WindowOptions, actions, div, prelude::*, px, size,
+    App, Bounds, Context, FontWeight, KeyBinding, Render, Window, WindowBounds, WindowOptions,
+    actions, div, prelude::*, px, size,
 };
 use gpui_platform::application;
 
@@ -59,6 +59,7 @@ impl Render for PlaygroundApp {
 
         let page_content = match self.page {
             Page::Overview => pages::overview::render(self, cx).into_any_element(),
+            Page::InteractiveBlur => pages::interactive_blur::render(self, cx).into_any_element(),
             Page::Analytics => pages::analytics::render(self, cx).into_any_element(),
             Page::Buttons => pages::buttons::render(self, cx).into_any_element(),
             Page::Inputs => pages::inputs::render(self, cx).into_any_element(),
@@ -73,6 +74,7 @@ impl Render for PlaygroundApp {
         let mut comp_group = SidebarGroup::new(Some("COMPONENTS"));
         let comp_items: &[(Page, LucideIcon, Option<&str>)] = &[
             (Page::Overview, LucideIcon::House, None),
+            (Page::InteractiveBlur, LucideIcon::Sparkles, Some("12")),
             (Page::Analytics, LucideIcon::ChartColumnStacked, Some("8")),
             (Page::Buttons, LucideIcon::MousePointerClick, Some("3")),
             (Page::Inputs, LucideIcon::TextCursorInput, Some("4")),
@@ -261,8 +263,8 @@ impl Render for PlaygroundApp {
             .flex()
             .flex_col()
             .on_action(cx.listener(|this, _: &FocusSearch, window, cx| {
-                let focus = this.nav_search.focus_handle(cx);
-                window.focus(&focus, cx);
+                this.command_palette
+                    .update(cx, |palette, cx| palette.toggle(window, cx));
             }))
             .child(
                 div().flex_1().min_h_0().w_full().child(
@@ -316,7 +318,7 @@ impl Render for PlaygroundApp {
                                                     div()
                                                         .text_size(px(11.5))
                                                         .text_color(theme.muted_foreground)
-                                                        .child("Filter"),
+                                                        .child("Commands"),
                                                 ),
                                         )
                                         .child(badge("v0.2.2").color(BadgeColor::Gray)),
@@ -449,6 +451,81 @@ impl Render for PlaygroundApp {
                     ),
             )
             .child(
+                drawer("pg-global-drawer", self.drawer_open)
+                    .side(self.drawer_side)
+                    .size(self.drawer_size)
+                    .backdrop_blur(px(self.glass_blur_px.min(10.0)))
+                    .icon(LucideIcon::SlidersHorizontal)
+                    .title("Workspace Inspector")
+                    .description("Slide-over Drawer with GPU-blurred scrim, scrollable body, and pinned footer.")
+                    .on_close(cx.listener(|this, _, _, cx| {
+                        this.drawer_open = false;
+                        this.log_event("Drawer", "closed", cx);
+                    }))
+                    .child(
+                        v_stack()
+                            .spacing(px(12.))
+                            .child(
+                                alert("Live Drawer State")
+                                    .variant(AlertVariant::Info)
+                                    .description("Controls inside the drawer stay fully interactive and sync live with the underlying page."),
+                            )
+                            .child(
+                                setting_row("Blurred Loading Demo")
+                                    .description("Toggle the LoadingOverlay on the Interactive & Blur page")
+                                    .control(
+                                        toggle("drw-loading-tog", self.loading_demo_active)
+                                            .size(ComponentSize::Sm)
+                                            .on_change(cx.listener(|this, v, _, cx| {
+                                                this.loading_demo_active = *v;
+                                                cx.notify();
+                                            })),
+                                    ),
+                            )
+                            .child(
+                                setting_row("Privacy Shield Blur")
+                                    .description("Keep the signing key masked behind BlurContainer")
+                                    .control(
+                                        toggle("drw-privacy-tog", self.privacy_blurred)
+                                            .size(ComponentSize::Sm)
+                                            .on_change(cx.listener(|this, v, _, cx| {
+                                                this.privacy_blurred = *v;
+                                                cx.notify();
+                                            })),
+                                    ),
+                            )
+                            .child(
+                                field()
+                                    .label("Progress Sync")
+                                    .child(slider(&self.ring_slider)),
+                            ),
+                    )
+                    .footer(
+                        button("drw-close-btn")
+                            .secondary()
+                            .label("Close")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.drawer_open = false;
+                                cx.notify();
+                            })),
+                    )
+                    .footer(
+                        button("drw-apply-btn")
+                            .primary()
+                            .label("Done")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.drawer_open = false;
+                                this.push_toast(
+                                    ToastVariant::Success,
+                                    "Inspector changes applied",
+                                    Some("Saved from slide-over Drawer."),
+                                    cx,
+                                );
+                            })),
+                    ),
+            )
+            .child(command_palette(&self.command_palette))
+            .child(
                 toast_host(self.toasts.clone())
                     .position(self.toast_position)
                     .on_dismiss(cx.listener(|this, id, _, cx| {
@@ -519,6 +596,7 @@ mod tests {
 
         let all_pages = [
             Page::Overview,
+            Page::InteractiveBlur,
             Page::Analytics,
             Page::Buttons,
             Page::Inputs,
@@ -535,11 +613,17 @@ mod tests {
                 cx.update(|cx| Theme::set_global(accent.build_theme(mode), cx));
                 for page in all_pages {
                     window
-                        .update(cx, |app, _, cx| {
+                        .update(cx, |app, window, cx| {
                             app.page = page;
                             app.accent = accent;
                             app.show_event_log = page == Page::Overview;
                             app.dialog_open = page == Page::OverlaysData;
+                            app.drawer_open = page == Page::InteractiveBlur;
+                            if page == Page::InteractiveBlur {
+                                app.command_palette.update(cx, |p, cx| p.open(window, cx));
+                            } else {
+                                app.command_palette.update(cx, |p, cx| p.close(cx));
+                            }
                             cx.notify();
                         })
                         .unwrap();

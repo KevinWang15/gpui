@@ -332,6 +332,16 @@ impl InputState {
         cx.notify();
     }
 
+    /// Updates the placeholder text dynamically.
+    pub fn set_placeholder(
+        &mut self,
+        placeholder: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        self.placeholder = placeholder.into();
+        cx.notify();
+    }
+
     fn is_effectively_masked(&self) -> bool {
         self.masked && !self.mask_revealed
     }
