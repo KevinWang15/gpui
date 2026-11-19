@@ -146,6 +146,7 @@ pub struct InputState {
     undo_stack: Vec<UndoEntry>,
     redo_stack: Vec<UndoEntry>,
     was_focused: bool,
+    frame_style: StyleRefinement,
 }
 
 impl EventEmitter<InputEvent> for InputState {}
@@ -185,6 +186,7 @@ impl InputState {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             was_focused: false,
+            frame_style: StyleRefinement::default(),
         }
     }
 
@@ -1201,7 +1203,7 @@ impl Render for InputState {
         let bg = if self.disabled {
             theme.disabled_bg
         } else {
-            theme.surface
+            theme.input_bg
         };
 
         let text_color = if self.disabled {
@@ -1229,9 +1231,10 @@ impl Render for InputState {
             .border_1()
             .border_color(border_color)
             .overflow_hidden()
-            .when(!self.disabled, |el| el.shadow_2xs())
+            .when(!self.disabled && theme.elevation_shadows, |el| el.shadow_2xs())
             .when(focused && !self.disabled, |el| {
-                el.shadow(focus_ring_shadow(&theme, self.invalid))
+                let ring = focus_ring_shadow(&theme, self.invalid);
+                el.when(!ring.is_empty(), |el| el.shadow(ring))
             })
             .when(!focused && !self.disabled, |el| {
                 let hover_border = if self.invalid {
@@ -1407,11 +1410,16 @@ impl Render for InputState {
             );
         }
 
+        crate::Refineable::refine(frame.style(), &self.frame_style);
         frame
     }
 }
 
 /// Renderable Tailwind-style single-line input element wrapping an [`Entity<InputState>`].
+///
+/// Implements [`Styled`] with direct passthrough to the underlying input frame, so `.bg(...)`,
+/// `.border_color(...)`, `.rounded(...)`, `.h(...)`, `.w(...)`, and typography overrides apply
+/// directly to the visible control while preserving GPUI view caching.
 #[derive(IntoElement)]
 pub struct Input {
     state: Entity<InputState>,
@@ -1440,10 +1448,14 @@ impl Styled for Input {
 }
 
 impl RenderOnce for Input {
-    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
-        let mut wrapper = div().w_full().child(self.state);
-        crate::Refineable::refine(wrapper.style(), &self.style);
-        wrapper
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        self.state.update(cx, |state, cx| {
+            if state.frame_style != self.style {
+                state.frame_style = self.style;
+                cx.notify();
+            }
+        });
+        self.state
     }
 }
 

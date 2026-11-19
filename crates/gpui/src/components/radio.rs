@@ -8,7 +8,6 @@ use crate::{
 };
 use crate::icons::{Icon, IconSize, LucideIcon};
 
-use super::palette as tw;
 use super::theme::{ActiveTheme, SPRING_SMOOTH, SPRING_SNAPPY};
 
 /// Presentation style for [`RadioGroup`].
@@ -176,7 +175,7 @@ impl<T: Clone + PartialEq + 'static> RenderOnce for RadioGroup<T> {
 
                     let dot = div()
                         .rounded_full()
-                        .bg(tw::WHITE)
+                        .bg(theme.primary_foreground)
                         .with_spring(
                             dot_id,
                             SpringAnimation::new(SPRING_SNAPPY).to(is_selected),

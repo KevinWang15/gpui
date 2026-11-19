@@ -82,6 +82,7 @@ pub struct StackedBarChart {
     height: Pixels,
     value_format: ChartValueFormat,
     bar_radius: Pixels,
+    palette: Option<ChartPalette>,
     style: StyleRefinement,
     on_bar_click: Option<Rc<dyn Fn(&usize, &mut Window, &mut App) + 'static>>,
 }
@@ -101,6 +102,7 @@ impl StackedBarChart {
             height: px(220.),
             value_format: ChartValueFormat::Currency,
             bar_radius: px(3.),
+            palette: None,
             style: StyleRefinement::default(),
             on_bar_click: None,
         }
@@ -136,6 +138,12 @@ impl StackedBarChart {
         self
     }
 
+    /// Overrides the chart color palette (defaults to [`ChartPalette::from_theme`]).
+    pub fn palette(mut self, palette: ChartPalette) -> Self {
+        self.palette = Some(palette);
+        self
+    }
+
     /// Registers a click callback invoked with the clicked column index.
     pub fn on_bar_click(
         mut self,
@@ -164,7 +172,9 @@ impl Styled for StackedBarChart {
 impl RenderOnce for StackedBarChart {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
-        let palette = ChartPalette::from_theme(&theme);
+        let palette = self
+            .palette
+            .unwrap_or_else(|| ChartPalette::from_theme(&theme));
         let tnum = FontFeatures(Arc::new(vec![("tnum".to_string(), 1)]));
 
         let hover_entity = window.use_keyed_state(

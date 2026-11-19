@@ -4,8 +4,7 @@ use crate::{
     AnyView, App, Context, IntoElement, Render, SharedString, Window, div, prelude::*, px,
 };
 
-use super::palette as tw;
-use super::theme::{ActiveTheme, ThemeMode};
+use super::theme::ActiveTheme;
 
 /// Styled dark/themed Tailwind tooltip optionally displaying a keyboard shortcut hint.
 pub struct Tooltip {
@@ -44,10 +43,9 @@ impl Tooltip {
 impl Render for Tooltip {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let (bg, fg, border) = match theme.mode {
-            ThemeMode::Light => (tw::SLATE_900, tw::WHITE, tw::SLATE_800),
-            ThemeMode::Dark => (tw::SLATE_800, tw::SLATE_50, tw::SLATE_700),
-        };
+        let bg = theme.tooltip_bg;
+        let fg = theme.tooltip_foreground;
+        let border = theme.tooltip_border;
 
         div()
             .flex()
@@ -61,7 +59,7 @@ impl Render for Tooltip {
             .text_color(fg)
             .border_1()
             .border_color(border)
-            .shadow_md()
+            .when(theme.elevation_shadows, |el| el.shadow_md())
             .text_size(px(12.))
             .child(self.text.clone())
             .when_some(self.shortcut.clone(), |el, sc| {
@@ -70,9 +68,12 @@ impl Render for Tooltip {
                         .px(px(5.))
                         .py(px(1.))
                         .rounded(px(3.))
-                        .bg(crate::Hsla::from(tw::WHITE).opacity(0.14))
+                        .bg(fg.opacity(0.14))
                         .text_size(px(11.))
-                        .text_color(tw::SLATE_200)
+                        .text_color(fg.opacity(0.85))
+                        .when_some(theme.mono_font_family.clone(), |el, font| {
+                            el.font_family(font)
+                        })
                         .child(sc),
                 )
             })

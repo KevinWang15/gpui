@@ -30,37 +30,24 @@ pub struct ChartPalette {
 }
 
 impl ChartPalette {
-    /// Derives a harmonious light- or dark-mode chart palette from `theme`.
+    /// Derives a chart palette directly from [`Theme`] tokens (`chart_colors`, `chart_baseline`,
+    /// `chart_gridline`, `muted_foreground`, and mode-appropriate hover crosshair).
     pub fn from_theme(theme: &Theme) -> Self {
-        match theme.mode {
-            ThemeMode::Light => Self {
-                colors: vec![
-                    tw::INDIGO_500.into(),
-                    tw::EMERALD_500.into(),
-                    tw::AMBER_500.into(),
-                    tw::SKY_500.into(),
-                    tw::ROSE_500.into(),
-                    tw::VIOLET_500.into(),
-                ],
-                baseline: tw::SLATE_400.into(),
-                gridline: Hsla::from(tw::SLATE_200).opacity(0.85),
-                axis_label: tw::SLATE_500.into(),
-                crosshair: Hsla::from(tw::SLATE_900).opacity(0.08),
-            },
-            ThemeMode::Dark => Self {
-                colors: vec![
-                    tw::INDIGO_400.into(),
-                    tw::EMERALD_400.into(),
-                    tw::AMBER_400.into(),
-                    tw::SKY_400.into(),
-                    tw::ROSE_400.into(),
-                    tw::VIOLET_400.into(),
-                ],
-                baseline: tw::SLATE_500.into(),
-                gridline: Hsla::from(tw::SLATE_700).opacity(0.65),
-                axis_label: tw::SLATE_400.into(),
-                crosshair: Hsla::from(tw::WHITE).opacity(0.07),
-            },
+        let colors = if theme.chart_colors.is_empty() {
+            vec![theme.primary]
+        } else {
+            theme.chart_colors.clone()
+        };
+        let crosshair = match theme.mode {
+            ThemeMode::Light => Hsla::from(tw::SLATE_900).opacity(0.08),
+            ThemeMode::Dark => Hsla::from(tw::WHITE).opacity(0.07),
+        };
+        Self {
+            colors,
+            baseline: theme.chart_baseline,
+            gridline: theme.chart_gridline,
+            axis_label: theme.muted_foreground,
+            crosshair,
         }
     }
 
@@ -488,7 +475,7 @@ impl RenderOnce for ChartCard {
             .bg(theme.surface)
             .border_1()
             .border_color(theme.border)
-            .shadow_xs()
+            .when(theme.elevation_shadows, |el| el.shadow_xs())
             .p(px(20.))
             .flex()
             .flex_col()

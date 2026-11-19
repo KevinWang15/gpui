@@ -151,6 +151,7 @@ pub struct TextBoxState {
     undo_stack: Vec<UndoEntry>,
     redo_stack: Vec<UndoEntry>,
     was_focused: bool,
+    frame_style: StyleRefinement,
 }
 
 impl EventEmitter<TextBoxEvent> for TextBoxState {}
@@ -187,6 +188,7 @@ impl TextBoxState {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             was_focused: false,
+            frame_style: StyleRefinement::default(),
         }
     }
 
@@ -1239,7 +1241,7 @@ impl Render for TextBoxState {
         let bg = if self.disabled {
             theme.disabled_bg
         } else {
-            theme.surface
+            theme.input_bg
         };
 
         let text_color = if self.disabled {
@@ -1260,7 +1262,7 @@ impl Render for TextBoxState {
             None
         };
 
-        div()
+        let mut frame = div()
             .flex()
             .flex_col()
             .w_full()
@@ -1269,9 +1271,10 @@ impl Render for TextBoxState {
             .border_1()
             .border_color(border_color)
             .overflow_hidden()
-            .when(!self.disabled, |el| el.shadow_2xs())
+            .when(!self.disabled && theme.elevation_shadows, |el| el.shadow_2xs())
             .when(focused && !self.disabled, |el| {
-                el.shadow(focus_ring_shadow(&theme, self.invalid))
+                let ring = focus_ring_shadow(&theme, self.invalid);
+                el.when(!ring.is_empty(), |el| el.shadow(ring))
             })
             .when(!focused && !self.disabled, |el| {
                 let hover_border = if self.invalid {
@@ -1341,7 +1344,9 @@ impl Render for TextBoxState {
                         .text_color(theme.muted_foreground)
                         .child(text),
                 )
-            })
+            });
+        crate::Refineable::refine(frame.style(), &self.frame_style);
+        frame
     }
 }
 
@@ -1391,15 +1396,24 @@ impl Styled for TextBox {
 }
 
 impl RenderOnce for TextBox {
-    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
-        let mut wrapper = div()
-            .flex()
-            .flex_col()
-            .gap(px(6.))
-            .w_full()
-            .child(self.state)
-            .when_some(self.footer, |el, footer| el.child(footer));
-        crate::Refineable::refine(wrapper.style(), &self.style);
-        wrapper
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        self.state.update(cx, |state, cx| {
+            if state.frame_style != self.style {
+                state.frame_style = self.style;
+                cx.notify();
+            }
+        });
+        if let Some(footer) = self.footer {
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .w_full()
+                .child(self.state)
+                .child(footer)
+                .into_any_element()
+        } else {
+            self.state.into_any_element()
+        }
     }
 }

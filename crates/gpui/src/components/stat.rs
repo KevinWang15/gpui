@@ -199,7 +199,7 @@ impl RenderOnce for StatGroup {
             .bg(theme.surface)
             .border_1()
             .border_color(theme.border)
-            .shadow_xs()
+            .when(theme.elevation_shadows, |el| el.shadow_xs())
             .overflow_hidden();
 
         for (index, item) in self.items.into_iter().enumerate() {

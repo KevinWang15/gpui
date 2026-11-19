@@ -108,6 +108,7 @@ pub struct LineChart {
     x_ticks: Vec<(f64, SharedString)>,
     height: Pixels,
     value_format: ChartValueFormat,
+    palette: Option<ChartPalette>,
     x_formatter: Option<Rc<dyn Fn(f64) -> String>>,
     style: StyleRefinement,
 }
@@ -127,6 +128,7 @@ impl LineChart {
             x_ticks: Vec::new(),
             height: px(220.),
             value_format: ChartValueFormat::Currency,
+            palette: None,
             x_formatter: None,
             style: StyleRefinement::default(),
         }
@@ -165,6 +167,12 @@ impl LineChart {
     /// Sets the Y-axis & tooltip value formatter (default [`ChartValueFormat::Currency`]).
     pub fn value_format(mut self, format: ChartValueFormat) -> Self {
         self.value_format = format;
+        self
+    }
+
+    /// Overrides the chart color palette (defaults to [`ChartPalette::from_theme`]).
+    pub fn palette(mut self, palette: ChartPalette) -> Self {
+        self.palette = Some(palette);
         self
     }
 
@@ -230,7 +238,9 @@ fn interpolate_series_y(points: &[(f64, f64)], target_x: f64) -> Option<f64> {
 impl RenderOnce for LineChart {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
-        let palette = ChartPalette::from_theme(&theme);
+        let palette = self
+            .palette
+            .unwrap_or_else(|| ChartPalette::from_theme(&theme));
         let tnum = FontFeatures(Arc::new(vec![("tnum".to_string(), 1)]));
 
         let hover_entity = window.use_keyed_state(

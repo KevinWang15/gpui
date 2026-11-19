@@ -9,7 +9,6 @@ use crate::{
 };
 use crate::icons::{Icon, IconSize, LucideIcon};
 
-use super::palette as tw;
 use super::theme::{ActiveTheme, ComponentSize, SPRING_SNAPPY};
 
 /// Alias for [`Toggle`].
@@ -27,6 +26,9 @@ pub struct Toggle {
     label: Option<SharedString>,
     description: Option<SharedString>,
     label_left: bool,
+    track_on_color: Option<Hsla>,
+    track_off_color: Option<Hsla>,
+    thumb_color: Option<Hsla>,
     style: StyleRefinement,
     on_change: Option<Box<dyn Fn(&bool, &mut Window, &mut App) + 'static>>,
 }
@@ -53,6 +55,9 @@ impl Toggle {
             label: None,
             description: None,
             label_left: false,
+            track_on_color: None,
+            track_off_color: None,
+            thumb_color: None,
             style: StyleRefinement::default(),
             on_change: None,
         }
@@ -94,6 +99,24 @@ impl Toggle {
         self
     }
 
+    /// Overrides the checked track color (defaults to [`Theme::toggle_track_on`](super::Theme::toggle_track_on)).
+    pub fn track_on_color(mut self, color: Hsla) -> Self {
+        self.track_on_color = Some(color);
+        self
+    }
+
+    /// Overrides the unchecked track color (defaults to [`Theme::toggle_track_off`](super::Theme::toggle_track_off)).
+    pub fn track_off_color(mut self, color: Hsla) -> Self {
+        self.track_off_color = Some(color);
+        self
+    }
+
+    /// Overrides the circular thumb color (defaults to [`Theme::toggle_thumb`](super::Theme::toggle_thumb)).
+    pub fn thumb_color(mut self, color: Hsla) -> Self {
+        self.thumb_color = Some(color);
+        self
+    }
+
     /// Registers a callback invoked with the new boolean state whenever toggled.
     pub fn on_change(
         mut self,
@@ -119,8 +142,9 @@ impl RenderOnce for Toggle {
             ComponentSize::Lg | ComponentSize::Xl => (px(52.), px(28.), px(24.), px(2.)),
         };
 
-        let off_bg: Hsla = theme.input_border;
-        let on_bg: Hsla = theme.primary;
+        let off_bg: Hsla = self.track_off_color.unwrap_or(theme.toggle_track_off);
+        let on_bg: Hsla = self.track_on_color.unwrap_or(theme.toggle_track_on);
+        let thumb_bg: Hsla = self.thumb_color.unwrap_or(theme.toggle_thumb);
         let travel_end = track_w - thumb_size - pad;
         let checked = self.checked;
         let with_icons = self.with_icons;
@@ -136,8 +160,8 @@ impl RenderOnce for Toggle {
             .w(thumb_size)
             .h(thumb_size)
             .rounded_full()
-            .bg(tw::WHITE)
-            .shadow_xs()
+            .bg(thumb_bg)
+            .when(theme.elevation_shadows, |el| el.shadow_xs())
             .when(with_icons, |el| {
                 let icon = if checked {
                     LucideIcon::Check
@@ -145,7 +169,7 @@ impl RenderOnce for Toggle {
                     LucideIcon::X
                 };
                 let color = if checked {
-                    theme.primary
+                    on_bg
                 } else {
                     theme.muted_foreground
                 };
@@ -253,6 +277,7 @@ pub struct ToggleButton {
     pressed: bool,
     disabled: bool,
     size: ComponentSize,
+    style: StyleRefinement,
     on_toggle: Option<Box<dyn Fn(&bool, &mut Window, &mut App) + 'static>>,
 }
 
@@ -266,6 +291,7 @@ impl ToggleButton {
             pressed,
             disabled: false,
             size: ComponentSize::Sm,
+            style: StyleRefinement::default(),
             on_toggle: None,
         }
     }
@@ -304,17 +330,24 @@ impl ToggleButton {
     }
 }
 
+impl Styled for ToggleButton {
+    fn style(&mut self) -> &mut StyleRefinement {
+        &mut self.style
+    }
+}
+
 impl RenderOnce for ToggleButton {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
         let next = !self.pressed;
-        let (bg, fg) = if self.pressed {
+        let (bg, default_fg) = if self.pressed {
             (theme.primary_soft, theme.primary_soft_foreground)
         } else {
             (crate::transparent_black(), theme.muted_foreground)
         };
+        let fg = self.style.text.color.unwrap_or(default_fg);
 
-        div()
+        let mut el = div()
             .id(self.id)
             .flex()
             .flex_row()
@@ -346,7 +379,9 @@ impl RenderOnce for ToggleButton {
                 el.when_some(self.on_toggle, |el, handler| {
                     el.on_click(move |_, window, cx| handler(&next, window, cx))
                 })
-            })
+            });
+        crate::Refineable::refine(el.style(), &self.style);
+        el
     }
 }
 

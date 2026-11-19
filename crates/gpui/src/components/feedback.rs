@@ -170,6 +170,7 @@ pub struct Spinner {
     size: IconSize,
     color: Option<Hsla>,
     label: Option<SharedString>,
+    style: StyleRefinement,
 }
 
 /// Convenience constructor for [`Spinner::new`].
@@ -190,6 +191,7 @@ impl Spinner {
             size: IconSize::Md,
             color: None,
             label: None,
+            style: StyleRefinement::default(),
         }
     }
 
@@ -212,11 +214,17 @@ impl Spinner {
     }
 }
 
+impl Styled for Spinner {
+    fn style(&mut self) -> &mut StyleRefinement {
+        &mut self.style
+    }
+}
+
 impl RenderOnce for Spinner {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
         let color = self.color.unwrap_or(theme.primary);
-        div()
+        let mut el = div()
             .flex()
             .flex_row()
             .items_center()
@@ -234,7 +242,9 @@ impl RenderOnce for Spinner {
                         .text_color(theme.muted_foreground)
                         .child(label),
                 )
-            })
+            });
+        crate::Refineable::refine(el.style(), &self.style);
+        el
     }
 }
 

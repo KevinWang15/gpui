@@ -265,6 +265,7 @@ pub struct DropdownMenu {
     trigger: Option<AnyElement>,
     entries: Vec<MenuEntry>,
     min_width: Pixels,
+    style: StyleRefinement,
     on_close: Option<Rc<dyn Fn(&(), &mut Window, &mut App) + 'static>>,
 }
 
@@ -282,6 +283,7 @@ impl DropdownMenu {
             trigger: None,
             entries: Vec::new(),
             min_width: px(210.),
+            style: StyleRefinement::default(),
             on_close: None,
         }
     }
@@ -451,6 +453,13 @@ impl RenderOnce for DropdownMenu {
         if let Some(on_close) = self.on_close {
             pop = pop.on_close(move |e, w, cx| on_close(e, w, cx));
         }
+        crate::Refineable::refine(pop.style(), &self.style);
         pop.child(menu_list)
+    }
+}
+
+impl Styled for DropdownMenu {
+    fn style(&mut self) -> &mut StyleRefinement {
+        &mut self.style
     }
 }

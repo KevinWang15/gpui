@@ -21,6 +21,8 @@ pub enum ButtonVariant {
     Secondary,
     /// Soft tinted accent button (Tailwind `bg-indigo-50 text-indigo-700`).
     Soft,
+    /// Soft tinted accent button with a crisp accent border (ideal for active/recording states).
+    SoftOutline,
     /// Transparent button with visible border.
     Outline,
     /// Borderless subtle button with hover surface highlight.
@@ -48,6 +50,7 @@ pub struct Button {
     full_width: bool,
     pill: bool,
     tooltip: Option<SharedString>,
+    hover_bg: Option<Hsla>,
     style: StyleRefinement,
     on_click: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
 }
@@ -74,6 +77,7 @@ impl Button {
             full_width: false,
             pill: false,
             tooltip: None,
+            hover_bg: None,
             style: StyleRefinement::default(),
             on_click: None,
         }
@@ -112,6 +116,17 @@ impl Button {
     /// Shorthand for [`ButtonVariant::Soft`].
     pub fn soft(self) -> Self {
         self.variant(ButtonVariant::Soft)
+    }
+
+    /// Shorthand for [`ButtonVariant::SoftOutline`].
+    pub fn soft_outline(self) -> Self {
+        self.variant(ButtonVariant::SoftOutline)
+    }
+
+    /// Overrides the hover background color (useful alongside custom `.bg(...)` overrides).
+    pub fn hover_bg(mut self, color: Hsla) -> Self {
+        self.hover_bg = Some(color);
+        self
     }
 
     /// Shorthand for [`ButtonVariant::Outline`].
@@ -235,6 +250,13 @@ impl Button {
                 None,
                 false,
             ),
+            ButtonVariant::SoftOutline => (
+                theme.primary_soft,
+                theme.primary.opacity(0.22),
+                theme.primary_soft_foreground,
+                Some(theme.primary),
+                false,
+            ),
             ButtonVariant::Outline => (
                 crate::transparent_black(),
                 theme.surface_hover,
@@ -277,7 +299,9 @@ impl RenderOnce for Button {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
         let interactive = !self.disabled && !self.loading;
-        let (bg, hover_bg, fg, border_color, has_shadow) = self.colors(&theme);
+        let (bg, default_hover_bg, default_fg, border_color, has_shadow) = self.colors(&theme);
+        let hover_bg = self.hover_bg.unwrap_or(default_hover_bg);
+        let fg = self.style.text.color.unwrap_or(default_fg);
         let height = self.size.height();
         let icon_size = self.size.icon_size();
 
@@ -304,7 +328,9 @@ impl RenderOnce for Button {
             .font_weight(FontWeight::MEDIUM)
             .whitespace_nowrap()
             .when_some(border_color, |el, bc| el.border_1().border_color(bc))
-            .when(has_shadow && interactive, |el| el.shadow_xs())
+            .when(has_shadow && interactive && theme.elevation_shadows, |el| {
+                el.shadow_xs()
+            })
             .when(interactive, |el| {
                 el.cursor_pointer()
                     .hover(move |style| {

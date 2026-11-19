@@ -1030,7 +1030,7 @@ impl RenderOnce for FilterBar {
         };
         tokens_row = tokens_row.child(inline_input);
 
-        let bar = div()
+        let mut bar = div()
             .id((self.id.clone(), "bar"))
             .track_focus(&focus_handle)
             .on_key_down({
@@ -1053,10 +1053,10 @@ impl RenderOnce for FilterBar {
             .items_center()
             .gap(px(8.))
             .rounded(theme.radius_xl)
-            .bg(theme.surface)
+            .bg(theme.input_bg)
             .border_1()
             .border_color(border_color)
-            .shadow_xs()
+            .when(theme.elevation_shadows, |el| el.shadow_xs())
             .cursor_text()
             .child(
                 Icon::new(LucideIcon::Funnel)
@@ -1088,6 +1088,7 @@ impl RenderOnce for FilterBar {
                 )
             });
 
+        crate::Refineable::refine(bar.style(), &self.style);
         let mut root = div().id(self.id.clone()).relative().w_full().flex_shrink_0().child(bar);
 
         // 4. Anchored Suggestion Popover
@@ -1417,7 +1418,6 @@ impl RenderOnce for FilterBar {
             );
         }
 
-        crate::Refineable::refine(root.style(), &self.style);
         root
     }
 }

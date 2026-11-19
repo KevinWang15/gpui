@@ -381,7 +381,7 @@ impl RenderOnce for Card {
             .border_color(theme.border)
             .rounded(theme.radius_xl)
             .overflow_hidden()
-            .when(self.elevated, |el| el.shadow_sm())
+            .when(self.elevated && theme.elevation_shadows, |el| el.shadow_sm())
             .when(self.padded, |el| el.p(px(20.)))
             .children(self.children);
         crate::Refineable::refine(el.style(), &self.style);
@@ -457,21 +457,33 @@ impl RenderOnce for CardHeader {
 #[derive(IntoElement)]
 pub struct CardTitle {
     text: SharedString,
+    style: StyleRefinement,
 }
 
 /// Creates a [`CardTitle`].
 pub fn card_title(text: impl Into<SharedString>) -> CardTitle {
-    CardTitle { text: text.into() }
+    CardTitle {
+        text: text.into(),
+        style: StyleRefinement::default(),
+    }
+}
+
+impl Styled for CardTitle {
+    fn style(&mut self) -> &mut StyleRefinement {
+        &mut self.style
+    }
 }
 
 impl RenderOnce for CardTitle {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
-        div()
+        let mut el = div()
             .text_size(px(16.))
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(theme.foreground)
-            .child(self.text)
+            .child(self.text);
+        crate::Refineable::refine(el.style(), &self.style);
+        el
     }
 }
 
@@ -479,20 +491,32 @@ impl RenderOnce for CardTitle {
 #[derive(IntoElement)]
 pub struct CardDescription {
     text: SharedString,
+    style: StyleRefinement,
 }
 
 /// Creates a [`CardDescription`].
 pub fn card_description(text: impl Into<SharedString>) -> CardDescription {
-    CardDescription { text: text.into() }
+    CardDescription {
+        text: text.into(),
+        style: StyleRefinement::default(),
+    }
+}
+
+impl Styled for CardDescription {
+    fn style(&mut self) -> &mut StyleRefinement {
+        &mut self.style
+    }
 }
 
 impl RenderOnce for CardDescription {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
-        div()
+        let mut el = div()
             .text_size(px(13.))
             .text_color(theme.muted_foreground)
-            .child(self.text)
+            .child(self.text);
+        crate::Refineable::refine(el.style(), &self.style);
+        el
     }
 }
 
@@ -675,6 +699,7 @@ pub struct PageHeader {
     description: Option<SharedString>,
     actions: SmallVec<[AnyElement; 3]>,
     bordered: bool,
+    style: StyleRefinement,
 }
 
 /// Creates a [`PageHeader`].
@@ -690,6 +715,7 @@ impl PageHeader {
             description: None,
             actions: SmallVec::new(),
             bordered: true,
+            style: StyleRefinement::default(),
         }
     }
 
@@ -712,10 +738,16 @@ impl PageHeader {
     }
 }
 
+impl Styled for PageHeader {
+    fn style(&mut self) -> &mut StyleRefinement {
+        &mut self.style
+    }
+}
+
 impl RenderOnce for PageHeader {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
-        div()
+        let mut el = div()
             .flex()
             .flex_row()
             .flex_shrink_0()
@@ -755,7 +787,9 @@ impl RenderOnce for PageHeader {
                         .gap(px(8.))
                         .children(self.actions),
                 )
-            })
+            });
+        crate::Refineable::refine(el.style(), &self.style);
+        el
     }
 }
 
@@ -763,9 +797,11 @@ impl RenderOnce for PageHeader {
 #[derive(IntoElement)]
 pub struct Navbar {
     height: Pixels,
+    bordered: bool,
     left: SmallVec<[AnyElement; 3]>,
     center: SmallVec<[AnyElement; 3]>,
     right: SmallVec<[AnyElement; 3]>,
+    style: StyleRefinement,
 }
 
 /// Creates a new [`Navbar`].
@@ -784,15 +820,23 @@ impl Navbar {
     pub fn new() -> Self {
         Self {
             height: px(56.),
+            bordered: true,
             left: SmallVec::new(),
             center: SmallVec::new(),
             right: SmallVec::new(),
+            style: StyleRefinement::default(),
         }
     }
 
     /// Sets navbar height.
     pub fn height(mut self, height: Pixels) -> Self {
         self.height = height;
+        self
+    }
+
+    /// Controls whether the bottom divider border is rendered.
+    pub fn bordered(mut self, bordered: bool) -> Self {
+        self.bordered = bordered;
         self
     }
 
@@ -815,10 +859,16 @@ impl Navbar {
     }
 }
 
+impl Styled for Navbar {
+    fn style(&mut self) -> &mut StyleRefinement {
+        &mut self.style
+    }
+}
+
 impl RenderOnce for Navbar {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
-        div()
+        let mut el = div()
             .flex()
             .flex_row()
             .flex_shrink_0()
@@ -828,8 +878,7 @@ impl RenderOnce for Navbar {
             .h(self.height)
             .px(px(20.))
             .bg(theme.surface)
-            .border_b_1()
-            .border_color(theme.border)
+            .when(self.bordered, |el| el.border_b_1().border_color(theme.border))
             .child(
                 div()
                     .flex()
@@ -853,7 +902,9 @@ impl RenderOnce for Navbar {
                     .items_center()
                     .gap(px(8.))
                     .children(self.right),
-            )
+            );
+        crate::Refineable::refine(el.style(), &self.style);
+        el
     }
 }
 
@@ -865,6 +916,11 @@ pub struct SidebarItem {
     icon: Option<LucideIcon>,
     badge: Option<SharedString>,
     active: bool,
+    active_bg: Option<crate::Hsla>,
+    active_text_color: Option<crate::Hsla>,
+    active_icon_color: Option<crate::Hsla>,
+    icon_color: Option<crate::Hsla>,
+    style: StyleRefinement,
     on_click: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
 }
 
@@ -877,6 +933,11 @@ impl SidebarItem {
             icon: None,
             badge: None,
             active: false,
+            active_bg: None,
+            active_text_color: None,
+            active_icon_color: None,
+            icon_color: None,
+            style: StyleRefinement::default(),
             on_click: None,
         }
     }
@@ -899,6 +960,30 @@ impl SidebarItem {
         self
     }
 
+    /// Overrides the active pill background color.
+    pub fn active_bg(mut self, color: crate::Hsla) -> Self {
+        self.active_bg = Some(color);
+        self
+    }
+
+    /// Overrides the active label color.
+    pub fn active_text_color(mut self, color: crate::Hsla) -> Self {
+        self.active_text_color = Some(color);
+        self
+    }
+
+    /// Overrides the active icon color.
+    pub fn active_icon_color(mut self, color: crate::Hsla) -> Self {
+        self.active_icon_color = Some(color);
+        self
+    }
+
+    /// Overrides the inactive icon color.
+    pub fn icon_color(mut self, color: crate::Hsla) -> Self {
+        self.icon_color = Some(color);
+        self
+    }
+
     /// Registers a click callback.
     pub fn on_click(
         mut self,
@@ -909,24 +994,31 @@ impl SidebarItem {
     }
 }
 
+impl Styled for SidebarItem {
+    fn style(&mut self) -> &mut StyleRefinement {
+        &mut self.style
+    }
+}
+
 impl RenderOnce for SidebarItem {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
         let (bg, fg, icon_fg) = if self.active {
             (
-                theme.primary_soft,
-                theme.primary_soft_foreground,
-                theme.primary,
+                self.active_bg.unwrap_or(theme.sidebar_active_bg),
+                self.active_text_color
+                    .unwrap_or(theme.sidebar_active_foreground),
+                self.active_icon_color.unwrap_or(theme.sidebar_active_icon),
             )
         } else {
             (
                 crate::transparent_black(),
                 theme.foreground,
-                theme.muted_foreground,
+                self.icon_color.unwrap_or(theme.muted_foreground),
             )
         };
 
-        div()
+        let mut el = div()
             .id(self.id)
             .flex()
             .flex_row()
@@ -976,13 +1068,15 @@ impl RenderOnce for SidebarItem {
                             theme.surface_muted
                         })
                         .text_color(if self.active {
-                            theme.primary_soft_foreground
+                            theme.sidebar_active_foreground
                         } else {
                             theme.muted_foreground
                         })
                         .child(badge),
                 )
-            })
+            });
+        crate::Refineable::refine(el.style(), &self.style);
+        el
     }
 }
 
@@ -990,6 +1084,7 @@ impl RenderOnce for SidebarItem {
 #[derive(IntoElement)]
 pub struct SidebarGroup {
     label: Option<SharedString>,
+    style: StyleRefinement,
     children: SmallVec<[AnyElement; 6]>,
 }
 
@@ -998,6 +1093,7 @@ impl SidebarGroup {
     pub fn new(label: Option<impl Into<SharedString>>) -> Self {
         Self {
             label: label.map(Into::into),
+            style: StyleRefinement::default(),
             children: SmallVec::new(),
         }
     }
@@ -1009,10 +1105,16 @@ impl ParentElement for SidebarGroup {
     }
 }
 
+impl Styled for SidebarGroup {
+    fn style(&mut self) -> &mut StyleRefinement {
+        &mut self.style
+    }
+}
+
 impl RenderOnce for SidebarGroup {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
-        div()
+        let mut el = div()
             .flex()
             .flex_col()
             .gap(px(2.))
@@ -1029,7 +1131,9 @@ impl RenderOnce for SidebarGroup {
                         .child(label),
                 )
             })
-            .children(self.children)
+            .children(self.children);
+        crate::Refineable::refine(el.style(), &self.style);
+        el
     }
 }
 
@@ -1038,8 +1142,11 @@ impl RenderOnce for SidebarGroup {
 pub struct Sidebar {
     id: ElementId,
     width: Pixels,
+    header_bordered: bool,
+    footer_bordered: bool,
     header: Option<AnyElement>,
     footer: Option<AnyElement>,
+    style: StyleRefinement,
     children: SmallVec<[AnyElement; 6]>,
 }
 
@@ -1049,8 +1156,11 @@ impl Sidebar {
         Self {
             id: id.into(),
             width: px(248.),
+            header_bordered: true,
+            footer_bordered: true,
             header: None,
             footer: None,
+            style: StyleRefinement::default(),
             children: SmallVec::new(),
         }
     }
@@ -1067,9 +1177,21 @@ impl Sidebar {
         self
     }
 
+    /// Controls whether a bottom border separates the header from navigation items.
+    pub fn header_bordered(mut self, bordered: bool) -> Self {
+        self.header_bordered = bordered;
+        self
+    }
+
     /// Sets an optional pinned footer element (e.g. user profile card).
     pub fn footer(mut self, footer: impl IntoElement) -> Self {
         self.footer = Some(footer.into_any_element());
+        self
+    }
+
+    /// Controls whether a top border separates the footer from navigation items.
+    pub fn footer_bordered(mut self, bordered: bool) -> Self {
+        self.footer_bordered = bordered;
         self
     }
 }
@@ -1080,25 +1202,34 @@ impl ParentElement for Sidebar {
     }
 }
 
+impl Styled for Sidebar {
+    fn style(&mut self) -> &mut StyleRefinement {
+        &mut self.style
+    }
+}
+
 impl RenderOnce for Sidebar {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
-        div()
+        let header_bordered = self.header_bordered;
+        let footer_bordered = self.footer_bordered;
+        let mut el = div()
             .flex()
             .flex_col()
             .flex_shrink_0()
             .w(self.width)
             .h_full()
-            .bg(theme.surface)
+            .bg(theme.sidebar_bg)
             .border_r_1()
-            .border_color(theme.border)
+            .border_color(theme.sidebar_border)
             .when_some(self.header, |el, header| {
                 el.child(
                     div()
                         .px(px(14.))
                         .py(px(14.))
-                        .border_b_1()
-                        .border_color(theme.border)
+                        .when(header_bordered, |el| {
+                            el.border_b_1().border_color(theme.sidebar_border)
+                        })
                         .child(header),
                 )
             })
@@ -1123,11 +1254,14 @@ impl RenderOnce for Sidebar {
                     div()
                         .px(px(12.))
                         .py(px(12.))
-                        .border_t_1()
-                        .border_color(theme.border)
+                        .when(footer_bordered, |el| {
+                            el.border_t_1().border_color(theme.sidebar_border)
+                        })
                         .child(footer),
                 )
-            })
+            });
+        crate::Refineable::refine(el.style(), &self.style);
+        el
     }
 }
 
@@ -1138,6 +1272,7 @@ pub struct AppShell {
     content_id: ElementId,
     sidebar: Option<AnyElement>,
     navbar: Option<AnyElement>,
+    style: StyleRefinement,
     content: SmallVec<[AnyElement; 4]>,
 }
 
@@ -1148,6 +1283,7 @@ impl AppShell {
             content_id: content_id.into(),
             sidebar: None,
             navbar: None,
+            style: StyleRefinement::default(),
             content: SmallVec::new(),
         }
     }
@@ -1171,15 +1307,22 @@ impl ParentElement for AppShell {
     }
 }
 
+impl Styled for AppShell {
+    fn style(&mut self) -> &mut StyleRefinement {
+        &mut self.style
+    }
+}
+
 impl RenderOnce for AppShell {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
-        div()
+        let mut el = div()
             .flex()
             .flex_row()
             .size_full()
             .bg(theme.background)
             .text_color(theme.foreground)
+            .when_some(theme.font_family.clone(), |el, font| el.font_family(font))
             .when_some(self.sidebar, |el, sidebar| el.child(sidebar))
             .child(
                 div()
@@ -1203,7 +1346,9 @@ impl RenderOnce for AppShell {
                                     .children(self.content),
                             ),
                     ),
-            )
+            );
+        crate::Refineable::refine(el.style(), &self.style);
+        el
     }
 }
 
@@ -1277,8 +1422,190 @@ impl RenderOnce for ScrollArea {
     }
 }
 
+/// Titled settings/content section pairing a heading and optional description with a grouped body.
+#[derive(IntoElement)]
+pub struct Section {
+    title: SharedString,
+    description: Option<SharedString>,
+    style: StyleRefinement,
+    children: SmallVec<[AnyElement; 4]>,
+}
+
+/// Convenience constructor for [`Section::new`].
+pub fn section(title: impl Into<SharedString>) -> Section {
+    Section::new(title)
+}
+
+impl Section {
+    /// Creates a new titled [`Section`].
+    pub fn new(title: impl Into<SharedString>) -> Self {
+        Self {
+            title: title.into(),
+            description: None,
+            style: StyleRefinement::default(),
+            children: SmallVec::new(),
+        }
+    }
+
+    /// Sets a muted helper subtitle below the section heading.
+    pub fn description(mut self, description: impl Into<SharedString>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+}
+
+impl ParentElement for Section {
+    fn extend(&mut self, elements: impl IntoIterator<Item = AnyElement>) {
+        self.children.extend(elements);
+    }
+}
+
+impl Styled for Section {
+    fn style(&mut self) -> &mut StyleRefinement {
+        &mut self.style
+    }
+}
+
+impl RenderOnce for Section {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let theme = cx.theme();
+        let mut el = div()
+            .flex()
+            .flex_col()
+            .flex_shrink_0()
+            .w_full()
+            .gap(px(10.))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(3.))
+                    .child(
+                        div()
+                            .text_size(px(15.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme.foreground)
+                            .child(self.title),
+                    )
+                    .when_some(self.description, |el, desc| {
+                        el.child(
+                            div()
+                                .text_size(px(12.5))
+                                .text_color(theme.muted_foreground)
+                                .child(desc),
+                        )
+                    }),
+            )
+            .children(self.children);
+        crate::Refineable::refine(el.style(), &self.style);
+        el
+    }
+}
+
+/// Horizontal preference / list row pairing a title and optional muted description on the left
+/// with one or more right-aligned controls (toggles, compact inputs, keycap buttons, actions).
+#[derive(IntoElement)]
+pub struct SettingRow {
+    title: SharedString,
+    description: Option<SharedString>,
+    controls: SmallVec<[AnyElement; 2]>,
+    style: StyleRefinement,
+}
+
+/// Convenience constructor for [`SettingRow::new`].
+pub fn setting_row(title: impl Into<SharedString>) -> SettingRow {
+    SettingRow::new(title)
+}
+
+impl SettingRow {
+    /// Creates a new [`SettingRow`] with a primary label.
+    pub fn new(title: impl Into<SharedString>) -> Self {
+        Self {
+            title: title.into(),
+            description: None,
+            controls: SmallVec::new(),
+            style: StyleRefinement::default(),
+        }
+    }
+
+    /// Attaches a muted secondary description beneath the row title.
+    pub fn description(mut self, description: impl Into<SharedString>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    /// Appends a right-aligned control element.
+    pub fn control(mut self, control: impl IntoElement) -> Self {
+        self.controls.push(control.into_any_element());
+        self
+    }
+}
+
+impl Styled for SettingRow {
+    fn style(&mut self) -> &mut StyleRefinement {
+        &mut self.style
+    }
+}
+
+impl RenderOnce for SettingRow {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let theme = cx.theme();
+        let mut el = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .gap(px(16.))
+            .w_full()
+            .px(px(18.))
+            .py(px(14.))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w_0()
+                    .gap(px(3.))
+                    .child(
+                        div()
+                            .text_size(px(13.5))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme.foreground)
+                            .child(self.title),
+                    )
+                    .when_some(self.description, |el, desc| {
+                        el.child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(theme.muted_foreground)
+                                .child(desc),
+                        )
+                    }),
+            )
+            .when(!self.controls.is_empty(), |el| {
+                el.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .flex_shrink_0()
+                        .items_center()
+                        .gap(px(8.))
+                        .children(self.controls),
+                )
+            });
+        crate::Refineable::refine(el.style(), &self.style);
+        el
+    }
+}
+
 /// Helper for focus ring shadow around Tailwind controls.
+///
+/// Respects [`Theme::focus_ring_width`]: when `<= 0px`, returns an empty shadow list so
+/// focused controls render with a crisp border-only highlight.
 pub(crate) fn focus_ring_shadow(theme: &Theme, invalid: bool) -> Vec<crate::BoxShadow> {
+    if theme.focus_ring_width <= px(0.) {
+        return Vec::new();
+    }
     let color = if invalid {
         theme.destructive.opacity(0.35)
     } else {
@@ -1287,6 +1614,6 @@ pub(crate) fn focus_ring_shadow(theme: &Theme, invalid: bool) -> Vec<crate::BoxS
     vec![
         crate::BoxShadow::new(px(0.), px(0.), color)
             .blur_radius(px(0.))
-            .spread_radius(px(3.)),
+            .spread_radius(theme.focus_ring_width),
     ]
 }

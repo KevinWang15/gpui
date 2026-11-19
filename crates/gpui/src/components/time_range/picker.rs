@@ -617,7 +617,7 @@ impl RenderOnce for TimeRangePicker {
                     }),
             );
 
-        let bar = div()
+        let mut bar = div()
             .id((self.id.clone(), "bar"))
             .track_focus(&focus_handle)
             .on_key_down({
@@ -632,10 +632,10 @@ impl RenderOnce for TimeRangePicker {
             .px(px(3.))
             .gap(px(2.))
             .rounded(theme.radius_lg)
-            .bg(theme.surface)
+            .bg(theme.input_bg)
             .border_1()
             .border_color(theme.input_border)
-            .shadow_xs()
+            .when(theme.elevation_shadows, |el| el.shadow_xs())
             .child(quick_btn)
             .child(range_label_btn)
             .child(div().w(px(1.)).h(px(18.)).mx(px(2.)).bg(theme.border))
@@ -643,6 +643,7 @@ impl RenderOnce for TimeRangePicker {
             .child(next_btn)
             .child(zoom_btn);
 
+        crate::Refineable::refine(bar.style(), &self.style);
         let mut root = div().id(self.id.clone()).relative().flex_shrink_0().child(bar);
 
         // Popover A: Quick Select
@@ -1125,7 +1126,6 @@ impl RenderOnce for TimeRangePicker {
             );
         }
 
-        crate::Refineable::refine(root.style(), &self.style);
         root
     }
 }

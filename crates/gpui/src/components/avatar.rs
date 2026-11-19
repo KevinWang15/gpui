@@ -188,6 +188,7 @@ impl RenderOnce for Avatar {
 pub struct AvatarGroup {
     children: SmallVec<[AnyElement; 5]>,
     overflow_count: Option<usize>,
+    style: StyleRefinement,
 }
 
 /// Creates a new [`AvatarGroup`].
@@ -195,6 +196,7 @@ pub fn avatar_group() -> AvatarGroup {
     AvatarGroup {
         children: SmallVec::new(),
         overflow_count: None,
+        style: StyleRefinement::default(),
     }
 }
 
@@ -209,6 +211,12 @@ impl AvatarGroup {
 impl ParentElement for AvatarGroup {
     fn extend(&mut self, elements: impl IntoIterator<Item = AnyElement>) {
         self.children.extend(elements);
+    }
+}
+
+impl Styled for AvatarGroup {
+    fn style(&mut self) -> &mut StyleRefinement {
+        &mut self.style
     }
 }
 
@@ -242,6 +250,7 @@ impl RenderOnce for AvatarGroup {
                     .child(format!("+{extra}")),
             );
         }
+        crate::Refineable::refine(row.style(), &self.style);
         row
     }
 }

@@ -63,9 +63,10 @@ pub use filter_bar::{
 pub use input::{Input, InputEvent, InputState, bind_input_keys, input};
 pub use layout::{
     AppShell, Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle, Container,
-    Divider, Grid, HStack, MaxWidth, Navbar, PageHeader, ScrollArea, Sidebar, SidebarGroup,
-    SidebarItem, Stack, StackDirection, VStack, card, card_content, card_description, card_footer,
-    card_header, card_title, container, divider, grid, h_stack, navbar, page_header, v_stack,
+    Divider, Grid, HStack, MaxWidth, Navbar, PageHeader, ScrollArea, Section, SettingRow, Sidebar,
+    SidebarGroup, SidebarItem, Stack, StackDirection, VStack, card, card_content, card_description,
+    card_footer, card_header, card_title, container, divider, grid, h_stack, navbar, page_header,
+    section, setting_row, v_stack,
 };
 pub use navigation::{Breadcrumb, BreadcrumbItem, Pagination, breadcrumb, pagination};
 pub use popover::{DropdownMenu, MenuEntry, Popover, dropdown_menu, popover};

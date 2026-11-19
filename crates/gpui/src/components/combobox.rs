@@ -127,6 +127,7 @@ pub struct ComboBoxState<T: Clone + PartialEq + 'static> {
     clearable: bool,
     max_menu_height: Pixels,
     trigger_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    frame_style: StyleRefinement,
 }
 
 impl<T: Clone + PartialEq + 'static> EventEmitter<ComboBoxEvent<T>> for ComboBoxState<T> {}
@@ -192,6 +193,7 @@ impl<T: Clone + PartialEq + 'static> ComboBoxState<T> {
             clearable: true,
             max_menu_height: px(280.),
             trigger_bounds: Rc::new(Cell::new(None)),
+            frame_style: StyleRefinement::default(),
         }
     }
 
@@ -521,7 +523,7 @@ impl<T: Clone + PartialEq + 'static> Render for ComboBoxState<T> {
         let bg = if self.disabled {
             theme.disabled_bg
         } else {
-            theme.surface
+            theme.input_bg
         };
 
         let bounds_cell = self.trigger_bounds.clone();
@@ -632,7 +634,7 @@ impl<T: Clone + PartialEq + 'static> Render for ComboBoxState<T> {
                 .into_any_element()
         };
 
-        let trigger = div()
+        let mut trigger = div()
             .id("gpui-combobox-trigger")
             .relative()
             .flex()
@@ -648,9 +650,13 @@ impl<T: Clone + PartialEq + 'static> Render for ComboBoxState<T> {
             .border_1()
             .border_color(border_color)
             .text_size(self.size.font_size())
-            .when(!self.disabled, |el| el.shadow_2xs().cursor_pointer())
+            .when(!self.disabled, |el| {
+                el.cursor_pointer()
+                    .when(theme.elevation_shadows, |el| el.shadow_2xs())
+            })
             .when((focused || self.open) && !self.disabled, |el| {
-                el.shadow(focus_ring_shadow(&theme, self.invalid))
+                let ring = focus_ring_shadow(&theme, self.invalid);
+                el.when(!ring.is_empty(), |el| el.shadow(ring))
             })
             .when(!focused && !self.open && !self.disabled, |el| {
                 let hover_border = if self.invalid {
@@ -931,10 +937,13 @@ impl<T: Clone + PartialEq + 'static> Render for ComboBoxState<T> {
             None
         };
 
+        crate::Refineable::refine(trigger.style(), &self.frame_style);
+        let has_explicit_width = self.frame_style.size.width.is_some();
+
         div()
             .flex()
             .flex_col()
-            .w_full()
+            .when(!has_explicit_width, |el| el.w_full())
             .child(trigger)
             .when_some(menu, |el, menu| el.child(div().h_0().w_full().child(menu)))
     }
@@ -971,9 +980,13 @@ impl<T: Clone + PartialEq + 'static> Styled for ComboBox<T> {
 }
 
 impl<T: Clone + PartialEq + 'static> RenderOnce for ComboBox<T> {
-    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
-        let mut wrapper = div().w_full().child(self.state);
-        crate::Refineable::refine(wrapper.style(), &self.style);
-        wrapper
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        self.state.update(cx, |state, cx| {
+            if state.frame_style != self.style {
+                state.frame_style = self.style;
+                cx.notify();
+            }
+        });
+        self.state
     }
 }

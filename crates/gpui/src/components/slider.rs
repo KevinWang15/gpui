@@ -11,7 +11,6 @@ use crate::{
     relative,
 };
 
-use super::palette as tw;
 use super::theme::ActiveTheme;
 
 /// Events emitted by [`SliderState`].
@@ -33,6 +32,7 @@ pub struct SliderState {
     label: Option<SharedString>,
     show_value: bool,
     track_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    frame_style: StyleRefinement,
 }
 
 impl EventEmitter<SliderEvent> for SliderState {}
@@ -57,6 +57,7 @@ impl SliderState {
             label: None,
             show_value: true,
             track_bounds: Rc::new(Cell::new(None)),
+            frame_style: StyleRefinement::default(),
         }
     }
 
@@ -211,7 +212,7 @@ impl Render for SliderState {
             format!("{:.1}", self.value)
         };
 
-        div()
+        let mut root = div()
             .flex()
             .flex_col()
             .gap(px(8.))
@@ -277,14 +278,14 @@ impl Render for SliderState {
                             .w_full()
                             .h(px(6.))
                             .rounded_full()
-                            .bg(theme.surface_muted)
+                            .bg(theme.slider_track)
                             .overflow_hidden()
                             .child(
                                 div()
                                     .h_full()
                                     .w(relative(pct))
                                     .rounded_full()
-                                    .bg(theme.primary),
+                                    .bg(theme.slider_fill),
                             ),
                     )
                     // Thumb positioned at fraction
@@ -296,15 +297,18 @@ impl Render for SliderState {
                             .w(px(18.))
                             .h(px(18.))
                             .rounded_full()
-                            .bg(tw::WHITE)
+                            .bg(theme.slider_thumb)
                             .border_2()
-                            .border_color(theme.primary)
-                            .shadow_sm()
+                            .border_color(theme.slider_fill)
+                            .when(theme.elevation_shadows, |el| el.shadow_sm())
                             .when(focused && !self.disabled, |el| {
-                                el.shadow(super::layout::focus_ring_shadow(&theme, false))
+                                let ring = super::layout::focus_ring_shadow(&theme, false);
+                                el.when(!ring.is_empty(), |el| el.shadow(ring))
                             }),
                     ),
-            )
+            );
+        crate::Refineable::refine(root.style(), &self.frame_style);
+        root
     }
 }
 
@@ -337,9 +341,13 @@ impl Styled for Slider {
 }
 
 impl RenderOnce for Slider {
-    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
-        let mut wrapper = div().w_full().child(self.state);
-        crate::Refineable::refine(wrapper.style(), &self.style);
-        wrapper
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        self.state.update(cx, |state, cx| {
+            if state.frame_style != self.style {
+                state.frame_style = self.style;
+                cx.notify();
+            }
+        });
+        self.state
     }
 }

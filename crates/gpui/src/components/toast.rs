@@ -4,7 +4,8 @@ use std::rc::Rc;
 
 use crate::{
     Animation, AnimationExt, App, ClickEvent, ElementId, FontWeight, Hsla, IntoElement,
-    RenderOnce, SharedString, Window, deferred, div, ease_out_quint, prelude::*, px,
+    RenderOnce, SharedString, StyleRefinement, Styled, Window, deferred, div, ease_out_quint,
+    prelude::*, px,
 };
 use crate::icons::{Icon, IconSize, LucideIcon};
 
@@ -66,6 +67,7 @@ impl ToastItem {
 pub struct Toast {
     id: ElementId,
     item: ToastItem,
+    style: StyleRefinement,
     on_dismiss: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
 }
 
@@ -75,6 +77,7 @@ impl Toast {
         Self {
             id: id.into(),
             item,
+            style: StyleRefinement::default(),
             on_dismiss: None,
         }
     }
@@ -98,13 +101,19 @@ impl Toast {
     }
 }
 
+impl Styled for Toast {
+    fn style(&mut self) -> &mut StyleRefinement {
+        &mut self.style
+    }
+}
+
 impl RenderOnce for Toast {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
         let (accent, icon) = Self::accent(self.item.variant, &theme);
 
         let anim_id = (self.id.clone(), "toast-enter");
-        div()
+        let mut el = div()
             .id(self.id.clone())
             .flex()
             .flex_row()
@@ -116,7 +125,7 @@ impl RenderOnce for Toast {
             .bg(theme.popover)
             .border_1()
             .border_color(theme.border)
-            .shadow_lg()
+            .when(theme.elevation_shadows, |el| el.shadow_lg())
             .child(
                 div()
                     .pt(px(1.))
@@ -163,12 +172,13 @@ impl RenderOnce for Toast {
                                 .color(theme.muted_foreground),
                         ),
                 )
-            })
-            .with_animation(
-                anim_id,
-                Animation::new(ANIM_NORMAL).with_easing(ease_out_quint()),
-                |el, delta| el.opacity(delta).mr(px(-24.0 * (1.0 - delta))),
-            )
+            });
+        crate::Refineable::refine(el.style(), &self.style);
+        el.with_animation(
+            anim_id,
+            Animation::new(ANIM_NORMAL).with_easing(ease_out_quint()),
+            |el, delta| el.opacity(delta).mr(px(-24.0 * (1.0 - delta))),
+        )
     }
 }
 
@@ -176,6 +186,7 @@ impl RenderOnce for Toast {
 #[derive(IntoElement)]
 pub struct ToastHost {
     toasts: Vec<ToastItem>,
+    style: StyleRefinement,
     on_dismiss: Option<Rc<dyn Fn(&u64, &mut Window, &mut App) + 'static>>,
 }
 
@@ -189,6 +200,7 @@ impl ToastHost {
     pub fn new(toasts: Vec<ToastItem>) -> Self {
         Self {
             toasts,
+            style: StyleRefinement::default(),
             on_dismiss: None,
         }
     }
@@ -199,6 +211,12 @@ impl ToastHost {
     pub fn on_dismiss(mut self, handler: impl Fn(&u64, &mut Window, &mut App) + 'static) -> Self {
         self.on_dismiss = Some(Rc::new(handler));
         self
+    }
+}
+
+impl Styled for ToastHost {
+    fn style(&mut self) -> &mut StyleRefinement {
+        &mut self.style
     }
 }
 
@@ -225,6 +243,7 @@ impl RenderOnce for ToastHost {
             stack = stack.child(toast);
         }
 
+        crate::Refineable::refine(stack.style(), &self.style);
         deferred(stack).priority(60).into_any_element()
     }
 }

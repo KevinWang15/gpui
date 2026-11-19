@@ -918,3 +918,152 @@ fn advanced_analytics_components_render_and_filter_narrow(cx: &mut TestAppContex
         .unwrap();
     cx.run_until_parked();
 }
+
+struct CustomStyledSettingsView {
+    search: Entity<InputState>,
+    count_input: Entity<InputState>,
+    enabled: bool,
+    recording: bool,
+}
+
+impl Render for CustomStyledSettingsView {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        AppShell::new("custom-styled-shell")
+            .sidebar(
+                Sidebar::new("custom-sidebar")
+                    .width(px(210.))
+                    .header_bordered(false)
+                    .header(
+                        crate::div()
+                            .font_weight(crate::FontWeight::SEMIBOLD)
+                            .child("Preferences"),
+                    )
+                    .child(
+                        SidebarGroup::new(None::<&str>)
+                            .child(
+                                SidebarItem::new("nav-general", "General")
+                                    .icon(LucideIcon::SlidersHorizontal)
+                                    .active(true),
+                            )
+                            .child(
+                                SidebarItem::new("nav-search", "Search").icon(LucideIcon::Search),
+                            ),
+                    ),
+            )
+            .child(
+                container().py(px(24.)).child(
+                    v_stack()
+                        .spacing(px(20.))
+                        .child(
+                            section("Shortcuts")
+                                .description("Click a shortcut, then press the keys you want.")
+                                .child(
+                                    card().flat().child(
+                                        v_stack()
+                                            .divided()
+                                            .spacing(px(0.))
+                                            .child(
+                                                setting_row("Quick launch")
+                                                    .description("Press again to dismiss.")
+                                                    .control(if self.recording {
+                                                        button("rec-btn")
+                                                            .soft_outline()
+                                                            .size(ComponentSize::Sm)
+                                                            .label("Press the new shortcut...")
+                                                    } else {
+                                                        button("rec-btn")
+                                                            .secondary()
+                                                            .size(ComponentSize::Sm)
+                                                            .label("Alt + Space")
+                                                    }),
+                                            )
+                                            .child(
+                                                setting_row("Launch at login")
+                                                    .description("Start in the background.")
+                                                    .control(toggle("autostart", self.enabled)),
+                                            )
+                                            .child(
+                                                setting_row("Visible results")
+                                                    .description("Rows in the search window.")
+                                                    .control(
+                                                        input(&self.count_input)
+                                                            .w(px(72.))
+                                                            .h(px(30.))
+                                                            .rounded(px(6.)),
+                                                    ),
+                                            ),
+                                    ),
+                                ),
+                        )
+                        .child(
+                            section("Items").description("Searchable list").child(
+                                card().flat().child(
+                                    crate::div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(8.))
+                                        .p(px(14.))
+                                        .child(input(&self.search).flex_1().h(px(34.)))
+                                        .child(
+                                            button("rescan")
+                                                .secondary()
+                                                .size(ComponentSize::Sm)
+                                                .label("Scan again"),
+                                        ),
+                                ),
+                            ),
+                        ),
+                ),
+            )
+    }
+}
+
+#[gpui::test]
+fn custom_theme_tokens_and_direct_styled_passthrough_render_cleanly(cx: &mut TestAppContext) {
+    cx.update(init_components);
+    let custom = Theme::dark()
+        .with_accent(crate::rgb(0xe11d48).into())
+        .with_surfaces(
+            crate::rgb(0x0d0e14).into(),
+            crate::rgb(0x101119).into(),
+            crate::rgb(0x141620).into(),
+            crate::rgb(0x0c0d13).into(),
+        )
+        .with_borders(
+            crate::rgb(0x222534).into(),
+            crate::rgb(0x282b3b).into(),
+            crate::rgb(0x3a3e52).into(),
+        )
+        .with_sidebar_colors(
+            crate::rgb(0x101119).into(),
+            crate::rgb(0x222534).into(),
+            crate::Hsla::from(crate::rgb(0xe11d48)).opacity(0.18),
+            crate::rgb(0xf8fafc).into(),
+            crate::rgb(0xf43f5e).into(),
+        )
+        .with_focus_ring_width(px(0.))
+        .with_elevation_shadows(false);
+
+    assert_eq!(custom.focus_ring_width, px(0.));
+    assert!(!custom.elevation_shadows);
+    assert_ne!(custom.input_bg, custom.surface);
+    assert_ne!(custom.sidebar_bg, custom.background);
+    assert_eq!(
+        ChartPalette::from_theme(&custom).color(0),
+        custom.chart_colors[0]
+    );
+    assert!(layout::focus_ring_shadow(&custom, false).is_empty());
+
+    cx.update(|cx| Theme::set_global(custom, cx));
+    let _window = cx.open_window(size(px(1000.), px(720.)), |_, cx| {
+        let search = cx.new(|cx| InputState::new(cx).placeholder("Filter...").size(ComponentSize::Sm));
+        let count_input = cx.new(|cx| InputState::new(cx).default_value("5").size(ComponentSize::Sm));
+        CustomStyledSettingsView {
+            search,
+            count_input,
+            enabled: true,
+            recording: true,
+        }
+    });
+    cx.run_until_parked();
+}

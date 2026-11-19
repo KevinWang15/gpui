@@ -202,17 +202,27 @@ impl RenderOnce for Field {
 #[derive(IntoElement)]
 pub struct Kbd {
     text: SharedString,
+    style: StyleRefinement,
 }
 
 /// Creates a new [`Kbd`] keycap badge.
 pub fn kbd(text: impl Into<SharedString>) -> Kbd {
-    Kbd { text: text.into() }
+    Kbd {
+        text: text.into(),
+        style: StyleRefinement::default(),
+    }
+}
+
+impl Styled for Kbd {
+    fn style(&mut self) -> &mut StyleRefinement {
+        &mut self.style
+    }
 }
 
 impl RenderOnce for Kbd {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
-        div()
+        let mut el = div()
             .flex()
             .items_center()
             .justify_center()
@@ -226,6 +236,11 @@ impl RenderOnce for Kbd {
             .text_size(px(11.))
             .font_weight(FontWeight::MEDIUM)
             .text_color(theme.muted_foreground)
-            .child(self.text)
+            .when_some(theme.mono_font_family.clone(), |el, font| {
+                el.font_family(font)
+            })
+            .child(self.text);
+        crate::Refineable::refine(el.style(), &self.style);
+        el
     }
 }

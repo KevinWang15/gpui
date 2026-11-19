@@ -133,6 +133,14 @@ impl AccentPreset {
                 theme.primary_soft_foreground = p_soft_fg_l.into();
                 theme.ring = p_light.into();
                 theme.selection = Hsla::from(p_light).opacity(0.22);
+                theme.sidebar_active_bg = p_soft_l.into();
+                theme.sidebar_active_foreground = p_soft_fg_l.into();
+                theme.sidebar_active_icon = p_light.into();
+                theme.toggle_track_on = p_light.into();
+                theme.slider_fill = p_light.into();
+                if let Some(first) = theme.chart_colors.first_mut() {
+                    *first = p_light.into();
+                }
             }
             ThemeMode::Dark => {
                 theme.primary = p_dark.into();
@@ -144,6 +152,14 @@ impl AccentPreset {
                 theme.primary_soft_foreground = p_soft_fg_d.into();
                 theme.ring = p_dark_h.into();
                 theme.selection = Hsla::from(p_dark_h).opacity(0.32);
+                theme.sidebar_active_bg = Hsla::from(p_dark).opacity(0.18);
+                theme.sidebar_active_foreground = p_soft_fg_d.into();
+                theme.sidebar_active_icon = p_dark_h.into();
+                theme.toggle_track_on = p_dark.into();
+                theme.slider_fill = p_dark.into();
+                if let Some(first) = theme.chart_colors.first_mut() {
+                    *first = p_dark_h.into();
+                }
             }
         }
 

@@ -58,6 +58,7 @@ pub struct BreakdownList {
     id: ElementId,
     items: Vec<BreakdownItem>,
     format: ChartValueFormat,
+    palette: Option<ChartPalette>,
     selected_key: Option<SharedString>,
     hint_text: Option<SharedString>,
     style: StyleRefinement,
@@ -76,6 +77,7 @@ impl BreakdownList {
             id: id.into(),
             items: Vec::new(),
             format: ChartValueFormat::Currency,
+            palette: None,
             selected_key: None,
             hint_text: None,
             style: StyleRefinement::default(),
@@ -92,6 +94,12 @@ impl BreakdownList {
     /// Sets the value formatter (default [`ChartValueFormat::Currency`]).
     pub fn value_format(mut self, format: ChartValueFormat) -> Self {
         self.format = format;
+        self
+    }
+
+    /// Overrides the chart color palette (defaults to [`ChartPalette::from_theme`]).
+    pub fn palette(mut self, palette: ChartPalette) -> Self {
+        self.palette = Some(palette);
         self
     }
 
@@ -126,7 +134,9 @@ impl Styled for BreakdownList {
 impl RenderOnce for BreakdownList {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
-        let palette = ChartPalette::from_theme(&theme);
+        let palette = self
+            .palette
+            .unwrap_or_else(|| ChartPalette::from_theme(&theme));
         let tnum = FontFeatures(Arc::new(vec![("tnum".to_string(), 1)]));
         let total: f64 = self.items.iter().map(|i| i.value).sum();
         let max_val = self

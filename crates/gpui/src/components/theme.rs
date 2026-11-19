@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::{
-    App, Global, Hsla, Pixels, Point, SpringConfig, Subscription, ViewTransition, Window,
-    WindowAppearance, px,
+    App, Global, Hsla, Pixels, Point, SharedString, SpringConfig, Subscription, ViewTransition,
+    Window, WindowAppearance, px,
 };
 
 use super::palette as tw;
@@ -137,8 +137,20 @@ pub struct Theme {
     pub preference: ThemePreference,
     /// Page / window canvas background.
     pub background: Hsla,
+    /// Left sidebar panel background (defaults to `surface`; customizable independently of cards).
+    pub sidebar_bg: Hsla,
+    /// Sidebar divider border color.
+    pub sidebar_border: Hsla,
+    /// Active [`SidebarItem`](super::SidebarItem) pill background.
+    pub sidebar_active_bg: Hsla,
+    /// Active [`SidebarItem`](super::SidebarItem) label color.
+    pub sidebar_active_foreground: Hsla,
+    /// Active [`SidebarItem`](super::SidebarItem) icon color.
+    pub sidebar_active_icon: Hsla,
     /// Elevated card / panel background.
     pub surface: Hsla,
+    /// Recessed background for inputs, selects, comboboxes, filter bars, and pickers.
+    pub input_bg: Hsla,
     /// Subtle muted surface background (headers, input addons, secondary hover).
     pub surface_muted: Hsla,
     /// Surface hover fill.
@@ -215,6 +227,38 @@ pub struct Theme {
     pub disabled_bg: Hsla,
     /// Disabled text / icon foreground.
     pub disabled_foreground: Hsla,
+    /// Unchecked [`Toggle`](super::Toggle) track background.
+    pub toggle_track_off: Hsla,
+    /// Checked [`Toggle`](super::Toggle) track background.
+    pub toggle_track_on: Hsla,
+    /// Circular [`Toggle`](super::Toggle) thumb fill.
+    pub toggle_thumb: Hsla,
+    /// Unfilled [`Slider`](super::Slider) rail background.
+    pub slider_track: Hsla,
+    /// Filled [`Slider`](super::Slider) range highlight.
+    pub slider_fill: Hsla,
+    /// Circular [`Slider`](super::Slider) thumb fill.
+    pub slider_thumb: Hsla,
+    /// [`Tooltip`](super::Tooltip) container background.
+    pub tooltip_bg: Hsla,
+    /// [`Tooltip`](super::Tooltip) text color.
+    pub tooltip_foreground: Hsla,
+    /// [`Tooltip`](super::Tooltip) border color.
+    pub tooltip_border: Hsla,
+    /// Ordered categorical color palette used by [`charts`](super::charts).
+    pub chart_colors: Vec<Hsla>,
+    /// Muted baseline/comparison line color used by [`charts`](super::charts).
+    pub chart_baseline: Hsla,
+    /// Hairline chart gridline color.
+    pub chart_gridline: Hsla,
+    /// Optional default UI font family applied at root shells (`AppShell`).
+    pub font_family: Option<SharedString>,
+    /// Optional monospace font family applied on [`Kbd`](super::Kbd) and code surfaces.
+    pub mono_font_family: Option<SharedString>,
+    /// Spread width for focus ring shadows (`px(0.)` produces a crisp border-only focus state).
+    pub focus_ring_width: Pixels,
+    /// Whether cards, inputs, buttons, and strips apply subtle drop shadows (`false` for flat chrome).
+    pub elevation_shadows: bool,
     /// Small border radius (`4px`).
     pub radius_sm: Pixels,
     /// Medium border radius (`6px`, Tailwind `rounded-md`).
@@ -238,7 +282,13 @@ impl Theme {
             mode: ThemeMode::Light,
             preference: ThemePreference::Light,
             background: tw::SLATE_50.into(),
+            sidebar_bg: tw::WHITE.into(),
+            sidebar_border: tw::SLATE_200.into(),
+            sidebar_active_bg: tw::INDIGO_50.into(),
+            sidebar_active_foreground: tw::INDIGO_700.into(),
+            sidebar_active_icon: tw::INDIGO_600.into(),
             surface: tw::WHITE.into(),
+            input_bg: tw::WHITE.into(),
             surface_muted: tw::SLATE_100.into(),
             surface_hover: tw::SLATE_100.into(),
             surface_active: tw::SLATE_200.into(),
@@ -277,6 +327,29 @@ impl Theme {
             backdrop: Hsla::from(tw::SLATE_950).opacity(0.45),
             disabled_bg: tw::SLATE_100.into(),
             disabled_foreground: tw::SLATE_400.into(),
+            toggle_track_off: tw::SLATE_200.into(),
+            toggle_track_on: tw::INDIGO_600.into(),
+            toggle_thumb: tw::WHITE.into(),
+            slider_track: tw::SLATE_200.into(),
+            slider_fill: tw::INDIGO_600.into(),
+            slider_thumb: tw::WHITE.into(),
+            tooltip_bg: tw::SLATE_900.into(),
+            tooltip_foreground: tw::WHITE.into(),
+            tooltip_border: tw::SLATE_800.into(),
+            chart_colors: vec![
+                tw::INDIGO_500.into(),
+                tw::EMERALD_500.into(),
+                tw::AMBER_500.into(),
+                tw::SKY_500.into(),
+                tw::ROSE_500.into(),
+                tw::VIOLET_500.into(),
+            ],
+            chart_baseline: tw::SLATE_400.into(),
+            chart_gridline: Hsla::from(tw::SLATE_200).opacity(0.85),
+            font_family: None,
+            mono_font_family: None,
+            focus_ring_width: px(3.),
+            elevation_shadows: true,
             radius_sm: px(4.),
             radius_md: px(6.),
             radius_lg: px(8.),
@@ -290,7 +363,13 @@ impl Theme {
             mode: ThemeMode::Dark,
             preference: ThemePreference::Dark,
             background: tw::SLATE_950.into(),
+            sidebar_bg: tw::SLATE_900.into(),
+            sidebar_border: tw::SLATE_800.into(),
+            sidebar_active_bg: Hsla::from(tw::INDIGO_500).opacity(0.18),
+            sidebar_active_foreground: tw::INDIGO_300.into(),
+            sidebar_active_icon: tw::INDIGO_400.into(),
             surface: tw::SLATE_900.into(),
+            input_bg: tw::SLATE_950.into(),
             surface_muted: tw::SLATE_800.into(),
             surface_hover: tw::SLATE_800.into(),
             surface_active: tw::SLATE_700.into(),
@@ -329,6 +408,29 @@ impl Theme {
             backdrop: Hsla::from(tw::BLACK).opacity(0.65),
             disabled_bg: tw::SLATE_900.into(),
             disabled_foreground: tw::SLATE_600.into(),
+            toggle_track_off: tw::SLATE_700.into(),
+            toggle_track_on: tw::INDIGO_500.into(),
+            toggle_thumb: tw::WHITE.into(),
+            slider_track: tw::SLATE_800.into(),
+            slider_fill: tw::INDIGO_500.into(),
+            slider_thumb: tw::WHITE.into(),
+            tooltip_bg: tw::SLATE_800.into(),
+            tooltip_foreground: tw::SLATE_50.into(),
+            tooltip_border: tw::SLATE_700.into(),
+            chart_colors: vec![
+                tw::INDIGO_400.into(),
+                tw::EMERALD_400.into(),
+                tw::AMBER_400.into(),
+                tw::SKY_400.into(),
+                tw::ROSE_400.into(),
+                tw::VIOLET_400.into(),
+            ],
+            chart_baseline: tw::SLATE_500.into(),
+            chart_gridline: Hsla::from(tw::SLATE_700).opacity(0.65),
+            font_family: None,
+            mono_font_family: None,
+            focus_ring_width: px(3.),
+            elevation_shadows: true,
             radius_sm: px(4.),
             radius_md: px(6.),
             radius_lg: px(8.),
@@ -349,6 +451,192 @@ impl Theme {
     /// Returns a copy of this theme tagged with the given [`ThemePreference`].
     pub fn with_preference(mut self, preference: ThemePreference) -> Self {
         self.preference = preference;
+        self
+    }
+
+    /// Re-tints the entire theme around a single brand `accent` color, automatically deriving
+    /// harmonious hover, soft tint, readable foreground, focus ring, selection, active sidebar,
+    /// toggle, slider, and primary chart tokens.
+    pub fn with_accent(mut self, accent: Hsla) -> Self {
+        let is_dark = self.mode == ThemeMode::Dark;
+        let primary_fg: Hsla = if accent.l > 0.68 {
+            tw::SLATE_950.into()
+        } else {
+            tw::WHITE.into()
+        };
+        let hover = Hsla {
+            l: if is_dark {
+                (accent.l + 0.06).min(0.92)
+            } else {
+                (accent.l - 0.06).max(0.08)
+            },
+            ..accent
+        };
+        let soft = if is_dark {
+            accent.opacity(0.18)
+        } else {
+            Hsla {
+                l: 0.96,
+                s: (accent.s * 0.85).min(1.0),
+                a: 1.0,
+                ..accent
+            }
+        };
+        let soft_fg = if is_dark {
+            Hsla {
+                l: (accent.l + 0.16).min(0.88),
+                ..accent
+            }
+        } else {
+            Hsla {
+                l: (accent.l - 0.10).max(0.18),
+                ..accent
+            }
+        };
+
+        self.primary = accent;
+        self.primary_hover = hover;
+        self.primary_foreground = primary_fg;
+        self.primary_soft = soft;
+        self.primary_soft_foreground = soft_fg;
+        self.ring = accent;
+        self.selection = accent.opacity(if is_dark { 0.30 } else { 0.22 });
+        self.sidebar_active_bg = soft;
+        self.sidebar_active_foreground = soft_fg;
+        self.sidebar_active_icon = accent;
+        self.toggle_track_on = accent;
+        self.slider_fill = accent;
+        if let Some(first) = self.chart_colors.first_mut() {
+            *first = accent;
+        }
+        self
+    }
+
+    /// Customizes the four core surface elevation tiers: canvas `background`, `sidebar`,
+    /// elevated card `surface`, and recessed `input_bg`.
+    pub fn with_surfaces(
+        mut self,
+        background: Hsla,
+        sidebar: Hsla,
+        surface: Hsla,
+        input_bg: Hsla,
+    ) -> Self {
+        self.background = background;
+        self.sidebar_bg = sidebar;
+        self.surface = surface;
+        self.input_bg = input_bg;
+        self.popover = surface;
+        self.secondary = input_bg;
+        self
+    }
+
+    /// Customizes subtle muted, hover, and active interactive surface fills.
+    pub fn with_surface_states(mut self, muted: Hsla, hover: Hsla, active: Hsla) -> Self {
+        self.surface_muted = muted;
+        self.surface_hover = hover;
+        self.surface_active = active;
+        self.secondary_hover = hover;
+        self
+    }
+
+    /// Customizes card/divider `border`, default `input_border`, and `input_border_hover`.
+    pub fn with_borders(
+        mut self,
+        border: Hsla,
+        input_border: Hsla,
+        input_border_hover: Hsla,
+    ) -> Self {
+        self.border = border;
+        self.sidebar_border = border;
+        self.input_border = input_border;
+        self.input_border_hover = input_border_hover;
+        self
+    }
+
+    /// Customizes primary, muted, and placeholder text foreground colors.
+    pub fn with_text_colors(
+        mut self,
+        foreground: Hsla,
+        muted_foreground: Hsla,
+        placeholder: Hsla,
+    ) -> Self {
+        self.foreground = foreground;
+        self.popover_foreground = foreground;
+        self.secondary_foreground = foreground;
+        self.muted_foreground = muted_foreground;
+        self.placeholder = placeholder;
+        self
+    }
+
+    /// Customizes sidebar surface, divider border, and active navigation pill styling.
+    pub fn with_sidebar_colors(
+        mut self,
+        bg: Hsla,
+        border: Hsla,
+        active_bg: Hsla,
+        active_foreground: Hsla,
+        active_icon: Hsla,
+    ) -> Self {
+        self.sidebar_bg = bg;
+        self.sidebar_border = border;
+        self.sidebar_active_bg = active_bg;
+        self.sidebar_active_foreground = active_foreground;
+        self.sidebar_active_icon = active_icon;
+        self
+    }
+
+    /// Customizes [`Toggle`](super::Toggle) track and thumb colors.
+    pub fn with_toggle_colors(
+        mut self,
+        track_off: Hsla,
+        track_on: Hsla,
+        thumb: Hsla,
+    ) -> Self {
+        self.toggle_track_off = track_off;
+        self.toggle_track_on = track_on;
+        self.toggle_thumb = thumb;
+        self
+    }
+
+    /// Customizes the four corner radius tokens (`sm`, `md`, `lg`, `xl`).
+    pub fn with_radii(mut self, sm: Pixels, md: Pixels, lg: Pixels, xl: Pixels) -> Self {
+        self.radius_sm = sm;
+        self.radius_md = md;
+        self.radius_lg = lg;
+        self.radius_xl = xl;
+        self
+    }
+
+    /// Sets the focus ring shadow spread width (`px(0.)` gives a crisp border-only focus state).
+    pub fn with_focus_ring_width(mut self, width: Pixels) -> Self {
+        self.focus_ring_width = width.max(px(0.));
+        self
+    }
+
+    /// Toggles elevation drop shadows on cards, inputs, buttons, and panels.
+    pub fn with_elevation_shadows(mut self, enabled: bool) -> Self {
+        self.elevation_shadows = enabled;
+        self
+    }
+
+    /// Sets the default UI font family applied on root shells.
+    pub fn with_font_family(mut self, family: impl Into<SharedString>) -> Self {
+        self.font_family = Some(family.into());
+        self
+    }
+
+    /// Sets the default monospace font family applied on [`Kbd`](super::Kbd) and code surfaces.
+    pub fn with_mono_font_family(mut self, family: impl Into<SharedString>) -> Self {
+        self.mono_font_family = Some(family.into());
+        self
+    }
+
+    /// Overrides the ordered categorical series color palette for [`charts`](super::charts).
+    pub fn with_chart_colors(mut self, colors: impl IntoIterator<Item = Hsla>) -> Self {
+        let collected: Vec<Hsla> = colors.into_iter().collect();
+        if !collected.is_empty() {
+            self.chart_colors = collected;
+        }
         self
     }
 
