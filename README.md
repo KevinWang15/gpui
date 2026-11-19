@@ -105,17 +105,34 @@ fn main() {
 }
 ```
 
-## Interactive Developer Playground & Tests
+## Documentation
 
-A dedicated developer playground app lives in [`crates/gpui_playground`](crates/gpui_playground) with live prop workbenches, auto-generated copyable Rust snippets, a live GPUI event inspector drawer, brand accent & light/dark theme switching, a paginated 2,092-icon Lucide explorer, and a 242-swatch Tailwind palette explorer:
+Detailed guides for the architecture, components, theming, and performance benchmarks:
+
+- [**GPU View Transitions & Radial Theme Switching**](docs/view-transitions.md) — Compositor snapshot/shader pipeline, `Window::start_view_transition`, `ViewTransition`, `ThemeSwitcher`, reduced-motion & fallback semantics.
+- [**Theming & Component Stylability**](docs/theming-and-stylability.md) — Four-tier `Theme` token hierarchy, fluent builders (`with_accent`, `with_surfaces`, `with_borders`, `with_elevation_shadows`, `with_focus_ring_width`), 100% `Styled` passthrough, `Section` / `SettingRow`, and per-component overrides.
+- [**Analytics, Charts, Time Range Picker & Faceted Filtering**](docs/charts-and-analytics.md) — `ChartCard`, `StackedBarChart`, `LineChart`, `BreakdownList`, drag-brush selection, interactive legends, `TimeRangePicker`, `CalendarGrid`, `FilterBar`, `StatGroup`, `SegmentedControl`, and component coordination recipes.
+- [**Performance Benchmarks & Optimizations**](docs/performance.md) — Reproducible `--release` benchmark commands, measured before/after metrics, and 120 FPS authoring guidelines.
+
+## Interactive Developer Playground, Tests & Benchmarks
+
+A dedicated developer playground app lives in [`crates/gpui_playground`](crates/gpui_playground) with an interactive Analytics & Charts dashboard, live prop workbenches, auto-generated copyable Rust snippets, a live GPUI event inspector drawer, brand accent & click-origin radial Light/System/Dark theme switching, a paginated 2,092-icon Lucide explorer, and a 242-swatch Tailwind palette explorer:
 
 ```bash
 # Launch the interactive Developer Playground app
 cargo run -p gpui_playground
 
-# Run all component, Lucide icon, and playground GPUI tests
+# Run all component, Lucide icon, WGSL shader, and playground GPUI tests
 cargo test -p gpui --lib -- components::tests icons::tests
+cargo test -p gpui_wgpu --lib -- view_transition_shader_is_valid_wgsl
 cargo test -p gpui_playground
+
+# Run release-mode component & WGPU ViewTransition performance benchmarks
+cargo test --release -p gpui --lib --features components,lucide -- components::perf_tests --ignored --nocapture --test-threads=1
+cargo test --release -p gpui_wgpu --lib -- view_transition_perf_30_frames --ignored --nocapture --test-threads=1
+
+# Generate Rust API documentation
+cargo doc --no-deps -p gpui --features components,lucide
 
 # Also available as a single-file GPUI example
 cargo run -p gpui --example components_showcase
