@@ -1,15 +1,17 @@
 //! GPU-batched [`StackedBarChart`] with top-segment corner rounding, nice Y ticks,
-//! auto-thinned X labels, interactive hover tooltip, and bar click callbacks.
+//! auto-thinned X labels, interactive hover tooltip, bar click callbacks, and optional
+//! horizontal drag-to-select brushing.
 
 use std::cell::RefCell;
+use std::ops::RangeInclusive;
 use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::{
-    App, Bounds, ClickEvent, Corners, Edges, ElementId, FontFeatures, FontWeight, Hsla,
-    IntoElement, MouseMoveEvent, ParentElement, Pixels, RenderOnce, SharedString, StyleRefinement,
-    Styled, TextAlign, Window, canvas, div, fill, point, prelude::*, px, quad, size,
-    transparent_black,
+    App, Bounds, Corners, CursorStyle, Edges, ElementId, FontFeatures, FontWeight, Hsla,
+    IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
+    RenderOnce, SharedString, StyleRefinement, Styled, TextAlign, Window, canvas, div, fill, point,
+    prelude::*, px, quad, size, transparent_black,
 };
 
 use super::core::{
@@ -68,12 +70,50 @@ impl StackedBarPoint {
 }
 
 #[derive(Default)]
-struct StackedBarHoverState {
+struct StackedBarInteractionState {
     hovered_index: Option<usize>,
     plot_bounds: Option<Bounds<Pixels>>,
+    drag_anchor_x: Option<f32>,
+    drag_current_x: Option<f32>,
 }
 
-/// GPU-native stacked vertical bar chart rendered with instanced GPUI quads and tabular axis labels.
+impl StackedBarInteractionState {
+    fn is_brushing(&self) -> bool {
+        match (self.drag_anchor_x, self.drag_current_x) {
+            (Some(a), Some(b)) => (b - a).abs() >= 4.0,
+            _ => false,
+        }
+    }
+
+    fn brushed_indices(
+        &self,
+        margin_left: f32,
+        margin_right: f32,
+        point_count: usize,
+    ) -> Option<RangeInclusive<usize>> {
+        if !self.is_brushing() || point_count == 0 {
+            return None;
+        }
+        let bounds = self.plot_bounds?;
+        let plot_left = bounds.origin.x.0 + margin_left;
+        let plot_right = (bounds.origin.x.0 + bounds.size.width.0 - margin_right).max(plot_left + 1.0);
+        let plot_width = plot_right - plot_left;
+        let scale = BandScale::new(plot_left, plot_width, point_count, 0.28);
+
+        let a = self.drag_anchor_x?.clamp(plot_left, plot_right - 0.01);
+        let b = self.drag_current_x?.clamp(plot_left, plot_right - 0.01);
+        let lo_x = a.min(b);
+        let hi_x = a.max(b);
+        let i0 = scale.index_at_x(lo_x).unwrap_or(0);
+        let i1 = scale
+            .index_at_x(hi_x)
+            .unwrap_or_else(|| point_count.saturating_sub(1));
+        Some(i0.min(i1)..=i0.max(i1))
+    }
+}
+
+/// GPU-native stacked vertical bar chart rendered with instanced GPUI quads, tabular axis labels,
+/// hover tooltips, and optional horizontal drag-to-select brushing.
 #[derive(IntoElement)]
 pub struct StackedBarChart {
     id: ElementId,
@@ -83,8 +123,11 @@ pub struct StackedBarChart {
     value_format: ChartValueFormat,
     bar_radius: Pixels,
     palette: Option<ChartPalette>,
+    selectable: bool,
+    selected_range: Option<RangeInclusive<usize>>,
     style: StyleRefinement,
     on_bar_click: Option<Rc<dyn Fn(&usize, &mut Window, &mut App) + 'static>>,
+    on_brush_select: Option<Rc<dyn Fn(&RangeInclusive<usize>, &mut Window, &mut App) + 'static>>,
 }
 
 /// Convenience constructor for [`StackedBarChart::new`].
@@ -103,8 +146,11 @@ impl StackedBarChart {
             value_format: ChartValueFormat::Currency,
             bar_radius: px(3.),
             palette: None,
+            selectable: false,
+            selected_range: None,
             style: StyleRefinement::default(),
             on_bar_click: None,
+            on_brush_select: None,
         }
     }
 
@@ -144,6 +190,18 @@ impl StackedBarChart {
         self
     }
 
+    /// Enables or disables horizontal drag-brush selection across bar columns.
+    pub fn selectable(mut self, selectable: bool) -> Self {
+        self.selectable = selectable;
+        self
+    }
+
+    /// Highlights a controlled inclusive column index range (dimming columns outside it).
+    pub fn selected_range(mut self, range: Option<RangeInclusive<usize>>) -> Self {
+        self.selected_range = range;
+        self
+    }
+
     /// Registers a click callback invoked with the clicked column index.
     pub fn on_bar_click(
         mut self,
@@ -153,12 +211,26 @@ impl StackedBarChart {
         self
     }
 
+    /// Registers a drag-selection callback invoked with the brushed inclusive column index range.
+    ///
+    /// Automatically enables [`Self::selectable`] unless explicitly disabled afterward.
+    pub fn on_brush_select(
+        mut self,
+        handler: impl Fn(&RangeInclusive<usize>, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.selectable = true;
+        self.on_brush_select = Some(Rc::new(handler));
+        self
+    }
+
     /// Builds matching [`ChartLegendItem`]s for use with [`ChartCard::legend`](super::ChartCard::legend).
     pub fn legend_items(series: &[StackedBarSeries], palette: &ChartPalette) -> Vec<ChartLegendItem> {
         series
             .iter()
             .enumerate()
-            .map(|(i, s)| ChartLegendItem::dot(s.label.clone(), s.color.unwrap_or_else(|| palette.color(i))))
+            .map(|(i, s)| {
+                ChartLegendItem::dot(s.label.clone(), s.color.unwrap_or_else(|| palette.color(i)))
+            })
             .collect()
     }
 }
@@ -177,13 +249,31 @@ impl RenderOnce for StackedBarChart {
             .unwrap_or_else(|| ChartPalette::from_theme(&theme));
         let tnum = FontFeatures(Arc::new(vec![("tnum".to_string(), 1)]));
 
-        let hover_entity = window.use_keyed_state(
-            (self.id.clone(), "stacked-bar-hover"),
+        let interaction_entity = window.use_keyed_state(
+            (self.id.clone(), "stacked-bar-interaction"),
             cx,
-            |_, _| Rc::new(RefCell::new(StackedBarHoverState::default())),
+            |_, _| Rc::new(RefCell::new(StackedBarInteractionState::default())),
         );
-        let hover_rc = hover_entity.read(cx).clone();
-        let hovered_index = hover_rc.borrow().hovered_index;
+        let interaction_rc = interaction_entity.read(cx).clone();
+
+        let margin_left = 54.0_f32;
+        let margin_right = 12.0_f32;
+        let margin_top = 10.0_f32;
+        let margin_bottom = 26.0_f32;
+        let point_count = self.points.len();
+
+        let (hovered_index, live_brush) = {
+            let state = interaction_rc.borrow();
+            (
+                state.hovered_index,
+                if self.selectable {
+                    state.brushed_indices(margin_left, margin_right, point_count)
+                } else {
+                    None
+                },
+            )
+        };
+        let active_selection = live_brush.clone().or(self.selected_range);
 
         let max_total = self
             .points
@@ -199,23 +289,21 @@ impl RenderOnce for StackedBarChart {
             .map(|(i, s)| s.color.unwrap_or_else(|| palette.color(i)))
             .collect();
 
-        let margin_left = 54.0_f32;
-        let margin_right = 12.0_f32;
-        let margin_top = 10.0_f32;
-        let margin_bottom = 26.0_f32;
-
         let points_paint = self.points.clone();
         let colors_paint = series_colors.clone();
         let ticks_paint = y_ticks;
         let format_paint = self.value_format.clone();
         let palette_paint = palette.clone();
         let surface_bg = theme.surface;
+        let accent_color = theme.primary;
         let bar_radius = self.bar_radius;
-        let hover_paint = hover_rc.clone();
+        let interaction_paint = interaction_rc.clone();
+        let active_selection_paint = active_selection;
+        let is_live_brushing = live_brush.is_some();
 
         let plot_canvas = canvas(
             move |bounds, _, _| {
-                hover_paint.borrow_mut().plot_bounds = Some(bounds);
+                interaction_paint.borrow_mut().plot_bounds = Some(bounds);
                 bounds
             },
             move |bounds, _, window, cx| {
@@ -253,8 +341,9 @@ impl RenderOnce for StackedBarChart {
                     );
                 }
 
-                // 2. Hover column backdrop highlight
-                if let Some(h_idx) = hovered_index
+                // 2. Hover column backdrop highlight (suppressed while dragging a brush)
+                if !is_live_brushing
+                    && let Some(h_idx) = hovered_index
                     && h_idx < points_paint.len()
                 {
                     let slot_x = plot_left + (h_idx as f32) * band_scale.step();
@@ -267,9 +356,40 @@ impl RenderOnce for StackedBarChart {
                     ));
                 }
 
-                // 3. Stacked bar segments (bottom-to-top; top-only corner rounding on highest segment)
+                // 3. Active drag/selected brush band behind bars
+                if let Some(sel) = &active_selection_paint
+                    && !points_paint.is_empty()
+                {
+                    let lo = (*sel.start()).min(points_paint.len() - 1);
+                    let hi = (*sel.end()).min(points_paint.len() - 1);
+                    let sel_left = plot_left + (lo as f32) * band_scale.step();
+                    let sel_right = plot_left + ((hi + 1) as f32) * band_scale.step();
+                    let sel_w = (sel_right - sel_left).max(2.0);
+                    let sel_h = plot_bottom - plot_top;
+                    window.paint_quad(fill(
+                        Bounds::new(point(px(sel_left), px(plot_top)), size(px(sel_w), px(sel_h))),
+                        accent_color.opacity(if is_live_brushing { 0.16 } else { 0.11 }),
+                    ));
+                    // Crisp vertical left/right brush edge guides
+                    window.paint_quad(fill(
+                        Bounds::new(point(px(sel_left), px(plot_top)), size(px(1.5), px(sel_h))),
+                        accent_color.opacity(0.85),
+                    ));
+                    window.paint_quad(fill(
+                        Bounds::new(
+                            point(px((sel_right - 1.5).max(sel_left)), px(plot_top)),
+                            size(px(1.5), px(sel_h)),
+                        ),
+                        accent_color.opacity(0.85),
+                    ));
+                }
+
+                // 4. Stacked bar segments (bottom-to-top; top-only corner rounding on highest segment)
                 let bw = band_scale.bandwidth();
                 for (col_idx, col) in points_paint.iter().enumerate() {
+                    let dimmed = active_selection_paint
+                        .as_ref()
+                        .is_some_and(|sel| !sel.contains(&col_idx));
                     let top_non_zero = col
                         .values
                         .iter()
@@ -290,10 +410,15 @@ impl RenderOnce for StackedBarChart {
                         let y_top = y_scale.map(cumulative);
                         let seg_h = (y_bot - y_top).max(1.0);
                         let is_top = top_non_zero == Some(s_idx);
-                        let color = colors_paint
+                        let base_color = colors_paint
                             .get(s_idx)
                             .copied()
                             .unwrap_or_else(|| palette_paint.color(s_idx));
+                        let color = if dimmed {
+                            base_color.opacity(0.32)
+                        } else {
+                            base_color
+                        };
 
                         let corner_radii = if is_top {
                             let r = bar_radius.min(px(bw * 0.45)).min(px(seg_h * 0.5));
@@ -307,7 +432,6 @@ impl RenderOnce for StackedBarChart {
                             Corners::default()
                         };
 
-                        // Add subtle 1px top divider between stacked segments.
                         let draw_y = if !is_top && seg_h > 2.0 { y_top + 0.75 } else { y_top };
                         let draw_h = if !is_top && seg_h > 2.0 { seg_h - 0.75 } else { seg_h };
 
@@ -329,17 +453,18 @@ impl RenderOnce for StackedBarChart {
                     }
                 }
 
-                // 4. Auto-thinned X-axis labels
+                // 5. Auto-thinned X-axis labels
                 let n = points_paint.len();
                 if n > 0 {
                     let max_labels = ((plot_width / 68.0).floor() as usize).clamp(2, n);
-                    let stride = (n.saturating_sub(1)).div_ceil(max_labels.saturating_sub(1).max(1)).max(1);
+                    let stride = (n.saturating_sub(1))
+                        .div_ceil(max_labels.saturating_sub(1).max(1))
+                        .max(1);
                     for (idx, col) in points_paint.iter().enumerate() {
                         let is_last = idx + 1 == n;
                         if idx % stride != 0 && !is_last {
                             continue;
                         }
-                        // Avoid colliding the second-to-last label with the last label ("Today").
                         if !is_last && n.saturating_sub(1) - idx < stride.div_ceil(2) {
                             continue;
                         }
@@ -377,66 +502,207 @@ impl RenderOnce for StackedBarChart {
         .w_full()
         .h(self.height);
 
-        let point_count = self.points.len();
-        let hover_move_entity = hover_entity.clone();
-        let hover_leave_entity = hover_entity;
-        let hover_click_rc = hover_rc.clone();
-        let on_bar_click = self.on_bar_click.clone();
+        let selectable = self.selectable;
+        let on_bar_click = self.on_bar_click;
+        let on_brush_select = self.on_brush_select;
+
+        let down_entity = interaction_entity.clone();
+        let move_entity = interaction_entity.clone();
+        let up_entity = interaction_entity.clone();
+        let up_out_entity = interaction_entity.clone();
+        let leave_entity = interaction_entity;
+
+        let on_brush_up = on_brush_select.clone();
+        let on_brush_up_out = on_brush_select;
+        let on_click_up = on_bar_click.clone();
+
+        let cursor_style = if selectable {
+            Some(CursorStyle::Crosshair)
+        } else if on_bar_click.is_some() {
+            Some(CursorStyle::PointingHand)
+        } else {
+            None
+        };
 
         let mut container = div()
             .id(self.id.clone())
             .relative()
             .w_full()
             .h(self.height)
-            .when(on_bar_click.is_some(), |el| el.cursor_pointer())
-            .on_mouse_move(move |event: &MouseMoveEvent, _, cx| {
-                let next_idx = {
-                    let state = hover_move_entity.read(cx).borrow();
-                    state.plot_bounds.and_then(|bounds| {
-                        let plot_left = bounds.origin.x.0 + margin_left;
-                        let plot_width = (bounds.size.width.0 - margin_left - margin_right).max(1.0);
-                        let scale = BandScale::new(plot_left, plot_width, point_count, 0.28);
-                        scale.index_at_x(event.position.x.0)
-                    })
+            .when_some(cursor_style, |el, cursor| el.cursor(cursor))
+            .on_mouse_down(MouseButton::Left, move |event: &MouseDownEvent, _, cx| {
+                let mut state = down_entity.read(cx).borrow_mut();
+                let Some(bounds) = state.plot_bounds else {
+                    return;
                 };
+                let plot_left = bounds.origin.x.0 + margin_left;
+                let plot_right =
+                    (bounds.origin.x.0 + bounds.size.width.0 - margin_right).max(plot_left + 1.0);
+                let mx = event.position.x.0;
+                if mx >= plot_left && mx <= plot_right {
+                    if selectable {
+                        state.drag_anchor_x = Some(mx);
+                        state.drag_current_x = Some(mx);
+                        drop(state);
+                        down_entity.update(cx, |_, cx| cx.notify());
+                    } else {
+                        state.drag_anchor_x = Some(mx);
+                        state.drag_current_x = Some(mx);
+                    }
+                }
+            })
+            .on_mouse_move(move |event: &MouseMoveEvent, _, cx| {
                 let changed = {
-                    let mut state = hover_move_entity.read(cx).borrow_mut();
+                    let mut state = move_entity.read(cx).borrow_mut();
+                    let Some(bounds) = state.plot_bounds else {
+                        return;
+                    };
+                    let plot_left = bounds.origin.x.0 + margin_left;
+                    let plot_right = (bounds.origin.x.0 + bounds.size.width.0 - margin_right)
+                        .max(plot_left + 1.0);
+                    let plot_width = plot_right - plot_left;
+                    let scale = BandScale::new(plot_left, plot_width, point_count, 0.28);
+                    let next_idx = scale.index_at_x(event.position.x.0);
+
+                    let mut dirty = false;
                     if state.hovered_index != next_idx {
                         state.hovered_index = next_idx;
-                        true
-                    } else {
-                        false
+                        dirty = true;
                     }
+                    if selectable && state.drag_anchor_x.is_some() {
+                        let clamped = event.position.x.0.clamp(plot_left, plot_right);
+                        if state.drag_current_x != Some(clamped) {
+                            state.drag_current_x = Some(clamped);
+                            dirty = true;
+                        }
+                    }
+                    dirty
                 };
                 if changed {
-                    hover_move_entity.update(cx, |_, cx| cx.notify());
+                    move_entity.update(cx, |_, cx| cx.notify());
+                }
+            })
+            .on_mouse_up(MouseButton::Left, move |_: &MouseUpEvent, window, cx| {
+                let (brushed, clicked_idx, had_drag) = {
+                    let mut state = up_entity.read(cx).borrow_mut();
+                    let had = state.drag_anchor_x.is_some();
+                    let brushed = if selectable {
+                        state.brushed_indices(margin_left, margin_right, point_count)
+                    } else {
+                        None
+                    };
+                    let clicked = state.hovered_index;
+                    state.drag_anchor_x = None;
+                    state.drag_current_x = None;
+                    (brushed, clicked, had)
+                };
+                if had_drag {
+                    up_entity.update(cx, |_, cx| cx.notify());
+                }
+                if let Some(range) = brushed {
+                    if let Some(cb) = &on_brush_up {
+                        cb(&range, window, cx);
+                    }
+                } else if had_drag
+                    && let Some(idx) = clicked_idx
+                    && let Some(cb) = &on_click_up
+                {
+                    cb(&idx, window, cx);
+                }
+            })
+            .on_mouse_up_out(MouseButton::Left, move |_: &MouseUpEvent, window, cx| {
+                let (brushed, had_drag) = {
+                    let mut state = up_out_entity.read(cx).borrow_mut();
+                    let had = state.drag_anchor_x.is_some();
+                    let brushed = if selectable {
+                        state.brushed_indices(margin_left, margin_right, point_count)
+                    } else {
+                        None
+                    };
+                    state.drag_anchor_x = None;
+                    state.drag_current_x = None;
+                    (brushed, had)
+                };
+                if had_drag {
+                    up_out_entity.update(cx, |_, cx| cx.notify());
+                }
+                if let Some(range) = brushed
+                    && let Some(cb) = &on_brush_up_out
+                {
+                    cb(&range, window, cx);
                 }
             })
             .on_hover(move |hovered, _, cx| {
                 if !hovered {
                     let changed = {
-                        let mut state = hover_leave_entity.read(cx).borrow_mut();
+                        let mut state = leave_entity.read(cx).borrow_mut();
                         state.hovered_index.take().is_some()
                     };
                     if changed {
-                        hover_leave_entity.update(cx, |_, cx| cx.notify());
+                        leave_entity.update(cx, |_, cx| cx.notify());
                     }
                 }
             })
-            .when_some(on_bar_click, |el, cb| {
-                el.on_click(move |_: &ClickEvent, window, cx| {
-                    if let Some(idx) = hover_click_rc.borrow().hovered_index {
-                        cb(&idx, window, cx);
-                    }
-                })
-            })
             .child(plot_canvas);
 
-        // 5. Floating hover tooltip pinned cleanly inside the plot bounds
-        if let Some(h_idx) = hovered_index
-            && let Some(col) = self.points.get(h_idx)
-            && let Some(bounds) = hover_rc.borrow().plot_bounds
+        // 6. Floating live brush pill during active drag selection
+        if let Some(brush_range) = live_brush
+            && let Some(bounds) = interaction_rc.borrow().plot_bounds
+            && !self.points.is_empty()
         {
+            let lo = (*brush_range.start()).min(self.points.len() - 1);
+            let hi = (*brush_range.end()).min(self.points.len() - 1);
+            let plot_width = (bounds.size.width.0 - margin_left - margin_right).max(1.0);
+            let band_scale = BandScale::new(margin_left, plot_width, point_count, 0.28);
+            let sel_left = margin_left + (lo as f32) * band_scale.step();
+            let sel_right = margin_left + ((hi + 1) as f32) * band_scale.step();
+            let mid_x = (sel_left + sel_right) * 0.5;
+            let count = hi - lo + 1;
+            let span_sum: f64 = self.points[lo..=hi].iter().map(StackedBarPoint::total).sum();
+            let summary = if lo == hi {
+                format!(
+                    "{} · {}",
+                    self.points[lo].label,
+                    self.value_format.format_detail(span_sum)
+                )
+            } else {
+                format!(
+                    "{} – {} ({}d) · {}",
+                    self.points[lo].label,
+                    self.points[hi].label,
+                    count,
+                    self.value_format.format_detail(span_sum)
+                )
+            };
+            let pill_w = ((summary.len() as f32) * 6.8 + 20.0).clamp(140.0, 290.0);
+            let left_x = (mid_x - pill_w * 0.5)
+                .clamp(margin_left, (bounds.size.width.0 - pill_w - 4.0).max(margin_left));
+
+            container = container.child(
+                div()
+                    .absolute()
+                    .top(px(6.))
+                    .left(px(left_x))
+                    .w(px(pill_w))
+                    .px(px(10.))
+                    .py(px(5.))
+                    .rounded(theme.radius_md)
+                    .bg(theme.primary)
+                    .text_color(theme.primary_foreground)
+                    .text_size(px(11.5))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .font_features(tnum)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .when(theme.elevation_shadows, |el| el.shadow_md())
+                    .child(summary),
+            );
+        } else if let Some(h_idx) = hovered_index
+            && let Some(col) = self.points.get(h_idx)
+            && let Some(bounds) = interaction_rc.borrow().plot_bounds
+        {
+            // 7. Floating hover tooltip when not actively brushing
             let plot_width = (bounds.size.width.0 - margin_left - margin_right).max(1.0);
             let band_scale = BandScale::new(margin_left, plot_width, point_count, 0.28);
             let center_x = band_scale.band_center(h_idx);
@@ -458,7 +724,7 @@ impl RenderOnce for StackedBarChart {
                 .bg(theme.popover)
                 .border_1()
                 .border_color(theme.border)
-                .shadow_lg()
+                .when(theme.elevation_shadows, |el| el.shadow_lg())
                 .flex()
                 .flex_col()
                 .gap(px(5.))

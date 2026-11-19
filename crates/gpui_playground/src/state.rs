@@ -189,6 +189,9 @@ pub struct PlaygroundApp {
     pub analytics_scope_select: Entity<SelectState<&'static str>>,
     pub analytics_metric: SharedString,
     pub analytics_refresh_seed: u64,
+    pub analytics_drag_zoom_enabled: bool,
+    pub analytics_line_selection: Option<(f64, f64)>,
+    pub analytics_hidden_models: Vec<SharedString>,
 }
 
 impl PlaygroundApp {
@@ -590,6 +593,9 @@ impl PlaygroundApp {
             analytics_scope_select,
             analytics_metric: "cost".into(),
             analytics_refresh_seed: 0,
+            analytics_drag_zoom_enabled: true,
+            analytics_line_selection: None,
+            analytics_hidden_models: Vec::new(),
         };
 
         app.log_event(

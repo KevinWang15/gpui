@@ -322,6 +322,8 @@ pub struct ChartLegendItem {
     pub color: Hsla,
     /// Swatch indicator shape.
     pub swatch: LegendSwatch,
+    /// Whether this series is currently muted/hidden via interactive legend toggle.
+    pub muted: bool,
 }
 
 impl ChartLegendItem {
@@ -331,6 +333,7 @@ impl ChartLegendItem {
             label: label.into(),
             color,
             swatch: LegendSwatch::Dot,
+            muted: false,
         }
     }
 
@@ -340,6 +343,7 @@ impl ChartLegendItem {
             label: label.into(),
             color,
             swatch: LegendSwatch::SolidLine,
+            muted: false,
         }
     }
 
@@ -349,62 +353,109 @@ impl ChartLegendItem {
             label: label.into(),
             color,
             swatch: LegendSwatch::DashedLine,
+            muted: false,
         }
+    }
+
+    /// Marks this legend item as muted/toggled off.
+    pub fn muted(mut self, muted: bool) -> Self {
+        self.muted = muted;
+        self
     }
 }
 
 /// Renders a horizontal wrapping legend bar from `items`.
 pub fn render_chart_legend(items: &[ChartLegendItem], theme: &Theme) -> impl IntoElement {
-    let mut row = div().flex().flex_wrap().items_center().gap_x(px(16.)).gap_y(px(6.));
-    for item in items {
+    render_interactive_chart_legend("chart-legend", items, theme, None)
+}
+
+fn render_interactive_chart_legend(
+    id: impl Into<ElementId>,
+    items: &[ChartLegendItem],
+    theme: &Theme,
+    on_click: Option<Rc<dyn Fn(&usize, &mut Window, &mut App) + 'static>>,
+) -> impl IntoElement {
+    let base_id = id.into();
+    let hover_bg = theme.surface_hover;
+    let mut row = div()
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .gap_x(px(12.))
+        .gap_y(px(6.));
+    for (idx, item) in items.iter().enumerate() {
+        let swatch_color = if item.muted {
+            item.color.opacity(0.32)
+        } else {
+            item.color
+        };
         let swatch = match item.swatch {
             LegendSwatch::Dot => div()
                 .w(px(8.))
                 .h(px(8.))
                 .rounded_full()
-                .bg(item.color)
+                .bg(swatch_color)
                 .into_any_element(),
             LegendSwatch::SolidLine => div()
                 .w(px(16.))
                 .h(px(2.5))
                 .rounded_full()
-                .bg(item.color)
+                .bg(swatch_color)
                 .into_any_element(),
             LegendSwatch::DashedLine => div()
                 .flex()
                 .items_center()
                 .gap(px(2.5))
-                .child(div().w(px(4.)).h(px(2.)).rounded_full().bg(item.color))
-                .child(div().w(px(4.)).h(px(2.)).rounded_full().bg(item.color))
-                .child(div().w(px(4.)).h(px(2.)).rounded_full().bg(item.color))
+                .child(div().w(px(4.)).h(px(2.)).rounded_full().bg(swatch_color))
+                .child(div().w(px(4.)).h(px(2.)).rounded_full().bg(swatch_color))
+                .child(div().w(px(4.)).h(px(2.)).rounded_full().bg(swatch_color))
                 .into_any_element(),
         };
 
-        row = row.child(
-            div()
-                .flex()
-                .items_center()
-                .gap(px(6.))
-                .child(swatch)
-                .child(
-                    div()
-                        .text_size(px(12.))
-                        .text_color(theme.muted_foreground)
-                        .child(item.label.clone()),
-                ),
-        );
+        let mut pill = div()
+            .id((base_id.clone(), format!("leg-{idx}")))
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .px(px(6.))
+            .py(px(2.))
+            .mx(px(-6.))
+            .rounded(theme.radius_sm)
+            .when(item.muted, |el| el.opacity(0.5))
+            .child(swatch)
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(theme.muted_foreground)
+                    .when(item.muted, |el| el.line_through())
+                    .child(item.label.clone()),
+            );
+
+        if let Some(cb) = &on_click {
+            let cb = cb.clone();
+            pill = pill
+                .cursor_pointer()
+                .hover(move |s| s.bg(hover_bg))
+                .on_click(move |_: &ClickEvent, window, cx| {
+                    cb(&idx, window, cx);
+                });
+        }
+
+        row = row.child(pill);
     }
     row
 }
 
 /// Reusable analytics card container framing any chart with title, right metadata,
-/// legend, main plot body, and an optional collapsible `"Show data table"` disclosure.
+/// interactive legend, main plot body, and an optional collapsible `"Show data table"` disclosure.
 #[derive(IntoElement)]
 pub struct ChartCard {
     id: ElementId,
     title: SharedString,
     subtitle: Option<SharedString>,
+    header_action: Option<AnyElement>,
     legend: Vec<ChartLegendItem>,
+    on_legend_click: Option<Rc<dyn Fn(&usize, &mut Window, &mut App) + 'static>>,
     body: Option<AnyElement>,
     data_table: Option<AnyElement>,
     style: StyleRefinement,
@@ -422,7 +473,9 @@ impl ChartCard {
             id: id.into(),
             title: title.into(),
             subtitle: None,
+            header_action: None,
             legend: Vec::new(),
+            on_legend_click: None,
             body: None,
             data_table: None,
             style: StyleRefinement::default(),
@@ -435,9 +488,24 @@ impl ChartCard {
         self
     }
 
+    /// Sets an optional inline action element in the top-right header (e.g. a `"Reset zoom"` button).
+    pub fn header_action(mut self, action: impl IntoElement) -> Self {
+        self.header_action = Some(action.into_any_element());
+        self
+    }
+
     /// Sets legend items displayed beneath the card header.
     pub fn legend(mut self, items: impl IntoIterator<Item = ChartLegendItem>) -> Self {
         self.legend = items.into_iter().collect();
+        self
+    }
+
+    /// Makes legend items interactive, invoking `handler` with the clicked legend index.
+    pub fn on_legend_click(
+        mut self,
+        handler: impl Fn(&usize, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_legend_click = Some(Rc::new(handler));
         self
     }
 
@@ -483,7 +551,7 @@ impl RenderOnce for ChartCard {
             .child(
                 div()
                     .flex()
-                    .items_baseline()
+                    .items_center()
                     .justify_between()
                     .gap(px(12.))
                     .child(
@@ -493,18 +561,30 @@ impl RenderOnce for ChartCard {
                             .text_color(theme.foreground)
                             .child(self.title),
                     )
-                    .when_some(self.subtitle, |el, sub| {
-                        el.child(
-                            div()
-                                .text_size(px(12.))
-                                .text_color(theme.muted_foreground)
-                                .child(sub),
-                        )
-                    }),
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(10.))
+                            .when_some(self.subtitle, |el, sub| {
+                                el.child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .text_color(theme.muted_foreground)
+                                        .child(sub),
+                                )
+                            })
+                            .when_some(self.header_action, |el, act| el.child(act)),
+                    ),
             );
 
         if !self.legend.is_empty() {
-            card = card.child(render_chart_legend(&self.legend, &theme));
+            card = card.child(render_interactive_chart_legend(
+                (self.id.clone(), "legend"),
+                &self.legend,
+                &theme,
+                self.on_legend_click,
+            ));
         }
 
         if let Some(body) = self.body {

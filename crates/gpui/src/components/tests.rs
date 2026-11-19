@@ -1067,3 +1067,166 @@ fn custom_theme_tokens_and_direct_styled_passthrough_render_cleanly(cx: &mut Tes
     });
     cx.run_until_parked();
 }
+
+struct ChartBrushToTimeRangeTestView {
+    time_range: Entity<TimeRangePickerState>,
+    selectable: bool,
+    brushed_cols: Rc<RefCell<Option<std::ops::RangeInclusive<usize>>>>,
+    brushed_line: Rc<RefCell<Option<(f64, f64)>>>,
+}
+
+impl Render for ChartBrushToTimeRangeTestView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let range = self.time_range.read(cx).range();
+        let span = range.span_days();
+        let points: Vec<StackedBarPoint> = (0..span)
+            .map(|i| {
+                let d = range.start.add_days(i64::from(i));
+                StackedBarPoint::new(d.format_short(), vec![10.0 + f64::from(i), 5.0])
+            })
+            .collect();
+
+        let tr = self.time_range.clone();
+        let brushed_cols = self.brushed_cols.clone();
+        let brushed_line = self.brushed_line.clone();
+        let start = range.start;
+
+        v_stack()
+            .w_full()
+            .p(px(20.))
+            .spacing(px(16.))
+            .child(time_range_picker("brush-test-tr", &self.time_range))
+            .child(
+                stacked_bar_chart("brush-test-bars")
+                    .series([StackedBarSeries::new("a"), StackedBarSeries::new("b")])
+                    .points(points)
+                    .height(px(200.))
+                    .on_brush_select(move |sel, _, cx| {
+                        *brushed_cols.borrow_mut() = Some(sel.clone());
+                        let s = start.add_days(*sel.start() as i64);
+                        let e = start.add_days(*sel.end() as i64);
+                        tr.update(cx, |state, cx| state.apply_custom_range(s, e, cx));
+                    })
+                    .selectable(self.selectable),
+            )
+            .child(
+                line_chart("brush-test-line")
+                    .x_domain(0.0, 24.0)
+                    .height(px(180.))
+                    .add_series(LineSeries::new(
+                        "Today",
+                        vec![(0.0, 0.0), (12.0, 20.0), (24.0, 40.0)],
+                    ))
+                    .on_brush_select(move |span, _, _| {
+                        *brushed_line.borrow_mut() = Some(*span);
+                    })
+                    .selectable(self.selectable),
+            )
+    }
+}
+
+#[gpui::test]
+fn chart_drag_selection_updates_time_range_when_selectable(cx: &mut TestAppContext) {
+    cx.update(init_components);
+    let brushed_cols: Rc<RefCell<Option<std::ops::RangeInclusive<usize>>>> =
+        Rc::new(RefCell::new(None));
+    let brushed_line: Rc<RefCell<Option<(f64, f64)>>> = Rc::new(RefCell::new(None));
+
+    let (view, cx) = cx.add_window_view(|_, cx| {
+        let time_range =
+            cx.new(|cx| TimeRangePickerState::new(CalendarDate::new(2026, 11, 19), cx));
+        ChartBrushToTimeRangeTestView {
+            time_range,
+            selectable: true,
+            brushed_cols: brushed_cols.clone(),
+            brushed_line: brushed_line.clone(),
+        }
+    });
+    cx.run_until_parked();
+
+    let initial_span = view.read_with(cx, |v, cx| v.time_range.read(cx).range().span_days());
+    assert_eq!(initial_span, 30);
+
+    // Drag horizontally across the StackedBarChart (y ~= 150 inside 200px tall chart)
+    cx.simulate_mouse_down(
+        crate::point(px(220.), px(150.)),
+        crate::MouseButton::Left,
+        crate::Modifiers::default(),
+    );
+    cx.simulate_mouse_move(
+        crate::point(px(460.), px(150.)),
+        Some(crate::MouseButton::Left),
+        crate::Modifiers::default(),
+    );
+    cx.simulate_mouse_up(
+        crate::point(px(460.), px(150.)),
+        crate::MouseButton::Left,
+        crate::Modifiers::default(),
+    );
+    cx.run_until_parked();
+
+    let brushed = brushed_cols.borrow().clone();
+    assert!(
+        brushed.is_some(),
+        "dragging across selectable StackedBarChart should emit on_brush_select"
+    );
+    let new_range = view.read_with(cx, |v, cx| v.time_range.read(cx).range());
+    assert!(
+        new_range.span_days() < 30,
+        "TimeRangePicker should have zoomed from 30d to {}d",
+        new_range.span_days()
+    );
+
+    // Drag horizontally across the LineChart (y ~= 360)
+    cx.simulate_mouse_down(
+        crate::point(px(240.), px(360.)),
+        crate::MouseButton::Left,
+        crate::Modifiers::default(),
+    );
+    cx.simulate_mouse_move(
+        crate::point(px(480.), px(360.)),
+        Some(crate::MouseButton::Left),
+        crate::Modifiers::default(),
+    );
+    cx.simulate_mouse_up(
+        crate::point(px(480.), px(360.)),
+        crate::MouseButton::Left,
+        crate::Modifiers::default(),
+    );
+    cx.run_until_parked();
+
+    let line_span = *brushed_line.borrow();
+    assert!(
+        line_span.is_some_and(|(a, b)| b > a + 1.0),
+        "dragging across selectable LineChart should emit normalized (a, b), got {line_span:?}"
+    );
+
+    // Disable selectable(false) and verify dragging no longer triggers selection
+    *brushed_cols.borrow_mut() = None;
+    view.update(cx, |v, cx| {
+        v.selectable = false;
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    cx.simulate_mouse_down(
+        crate::point(px(200.), px(150.)),
+        crate::MouseButton::Left,
+        crate::Modifiers::default(),
+    );
+    cx.simulate_mouse_move(
+        crate::point(px(400.), px(150.)),
+        Some(crate::MouseButton::Left),
+        crate::Modifiers::default(),
+    );
+    cx.simulate_mouse_up(
+        crate::point(px(400.), px(150.)),
+        crate::MouseButton::Left,
+        crate::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    assert!(
+        brushed_cols.borrow().is_none(),
+        "selectable(false) must suppress drag brush selection"
+    );
+}

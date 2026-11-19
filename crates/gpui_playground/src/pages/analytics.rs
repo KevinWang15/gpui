@@ -127,11 +127,15 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
     let theme = cx.theme();
     let palette = ChartPalette::from_theme(&theme);
     let range = app.analytics_time_range.read(cx).range();
+    let active_preset = app.analytics_time_range.read(cx).active_preset();
     let today = app.analytics_time_range.read(cx).today();
     let span_days = range.span_days();
     let clauses = app.analytics_filter.read(cx).clauses().to_vec();
     let metric_key = app.analytics_metric.clone();
     let seed = app.analytics_refresh_seed;
+    let drag_zoom_enabled = app.analytics_drag_zoom_enabled;
+    let line_selection = app.analytics_line_selection;
+    let hidden_models = &app.analytics_hidden_models;
     let scope_mult = match app.analytics_scope_select.read(cx).selected_value() {
         Some(&"team") => 2.35,
         Some(&"all") => 3.80,
@@ -198,7 +202,8 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
                 _ => day_cost,
             };
             model_totals_metric[idx] += metric_val;
-            col_values.push(metric_val);
+            let is_hidden = hidden_models.iter().any(|h| h.as_ref() == m.name);
+            col_values.push(if is_hidden { 0.0 } else { metric_val });
         }
         bar_points.push(StackedBarPoint::new(label, col_values));
     }
@@ -232,12 +237,22 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
     }
     let today_cost_now = (avg_daily_cost * 1.18 * today_scale).max(0.0);
 
-    // Stacked bar series metadata & legend
+    // Stacked bar series metadata & interactive legend (clicking toggles visibility)
     let bar_series: Vec<StackedBarSeries> = active_models
         .iter()
         .map(|&(orig_idx, m)| StackedBarSeries::new(m.name).color(palette.color(orig_idx)))
         .collect();
-    let bar_legend = StackedBarChart::legend_items(&bar_series, &palette);
+    let bar_legend: Vec<ChartLegendItem> = active_models
+        .iter()
+        .map(|&(orig_idx, m)| {
+            let muted = hidden_models.iter().any(|h| h.as_ref() == m.name);
+            ChartLegendItem::dot(m.name, palette.color(orig_idx)).muted(muted)
+        })
+        .collect();
+    let legend_model_names: Vec<SharedString> = active_models
+        .iter()
+        .map(|(_, m)| SharedString::from(m.name))
+        .collect();
 
     // Line chart series & legend
     let line_series = vec![
@@ -418,8 +433,9 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
         .child(
             div()
                 .flex()
+                .flex_wrap()
                 .items_center()
-                .gap(px(8.))
+                .gap(px(10.))
                 .child(div().w(px(148.)).child(select(&app.analytics_scope_select)))
                 .child(
                     segmented_control("analytics-metric-seg", metric_key)
@@ -433,6 +449,22 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
                             this.analytics_metric = val.clone();
                             this.log_event("SegmentedControl", format!("metric -> {val}"), cx);
                         })),
+                )
+                .child(
+                    toggle("analytics-drag-select-toggle", drag_zoom_enabled)
+                        .size(ComponentSize::Sm)
+                        .label("Drag to zoom")
+                        .on_change(cx.listener(|this, enabled: &bool, _, cx| {
+                            this.analytics_drag_zoom_enabled = *enabled;
+                            if !*enabled {
+                                this.analytics_line_selection = None;
+                            }
+                            this.log_event(
+                                "Charts",
+                                format!("selectable -> {}", *enabled),
+                                cx,
+                            );
+                        })),
                 ),
         )
         .child(
@@ -440,7 +472,17 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
                 .text_size(px(12.))
                 .text_color(theme.muted_foreground)
                 .child(if clauses.is_empty() {
-                    format!("Showing all {} models · click any bar or breakdown row to narrow", MODELS.len())
+                    if drag_zoom_enabled {
+                        format!(
+                            "Showing all {} models · drag on bars to zoom TimeRangePicker",
+                            MODELS.len()
+                        )
+                    } else {
+                        format!(
+                            "Showing all {} models · click breakdown rows to narrow",
+                            MODELS.len()
+                        )
+                    }
                 } else {
                     format!(
                         "{} active filter{} · {} matching model{}",
@@ -452,9 +494,32 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
                 }),
         );
 
-    let stacked_card = chart_card("card-stacked", format!("Daily {metric_noun} by model"))
-        .subtitle(format!("{span_days} days · local time"))
+    let time_range_for_brush = app.analytics_time_range.clone();
+    let time_range_for_reset = app.analytics_time_range.clone();
+    let range_start_for_brush = range.start;
+    let is_custom_zoom = active_preset == TimeRangePreset::Custom;
+
+    let mut stacked_card = chart_card("card-stacked", format!("Daily {metric_noun} by model"))
+        .subtitle(if drag_zoom_enabled {
+            format!("{span_days} days · drag across bars to zoom range")
+        } else {
+            format!("{span_days} days · local time")
+        })
         .legend(bar_legend)
+        .on_legend_click(cx.listener(move |this, idx: &usize, _, cx| {
+            if let Some(name) = legend_model_names.get(*idx) {
+                if let Some(pos) = this
+                    .analytics_hidden_models
+                    .iter()
+                    .position(|m| m == name)
+                {
+                    this.analytics_hidden_models.remove(pos);
+                } else if this.analytics_hidden_models.len() + 1 < legend_model_names.len() {
+                    this.analytics_hidden_models.push(name.clone());
+                }
+                this.log_event("ChartLegend", format!("toggled {name}"), cx);
+            }
+        }))
         .content(
             stacked_bar_chart("analytics-stacked-bar")
                 .series(bar_series)
@@ -463,12 +528,74 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
                 .value_format(value_format.clone())
                 .on_bar_click(cx.listener(|this, idx, _, cx| {
                     this.log_event("StackedBarChart", format!("clicked column #{idx}"), cx);
-                })),
+                }))
+                .on_brush_select(cx.listener(move |this, sel: &std::ops::RangeInclusive<usize>, _, cx| {
+                    let start_day = range_start_for_brush.add_days(*sel.start() as i64);
+                    let end_day = range_start_for_brush.add_days(*sel.end() as i64);
+                    time_range_for_brush.update(cx, |s, cx| {
+                        s.apply_custom_range(start_day, end_day, cx);
+                    });
+                    let zoomed = DateRange::new(start_day, end_day);
+                    this.log_event(
+                        "Chart -> TimeRange",
+                        format!("brushed {} ({}d)", zoomed.format_compact(), zoomed.span_days()),
+                        cx,
+                    );
+                }))
+                .selectable(drag_zoom_enabled),
         )
         .data_table(daily_data_table);
 
-    let line_card = chart_card("card-line", "Today vs previous workdays")
-        .subtitle(format!("{metric_title} · cumulative · 5-workday average"))
+    if is_custom_zoom {
+        stacked_card = stacked_card.header_action(
+            button("analytics-reset-zoom")
+                .soft()
+                .size(ComponentSize::Xs)
+                .leading_icon(LucideIcon::ZoomOut)
+                .label("Reset 30d")
+                .on_click(move |_, _, cx| {
+                    time_range_for_reset.update(cx, |s, cx| {
+                        s.apply_preset(TimeRangePreset::Last30Days, cx);
+                    });
+                }),
+        );
+    }
+
+    let fmt_hour = |hr: f64| {
+        let h = hr.floor().clamp(0.0, 24.0) as u32;
+        let m = ((hr.fract() * 60.0).round() as u32).min(59);
+        format!("{h:02}:{m:02}")
+    };
+
+    let line_subtitle = if let Some((a, b)) = line_selection {
+        let sample = |pts: &[(f64, f64)], x: f64| -> Option<f64> {
+            let first = pts.first()?;
+            let last = pts.last()?;
+            if x < first.0 - 1e-6 || x > last.0 + 1e-6 {
+                return None;
+            }
+            for w in pts.windows(2) {
+                if x >= w[0].0 - 1e-6 && x <= w[1].0 + 1e-6 {
+                    let span = (w[1].0 - w[0].0).max(1e-9);
+                    let t = ((x - w[0].0) / span).clamp(0.0, 1.0);
+                    return Some(w[0].1 + (w[1].1 - w[0].1) * t);
+                }
+            }
+            Some(last.1)
+        };
+        let delta_str = match (sample(&today_points, a), sample(&today_points, b)) {
+            (Some(y0), Some(y1)) => format!(" · Δ {}", value_format.format_detail((y1 - y0).max(0.0))),
+            _ => String::new(),
+        };
+        format!("Window {} – {}{delta_str}", fmt_hour(a), fmt_hour(b))
+    } else if drag_zoom_enabled {
+        format!("{metric_title} · cumulative · drag to measure window")
+    } else {
+        format!("{metric_title} · cumulative · 5-workday average")
+    };
+
+    let mut line_card = chart_card("card-line", "Today vs previous workdays")
+        .subtitle(line_subtitle)
         .legend(line_legend)
         .content(
             line_chart("analytics-line-chart")
@@ -481,15 +608,39 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
                     (18.0, "18:00".into()),
                     (24.0, "24:00".into()),
                 ])
-                .x_formatter(|hr| {
-                    let h = hr.floor().clamp(0.0, 24.0) as u32;
-                    let m = ((hr.fract() * 60.0).round() as u32).min(59);
-                    format!("{h:02}:{m:02}")
-                })
+                .x_formatter(fmt_hour)
                 .height(px(225.))
-                .value_format(value_format.clone()),
+                .value_format(value_format.clone())
+                .selected_range(line_selection)
+                .on_brush_select(cx.listener(|this, &(a, b): &(f64, f64), _, cx| {
+                    this.analytics_line_selection = Some((a, b));
+                    this.log_event(
+                        "LineChart",
+                        format!("selected {:.1}h – {:.1}h", a, b),
+                        cx,
+                    );
+                }))
+                .on_selection_clear(cx.listener(|this, _, _, cx| {
+                    this.analytics_line_selection = None;
+                    this.log_event("LineChart", "cleared selection", cx);
+                }))
+                .selectable(drag_zoom_enabled),
         )
         .data_table(hourly_data_table);
+
+    if line_selection.is_some() {
+        line_card = line_card.header_action(
+            button("analytics-clear-line-sel")
+                .ghost()
+                .size(ComponentSize::Xs)
+                .leading_icon(LucideIcon::X)
+                .label("Clear")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.analytics_line_selection = None;
+                    cx.notify();
+                })),
+        );
+    }
 
     let breakdown_card = chart_card("card-breakdown", format!("{metric_title} by model"))
         .subtitle(format!("{span_days} days · click to narrow"))

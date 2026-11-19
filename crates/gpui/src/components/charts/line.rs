@@ -1,16 +1,16 @@
 //! GPU-native multi-series [`LineChart`] supporting solid & dashed strokes via Lyon
-//! [`PathBuilder`], optional area gradient fills, endpoint callout annotations, and
-//! interactive hover crosshairs.
+//! [`PathBuilder`], optional area gradient fills, endpoint callout annotations, interactive
+//! hover crosshairs, and optional horizontal drag-to-select brushing.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::{
-    App, Bounds, Corners, Edges, ElementId, FontFeatures, FontWeight, Hsla, IntoElement,
-    MouseMoveEvent, ParentElement, PathBuilder, Pixels, RenderOnce, SharedString, StyleRefinement,
-    Styled, TextAlign, Window, canvas, div, fill, linear_color_stop, linear_gradient, point,
-    prelude::*, px, quad, size,
+    App, Bounds, Corners, CursorStyle, Edges, ElementId, FontFeatures, FontWeight, Hsla,
+    IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement,
+    PathBuilder, Pixels, RenderOnce, SharedString, StyleRefinement, Styled, TextAlign, Window,
+    canvas, div, fill, linear_color_stop, linear_gradient, point, prelude::*, px, quad, size,
 };
 
 use super::core::{
@@ -93,13 +93,46 @@ impl LineSeries {
 }
 
 #[derive(Default)]
-struct LineChartHoverState {
+struct LineChartInteractionState {
     hover_x: Option<f64>,
     plot_bounds: Option<Bounds<Pixels>>,
+    drag_anchor_x: Option<f32>,
+    drag_current_x: Option<f32>,
+}
+
+impl LineChartInteractionState {
+    fn is_brushing(&self) -> bool {
+        match (self.drag_anchor_x, self.drag_current_x) {
+            (Some(a), Some(b)) => (b - a).abs() >= 4.0,
+            _ => false,
+        }
+    }
+
+    fn brushed_domain(
+        &self,
+        margin_left: f32,
+        margin_right: f32,
+        x_min: f64,
+        x_max: f64,
+    ) -> Option<(f64, f64)> {
+        if !self.is_brushing() {
+            return None;
+        }
+        let bounds = self.plot_bounds?;
+        let plot_left = bounds.origin.x.0 + margin_left;
+        let plot_right =
+            (bounds.origin.x.0 + bounds.size.width.0 - margin_right).max(plot_left + 1.0);
+        let scale = LinearScale::new(x_min, x_max, plot_left, plot_right);
+        let a = self.drag_anchor_x?.clamp(plot_left, plot_right);
+        let b = self.drag_current_x?.clamp(plot_left, plot_right);
+        let x0 = scale.invert(a.min(b)).clamp(x_min, x_max);
+        let x1 = scale.invert(a.max(b)).clamp(x_min, x_max);
+        Some((x0, x1))
+    }
 }
 
 /// GPU-native multi-series line chart with solid/dashed strokes, inline endpoint callout,
-/// and interactive vertical crosshair scrubber.
+/// interactive vertical crosshair scrubber, and optional horizontal drag-to-select brushing.
 #[derive(IntoElement)]
 pub struct LineChart {
     id: ElementId,
@@ -109,8 +142,12 @@ pub struct LineChart {
     height: Pixels,
     value_format: ChartValueFormat,
     palette: Option<ChartPalette>,
+    selectable: bool,
+    selected_range: Option<(f64, f64)>,
     x_formatter: Option<Rc<dyn Fn(f64) -> String>>,
     style: StyleRefinement,
+    on_brush_select: Option<Rc<dyn Fn(&(f64, f64), &mut Window, &mut App) + 'static>>,
+    on_selection_clear: Option<Rc<dyn Fn(&(), &mut Window, &mut App) + 'static>>,
 }
 
 /// Convenience constructor for [`LineChart::new`].
@@ -129,8 +166,12 @@ impl LineChart {
             height: px(220.),
             value_format: ChartValueFormat::Currency,
             palette: None,
+            selectable: false,
+            selected_range: None,
             x_formatter: None,
             style: StyleRefinement::default(),
+            on_brush_select: None,
+            on_selection_clear: None,
         }
     }
 
@@ -176,9 +217,42 @@ impl LineChart {
         self
     }
 
-    /// Sets a custom formatter for the hovered X value shown in the crosshair tooltip.
+    /// Enables or disables horizontal drag-brush selection across the X domain.
+    pub fn selectable(mut self, selectable: bool) -> Self {
+        self.selectable = selectable;
+        self
+    }
+
+    /// Highlights a controlled X-domain span `(start_x, end_x)`.
+    pub fn selected_range(mut self, range: Option<(f64, f64)>) -> Self {
+        self.selected_range = range;
+        self
+    }
+
+    /// Sets a custom formatter for the hovered/brushed X value shown in tooltips and range pills.
     pub fn x_formatter(mut self, formatter: impl Fn(f64) -> String + 'static) -> Self {
         self.x_formatter = Some(Rc::new(formatter));
+        self
+    }
+
+    /// Registers a drag-selection callback invoked with the normalized `(start_x, end_x)` domain span.
+    ///
+    /// Automatically enables [`Self::selectable`] unless explicitly disabled afterward.
+    pub fn on_brush_select(
+        mut self,
+        handler: impl Fn(&(f64, f64), &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.selectable = true;
+        self.on_brush_select = Some(Rc::new(handler));
+        self
+    }
+
+    /// Registers a callback invoked when the user clicks without dragging while [`Self::selected_range`] is active.
+    pub fn on_selection_clear(
+        mut self,
+        handler: impl Fn(&(), &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_selection_clear = Some(Rc::new(handler));
         self
     }
 
@@ -243,13 +317,12 @@ impl RenderOnce for LineChart {
             .unwrap_or_else(|| ChartPalette::from_theme(&theme));
         let tnum = FontFeatures(Arc::new(vec![("tnum".to_string(), 1)]));
 
-        let hover_entity = window.use_keyed_state(
-            (self.id.clone(), "line-chart-hover"),
+        let interaction_entity = window.use_keyed_state(
+            (self.id.clone(), "line-chart-interaction"),
             cx,
-            |_, _| Rc::new(RefCell::new(LineChartHoverState::default())),
+            |_, _| Rc::new(RefCell::new(LineChartInteractionState::default())),
         );
-        let hover_rc = hover_entity.read(cx).clone();
-        let hover_x = hover_rc.borrow().hover_x;
+        let interaction_rc = interaction_entity.read(cx).clone();
 
         let (x_min, x_max) = self.x_domain.unwrap_or_else(|| {
             let mut min_x = f64::INFINITY;
@@ -266,6 +339,25 @@ impl RenderOnce for LineChart {
                 (min_x, max_x)
             }
         });
+
+        let margin_left = 54.0_f32;
+        let margin_right = 16.0_f32;
+        let margin_top = 14.0_f32;
+        let margin_bottom = 26.0_f32;
+
+        let (hover_x, live_brush) = {
+            let state = interaction_rc.borrow();
+            (
+                state.hover_x,
+                if self.selectable {
+                    state.brushed_domain(margin_left, margin_right, x_min, x_max)
+                } else {
+                    None
+                },
+            )
+        };
+        let active_selection = live_brush.or(self.selected_range);
+        let has_controlled_selection = self.selected_range.is_some();
 
         let max_y = self
             .series
@@ -290,11 +382,6 @@ impl RenderOnce for LineChart {
             })
             .collect();
 
-        let margin_left = 54.0_f32;
-        let margin_right = 16.0_f32;
-        let margin_top = 14.0_f32;
-        let margin_bottom = 26.0_f32;
-
         let series_paint = self.series.clone();
         let colors_paint = resolved_colors.clone();
         let y_ticks_paint = y_ticks;
@@ -302,11 +389,13 @@ impl RenderOnce for LineChart {
         let format_paint = self.value_format.clone();
         let palette_paint = palette;
         let surface_bg = theme.surface;
-        let hover_paint = hover_rc.clone();
+        let accent_color = theme.primary;
+        let interaction_paint = interaction_rc.clone();
+        let is_live_brushing = live_brush.is_some();
 
         let plot_canvas = canvas(
             move |bounds, _, _| {
-                hover_paint.borrow_mut().plot_bounds = Some(bounds);
+                interaction_paint.borrow_mut().plot_bounds = Some(bounds);
                 bounds
             },
             move |bounds, _, window, cx| {
@@ -341,8 +430,33 @@ impl RenderOnce for LineChart {
                     );
                 }
 
-                // 2. Vertical crosshair line if hovered
-                if let Some(hx) = hover_x {
+                // 2. Highlighted brush/selected X-domain band
+                if let Some((a, b)) = active_selection {
+                    let sx0 = x_scale.map(a.min(b)).clamp(plot_left, plot_right);
+                    let sx1 = x_scale.map(a.max(b)).clamp(plot_left, plot_right);
+                    let sel_w = (sx1 - sx0).max(2.0);
+                    let sel_h = plot_bottom - plot_top;
+                    window.paint_quad(fill(
+                        Bounds::new(point(px(sx0), px(plot_top)), size(px(sel_w), px(sel_h))),
+                        accent_color.opacity(if is_live_brushing { 0.16 } else { 0.11 }),
+                    ));
+                    window.paint_quad(fill(
+                        Bounds::new(point(px(sx0), px(plot_top)), size(px(1.5), px(sel_h))),
+                        accent_color.opacity(0.85),
+                    ));
+                    window.paint_quad(fill(
+                        Bounds::new(
+                            point(px((sx1 - 1.5).max(sx0)), px(plot_top)),
+                            size(px(1.5), px(sel_h)),
+                        ),
+                        accent_color.opacity(0.85),
+                    ));
+                }
+
+                // 3. Vertical crosshair line if hovered (hidden while actively brushing)
+                if !is_live_brushing
+                    && let Some(hx) = hover_x
+                {
                     let x_px = x_scale.map(hx).clamp(plot_left, plot_right);
                     window.paint_quad(fill(
                         Bounds::new(
@@ -353,7 +467,7 @@ impl RenderOnce for LineChart {
                     ));
                 }
 
-                // 3. Draw area fills first, then dashed series, then solid series on top
+                // 4. Area fills first, then dashed series, then solid series on top
                 for (idx, s) in series_paint.iter().enumerate() {
                     if !s.fill_area || s.points.len() < 2 {
                         continue;
@@ -380,7 +494,6 @@ impl RenderOnce for LineChart {
                     }
                 }
 
-                // Draw dashed comparison lines behind solid primary lines
                 for pass_dashed in [true, false] {
                     for (idx, s) in series_paint.iter().enumerate() {
                         let is_dashed = s.style == LineStyle::Dashed;
@@ -407,7 +520,7 @@ impl RenderOnce for LineChart {
                     }
                 }
 
-                // 4. Endpoint dot & clamped inline callout (e.g. "Today: $36.21")
+                // 5. Endpoint dot & clamped inline callout badge (e.g. "Today: $36.21")
                 for (idx, s) in series_paint.iter().enumerate() {
                     let Some(prefix) = &s.endpoint_callout else {
                         continue;
@@ -472,8 +585,10 @@ impl RenderOnce for LineChart {
                     );
                 }
 
-                // 5. Hover marker dots on every series covering hover_x
-                if let Some(hx) = hover_x {
+                // 6. Hover marker dots on every series covering hover_x
+                if !is_live_brushing
+                    && let Some(hx) = hover_x
+                {
                     let x_px = x_scale.map(hx).clamp(plot_left, plot_right);
                     for (idx, s) in series_paint.iter().enumerate() {
                         if let Some(hy) = interpolate_series_y(&s.points, hx) {
@@ -506,7 +621,7 @@ impl RenderOnce for LineChart {
                     }
                 }
 
-                // 6. X-axis ticks
+                // 7. X-axis ticks
                 let tick_count = x_ticks_paint.len();
                 for (t_idx, (tx, label)) in x_ticks_paint.iter().enumerate() {
                     let x_px = x_scale.map(*tx);
@@ -535,64 +650,192 @@ impl RenderOnce for LineChart {
         .w_full()
         .h(self.height);
 
-        let hover_move_entity = hover_entity.clone();
-        let hover_leave_entity = hover_entity;
+        let selectable = self.selectable;
+        let on_brush_up = self.on_brush_select.clone();
+        let on_brush_up_out = self.on_brush_select;
+        let on_clear = self.on_selection_clear;
+
+        let down_entity = interaction_entity.clone();
+        let move_entity = interaction_entity.clone();
+        let up_entity = interaction_entity.clone();
+        let up_out_entity = interaction_entity.clone();
+        let leave_entity = interaction_entity;
 
         let mut container = div()
             .id(self.id.clone())
             .relative()
             .w_full()
             .h(self.height)
-            .on_mouse_move(move |event: &MouseMoveEvent, _, cx| {
-                let next_x = {
-                    let state = hover_move_entity.read(cx).borrow();
-                    state.plot_bounds.and_then(|bounds| {
-                        let plot_left = bounds.origin.x.0 + margin_left;
-                        let plot_right =
-                            (bounds.origin.x.0 + bounds.size.width.0 - margin_right)
-                                .max(plot_left + 1.0);
-                        let mx = event.position.x.0;
-                        if mx >= plot_left && mx <= plot_right {
-                            let scale = LinearScale::new(x_min, x_max, plot_left, plot_right);
-                            Some(scale.invert(mx).clamp(x_min, x_max))
-                        } else {
-                            None
-                        }
-                    })
+            .when(selectable, |el| el.cursor(CursorStyle::Crosshair))
+            .on_mouse_down(MouseButton::Left, move |event: &MouseDownEvent, _, cx| {
+                if !selectable {
+                    return;
+                }
+                let mut state = down_entity.read(cx).borrow_mut();
+                let Some(bounds) = state.plot_bounds else {
+                    return;
                 };
+                let plot_left = bounds.origin.x.0 + margin_left;
+                let plot_right =
+                    (bounds.origin.x.0 + bounds.size.width.0 - margin_right).max(plot_left + 1.0);
+                let mx = event.position.x.0;
+                if mx >= plot_left && mx <= plot_right {
+                    state.drag_anchor_x = Some(mx);
+                    state.drag_current_x = Some(mx);
+                    drop(state);
+                    down_entity.update(cx, |_, cx| cx.notify());
+                }
+            })
+            .on_mouse_move(move |event: &MouseMoveEvent, _, cx| {
                 let changed = {
-                    let mut state = hover_move_entity.read(cx).borrow_mut();
-                    let diff = match (state.hover_x, next_x) {
+                    let mut state = move_entity.read(cx).borrow_mut();
+                    let Some(bounds) = state.plot_bounds else {
+                        return;
+                    };
+                    let plot_left = bounds.origin.x.0 + margin_left;
+                    let plot_right = (bounds.origin.x.0 + bounds.size.width.0 - margin_right)
+                        .max(plot_left + 1.0);
+                    let mx = event.position.x.0;
+                    let next_x = if mx >= plot_left && mx <= plot_right {
+                        let scale = LinearScale::new(x_min, x_max, plot_left, plot_right);
+                        Some(scale.invert(mx).clamp(x_min, x_max))
+                    } else {
+                        None
+                    };
+                    let mut dirty = match (state.hover_x, next_x) {
                         (Some(a), Some(b)) => (a - b).abs() > (x_max - x_min) * 0.005,
                         (None, None) => false,
                         _ => true,
                     };
-                    if diff {
+                    if dirty {
                         state.hover_x = next_x;
                     }
-                    diff
+                    if selectable && state.drag_anchor_x.is_some() {
+                        let clamped = mx.clamp(plot_left, plot_right);
+                        if state.drag_current_x != Some(clamped) {
+                            state.drag_current_x = Some(clamped);
+                            dirty = true;
+                        }
+                    }
+                    dirty
                 };
                 if changed {
-                    hover_move_entity.update(cx, |_, cx| cx.notify());
+                    move_entity.update(cx, |_, cx| cx.notify());
+                }
+            })
+            .on_mouse_up(MouseButton::Left, move |_: &MouseUpEvent, window, cx| {
+                let (brushed, had_drag) = {
+                    let mut state = up_entity.read(cx).borrow_mut();
+                    let had = state.drag_anchor_x.is_some();
+                    let brushed = if selectable {
+                        state.brushed_domain(margin_left, margin_right, x_min, x_max)
+                    } else {
+                        None
+                    };
+                    state.drag_anchor_x = None;
+                    state.drag_current_x = None;
+                    (brushed, had)
+                };
+                if had_drag {
+                    up_entity.update(cx, |_, cx| cx.notify());
+                }
+                if let Some(span) = brushed {
+                    if let Some(cb) = &on_brush_up {
+                        cb(&span, window, cx);
+                    }
+                } else if had_drag
+                    && has_controlled_selection
+                    && let Some(cb) = &on_clear
+                {
+                    cb(&(), window, cx);
+                }
+            })
+            .on_mouse_up_out(MouseButton::Left, move |_: &MouseUpEvent, window, cx| {
+                let (brushed, had_drag) = {
+                    let mut state = up_out_entity.read(cx).borrow_mut();
+                    let had = state.drag_anchor_x.is_some();
+                    let brushed = if selectable {
+                        state.brushed_domain(margin_left, margin_right, x_min, x_max)
+                    } else {
+                        None
+                    };
+                    state.drag_anchor_x = None;
+                    state.drag_current_x = None;
+                    (brushed, had)
+                };
+                if had_drag {
+                    up_out_entity.update(cx, |_, cx| cx.notify());
+                }
+                if let Some(span) = brushed
+                    && let Some(cb) = &on_brush_up_out
+                {
+                    cb(&span, window, cx);
                 }
             })
             .on_hover(move |hovered, _, cx| {
                 if !hovered {
                     let changed = {
-                        let mut state = hover_leave_entity.read(cx).borrow_mut();
+                        let mut state = leave_entity.read(cx).borrow_mut();
                         state.hover_x.take().is_some()
                     };
                     if changed {
-                        hover_leave_entity.update(cx, |_, cx| cx.notify());
+                        leave_entity.update(cx, |_, cx| cx.notify());
                     }
                 }
             })
             .child(plot_canvas);
 
-        // Floating crosshair tooltip
-        if let Some(hx) = hover_x
-            && let Some(bounds) = hover_rc.borrow().plot_bounds
+        // Live drag-selection pill
+        if let Some((a, b)) = live_brush
+            && let Some(bounds) = interaction_rc.borrow().plot_bounds
         {
+            let plot_left = margin_left;
+            let plot_right = (bounds.size.width.0 - margin_right).max(plot_left + 1.0);
+            let x_scale = LinearScale::new(x_min, x_max, plot_left, plot_right);
+            let mid_x = (x_scale.map(a) + x_scale.map(b)) * 0.5;
+            let fmt_x = |v: f64| match &self.x_formatter {
+                Some(f) => f(v),
+                None => format!("{v:.1}"),
+            };
+            let delta_suffix = self.series.first().and_then(|primary| {
+                let y0 = interpolate_series_y(&primary.points, a)?;
+                let y1 = interpolate_series_y(&primary.points, b)?;
+                Some(format!(" · Δ {}", self.value_format.format_detail((y1 - y0).max(0.0))))
+            });
+            let summary = format!(
+                "{} – {}{}",
+                fmt_x(a),
+                fmt_x(b),
+                delta_suffix.unwrap_or_default()
+            );
+            let pill_w = ((summary.len() as f32) * 6.8 + 20.0).clamp(124.0, 260.0);
+            let left_x = (mid_x - pill_w * 0.5)
+                .clamp(plot_left, (bounds.size.width.0 - pill_w - 4.0).max(plot_left));
+
+            container = container.child(
+                div()
+                    .absolute()
+                    .top(px(6.))
+                    .left(px(left_x))
+                    .w(px(pill_w))
+                    .px(px(10.))
+                    .py(px(5.))
+                    .rounded(theme.radius_md)
+                    .bg(theme.primary)
+                    .text_color(theme.primary_foreground)
+                    .text_size(px(11.5))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .font_features(tnum)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .when(theme.elevation_shadows, |el| el.shadow_md())
+                    .child(summary),
+            );
+        } else if let Some(hx) = hover_x
+            && let Some(bounds) = interaction_rc.borrow().plot_bounds
+        {
+            // Floating crosshair tooltip
             let plot_left = margin_left;
             let plot_right = (bounds.size.width.0 - margin_right).max(plot_left + 1.0);
             let x_scale = LinearScale::new(x_min, x_max, plot_left, plot_right);
@@ -619,7 +862,7 @@ impl RenderOnce for LineChart {
                 .bg(theme.popover)
                 .border_1()
                 .border_color(theme.border)
-                .shadow_lg()
+                .when(theme.elevation_shadows, |el| el.shadow_lg())
                 .flex()
                 .flex_col()
                 .gap(px(5.))
