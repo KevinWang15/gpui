@@ -44,6 +44,8 @@ pub(crate) struct DirectXRenderer {
     pipelines: DirectXRenderPipelines,
     direct_composition: Option<DirectComposition>,
     font_info: &'static FontInfo,
+    /// The frames of a running view transition, once one is captured.
+    transition: Option<TransitionFrames>,
 
     width: u32,
     height: u32,
@@ -90,6 +92,37 @@ struct DirectXRenderPipelines {
     mono_sprites: PipelineState<MonochromeSprite>,
     subpixel_sprites: PipelineState<SubpixelSprite>,
     poly_sprites: PipelineState<PolychromeSprite>,
+    view_transition: ViewTransitionPipeline,
+}
+
+/// The two frames a view transition blends, as copies of the render target:
+/// `old` captured before the change, `new` rendered each frame while it runs.
+struct TransitionFrames {
+    width: u32,
+    height: u32,
+    old: ID3D11Texture2D,
+    old_view: Option<ID3D11ShaderResourceView>,
+    new: ID3D11Texture2D,
+    new_view: Option<ID3D11ShaderResourceView>,
+}
+
+/// The pass that blends the two frames into the render target (shaders.hlsl,
+/// "View transitions").
+struct ViewTransitionPipeline {
+    vertex: ID3D11VertexShader,
+    fragment: ID3D11PixelShader,
+    params: Option<ID3D11Buffer>,
+}
+
+/// `ViewTransitionParams` in shaders.hlsl.
+#[repr(C)]
+struct ViewTransitionParams {
+    origin: [f32; 2],
+    radius: f32,
+    feather: f32,
+    progress: f32,
+    kind: u32,
+    _pad: [u32; 2],
 }
 
 struct DirectXGlobalElements {
@@ -191,6 +224,7 @@ impl DirectXRenderer {
             pipelines,
             direct_composition,
             font_info: Self::get_font_info(),
+            transition: None,
             width: 1,
             height: 1,
             skip_draws: false,
@@ -291,6 +325,7 @@ impl DirectXRenderer {
             }
 
             self.resources.take();
+            self.transition.take();
             if let Some(devices) = &self.devices {
                 devices.device_context.OMSetRenderTargets(None, None);
                 devices.device_context.ClearState();
@@ -358,7 +393,92 @@ impl DirectXRenderer {
             return Ok(());
         }
         self.render(scene, background_appearance)?;
+        if let Some(transition) = scene.transition
+            && self
+                .transition
+                .as_ref()
+                .is_some_and(|t| t.width == self.width && t.height == self.height)
+        {
+            self.composite_transition(&transition)?;
+        }
         self.present()
+    }
+
+    /// Renders `scene` (the frame before a change) and keeps a copy of it for
+    /// the view transition that follows. Nothing is presented.
+    pub(crate) fn capture_transition_snapshot(
+        &mut self,
+        scene: &Scene,
+        background_appearance: WindowBackgroundAppearance,
+    ) -> Result<bool> {
+        if self.skip_draws {
+            return Ok(false);
+        }
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let render_target = self
+            .resources
+            .as_ref()
+            .and_then(|r| r.render_target.clone())
+            .context("render target missing")?;
+        if !self
+            .transition
+            .as_ref()
+            .is_some_and(|t| t.width == self.width && t.height == self.height)
+        {
+            self.transition = Some(TransitionFrames::new(&devices.device, &render_target)?);
+        }
+        self.render(scene, background_appearance)?;
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let frames = self.transition.as_ref().context("transition frames missing")?;
+        unsafe { devices.device_context.CopyResource(&frames.old, &render_target) };
+        Ok(true)
+    }
+
+    /// Releases the frames of a finished or cancelled view transition.
+    pub(crate) fn clear_transition_snapshot(&mut self) {
+        self.transition = None;
+    }
+
+    /// Blends the captured frame with the frame just rendered, into the
+    /// render target.
+    fn composite_transition(&mut self, transition: &SceneTransition) -> Result<()> {
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let resources = self.resources.as_ref().context("resources missing")?;
+        let render_target = resources.render_target.as_ref().context("render target missing")?;
+        let frames = self.transition.as_ref().context("transition frames missing")?;
+        let pipeline = &self.pipelines.view_transition;
+        let params = pipeline.params.as_ref().context("view transition params missing")?;
+        let context = &devices.device_context;
+        update_buffer(
+            context,
+            params,
+            &[ViewTransitionParams {
+                origin: [transition.origin.x.0, transition.origin.y.0],
+                radius: transition.radius.0,
+                feather: transition.feather.0,
+                progress: transition.progress,
+                kind: transition.kind as u32,
+                _pad: [0; 2],
+            }],
+        )?;
+        unsafe {
+            context.CopyResource(&frames.new, render_target);
+            // Every pixel is written as blended, so no blending and no depth.
+            context.OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
+            context.RSSetViewports(Some(slice::from_ref(&resources.viewport)));
+            context.OMSetBlendState(None, None, 0xFFFFFFFF);
+            context.OMSetDepthStencilState(None, 0);
+            context.IASetInputLayout(None);
+            context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            context.VSSetShader(&pipeline.vertex, None);
+            context.PSSetShader(&pipeline.fragment, None);
+            context.PSSetConstantBuffers(2, Some(slice::from_ref(&pipeline.params)));
+            context.PSSetShaderResources(0, Some(&[frames.old_view.clone(), frames.new_view.clone()]));
+            context.Draw(3, 0);
+            // Unbound, so the frames can be copied into again next frame.
+            context.PSSetShaderResources(0, Some(&[None, None]));
+        }
+        Ok(())
     }
 
     /// Clear the render target for `background_appearance` and encode every
@@ -575,6 +695,7 @@ impl DirectXRenderer {
         }
         self.width = width;
         self.height = height;
+        self.transition = None;
 
         // Clear the render target before resizing
         let devices = self.devices.as_ref().context("devices missing")?;
@@ -1013,6 +1134,7 @@ impl DirectXRenderPipelines {
             create_blend_state(device)?,
         )?;
         let opaque_quad_pipeline = OpaqueQuadPipeline::new(device)?;
+        let view_transition = ViewTransitionPipeline::new(device)?;
 
         Ok(Self {
             shadow_pipeline,
@@ -1025,6 +1147,64 @@ impl DirectXRenderPipelines {
             mono_sprites,
             subpixel_sprites,
             poly_sprites,
+            view_transition,
+        })
+    }
+}
+
+impl ViewTransitionPipeline {
+    fn new(device: &ID3D11Device) -> Result<Self> {
+        let vertex = {
+            let raw_shader = RawShaderBytes::new(ShaderModule::ViewTransition, ShaderTarget::Vertex)?;
+            create_vertex_shader(device, raw_shader.as_bytes())?
+        };
+        let fragment = {
+            let raw_shader = RawShaderBytes::new(ShaderModule::ViewTransition, ShaderTarget::Fragment)?;
+            create_fragment_shader(device, raw_shader.as_bytes())?
+        };
+        Ok(Self {
+            vertex,
+            fragment,
+            params: create_constant_buffer::<ViewTransitionParams>(device)?,
+        })
+    }
+}
+
+impl TransitionFrames {
+    /// Two shader-readable textures shaped like `render_target`.
+    fn new(device: &ID3D11Device, render_target: &ID3D11Texture2D) -> Result<Self> {
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        unsafe { render_target.GetDesc(&mut desc) };
+        let desc = D3D11_TEXTURE2D_DESC {
+            MipLevels: 1,
+            ArraySize: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+            ..desc
+        };
+        let texture = || -> Result<(ID3D11Texture2D, Option<ID3D11ShaderResourceView>)> {
+            let mut texture = None;
+            unsafe { device.CreateTexture2D(&desc, None, Some(&mut texture))? };
+            let texture = texture.context("creating a view transition texture")?;
+            let mut view = None;
+            unsafe { device.CreateShaderResourceView(&texture, None, Some(&mut view))? };
+            Ok((texture, view))
+        };
+        let (old, old_view) = texture()?;
+        let (new, new_view) = texture()?;
+        Ok(Self {
+            width: desc.Width,
+            height: desc.Height,
+            old,
+            old_view,
+            new,
+            new_view,
         })
     }
 }
@@ -1740,6 +1920,7 @@ pub(crate) mod shader_resources {
         MonochromeSprite,
         SubpixelSprite,
         PolychromeSprite,
+        ViewTransition,
     }
 
     #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -1812,6 +1993,10 @@ pub(crate) mod shader_resources {
                 ShaderModule::PolychromeSprite => match target {
                     ShaderTarget::Vertex => POLYCHROME_SPRITE_VERTEX_BYTES,
                     ShaderTarget::Fragment => POLYCHROME_SPRITE_FRAGMENT_BYTES,
+                },
+                ShaderModule::ViewTransition => match target {
+                    ShaderTarget::Vertex => VIEW_TRANSITION_VERTEX_BYTES,
+                    ShaderTarget::Fragment => VIEW_TRANSITION_FRAGMENT_BYTES,
                 },
             };
             Self { inner: bytes }
@@ -1893,6 +2078,7 @@ pub(crate) mod shader_resources {
                 ShaderModule::MonochromeSprite => "monochrome_sprite",
                 ShaderModule::SubpixelSprite => "subpixel_sprite",
                 ShaderModule::PolychromeSprite => "polychrome_sprite",
+                ShaderModule::ViewTransition => "view_transition",
             }
         }
     }

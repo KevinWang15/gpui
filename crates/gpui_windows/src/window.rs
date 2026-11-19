@@ -1053,6 +1053,19 @@ impl PlatformWindow for WindowsWindow {
             .log_err();
     }
 
+    fn capture_transition_snapshot(&self, scene: &Scene) -> bool {
+        self.state
+            .renderer
+            .borrow_mut()
+            .capture_transition_snapshot(scene, self.state.background_appearance.get())
+            .log_err()
+            .unwrap_or(false)
+    }
+
+    fn clear_transition_snapshot(&self) {
+        self.state.renderer.borrow_mut().clear_transition_snapshot();
+    }
+
     #[cfg(feature = "test-support")]
     fn render_to_image(&self, scene: &Scene) -> anyhow::Result<image::RgbaImage> {
         self.state

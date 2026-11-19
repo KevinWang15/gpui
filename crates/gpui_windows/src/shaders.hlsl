@@ -1370,3 +1370,47 @@ float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Targe
     color.a *= input.opacity * saturate(0.5 - distance);
     return color;
 }
+
+/*
+**
+**              View transitions
+**
+*/
+
+// A full-window transition between two frames: `t_transition_old` (the frame
+// captured before the change) and `t_transition_new` (this frame), blended by
+// a circle that grows from (or shrinks to) `vt_origin`, or by a cross-fade.
+// The same geometry as gpui_wgpu's shaders_view_transition.wgsl.
+cbuffer ViewTransitionParams: register(b2) {
+    float2 vt_origin;
+    float vt_radius;
+    float vt_feather;
+    float vt_progress;
+    uint vt_kind;
+    uint2 vt_pad;
+};
+
+Texture2D<float4> t_transition_old: register(t0);
+Texture2D<float4> t_transition_new: register(t1);
+
+// One triangle that covers the viewport: (-1, -1), (3, -1), (-1, 3).
+float4 view_transition_vertex(uint vertex_id: SV_VertexID): SV_Position {
+    float2 p = float2((vertex_id << 1) & 2, vertex_id & 2);
+    return float4(p * 2.0 - 1.0, 0.0, 1.0);
+}
+
+float4 view_transition_fragment(float4 position: SV_Position): SV_Target {
+    int3 coord = int3(int2(position.xy), 0);
+    float4 old_color = t_transition_old.Load(coord);
+    float4 new_color = t_transition_new.Load(coord);
+    float show_old;
+    if (vt_kind == 2) {
+        // Cross-fade.
+        show_old = 1.0 - saturate(vt_progress);
+    } else {
+        float edge = smoothstep(vt_radius - max(vt_feather, 0.5), vt_radius + max(vt_feather, 0.5), length(position.xy - vt_origin));
+        // 0: the new frame inside a growing circle; 1: the old frame inside a shrinking one.
+        show_old = vt_kind == 0 ? edge : 1.0 - edge;
+    }
+    return lerp(new_color, old_color, show_old);
+}
