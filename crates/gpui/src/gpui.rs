@@ -21,6 +21,10 @@ pub extern crate subsecond;
 extern crate self as gpui;
 
 pub mod colors;
+#[cfg(feature = "components")]
+pub mod components;
+#[cfg(feature = "lucide")]
+pub mod icons;
 pub mod prelude;
 pub mod profiler;
 

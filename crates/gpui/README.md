@@ -3,6 +3,11 @@
 GPUI is a hybrid immediate and retained mode, GPU accelerated, UI framework
 for Rust, designed to support a wide variety of applications.
 
+> **Fork additions:** This fork includes a Tailwind-inspired component library
+> (`gpui::components`), all 2,092 bundled Lucide SVG icons (`gpui::icons`), and an
+> interactive developer playground (`cargo run -p gpui_playground`). See the
+> repository root `README.md` for full documentation and examples.
+
 ## Getting Started
 
 GPUI is still in active development as we work on the Zed code editor, and is still pre-1.0. There will often be breaking changes between versions. You'll also need to use the latest version of stable Rust. Add `gpui`, and optionally `gpui_platform`, to your `Cargo.toml`:

@@ -18,7 +18,9 @@ autobenches = false
 workspace = true
 
 [features]
-default = ["font-kit", "wayland", "x11", "windows-manifest"]
+default = ["font-kit", "wayland", "x11", "windows-manifest", "lucide", "components"]
+lucide = []
+components = ["lucide"]
 test-support = [
     "bench_metrics?/test-support",
     "collections/test-support",
@@ -304,3 +306,7 @@ path = "examples/view_example/view_example_main.rs"
 [[example]]
 name = "toggle_headless"
 path = "examples/toggle_headless.rs"
+
+[[example]]
+name = "components_showcase"
+path = "examples/components_showcase.rs"
