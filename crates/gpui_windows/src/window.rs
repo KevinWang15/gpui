@@ -492,7 +492,10 @@ impl WindowsWindow {
         );
 
         let (mut dwexstyle, dwstyle) = if params.kind == WindowKind::PopUp {
-            (WS_EX_TOOLWINDOW | WS_EX_TOPMOST, WINDOW_STYLE(0x0))
+            // WS_POPUP, not style 0: style 0 is WS_OVERLAPPED, which Windows
+            // frames, and the frame was taken out of the content's height,
+            // so a frameless pop-up drew short of its window.
+            (WS_EX_TOOLWINDOW | WS_EX_TOPMOST, WS_POPUP)
         } else {
             let mut dwstyle = WS_SYSMENU;
 
@@ -584,6 +587,13 @@ impl WindowsWindow {
             }
             unsafe { SetWindowPlacement(hwnd, &placement)? };
         } else {
+            // A hidden window gets its bounds now, still hidden. Deferring them
+            // to the first `activate()` moved a window the app had positioned
+            // itself (while hidden) back to its creation bounds. Maximize and
+            // fullscreen requests made while hidden still wait for activate.
+            let mut hidden = placement;
+            hidden.showCmd = SW_HIDE.0 as u32;
+            unsafe { SetWindowPlacement(hwnd, &hidden)? };
             this.state.initial_placement.set(Some(WindowOpenStatus {
                 placement,
                 state: WindowOpenState::Windowed,

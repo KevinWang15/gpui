@@ -109,7 +109,7 @@ impl WindowsWindowInner {
             WM_CLOSE => self.handle_close_msg(),
             WM_DESTROY => self.handle_destroy_msg(handle),
             WM_MOUSEMOVE => self.handle_mouse_move_msg(handle, lparam, wparam),
-            WM_MOUSELEAVE | WM_NCMOUSELEAVE => self.handle_mouse_leave_msg(),
+            WM_MOUSELEAVE | WM_NCMOUSELEAVE => self.handle_mouse_leave_msg(handle),
             WM_NCMOUSEMOVE => self.handle_nc_mouse_move_msg(handle, lparam),
             // Treat double click as a second single click, since we track the double clicks ourselves.
             // If you don't interact with any elements, this will fall through to the windows default
@@ -392,7 +392,7 @@ impl WindowsWindowInner {
         if handled { Some(0) } else { Some(1) }
     }
 
-    fn handle_mouse_leave_msg(&self) -> Option<isize> {
+    fn handle_mouse_leave_msg(&self, handle: HWND) -> Option<isize> {
         self.state.hovered.set(false);
         // The next window's `WM_SETCURSOR` picks its own cursor, so we just clear
         // the flag for tight `is_cursor_visible()` semantics.
@@ -403,6 +403,21 @@ impl WindowsWindowInner {
                 .callbacks
                 .hovered_status_change
                 .set(Some(callback));
+        }
+
+        // Hover is hit-tested against the last mouse position seen, which on
+        // leaving is still inside the window, so hover styles and the cursor
+        // shape stayed. Report where the mouse is now (outside).
+        let mut cursor = POINT::default();
+        let known = unsafe { GetCursorPos(&mut cursor).is_ok() && ScreenToClient(handle, &mut cursor).as_bool() };
+        if known && let Some(mut func) = self.state.callbacks.input.take() {
+            let scale_factor = self.state.scale_factor.get();
+            func(PlatformInput::MouseMove(MouseMoveEvent {
+                position: logical_point(cursor.x as f32, cursor.y as f32, scale_factor),
+                pressed_button: None,
+                modifiers: current_modifiers(),
+            }));
+            self.state.callbacks.input.set(Some(func));
         }
 
         Some(0)
@@ -779,6 +794,11 @@ impl WindowsWindowInner {
         lparam: LPARAM,
     ) -> Option<isize> {
         if !self.hide_title_bar || self.state.is_fullscreen() || wparam.0 == 0 {
+            return None;
+        }
+        // Pop-ups (WS_POPUP) have no resize frame: their client area is the
+        // whole window.
+        if unsafe { GetWindowLongPtrW(handle, GWL_STYLE) } & WS_POPUP.0 as isize != 0 {
             return None;
         }
 
