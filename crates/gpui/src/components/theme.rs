@@ -3,7 +3,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::{App, Global, Hsla, Pixels, SpringConfig, Window, WindowAppearance, px};
+use crate::{
+    App, Global, Hsla, Pixels, Point, SpringConfig, Subscription, ViewTransition, Window,
+    WindowAppearance, px,
+};
 
 use super::palette as tw;
 
@@ -21,8 +24,31 @@ pub const ANIM_FAST: Duration = Duration::from_millis(140);
 /// Standard duration (175ms) for modal dialog and toast entrance animations.
 pub const ANIM_NORMAL: Duration = Duration::from_millis(175);
 
+/// User-facing theme selection preference (`Light`, `System`, or `Dark`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ThemePreference {
+    /// Always use the light theme.
+    #[default]
+    Light,
+    /// Follow the operating system's light/dark window appearance dynamically.
+    System,
+    /// Always use the dark theme.
+    Dark,
+}
+
+impl ThemePreference {
+    /// Resolves this preference into a concrete [`ThemeMode`] given the current `appearance`.
+    pub fn resolve(self, appearance: WindowAppearance) -> ThemeMode {
+        match self {
+            Self::Light => ThemeMode::Light,
+            Self::Dark => ThemeMode::Dark,
+            Self::System => ThemeMode::from(appearance),
+        }
+    }
+}
+
 /// Whether the active UI theme is light or dark.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum ThemeMode {
     /// Crisp light Tailwind aesthetic (white surfaces, slate-900 ink, indigo-600 primary).
     #[default]
@@ -107,6 +133,8 @@ impl ComponentSize {
 pub struct Theme {
     /// Active light or dark mode.
     pub mode: ThemeMode,
+    /// User preference (`Light`, `System`, or `Dark`) that produced `mode`.
+    pub preference: ThemePreference,
     /// Page / window canvas background.
     pub background: Hsla,
     /// Elevated card / panel background.
@@ -208,6 +236,7 @@ impl Theme {
     pub fn light() -> Self {
         Self {
             mode: ThemeMode::Light,
+            preference: ThemePreference::Light,
             background: tw::SLATE_50.into(),
             surface: tw::WHITE.into(),
             surface_muted: tw::SLATE_100.into(),
@@ -259,6 +288,7 @@ impl Theme {
     pub fn dark() -> Self {
         Self {
             mode: ThemeMode::Dark,
+            preference: ThemePreference::Dark,
             background: tw::SLATE_950.into(),
             surface: tw::SLATE_900.into(),
             surface_muted: tw::SLATE_800.into(),
@@ -306,12 +336,84 @@ impl Theme {
         }
     }
 
-    /// Creates a theme matching the window's light/dark appearance.
+    /// Creates a theme matching the window's light/dark appearance with [`ThemePreference::System`].
     pub fn for_window(window: &Window) -> Self {
-        match ThemeMode::from(window.appearance()) {
+        let mut theme = match ThemeMode::from(window.appearance()) {
+            ThemeMode::Light => Self::light(),
+            ThemeMode::Dark => Self::dark(),
+        };
+        theme.preference = ThemePreference::System;
+        theme
+    }
+
+    /// Returns a copy of this theme tagged with the given [`ThemePreference`].
+    pub fn with_preference(mut self, preference: ThemePreference) -> Self {
+        self.preference = preference;
+        self
+    }
+
+    /// Resolves `preference` into a concrete [`ThemeMode`] for the current `window`.
+    pub fn resolve_mode(preference: ThemePreference, window: &Window) -> ThemeMode {
+        preference.resolve(window.appearance())
+    }
+
+    /// Switches to `next_theme`, running a GPU-composited circular reveal originating from `origin`
+    /// (or a cross-fade when `origin` is `None`) whenever the resolved [`ThemeMode`] changes.
+    pub fn switch_with_transition(
+        next_theme: Self,
+        origin: Option<Point<Pixels>>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let current_mode = Self::active(cx).mode;
+        if current_mode == next_theme.mode {
+            Self::set_global(next_theme, cx);
+            cx.refresh_windows();
+            return;
+        }
+        let transition = match origin {
+            Some(point) => ViewTransition::radial_reveal(point),
+            None => ViewTransition::cross_fade(),
+        };
+        window.start_view_transition(transition, cx, move |_, cx| {
+            Self::set_global(next_theme, cx);
+            cx.refresh_windows();
+        });
+    }
+
+    /// Applies `preference` (`Light`, `System`, or `Dark`) with a GPU-composited radial transition
+    /// expanding from `origin` (or a cross-fade when `origin` is `None`).
+    pub fn set_preference_with_transition(
+        preference: ThemePreference,
+        origin: Option<Point<Pixels>>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let mode = Self::resolve_mode(preference, window);
+        let next = match mode {
             ThemeMode::Light => Self::light(),
             ThemeMode::Dark => Self::dark(),
         }
+        .with_preference(preference);
+        Self::switch_with_transition(next, origin, window, cx);
+    }
+
+    /// Subscribes to OS appearance changes on `window` so [`ThemePreference::System`] updates live.
+    pub fn observe_system_appearance(
+        window: &mut Window,
+        mut build_theme: impl FnMut(ThemeMode, ThemePreference, &App) -> Self + 'static,
+    ) -> Subscription {
+        window.observe_window_appearance(move |window, cx| {
+            let current = Self::active(cx);
+            if current.preference != ThemePreference::System {
+                return;
+            }
+            let target_mode = ThemeMode::from(window.appearance());
+            if target_mode != current.mode {
+                let next = build_theme(target_mode, ThemePreference::System, cx);
+                Self::switch_with_transition(next, None, window, cx);
+            }
+        })
     }
 
     /// Returns a cloned active theme from `cx`, or the default light theme if none is installed.

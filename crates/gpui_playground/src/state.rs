@@ -10,6 +10,7 @@ use crate::accent::AccentPreset;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Page {
     Overview,
+    Analytics,
     Buttons,
     Inputs,
     Controls,
@@ -24,6 +25,7 @@ impl Page {
     pub const fn title(self) -> &'static str {
         match self {
             Self::Overview => "Overview",
+            Self::Analytics => "Analytics & Charts",
             Self::Buttons => "Buttons & Groups",
             Self::Inputs => "Input & TextBox",
             Self::Controls => "Toggles, Checks & Radios",
@@ -38,6 +40,9 @@ impl Page {
     pub const fn keywords(self) -> &'static str {
         match self {
             Self::Overview => "overview home welcome playground dashboard",
+            Self::Analytics => {
+                "analytics charts stacked bar line breakdown filter bar time date range picker calendar kpi stat segmented theme switcher radial"
+            }
             Self::Buttons => "button group variant icon loading pill ghost link toggle group",
             Self::Inputs => "input textbox textarea form field password email validation ime",
             Self::Controls => "toggle switch checkbox indeterminate radio cards slider range",
@@ -177,6 +182,13 @@ pub struct PlaygroundApp {
     pub icon_spin: bool,
     pub icon_page: usize,
     pub selected_icon: LucideIcon,
+
+    // Analytics & Charts state
+    pub analytics_time_range: Entity<TimeRangePickerState>,
+    pub analytics_filter: Entity<FilterBarState>,
+    pub analytics_scope_select: Entity<SelectState<&'static str>>,
+    pub analytics_metric: SharedString,
+    pub analytics_refresh_seed: u64,
 }
 
 impl PlaygroundApp {
@@ -414,8 +426,67 @@ impl PlaygroundApp {
         })
         .detach();
 
+        let analytics_time_range = cx.new(|cx| {
+            TimeRangePickerState::new(CalendarDate::new(2026, 11, 19), cx)
+                .max_span_days(92)
+                .preset(TimeRangePreset::Last30Days)
+        });
+        cx.subscribe(&analytics_time_range, |this, _, ev: &TimeRangeEvent, cx| {
+            let TimeRangeEvent::Change { range, preset } = *ev;
+            this.log_event(
+                "TimeRangePicker",
+                format!("{} ({})", preset.label(), range.format_compact()),
+                cx,
+            );
+        })
+        .detach();
+
+        let analytics_filter = cx.new(|cx| {
+            FilterBarState::new(
+                vec![
+                    FilterFieldDef::new("provider", "Provider").hint("openai, anthropic, local, cursor"),
+                    FilterFieldDef::new("model", "Model").hint("claude-sonnet-5-5, gpt-6.2, ..."),
+                    FilterFieldDef::new("key", "Key").hint("prod-api, dev-local, ide-agent"),
+                ],
+                crate::pages::analytics::analytics_facet_provider,
+                cx,
+            )
+            .placeholder("Filter by Provider, Model, or Key (click or press Enter)...")
+        });
+        cx.subscribe(&analytics_filter, |this, _, ev: &FilterBarEvent, cx| {
+            let FilterBarEvent::Change(clauses) = ev;
+            this.log_event(
+                "FilterBar",
+                format!("{} active clause(s)", clauses.len()),
+                cx,
+            );
+        })
+        .detach();
+
+        let analytics_scope_select = cx.new(|cx| {
+            SelectState::new(
+                vec![
+                    SelectOption::new("my", "My keys"),
+                    SelectOption::new("team", "Team keys"),
+                    SelectOption::new("all", "All keys"),
+                ],
+                cx,
+            )
+            .default_value("my")
+            .size(ComponentSize::Sm)
+        });
+        cx.subscribe(
+            &analytics_scope_select,
+            |this, _, ev: &SelectEvent<&'static str>, cx| {
+                if let SelectEvent::Change(val) = ev {
+                    this.log_event("Select(Scope)", format!("scope -> {val:?}"), cx);
+                }
+            },
+        )
+        .detach();
+
         let mut app = Self {
-            page: Page::Overview,
+            page: Page::Analytics,
             accent: AccentPreset::Indigo,
             show_event_log: false,
             event_log: Vec::new(),
@@ -513,6 +584,12 @@ impl PlaygroundApp {
             icon_spin: false,
             icon_page: 1,
             selected_icon: LucideIcon::Sparkles,
+
+            analytics_time_range,
+            analytics_filter,
+            analytics_scope_select,
+            analytics_metric: "cost".into(),
+            analytics_refresh_seed: 0,
         };
 
         app.log_event(
@@ -643,7 +720,8 @@ impl PlaygroundApp {
     }
 
     pub fn apply_theme(&self, mode: ThemeMode, cx: &mut Context<Self>) {
-        Theme::set_global(self.accent.build_theme(mode), cx);
+        let pref = cx.theme().preference;
+        Theme::set_global(self.accent.build_theme(mode).with_preference(pref), cx);
         cx.notify();
     }
 

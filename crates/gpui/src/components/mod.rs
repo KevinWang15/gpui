@@ -13,23 +13,29 @@ pub mod alert;
 pub mod avatar;
 pub mod badge;
 pub mod button;
+pub mod charts;
 pub mod checkbox;
 pub mod combobox;
 pub mod dialog;
 pub mod feedback;
 pub mod field;
+pub mod filter_bar;
 pub mod input;
 pub mod layout;
 pub mod navigation;
 pub mod palette;
 pub mod popover;
 pub mod radio;
+pub mod segmented;
 pub mod select;
 pub mod slider;
+pub mod stat;
 pub mod table;
 pub mod tabs;
 pub mod textbox;
 pub mod theme;
+pub mod theme_switcher;
+pub mod time_range;
 pub mod toast;
 pub mod toggle;
 pub mod tooltip;
@@ -39,11 +45,21 @@ pub use alert::{Alert, AlertVariant, alert};
 pub use avatar::{Avatar, AvatarGroup, AvatarStatus, avatar, avatar_group};
 pub use badge::{Badge, BadgeColor, BadgeVariant, badge};
 pub use button::{Button, ButtonGroup, ButtonVariant, button, button_group};
+pub use charts::{
+    BandScale, BreakdownItem, BreakdownList, ChartCard, ChartLegendItem, ChartPalette,
+    ChartValueFormat, LegendSwatch, LineChart, LineSeries, LineStyle, LinearScale, StackedBarChart,
+    StackedBarPoint, StackedBarSeries, breakdown_list, chart_card, format_compact, line_chart,
+    nice_ticks, stacked_bar_chart,
+};
 pub use checkbox::{CheckState, Checkbox, CheckboxGroup, checkbox, checkbox_group};
 pub use combobox::{ComboBox, ComboBoxEvent, ComboBoxOption, ComboBoxState, combo_box};
 pub use dialog::{Dialog, DialogSize, dialog};
 pub use feedback::{EmptyState, ProgressBar, Skeleton, Spinner, empty_state, progress_bar, skeleton, spinner};
 pub use field::{Field, Kbd, Label, field, kbd, label};
+pub use filter_bar::{
+    FacetProvider, FilterBar, FilterBarEvent, FilterBarState, FilterClause, FilterFacetOption,
+    FilterFieldDef, FilterOperator, filter_bar,
+};
 pub use input::{Input, InputEvent, InputState, bind_input_keys, input};
 pub use layout::{
     AppShell, Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle, Container,
@@ -54,8 +70,10 @@ pub use layout::{
 pub use navigation::{Breadcrumb, BreadcrumbItem, Pagination, breadcrumb, pagination};
 pub use popover::{DropdownMenu, MenuEntry, Popover, dropdown_menu, popover};
 pub use radio::{RadioGroup, RadioOption, RadioVariant, radio_group};
+pub use segmented::{SegmentedControl, SegmentedItem, segmented_control};
 pub use select::{Select, SelectEvent, SelectOption, SelectState, select};
 pub use slider::{Slider, SliderEvent, SliderState, slider};
+pub use stat::{StatDelta, StatDeltaTone, StatGroup, StatItem, TrendPolarity, stat_group};
 pub use table::{SortDirection, Table, TableAlign, TableColumn, TableRow, table};
 pub use tabs::{TabItem, Tabs, TabsVariant, tabs};
 pub use textbox::{
@@ -64,7 +82,12 @@ pub use textbox::{
 };
 pub use theme::{
     ANIM_FAST, ANIM_NORMAL, ActiveTheme, ComponentSize, GlobalTheme, SPRING_SMOOTH, SPRING_SNAPPY,
-    Theme, ThemeMode, init_components,
+    Theme, ThemeMode, ThemePreference, init_components,
+};
+pub use theme_switcher::{ThemeSwitcher, theme_switcher};
+pub use time_range::{
+    CalendarDate, CalendarGrid, DateRange, TimeRangeEvent, TimeRangePicker, TimeRangePickerState,
+    TimeRangePreset, TimeRangeUnit, calendar_grid, time_range_picker,
 };
 pub use toast::{Toast, ToastHost, ToastItem, ToastVariant, toast_host};
 pub use toggle::{Switch, Toggle, ToggleButton, ToggleGroup, switch, toggle, toggle_group};

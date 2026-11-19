@@ -7,7 +7,8 @@ use crate::profiler;
 use crate::subscription::SingleSubscriberSet;
 use crate::taffy::TaffyLayoutEngine;
 use crate::{
-    Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
+    Action, ActiveViewTransition, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App,
+    AppContext, Arena, Asset,
     AsyncWindowContext, AtlasTile, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow,
     Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
@@ -22,7 +23,8 @@ use crate::{
     SpriteAnimation, SpriteAnimationId, StrikethroughStyle, Style, SubpixelSprite, Subscription,
     SystemWindowTab, SystemWindowTabController, TabStopMap, Task, TextInputConfiguration,
     TextInputStateChange, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
-    TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
+    TransformationMatrix, Underline, UnderlineStyle, ViewTransition, WindowAppearance,
+    WindowBackgroundAppearance,
     WindowBounds, WindowControls, WindowDecorations, WindowInsets, WindowOptions, WindowParams,
     WindowTextSystem, WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
 };
@@ -1290,6 +1292,8 @@ pub struct Window {
     /// The rendered scene's [`Scene::animation_frame_interval`]. While it is
     /// `Some`, the scene must keep being presented even when nothing is redrawn.
     scene_animation_interval: Rc<Cell<Option<Duration>>>,
+    /// Active full-window GPU view transition (e.g., radial theme reveal), if any.
+    active_view_transition: Option<ActiveViewTransition>,
     /// Tracks recent input event timestamps to determine if input is arriving at a high rate.
     /// Used to selectively enable VRR optimization only when input rate exceeds 60fps.
     pub(crate) input_rate_tracker: Rc<RefCell<InputRateTracker>>,
@@ -2442,6 +2446,7 @@ impl Window {
             hovered,
             needs_present,
             scene_animation_interval,
+            active_view_transition: None,
             input_rate_tracker,
             #[cfg(feature = "profiler")]
             window_profiler: profiler::WindowProfiler::new(handle.window_id())?,
@@ -3054,9 +3059,101 @@ impl Window {
         self.on_next_frame(move |_, cx| cx.notify(entity));
     }
 
+    /// Starts a GPU-composited full-window view transition (such as a click-origin radial
+    /// theme reveal) around the state change performed by `update`.
+    ///
+    /// 1. Captures the currently displayed scene into a GPU offscreen snapshot texture (zero CPU readback).
+    /// 2. Runs `update(self, cx)` immediately so the new UI becomes interactive on the next frame.
+    /// 3. Animates the transition mask across subsequent frames without triggering extra layout passes.
+    /// 4. Automatically falls back to an immediate update when [`App::reduce_motion`] is active
+    ///    (unless [`ViewTransition::reduce_motion_crossfade`] is enabled) or on backends without
+    ///    snapshot support.
+    pub fn start_view_transition(
+        &mut self,
+        mut transition: ViewTransition,
+        cx: &mut App,
+        update: impl FnOnce(&mut Window, &mut App),
+    ) {
+        if cx.reduce_motion() {
+            if transition.reduce_motion_crossfade {
+                transition = ViewTransition::cross_fade().duration(Duration::from_millis(140));
+            } else {
+                self.cancel_view_transition();
+                update(self, cx);
+                return;
+            }
+        }
+
+        let now = cx.background_executor().now();
+        // If another transition is already mid-flight, evaluate its current mask so the backend
+        // snapshots the currently visible composite (smooth mid-flight interruption).
+        if let Some(active) = &self.active_view_transition {
+            self.rendered_frame.scene.transition =
+                active.evaluate(now, self.viewport_size, self.scale_factor);
+        } else {
+            self.rendered_frame.scene.transition = None;
+        }
+
+        let captured = !self.rendered_frame.scene.paint_operations.is_empty()
+            && self
+                .platform_window
+                .capture_transition_snapshot(&self.rendered_frame.scene);
+
+        update(self, cx);
+
+        if captured {
+            self.active_view_transition = Some(ActiveViewTransition {
+                started_at: now,
+                transition,
+                viewport_size: self.viewport_size,
+                scale_factor: self.scale_factor,
+            });
+            self.scene_animation_interval.set(Some(Duration::ZERO));
+            self.refresh();
+            self.platform_window.schedule_frame();
+            self.invalidator.wake_platform();
+        } else {
+            self.active_view_transition = None;
+            self.rendered_frame.scene.transition = None;
+        }
+    }
+
+    /// Cancels any active full-window view transition and releases its GPU snapshot resources.
+    pub fn cancel_view_transition(&mut self) {
+        if self.active_view_transition.take().is_some() {
+            self.rendered_frame.scene.transition = None;
+            self.platform_window.clear_transition_snapshot();
+            self.scene_animation_interval
+                .set(self.rendered_frame.scene.animation_frame_interval());
+        }
+    }
+
+    /// Returns `true` if a full-window GPU view transition is currently animating.
+    pub fn has_active_view_transition(&self) -> bool {
+        self.active_view_transition.is_some()
+    }
+
     pub(crate) fn advance_scene_animations(&mut self, cx: &App) {
-        let elapsed = cx.background_executor().now() - cx.synced_animation_epoch;
+        let now = cx.background_executor().now();
+        let elapsed = now - cx.synced_animation_epoch;
         self.rendered_frame.scene.advance_animations(elapsed);
+
+        if let Some(active) = &self.active_view_transition {
+            if let Some(scene_transition) =
+                active.evaluate(now, self.viewport_size, self.scale_factor)
+            {
+                self.rendered_frame.scene.transition = Some(scene_transition);
+                self.scene_animation_interval.set(Some(Duration::ZERO));
+            } else {
+                self.active_view_transition = None;
+                self.rendered_frame.scene.transition = None;
+                self.platform_window.clear_transition_snapshot();
+                self.scene_animation_interval
+                    .set(self.rendered_frame.scene.animation_frame_interval());
+            }
+        } else {
+            self.rendered_frame.scene.transition = None;
+        }
     }
 
     /// Runs all callbacks scheduled via [`Self::on_next_frame`], returning how many ran.
@@ -3881,8 +3978,12 @@ impl Window {
         let previous_focus_path = self.rendered_frame.focus_path();
         let previous_window_active = self.rendered_frame.window_active;
         mem::swap(&mut self.rendered_frame, &mut self.next_frame);
-        self.scene_animation_interval
-            .set(self.rendered_frame.scene.animation_frame_interval());
+        let animation_interval = if self.active_view_transition.is_some() {
+            Some(Duration::ZERO)
+        } else {
+            self.rendered_frame.scene.animation_frame_interval()
+        };
+        self.scene_animation_interval.set(animation_interval);
         self.next_frame.clear();
         let current_focus_path = self.rendered_frame.focus_path();
         let current_window_active = self.rendered_frame.window_active;

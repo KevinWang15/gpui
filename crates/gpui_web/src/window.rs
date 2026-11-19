@@ -1009,6 +1009,22 @@ impl PlatformWindow for WebWindow {
         self.inner.state.borrow_mut().renderer.draw(scene);
     }
 
+    fn capture_transition_snapshot(&self, scene: &Scene) -> bool {
+        self.inner
+            .state
+            .borrow_mut()
+            .renderer
+            .capture_transition_snapshot(scene)
+    }
+
+    fn clear_transition_snapshot(&self) {
+        self.inner
+            .state
+            .borrow_mut()
+            .renderer
+            .clear_transition_snapshot();
+    }
+
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         self.inner.state.borrow().renderer.sprite_atlas().clone()
     }

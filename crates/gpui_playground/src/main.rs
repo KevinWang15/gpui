@@ -49,7 +49,6 @@ fn load_bundled_fonts(cx: &mut App) {
 impl Render for PlaygroundApp {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let is_dark = theme.mode == ThemeMode::Dark;
         let nav_filter = self.nav_search.read(cx).value().trim().to_lowercase();
 
         let matches_nav = |page: Page| {
@@ -60,6 +59,7 @@ impl Render for PlaygroundApp {
 
         let page_content = match self.page {
             Page::Overview => pages::overview::render(self, cx).into_any_element(),
+            Page::Analytics => pages::analytics::render(self, cx).into_any_element(),
             Page::Buttons => pages::buttons::render(self, cx).into_any_element(),
             Page::Inputs => pages::inputs::render(self, cx).into_any_element(),
             Page::Controls => pages::controls::render(self, cx).into_any_element(),
@@ -73,6 +73,7 @@ impl Render for PlaygroundApp {
         let mut comp_group = SidebarGroup::new(Some("COMPONENTS"));
         let comp_items: &[(Page, LucideIcon, Option<&str>)] = &[
             (Page::Overview, LucideIcon::House, None),
+            (Page::Analytics, LucideIcon::ChartColumnStacked, Some("8")),
             (Page::Buttons, LucideIcon::MousePointerClick, Some("3")),
             (Page::Inputs, LucideIcon::TextCursorInput, Some("4")),
             (Page::Controls, LucideIcon::ToggleRight, Some("4")),
@@ -342,29 +343,33 @@ impl Render for PlaygroundApp {
                                                     cx.notify();
                                                 })),
                                         )
-                                        .child(
-                                            button("nav-theme-btn")
-                                                .secondary()
-                                                .size(ComponentSize::Sm)
-                                                .leading_icon(if is_dark {
-                                                    LucideIcon::Sun
-                                                } else {
-                                                    LucideIcon::Moon
-                                                })
-                                                .label(if is_dark { "Light" } else { "Dark" })
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    let next = match cx.theme().mode {
-                                                        ThemeMode::Light => ThemeMode::Dark,
-                                                        ThemeMode::Dark => ThemeMode::Light,
-                                                    };
-                                                    this.apply_theme(next, cx);
-                                                    this.log_event(
-                                                        "Theme",
-                                                        format!("mode -> {next:?}"),
+                                        .child({
+                                            let accent = self.accent;
+                                            let app_handle = cx.entity().downgrade();
+                                            theme_switcher("nav-theme-switcher").on_change(
+                                                move |pref, origin, window, cx| {
+                                                    let mode = Theme::resolve_mode(pref, window);
+                                                    let next_theme = accent
+                                                        .build_theme(mode)
+                                                        .with_preference(pref);
+                                                    Theme::switch_with_transition(
+                                                        next_theme,
+                                                        Some(origin),
+                                                        window,
                                                         cx,
                                                     );
-                                                })),
-                                        ),
+                                                    if let Some(app) = app_handle.upgrade() {
+                                                        app.update(cx, |this, cx| {
+                                                            this.log_event(
+                                                                "Theme",
+                                                                format!("preference -> {pref:?}"),
+                                                                cx,
+                                                            );
+                                                        });
+                                                    }
+                                                },
+                                            )
+                                        }),
                                 ),
                         )
                         .child(
@@ -471,7 +476,19 @@ fn main() {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     ..Default::default()
                 },
-                |_, cx| cx.new(PlaygroundApp::new),
+                |window, cx| {
+                    let app = cx.new(PlaygroundApp::new);
+                    let app_weak = app.downgrade();
+                    Theme::observe_system_appearance(window, move |mode, pref, cx| {
+                        let accent = app_weak
+                            .upgrade()
+                            .map(|entity| entity.read(cx).accent)
+                            .unwrap_or_default();
+                        accent.build_theme(mode).with_preference(pref)
+                    })
+                    .detach();
+                    app
+                },
             )
             .unwrap();
             cx.activate(true);
@@ -491,6 +508,7 @@ mod tests {
 
         let all_pages = [
             Page::Overview,
+            Page::Analytics,
             Page::Buttons,
             Page::Inputs,
             Page::Controls,

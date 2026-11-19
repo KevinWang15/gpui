@@ -1814,6 +1814,24 @@ impl PlatformWindow for X11Window {
         }
     }
 
+    fn capture_transition_snapshot(&self, scene: &Scene) -> bool {
+        let mut inner = self.0.state.borrow_mut();
+        let Some(renderer) = &mut inner.renderer else {
+            return false;
+        };
+        if renderer.device_lost() {
+            return false;
+        }
+        renderer.capture_transition_snapshot(scene)
+    }
+
+    fn clear_transition_snapshot(&self) {
+        let mut inner = self.0.state.borrow_mut();
+        if let Some(renderer) = &mut inner.renderer {
+            renderer.clear_transition_snapshot();
+        }
+    }
+
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         self.0
             .state

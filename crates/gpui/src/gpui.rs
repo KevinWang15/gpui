@@ -63,6 +63,7 @@ mod taffy;
 mod text_system;
 mod util;
 mod view;
+mod view_transition;
 mod window;
 
 #[cfg(feature = "profiler")]
@@ -154,6 +155,7 @@ pub use taffy::{AvailableSpace, LayoutId};
 pub use text_system::*;
 pub use util::{FutureExt, Timeout};
 pub use view::*;
+pub use view_transition::*;
 pub use window::*;
 
 #[cfg(not(target_family = "wasm"))]

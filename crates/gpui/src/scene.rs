@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Path,
-    PathTiles, Pixels, Point, Radians, ScaledPixels, Size, TimedTransformation,
+    PathTiles, Pixels, Point, Radians, ScaledPixels, SceneTransition, Size, TimedTransformation,
     bounds_tree::BoundsTree,
 };
 use smallvec::SmallVec;
@@ -61,6 +61,8 @@ pub struct Scene {
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
     animations: Vec<SpriteAnimation>,
+    /// Optional active full-window GPU view transition evaluated for the current frame.
+    pub transition: Option<SceneTransition>,
 }
 
 #[expect(missing_docs)]
@@ -79,6 +81,7 @@ impl Scene {
         self.polychrome_sprites.clear();
         self.surfaces.clear();
         self.animations.clear();
+        self.transition = None;
     }
 
     /// Inserts a sprite that [`Self::advance_animations`] keeps moving. The

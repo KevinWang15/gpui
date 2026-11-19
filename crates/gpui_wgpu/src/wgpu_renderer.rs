@@ -4,7 +4,7 @@ use bytemuck::{Pod, Zeroable};
 use collections::FxHashMap;
 use gpui::{
     AtlasTextureId, Bounds, DevicePixels, GpuSpecs, PaintedPath, PrimitiveBatch, ScaledPixels,
-    Scene, Size, get_gamma_correction_ratios, quad_depth, quad_depth_scale,
+    Scene, SceneTransition, Size, get_gamma_correction_ratios, quad_depth, quad_depth_scale,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -44,6 +44,8 @@ const SUBPIXEL_SHADERS: &str = concat!(
     include_str!("shaders_subpixel.wgsl"),
 );
 
+const VIEW_TRANSITION_SHADER: &str = include_str!("shaders_view_transition.wgsl");
+
 fn least_common_multiple(left: u64, right: u64) -> u64 {
     let mut first = left;
     let mut second = right;
@@ -72,6 +74,37 @@ const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 struct DepthTexture {
     texture: wgpu::Texture,
     view: wgpu::TextureView,
+}
+
+struct TransitionTexture {
+    #[allow(dead_code)]
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    size: Size<DevicePixels>,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct ViewTransitionParams {
+    origin_px: [f32; 2],
+    radius_px: f32,
+    feather_px: f32,
+    progress: f32,
+    kind: u32,
+    _pad: [u32; 2],
+}
+
+impl From<SceneTransition> for ViewTransitionParams {
+    fn from(transition: SceneTransition) -> Self {
+        Self {
+            origin_px: [transition.origin.x.0, transition.origin.y.0],
+            radius_px: transition.radius.0,
+            feather_px: transition.feather.0,
+            progress: transition.progress,
+            kind: transition.kind as u32,
+            _pad: [0, 0],
+        }
+    }
 }
 
 #[repr(C)]
@@ -130,6 +163,7 @@ struct WgpuPipelines {
     poly_sprites: wgpu::RenderPipeline,
     #[allow(dead_code)]
     surfaces: wgpu::RenderPipeline,
+    view_transition: wgpu::RenderPipeline,
     premultiplied_alpha: bool,
 }
 
@@ -173,6 +207,7 @@ struct WgpuBindGroupLayouts {
     path_tiles: wgpu::BindGroupLayout,
     texture: wgpu::BindGroupLayout,
     surfaces: wgpu::BindGroupLayout,
+    view_transition: wgpu::BindGroupLayout,
 }
 
 /// Shared GPU context reference, used to coordinate device recovery across multiple windows.
@@ -200,6 +235,7 @@ struct WgpuResources {
     atlas_texture_bind_groups: FxHashMap<AtlasTextureId, CachedTextureBindGroup>,
     globals_buffer: wgpu::Buffer,
     globals_bind_group: wgpu::BindGroup,
+    view_transition_buffer: wgpu::Buffer,
     instance_data: InstanceData,
 }
 
@@ -222,11 +258,8 @@ struct WgpuRendererCore {
     transient_attachments: bool,
     adapter_info: wgpu::AdapterInfo,
     depth_texture: Option<DepthTexture>,
-    /// Read by the headless renderer to create its render target.
-    #[cfg(all(
-        not(target_family = "wasm"),
-        any(test, feature = "bench-support", feature = "test-support")
-    ))]
+    transition_old: Option<TransitionTexture>,
+    transition_new: Option<TransitionTexture>,
     target_format: wgpu::TextureFormat,
     max_texture_size: u32,
 }
@@ -673,12 +706,51 @@ impl WgpuRendererCore {
             ],
         });
 
+        let view_transition = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("view_transition_layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: NonZeroU64::new(
+                            std::mem::size_of::<ViewTransitionParams>() as u64,
+                        ),
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
         WgpuBindGroupLayouts {
             globals,
             instances,
             path_tiles,
             texture,
             surfaces,
+            view_transition,
         }
     }
 
@@ -980,6 +1052,50 @@ impl WgpuRendererCore {
             &shader_module,
         );
 
+        let view_transition_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("gpui_view_transition_shader"),
+            source: wgpu::ShaderSource::Wgsl(VIEW_TRANSITION_SHADER.into()),
+        });
+        let view_transition_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("view_transition_pipeline_layout"),
+                bind_group_layouts: &[Some(&layouts.view_transition)],
+                immediate_size: 0,
+            });
+        let view_transition = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("view_transition"),
+            layout: Some(&view_transition_layout),
+            vertex: wgpu::VertexState {
+                module: &view_transition_module,
+                entry_point: Some("vs_view_transition"),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &view_transition_module,
+                entry_point: Some("fs_view_transition"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
         WgpuPipelines {
             quads,
             opaque_quads,
@@ -990,6 +1106,7 @@ impl WgpuRendererCore {
             subpixel_sprites,
             poly_sprites,
             surfaces,
+            view_transition,
             premultiplied_alpha,
         }
     }
@@ -1018,7 +1135,8 @@ impl WgpuRenderer {
         self.surface_config.width = clamped_width.max(1);
         self.surface_config.height = clamped_height.max(1);
 
-        if let RendererState::Ready { surface, core } = &self.state {
+        if let RendererState::Ready { surface, core } = &mut self.state {
+            core.clear_transition_snapshot();
             surface.configure(&core.resources.device, &self.surface_config);
         }
     }
@@ -1047,7 +1165,8 @@ impl WgpuRenderer {
         };
         core.rebuild_pipelines(format, new_alpha_mode);
 
-        if let RendererState::Ready { surface, core } = &self.state {
+        if let RendererState::Ready { surface, core } = &mut self.state {
+            core.clear_transition_snapshot();
             surface.configure(&core.resources.device, &self.surface_config);
         }
     }
@@ -1082,6 +1201,35 @@ impl WgpuRenderer {
 
     pub fn max_texture_size(&self) -> u32 {
         self.max_texture_size
+    }
+
+    /// Captures `scene` into a GPU-side offscreen snapshot texture for an upcoming view transition.
+    pub fn capture_transition_snapshot(&mut self, scene: &Scene) -> bool {
+        let size = Size {
+            width: DevicePixels(self.surface_config.width as i32),
+            height: DevicePixels(self.surface_config.height as i32),
+        };
+        if size.width.0 <= 0 || size.height.0 <= 0 {
+            return false;
+        }
+        let RendererState::Ready { core, .. } = &mut self.state else {
+            return false;
+        };
+        match core.capture_transition_snapshot(scene, size) {
+            Ok(()) => true,
+            Err(error) => {
+                log::warn!("failed to capture view transition snapshot: {error:#}");
+                core.clear_transition_snapshot();
+                false
+            }
+        }
+    }
+
+    /// Releases any offscreen GPU textures allocated for an active view transition.
+    pub fn clear_transition_snapshot(&mut self) {
+        if let Some(core) = self.core_mut() {
+            core.clear_transition_snapshot();
+        }
     }
 
     pub fn draw(&mut self, scene: &Scene) -> bool {
@@ -1157,7 +1305,15 @@ impl WgpuRenderer {
         let frame_view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        if let Err(error) = core.render_frame(scene, &frame_view, size, wgpu::Color::TRANSPARENT) {
+        let render_result = if let Some(transition) = scene.transition
+            && core.has_transition_snapshot(size)
+        {
+            core.render_frame_with_transition(scene, transition, &frame_view, size)
+        } else {
+            core.render_frame(scene, &frame_view, size, wgpu::Color::TRANSPARENT)
+                .map(|_| ())
+        };
+        if let Err(error) = render_result {
             log::error!("{error:#}");
             return false;
         }
@@ -1202,6 +1358,12 @@ impl WgpuRendererCore {
         let globals_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("globals_buffer"),
             size: gamma_offset + gamma_size,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let view_transition_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("view_transition_buffer"),
+            size: std::mem::size_of::<ViewTransitionParams>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -1278,6 +1440,7 @@ impl WgpuRendererCore {
                 atlas_texture_bind_groups: FxHashMap::default(),
                 globals_buffer,
                 globals_bind_group,
+                view_transition_buffer,
                 instance_data,
             },
             atlas,
@@ -1292,10 +1455,8 @@ impl WgpuRendererCore {
             transient_attachments: context.supports_transient_attachments(),
             adapter_info: context.adapter.get_info(),
             depth_texture: None,
-            #[cfg(all(
-                not(target_family = "wasm"),
-                any(test, feature = "bench-support", feature = "test-support")
-            ))]
+            transition_old: None,
+            transition_new: None,
             target_format,
             max_texture_size,
         }
@@ -1310,6 +1471,8 @@ impl WgpuRendererCore {
         surface_format: wgpu::TextureFormat,
         alpha_mode: wgpu::CompositeAlphaMode,
     ) {
+        self.target_format = surface_format;
+        self.clear_transition_snapshot();
         self.resources.pipelines = Self::create_pipelines(
             &self.resources.device,
             &self.resources.bind_group_layouts,
@@ -1318,6 +1481,168 @@ impl WgpuRendererCore {
             self.dual_source_blending,
             self.uses_webgl_instance_data,
         );
+    }
+
+    fn create_transition_texture(
+        &self,
+        label: &str,
+        size: Size<DevicePixels>,
+    ) -> TransitionTexture {
+        let texture = self
+            .resources
+            .device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width: size.width.0 as u32,
+                    height: size.height.0 as u32,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: self.target_format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        TransitionTexture {
+            texture,
+            view,
+            size,
+        }
+    }
+
+    fn has_transition_snapshot(&self, size: Size<DevicePixels>) -> bool {
+        self.transition_old
+            .as_ref()
+            .is_some_and(|tex| tex.size == size)
+    }
+
+    fn clear_transition_snapshot(&mut self) {
+        self.transition_old = None;
+        self.transition_new = None;
+    }
+
+    fn capture_transition_snapshot(
+        &mut self,
+        scene: &Scene,
+        size: Size<DevicePixels>,
+    ) -> Result<()> {
+        if let Some(active_transition) = scene.transition
+            && self.has_transition_snapshot(size)
+        {
+            // Mid-flight interruption: capture the currently visible composited frame so the
+            // new transition smoothly sweeps over the partially revealed previous transition.
+            let captured = self.create_transition_texture("view_transition_captured", size);
+            self.render_frame_with_transition(scene, active_transition, &captured.view, size)?;
+            self.transition_old = Some(captured);
+            return Ok(());
+        }
+
+        let needs_alloc = self
+            .transition_old
+            .as_ref()
+            .is_none_or(|tex| tex.size != size);
+        if needs_alloc {
+            self.transition_old = Some(self.create_transition_texture("view_transition_old", size));
+        }
+        let old_tex = self.transition_old.take().expect("just initialized");
+        let result = self.render_frame(scene, &old_tex.view, size, wgpu::Color::TRANSPARENT);
+        self.transition_old = Some(old_tex);
+        result?;
+        Ok(())
+    }
+
+    fn render_frame_with_transition(
+        &mut self,
+        scene: &Scene,
+        transition: SceneTransition,
+        target_view: &wgpu::TextureView,
+        size: Size<DevicePixels>,
+    ) -> Result<()> {
+        let needs_alloc = self
+            .transition_new
+            .as_ref()
+            .is_none_or(|tex| tex.size != size);
+        if needs_alloc {
+            self.transition_new = Some(self.create_transition_texture("view_transition_new", size));
+        }
+        let new_tex = self.transition_new.take().expect("just initialized");
+        let render_result = self.render_frame(scene, &new_tex.view, size, wgpu::Color::TRANSPARENT);
+        self.transition_new = Some(new_tex);
+        render_result?;
+
+        let old_view = &self
+            .transition_old
+            .as_ref()
+            .expect("transition_old checked before composite")
+            .view;
+        let new_view = &self
+            .transition_new
+            .as_ref()
+            .expect("transition_new initialized")
+            .view;
+
+        let params = ViewTransitionParams::from(transition);
+        self.resources.queue.write_buffer(
+            &self.resources.view_transition_buffer,
+            0,
+            bytemuck::bytes_of(&params),
+        );
+
+        let bind_group = self
+            .resources
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("view_transition_bind_group"),
+                layout: &self.resources.bind_group_layouts.view_transition,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.resources.view_transition_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(old_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(new_view),
+                    },
+                ],
+            });
+
+        let mut encoder =
+            self.resources
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("view_transition_encoder"),
+                });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("view_transition_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+            pass.set_pipeline(&self.resources.pipelines.view_transition);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        self.resources
+            .queue
+            .submit(std::iter::once(encoder.finish()));
+        Ok(())
     }
 
     fn resources_mut(&mut self) -> &mut WgpuResources {

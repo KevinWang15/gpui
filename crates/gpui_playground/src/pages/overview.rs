@@ -15,6 +15,12 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
 
     let jump_cards: &[(Page, LucideIcon, &str, &str)] = &[
         (
+            Page::Analytics,
+            LucideIcon::ChartColumnStacked,
+            "Analytics & Charts",
+            "StackedBarChart, LineChart, BreakdownList, FilterBar, TimeRangePicker, StatGroup & radial ThemeSwitcher.",
+        ),
+        (
             Page::Buttons,
             LucideIcon::MousePointerClick,
             "Buttons & Groups",

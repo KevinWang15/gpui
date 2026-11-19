@@ -676,3 +676,245 @@ fn app_shell_scroll_container_never_squishes_tall_cards(cx: &mut TestAppContext)
         second_card_height.get()
     );
 }
+
+#[test]
+fn calendar_date_and_time_range_arithmetic() {
+    let nov19 = CalendarDate::new(2026, 11, 19);
+    let oct21 = CalendarDate::new(2026, 10, 21);
+    let range = TimeRangePreset::Last30Days.resolve(nov19, 92);
+    assert_eq!(range.start, oct21);
+    assert_eq!(range.end, nov19);
+    assert_eq!(range.span_days(), 30);
+    assert_eq!(range.format_compact(), "Oct 21 – Nov 19");
+
+    // Epoch & leap-year roundtrip
+    let leap = CalendarDate::new(2024, 2, 29);
+    assert_eq!(
+        CalendarDate::from_days_since_epoch(leap.to_days_since_epoch()),
+        leap
+    );
+    assert_eq!(leap.add_days(1), CalendarDate::new(2024, 3, 1));
+    assert_eq!(CalendarDate::new(2026, 11, 1).weekday_mon0(), 6); // Sunday
+
+    // Stepping & zooming out clamp cleanly
+    let prev = range.shift_backward();
+    assert_eq!(prev.span_days(), 30);
+    assert_eq!(prev.end, CalendarDate::new(2026, 10, 20));
+    assert_eq!(prev.shift_forward(nov19), range);
+
+    let zoomed = range.zoom_out(nov19, 92);
+    assert_eq!(zoomed.span_days(), 60);
+    assert_eq!(zoomed.end, nov19);
+    assert_eq!(zoomed.zoom_out(nov19, 92).span_days(), 92);
+}
+
+#[test]
+fn chart_scales_and_nice_ticks_are_well_behaved() {
+    let (nice_max, ticks) = nice_ticks(54.2, 4);
+    assert!(nice_max >= 54.2);
+    assert_eq!(ticks.first().copied(), Some(0.0));
+    assert!((ticks.last().copied().unwrap() - nice_max).abs() < 1e-6);
+
+    let lin = LinearScale::new(0.0, 100.0, 200.0, 0.0);
+    assert!((lin.map(50.0) - 100.0).abs() < 1e-4);
+    assert!((lin.invert(100.0) - 50.0).abs() < 1e-4);
+
+    let band = BandScale::new(50.0, 300.0, 10, 0.25);
+    assert_eq!(band.index_at_x(55.0), Some(0));
+    assert_eq!(band.index_at_x(345.0), Some(9));
+    assert_eq!(band.index_at_x(10.0), None);
+    assert_eq!(format_compact(36_800_000.0), "36.8M");
+    assert_eq!(format_compact(19_700.0), "19.7K");
+}
+
+#[test]
+fn view_transition_radial_geometry_reaches_farthest_corner() {
+    let now = std::time::Instant::now();
+    let origin = crate::point(px(1200.), px(20.));
+    let active = crate::ActiveViewTransition {
+        started_at: now,
+        transition: crate::ViewTransition::radial_reveal(origin)
+            .duration(std::time::Duration::from_millis(400)),
+        viewport_size: size(px(1280.), px(800.)),
+        scale_factor: 2.0,
+    };
+
+    let start = active
+        .evaluate(now, size(px(1280.), px(800.)), 2.0)
+        .expect("active at t=0");
+    assert_eq!(start.radius.0, 0.0);
+
+    let mid = active
+        .evaluate(
+            now + std::time::Duration::from_millis(200),
+            size(px(1280.), px(800.)),
+            2.0,
+        )
+        .expect("active at midpoint");
+    assert!(mid.radius.0 > 1000.0);
+
+    // Finishes cleanly at elapsed >= duration
+    assert!(
+        active
+            .evaluate(
+                now + std::time::Duration::from_millis(400),
+                size(px(1280.), px(800.)),
+                2.0,
+            )
+            .is_none()
+    );
+
+    // Viewport resize aborts cleanly
+    assert!(
+        active
+            .evaluate(
+                now + std::time::Duration::from_millis(100),
+                size(px(1024.), px(768.)),
+                2.0,
+            )
+            .is_none()
+    );
+}
+
+struct AdvancedAnalyticsTestView {
+    filter: Entity<FilterBarState>,
+    time_range: Entity<TimeRangePickerState>,
+    metric: SharedString,
+}
+
+impl Render for AdvancedAnalyticsTestView {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        v_stack()
+            .w_full()
+            .spacing(px(12.))
+            .child(
+                h_stack()
+                    .spacing(px(8.))
+                    .child(time_range_picker("test-tr", &self.time_range))
+                    .child(theme_switcher("test-theme-sw"))
+                    .child(
+                        segmented_control("test-seg", self.metric.clone()).items([
+                            SegmentedItem::new("cost", "Cost"),
+                            SegmentedItem::new("tokens", "Tokens"),
+                        ]),
+                    ),
+            )
+            .child(filter_bar("test-fb", &self.filter))
+            .child(stat_group("test-stats").items([
+                StatItem::new("30-day cost", "$896.90").delta(StatDelta::percent(
+                    10.9,
+                    "vs previous 30 days",
+                    TrendPolarity::LowerIsBetter,
+                )),
+                StatItem::new("Today", "$36.21").delta(StatDelta::percent(
+                    -11.9,
+                    "vs workdays",
+                    TrendPolarity::LowerIsBetter,
+                )),
+            ]))
+            .child(
+                chart_card("test-bar-card", "Daily cost")
+                    .subtitle("30 days")
+                    .content(
+                        stacked_bar_chart("test-bars")
+                            .series([StackedBarSeries::new("sonnet"), StackedBarSeries::new("gpt")])
+                            .points([
+                                StackedBarPoint::new("Oct 21", vec![18.0, 9.0]),
+                                StackedBarPoint::new("Today", vec![22.0, 14.0]),
+                            ]),
+                    ),
+            )
+            .child(
+                chart_card("test-line-card", "Today vs baseline").content(
+                    line_chart("test-lines")
+                        .x_domain(0.0, 24.0)
+                        .x_ticks([(0.0, "00:00".into()), (24.0, "24:00".into())])
+                        .add_series(
+                            LineSeries::new("Today", vec![(0.0, 0.0), (12.0, 20.0), (18.0, 36.21)])
+                                .fill_area(true)
+                                .endpoint_callout("Today"),
+                        )
+                        .add_series(
+                            LineSeries::new("Baseline", vec![(0.0, 0.0), (12.0, 24.0), (24.0, 48.0)])
+                                .line_style(LineStyle::Dashed),
+                        ),
+                ),
+            )
+            .child(
+                breakdown_list("test-bd").items([
+                    BreakdownItem::new("claude-sonnet-5-5", 520.20),
+                    BreakdownItem::new("gpt-6.2", 269.07),
+                ]),
+            )
+    }
+}
+
+#[gpui::test]
+fn advanced_analytics_components_render_and_filter_narrow(cx: &mut TestAppContext) {
+    cx.update(init_components);
+    let window = cx.open_window(size(px(1200.), px(900.)), |_, cx| {
+        let filter = cx.new(|cx| {
+            FilterBarState::new(
+                vec![
+                    FilterFieldDef::new("provider", "Provider"),
+                    FilterFieldDef::new("model", "Model"),
+                ],
+                |_, field, _| match field {
+                    "provider" => vec![
+                        FilterFacetOption::new("openai", Some(476)),
+                        FilterFacetOption::new("anthropic", Some(309)),
+                    ],
+                    _ => vec![FilterFacetOption::new("claude-sonnet-5-5", Some(309))],
+                },
+                cx,
+            )
+        });
+        let time_range =
+            cx.new(|cx| TimeRangePickerState::new(CalendarDate::new(2026, 11, 19), cx));
+        AdvancedAnalyticsTestView {
+            filter,
+            time_range,
+            metric: "cost".into(),
+        }
+    });
+    cx.run_until_parked();
+
+    // Test programmatic narrow + toggle off on FilterBarState
+    window
+        .update(cx, |view, _, cx| {
+            view.filter
+                .update(cx, |s, cx| s.toggle_narrow("model", "claude-sonnet-5-5", cx));
+            assert!(view.filter.read(cx).is_narrowed_to("model", "claude-sonnet-5-5"));
+            assert_eq!(view.filter.read(cx).clauses().len(), 1);
+
+            view.filter
+                .update(cx, |s, cx| s.toggle_narrow("model", "claude-sonnet-5-5", cx));
+            assert!(view.filter.read(cx).clauses().is_empty());
+
+            // Test TimeRangePickerState preset + stepping
+            view.time_range
+                .update(cx, |s, cx| s.apply_preset(TimeRangePreset::Last7Days, cx));
+            assert_eq!(view.time_range.read(cx).range().span_days(), 7);
+            view.time_range.update(cx, |s, cx| s.step_backward(cx));
+            assert!(view.time_range.read(cx).can_step_forward());
+            view.time_range.update(cx, |s, cx| s.zoom_out(cx));
+            assert_eq!(view.time_range.read(cx).range().span_days(), 14);
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    // Verify switching theme with transition commits cleanly in headless test window
+    window
+        .update(cx, |_, window, cx| {
+            Theme::set_preference_with_transition(
+                ThemePreference::Dark,
+                Some(crate::point(px(1100.), px(24.))),
+                window,
+                cx,
+            );
+            assert_eq!(cx.theme().mode, ThemeMode::Dark);
+            assert_eq!(cx.theme().preference, ThemePreference::Dark);
+        })
+        .unwrap();
+    cx.run_until_parked();
+}

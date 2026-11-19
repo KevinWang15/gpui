@@ -1368,6 +1368,17 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>);
     fn on_button_layout_changed(&self, _callback: Box<dyn FnMut()>) {}
     fn draw(&self, scene: &Scene);
+    /// Captures the currently displayed `scene` into a GPU-side offscreen snapshot texture for an
+    /// upcoming full-window [`ViewTransition`](crate::ViewTransition).
+    ///
+    /// Returns `true` if the renderer supports GPU view transitions and captured the snapshot.
+    /// Backends that do not override this return `false`, causing `Window::start_view_transition`
+    /// to commit state changes immediately without error.
+    fn capture_transition_snapshot(&self, _scene: &Scene) -> bool {
+        false
+    }
+    /// Releases any GPU-side offscreen textures held for an active [`ViewTransition`](crate::ViewTransition).
+    fn clear_transition_snapshot(&self) {}
     fn schedule_frame(&self) {}
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
     fn is_subpixel_rendering_supported(&self) -> bool;
