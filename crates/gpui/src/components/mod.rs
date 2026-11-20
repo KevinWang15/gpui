@@ -35,6 +35,7 @@ pub mod image_preview;
 pub mod input;
 pub mod interactive;
 pub mod layout;
+pub mod liquid_glass;
 pub mod list;
 pub mod loading_overlay;
 pub mod menu;
@@ -133,6 +134,11 @@ pub use layout::{
     card_footer, card_header, card_title, container, divider, grid, h_stack, navbar, page_header,
     section, setting_row, v_stack,
 };
+pub use liquid_glass::{
+    LiquidGlass, LiquidGlassDragEvent, LiquidGlassDragState, LiquidGlassStage, liquid_glass,
+    liquid_glass_stage,
+};
+pub use crate::{LiquidGlassOptions, ProgressiveBlur};
 pub use list::{List, ListItem, VirtualList, list, virtual_list};
 pub use loading_overlay::{BlurContainer, LoadingOverlay, blur_container, loading_overlay};
 pub use menu::{Menu, MenuEvent, MenuMode, MenuNode, MenuState, nav_menu};
@@ -161,7 +167,7 @@ pub use textbox::{
 };
 pub use theme::{
     ANIM_FAST, ANIM_NORMAL, ActiveTheme, ComponentSize, GlobalTheme, SPRING_SMOOTH, SPRING_SNAPPY,
-    Theme, ThemeMode, ThemePreference, init_components, tabular_numerals,
+    Theme, ThemeMode, ThemePreference, ThemeTransitionStyle, init_components, tabular_numerals,
 };
 pub use theme_switcher::{ThemeSwitcher, theme_switcher};
 pub use time_range::{

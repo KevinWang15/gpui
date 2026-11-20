@@ -1378,20 +1378,24 @@ float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Targe
 */
 
 // A full-window transition between two frames: `t_transition_old` (the frame
-// captured before the change) and `t_transition_new` (this frame), blended by
-// a circle that grows from (or shrinks to) `vt_origin`, or by a cross-fade.
-// The same geometry as gpui_wgpu's shaders_view_transition.wgsl.
+// captured before the change) and `t_transition_new` (this frame), matching
+// gpui_wgpu's shaders_view_transition.wgsl pixel-for-pixel across all modes:
+//   0: RadialExpand, 1: RadialCollapse, 2: CrossFade,
+//   3: Shockwave (optical refraction + RGB dispersion + caustic ridge),
+//   4: PageCurl (3D cylindrical curl + specular ridge + cast shadow),
+//   5: LiquidDissolve (domain-warped FBM liquid melt + meniscus refraction).
 cbuffer ViewTransitionParams: register(b2) {
     float2 vt_origin;
     float vt_radius;
     float vt_feather;
     float vt_progress;
     uint vt_kind;
-    uint2 vt_pad;
+    float2 vt_viewport_size;
 };
 
 Texture2D<float4> t_transition_old: register(t0);
 Texture2D<float4> t_transition_new: register(t1);
+SamplerState s_transition: register(s0);
 
 // One triangle that covers the viewport: (-1, -1), (3, -1), (-1, 3).
 float4 view_transition_vertex(uint vertex_id: SV_VertexID): SV_Position {
@@ -1399,25 +1403,310 @@ float4 view_transition_vertex(uint vertex_id: SV_VertexID): SV_Position {
     return float4(p * 2.0 - 1.0, 0.0, 1.0);
 }
 
+float4 vt_sample_old(float2 uv) {
+    return t_transition_old.SampleLevel(s_transition, saturate(uv), 0.0);
+}
+
+float4 vt_sample_new(float2 uv) {
+    return t_transition_new.SampleLevel(s_transition, saturate(uv), 0.0);
+}
+
+float4 vt_load_old(float2 frag_pos) {
+    return t_transition_old.Load(int3(int2(frag_pos), 0));
+}
+
+float4 vt_load_new(float2 frag_pos) {
+    return t_transition_new.Load(int3(int2(frag_pos), 0));
+}
+
+float vt_rect_sdf(float2 p, float2 dims) {
+    return max(max(-p.x, p.x - dims.x), max(-p.y, p.y - dims.y));
+}
+
+float vt_hash21(float2 p) {
+    float3 p3 = frac(float3(p.x, p.y, p.x) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return frac((p3.x + p3.y) * p3.z);
+}
+
+float vt_noise2d(float2 p) {
+    float2 i = floor(p);
+    float2 f = frac(p);
+    float2 u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+    float a = vt_hash21(i);
+    float b = vt_hash21(i + float2(1.0, 0.0));
+    float c = vt_hash21(i + float2(0.0, 1.0));
+    float d = vt_hash21(i + float2(1.0, 1.0));
+    return lerp(lerp(a, b, u.x), lerp(c, d, u.x), u.y);
+}
+
+float vt_fbm(float2 p) {
+    float val = 0.0;
+    float amp = 0.5;
+    [unroll]
+    for (int i = 0; i < 4; i++) {
+        val += amp * vt_noise2d(p);
+        p = float2(p.x * 1.60 - p.y * 1.24, p.x * 1.24 + p.y * 1.60) + float2(13.7, 7.3);
+        amp *= 0.5;
+    }
+    return val / 0.9375;
+}
+
+float vt_warped_fbm(float2 q) {
+    float wx = vt_fbm(q + float2(5.2, 1.3));
+    float wy = vt_fbm(q + float2(1.7, 9.2));
+    return vt_fbm(q + float2(wx - 0.5, wy - 0.5) * 1.35);
+}
+
+float4 vt_shockwave(float2 frag_pos, float2 dims) {
+    float scale = max(vt_feather, 1.0);
+    float p = saturate(vt_progress);
+    float2 delta = frag_pos - vt_origin;
+    float dist = length(delta);
+    float2 dir = delta / max(dist, 0.001);
+
+    float band = 82.0 * scale;
+    float d = dist - vt_radius;
+    float wake_d = d + band * 0.88;
+    float time_env = smoothstep(0.0, 0.07, p) * smoothstep(1.0, 0.84, p);
+
+    if ((abs(d) > band * 2.4 && abs(wake_d) > band * 1.8) || time_env <= 0.0005) {
+        return d < 0.0 ? vt_load_new(frag_pos) : vt_load_old(frag_pos);
+    }
+
+    float sigma_main = band * 0.44;
+    float wave_env = exp(-(d * d) / (2.0 * sigma_main * sigma_main)) * time_env;
+    float ripple = sin((d / band) * M_PI_F * 2.0) * wave_env;
+
+    float sigma_wake = band * 0.30;
+    float wake_env = exp(-(wake_d * wake_d) / (2.0 * sigma_wake * sigma_wake)) * time_env * 0.28;
+    float wake_ripple = sin((wake_d / band) * 4.8) * wake_env;
+
+    float border_dist = min(min(frag_pos.x, dims.x - frag_pos.x), min(frag_pos.y, dims.y - frag_pos.y));
+    float edge_damp = smoothstep(0.0, 22.0 * scale, border_dist);
+
+    float disp_px = (ripple + wake_ripple) * (20.0 * scale) * edge_damp;
+    float2 uv_r = (frag_pos - dir * disp_px * 0.76) / dims;
+    float2 uv_g = (frag_pos - dir * disp_px * 1.00) / dims;
+    float2 uv_b = (frag_pos - dir * disp_px * 1.28) / dims;
+
+    float4 old_g = vt_sample_old(uv_g);
+    float4 old_col = float4(vt_sample_old(uv_r).r, old_g.g, vt_sample_old(uv_b).b, old_g.a);
+    float4 new_g = vt_sample_new(uv_g);
+    float4 new_col = float4(vt_sample_new(uv_r).r, new_g.g, vt_sample_new(uv_b).b, new_g.a);
+
+    float mix_w = 18.0 * scale;
+    float show_old = smoothstep(-mix_w * 0.5, mix_w * 0.5, d);
+    float4 color = lerp(new_col, old_col, show_old);
+
+    float crest_sigma = band * 0.13;
+    float crest_d = d - band * 0.05;
+    float crest = exp(-(crest_d * crest_d) / (2.0 * crest_sigma * crest_sigma)) * time_env;
+    float2 light_dir = normalize(float2(-0.55, -0.83));
+    float spec_dir = 0.58 + 0.42 * max(dot(dir, light_dir), 0.0);
+    float caustic = crest * spec_dir * 0.23;
+
+    float trough_sigma = band * 0.17;
+    float trough_d = d + band * 0.22;
+    float trough = exp(-(trough_d * trough_d) / (2.0 * trough_sigma * trough_sigma)) * time_env * 0.10;
+
+    float3 lit_rgb = color.rgb * (1.0 - trough) + float3(caustic * 0.90, caustic * 0.97, caustic * 1.08) * color.a;
+    return float4(saturate(lit_rgb), color.a);
+}
+
+float4 vt_vellum_backside(float4 back_tex, float shade, float spec, float edge_rim) {
+    float luma = dot(back_tex.rgb, float3(0.299, 0.587, 0.114));
+    float3 vellum = lerp(float3(0.16, 0.18, 0.24), float3(0.95, 0.96, 0.98), smoothstep(0.16, 0.72, luma));
+    float3 base_rgb = lerp(back_tex.rgb, vellum, 0.50) * shade
+        + float3(spec * 0.96, spec * 0.98, spec * 1.02)
+        + float3(edge_rim * 0.22, edge_rim * 0.22, edge_rim * 0.22);
+    return float4(saturate(base_rgb), back_tex.a);
+}
+
+float4 vt_page_curl(float2 frag_pos, float2 dims) {
+    float scale = max(vt_feather, 1.0);
+    float p = saturate(vt_progress);
+    if (p <= 0.0005) {
+        return vt_load_old(frag_pos);
+    }
+    if (p >= 0.9995) {
+        return vt_load_new(frag_pos);
+    }
+
+    float2 start_corner = float2(
+        vt_origin.x >= dims.x * 0.5 ? dims.x : 0.0,
+        vt_origin.y >= dims.y * 0.5 ? dims.y : 0.0
+    );
+    float2 end_corner = dims - start_corner;
+    float2 diag_vec = end_corner - start_corner;
+    float diag = max(length(diag_vec), 1.0);
+    float2 curl_dir = diag_vec / diag;
+
+    float R = clamp(min(dims.x, dims.y) * 0.135, 48.0 * scale, 148.0 * scale);
+    float start_fade = smoothstep(0.0, 0.07, p);
+    float end_fade = smoothstep(1.0, 0.88, p);
+    float axis_s = lerp(0.0, diag + R * 2.65, p);
+
+    float s = dot(frag_pos - start_corner, curl_dir);
+    float d = s - axis_s;
+
+    if (d > 0.0) {
+        float2 p_back = frag_pos - (M_PI_F * R + 2.0 * d) * curl_dir;
+        float bdist = vt_rect_sdf(p_back, dims);
+
+        float4 base_old = vt_load_old(frag_pos);
+        float crease_ao = 1.0 - 0.11 * exp(-d / (R * 0.28)) * start_fade;
+        float flap_shadow = bdist > 0.0
+            ? (1.0 - 0.34 * exp(-bdist / (R * 0.28)) * smoothstep(R * 1.25, 0.0, bdist) * start_fade)
+            : 1.0;
+        base_old.rgb *= crease_ao * flap_shadow;
+
+        if (bdist <= 0.85) {
+            float4 back_tex = vt_sample_old(p_back / dims);
+            float3 l_dir = normalize(float3(-0.42, -0.55, 0.72));
+            float3 h_vec = normalize(l_dir + float3(0.0, 0.0, 1.0));
+            float flat_diffuse = 0.62 + 0.38 * l_dir.z;
+            float flat_spec = pow(max(h_vec.z, 0.0), 20.0) * 0.40 * start_fade;
+            float shade = lerp(flat_diffuse, 0.96, smoothstep(0.0, R * 1.4, d));
+            float spec = flat_spec * exp(-d / (R * 0.55));
+            float edge_rim = smoothstep(2.2 * scale, 0.0, abs(bdist)) * start_fade;
+            float4 back_col = vt_vellum_backside(back_tex, shade, spec, edge_rim);
+            float aa = smoothstep(0.85, -0.85, bdist);
+            return lerp(base_old, back_col, aa);
+        }
+        return base_old;
+    }
+
+    if (d >= -R) {
+        float sin_t = saturate(-d / R);
+        float theta = asin(sin_t);
+        float cos_t = sqrt(max(1.0 - sin_t * sin_t, 0.0));
+
+        float4 new_raw = vt_load_new(frag_pos);
+        float under_shadow = 1.0 - 0.48 * pow(cos_t, 1.15) * start_fade;
+        float4 out_col = float4(new_raw.rgb * under_shadow, new_raw.a);
+
+        float s_bot = axis_s - R * theta;
+        float2 p_bot = frag_pos + (s_bot - s) * curl_dir;
+        float dist_bot = vt_rect_sdf(p_bot, dims);
+        if (dist_bot <= 0.85) {
+            float4 bot_tex = vt_sample_old(p_bot / dims);
+            float bot_shade = 0.80 + 0.20 * cos_t;
+            float4 bot_col = float4(bot_tex.rgb * bot_shade, bot_tex.a);
+            float aa_bot = smoothstep(0.85, -0.85, dist_bot);
+            out_col = lerp(out_col, bot_col, aa_bot);
+        }
+
+        float theta_top = M_PI_F - theta;
+        float s_top = axis_s - R * theta_top;
+        float2 p_top = frag_pos + (s_top - s) * curl_dir;
+        float dist_top = vt_rect_sdf(p_top, dims);
+        if (dist_top <= 0.85) {
+            float4 top_tex = vt_sample_old(p_top / dims);
+            float3 n_cyl = normalize(float3(-curl_dir * sin_t, cos_t));
+            float3 l_dir = normalize(float3(-0.42, -0.55, 0.72));
+            float3 v_dir = float3(0.0, 0.0, 1.0);
+            float3 h_vec = normalize(l_dir + v_dir);
+            float ndl = max(dot(n_cyl, l_dir), 0.0);
+            float diffuse = 0.62 + 0.38 * ndl;
+            float spec = pow(max(dot(n_cyl, h_vec), 0.0), 20.0) * 0.40 * start_fade;
+            float edge_rim = smoothstep(2.2 * scale, 0.0, abs(dist_top)) * start_fade;
+            float4 top_col = vt_vellum_backside(top_tex, diffuse, spec, edge_rim);
+            float aa_top = smoothstep(0.85, -0.85, dist_top);
+            out_col = lerp(out_col, top_col, aa_top);
+        }
+        return out_col;
+    }
+
+    float4 new_raw = vt_load_new(frag_pos);
+    float dist_behind = -d - R;
+    float trail_shadow = 1.0
+        - 0.26 * exp(-dist_behind / (R * 0.36)) * smoothstep(R * 1.45, 0.0, dist_behind) * start_fade * end_fade;
+    return float4(new_raw.rgb * trail_shadow, new_raw.a);
+}
+
+float4 vt_liquid_dissolve(float2 frag_pos, float2 dims) {
+    float scale = max(vt_feather, 1.0);
+    float p = saturate(vt_progress);
+    if (p <= 0.0005) {
+        return vt_load_old(frag_pos);
+    }
+    if (p >= 0.9995) {
+        return vt_load_new(frag_pos);
+    }
+
+    float2 q = frag_pos / (120.0 * scale);
+    float norm_dist = saturate(length(frag_pos - vt_origin) / max(vt_radius, 1.0));
+    float n = vt_warped_fbm(q);
+    float field = norm_dist * 0.66 + n * 0.34;
+    float threshold = lerp(-0.11, 1.11, p);
+    float diff = field - threshold;
+    float time_env = smoothstep(0.0, 0.07, p) * smoothstep(1.0, 0.88, p);
+
+    if (abs(diff) > 0.095 || time_env <= 0.0005) {
+        return diff < 0.0 ? vt_load_new(frag_pos) : vt_load_old(frag_pos);
+    }
+
+    float eps = 0.045;
+    float nx = vt_warped_fbm(q + float2(eps, 0.0)) - vt_warped_fbm(q - float2(eps, 0.0));
+    float ny = vt_warped_fbm(q + float2(0.0, eps)) - vt_warped_fbm(q - float2(0.0, eps));
+    float2 grad = float2(nx, ny) / (2.0 * eps);
+
+    float border_dist = min(min(frag_pos.x, dims.x - frag_pos.x), min(frag_pos.y, dims.y - frag_pos.y));
+    float edge_damp = smoothstep(0.0, 20.0 * scale, border_dist);
+
+    float meniscus = exp(-(diff * diff) / (2.0 * 0.028 * 0.028)) * time_env;
+    float2 disp_px = grad * meniscus * (18.0 * scale) * edge_damp;
+
+    float2 uv_r = (frag_pos + disp_px * 0.80) / dims;
+    float2 uv_g = (frag_pos + disp_px * 1.00) / dims;
+    float2 uv_b = (frag_pos + disp_px * 1.22) / dims;
+
+    float4 old_g = vt_sample_old(uv_g);
+    float4 old_col = float4(vt_sample_old(uv_r).r, old_g.g, vt_sample_old(uv_b).b, old_g.a);
+    float4 new_g = vt_sample_new(uv_g);
+    float4 new_col = float4(vt_sample_new(uv_r).r, new_g.g, vt_sample_new(uv_b).b, new_g.a);
+
+    float show_old = smoothstep(-0.018, 0.018, diff);
+    float4 color = lerp(new_col, old_col, show_old);
+
+    float rim = exp(-(diff * diff) / (2.0 * 0.009 * 0.009)) * time_env;
+    float3 rim_tint = lerp(float3(0.72, 0.90, 1.0), float3(0.96, 0.78, 1.0), n);
+    float inner_d = diff + 0.018;
+    float inner_shade = exp(-(inner_d * inner_d) / (2.0 * 0.014 * 0.014)) * time_env * 0.10;
+    float3 lit_rgb = color.rgb * (1.0 - inner_shade) + rim_tint * (rim * 0.34 * color.a);
+    return float4(saturate(lit_rgb), color.a);
+}
+
 float4 view_transition_fragment(float4 position: SV_Position): SV_Target {
-    int3 coord = int3(int2(position.xy), 0);
-    float4 old_color = t_transition_old.Load(coord);
-    float4 new_color = t_transition_new.Load(coord);
+    float2 dims = max(vt_viewport_size, float2(1.0, 1.0));
+    if (vt_kind == 3u) {
+        return vt_shockwave(position.xy, dims);
+    }
+    if (vt_kind == 4u) {
+        return vt_page_curl(position.xy, dims);
+    }
+    if (vt_kind == 5u) {
+        return vt_liquid_dissolve(position.xy, dims);
+    }
+
+    float4 old_color = vt_load_old(position.xy);
+    float4 new_color = vt_load_new(position.xy);
     float show_old;
-    if (vt_kind == 2) {
+    if (vt_kind == 2u) {
         // Cross-fade.
         show_old = 1.0 - saturate(vt_progress);
     } else {
         float edge = smoothstep(vt_radius - max(vt_feather, 0.5), vt_radius + max(vt_feather, 0.5), length(position.xy - vt_origin));
         // 0: the new frame inside a growing circle; 1: the old frame inside a shrinking one.
-        show_old = vt_kind == 0 ? edge : 1.0 - edge;
+        show_old = vt_kind == 0u ? edge : 1.0 - edge;
     }
     return lerp(new_color, old_color, show_old);
 }
 
 /*
 **
-**              Backdrop blur (Dual-Kawase)
+**              Backdrop blur (Dual-Kawase) & Optical LiquidGlass
 **
 */
 
@@ -1426,15 +1715,25 @@ cbuffer BackdropBlurParams: register(b2) {
     float2 blur_texel_size;
     float blur_radius;
     float blur_kawase_offset;
-    uint2 blur_pad;
+    uint blur_premultiplied_alpha;
+    uint blur_progressive_mode;
     float2 blur_bounds_origin;
     float2 blur_bounds_size;
     float4 blur_corner_radii; // (top_left, top_right, bottom_right, bottom_left)
     float2 blur_mask_origin;
     float2 blur_mask_size;
+    float blur_refraction;
+    float blur_dispersion;
+    float blur_bevel_width;
+    float blur_specular;
+    float2 blur_pointer_pos;
+    float blur_scale_factor;
+    float blur_shadow_opacity;
+    float4 blur_tint_rgba;
 };
 
 Texture2D<float4> t_blur_src: register(t0);
+Texture2D<float4> t_blur_sharp: register(t1);
 SamplerState s_blur: register(s0);
 
 struct BlurFullscreenInput {
@@ -1485,8 +1784,12 @@ float4 kawase_upsample_fragment(BlurFullscreenInput input): SV_Target {
 
 BlurFullscreenInput backdrop_blur_vertex(uint vertex_id: SV_VertexID) {
     float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
-    float2 clip_min = max(blur_bounds_origin, blur_mask_origin);
-    float2 clip_max = min(blur_bounds_origin + blur_bounds_size, blur_mask_origin + blur_mask_size);
+    float scale = max(blur_scale_factor, 1.0);
+    bool has_shadow = blur_shadow_opacity > 0.0005;
+    float2 pad_min = has_shadow ? (float2(40.0, 32.0) * scale) : float2(0.0, 0.0);
+    float2 pad_max = has_shadow ? (float2(40.0, 52.0) * scale) : float2(0.0, 0.0);
+    float2 clip_min = max(blur_bounds_origin - pad_min, blur_mask_origin);
+    float2 clip_max = min(blur_bounds_origin + blur_bounds_size + pad_max, blur_mask_origin + blur_mask_size);
     float2 clipped_size = max(clip_max - clip_min, float2(0.0, 0.0));
     float2 px_pos = clip_min + unit_vertex * clipped_size;
     float2 ndc = float2(
@@ -1507,23 +1810,219 @@ float pick_blur_corner_radius(float2 pos, float4 radii) {
     }
 }
 
+float blur_rounded_rect_sdf(float2 rel, float2 half_size, float4 radii) {
+    float r = min(pick_blur_corner_radius(rel, radii), min(half_size.x, half_size.y));
+    float2 q = abs(rel) - (half_size - float2(r, r));
+    return length(max(q, float2(0.0, 0.0))) + min(max(q.x, q.y), 0.0) - r;
+}
+
+float4 sample_glass_layer(float2 uv_r, float2 uv_g, float2 uv_b, float blur_mix) {
+    float2 cr = saturate(uv_r);
+    float2 cg = saturate(uv_g);
+    float2 cb = saturate(uv_b);
+
+    if (blur_mix <= 0.001) {
+        float4 sg = t_blur_sharp.SampleLevel(s_blur, cg, 0.0);
+        return float4(
+            t_blur_sharp.SampleLevel(s_blur, cr, 0.0).r,
+            sg.g,
+            t_blur_sharp.SampleLevel(s_blur, cb, 0.0).b,
+            sg.a
+        );
+    }
+    if (blur_mix >= 0.999) {
+        float4 bg = t_blur_src.SampleLevel(s_blur, cg, 0.0);
+        return float4(
+            t_blur_src.SampleLevel(s_blur, cr, 0.0).r,
+            bg.g,
+            t_blur_src.SampleLevel(s_blur, cb, 0.0).b,
+            bg.a
+        );
+    }
+    float4 sg = t_blur_sharp.SampleLevel(s_blur, cg, 0.0);
+    float4 sharp = float4(
+        t_blur_sharp.SampleLevel(s_blur, cr, 0.0).r,
+        sg.g,
+        t_blur_sharp.SampleLevel(s_blur, cb, 0.0).b,
+        sg.a
+    );
+    float4 bg = t_blur_src.SampleLevel(s_blur, cg, 0.0);
+    float4 blurred = float4(
+        t_blur_src.SampleLevel(s_blur, cr, 0.0).r,
+        bg.g,
+        t_blur_src.SampleLevel(s_blur, cb, 0.0).b,
+        bg.a
+    );
+    return lerp(sharp, blurred, blur_mix);
+}
+
 float4 backdrop_blur_fragment(BlurFullscreenInput input): SV_Target {
     float2 frag_px = input.position.xy;
-    float2 half_size = blur_bounds_size * 0.5;
+    float2 half_size = max(blur_bounds_size * 0.5, float2(0.5, 0.5));
     float2 center = blur_bounds_origin + half_size;
     float2 rel = frag_px - center;
     float radius = min(pick_blur_corner_radius(rel, blur_corner_radii), min(half_size.x, half_size.y));
 
     float2 q = abs(rel) - (half_size - float2(radius, radius));
-    float dist = length(max(q, float2(0.0, 0.0))) + min(max(q.x, q.y), 0.0) - radius;
+    float2 q_pos = max(q, float2(0.0, 0.0));
+    float outside_len = length(q_pos);
+    float dist = outside_len + min(max(q.x, q.y), 0.0) - radius;
 
+    float scale = max(blur_scale_factor, 1.0);
     float edge_alpha = saturate(0.5 - dist);
-    float strength = saturate(blur_radius / 3.0);
-    float alpha = edge_alpha * strength;
-    if (alpha <= 0.001) {
-        discard;
+    float outside_alpha = 1.0 - edge_alpha;
+
+    // Exterior-only analytical optical drop shadow (0% shadow leaks under the transparent glass interior!).
+    float shadow_a = 0.0;
+    if (blur_shadow_opacity > 0.0005 && outside_alpha > 0.001) {
+        float dist_amb = blur_rounded_rect_sdf(rel - float2(0.0, 9.0 * scale), half_size, blur_corner_radii);
+        float d_amb = max(dist_amb + 3.0 * scale, 0.0);
+        float amb = exp(-(d_amb * d_amb) / (2.0 * (12.5 * scale) * (12.5 * scale)))
+            * smoothstep(38.0 * scale, 16.0 * scale, d_amb);
+
+        float dist_con = blur_rounded_rect_sdf(rel - float2(0.0, 2.5 * scale), half_size, blur_corner_radii);
+        float d_con = max(dist_con + 0.5 * scale, 0.0);
+        float con = exp(-(d_con * d_con) / (2.0 * (3.6 * scale) * (3.6 * scale)));
+
+        shadow_a = clamp((amb * 0.72 + con * 0.34) * blur_shadow_opacity * outside_alpha, 0.0, 0.85);
     }
 
-    float4 blurred = t_blur_src.Sample(s_blur, saturate(input.uv));
-    return float4(blurred.rgb, alpha);
+    float3 shadow_rgb = float3(0.02, 0.04, 0.09);
+    if (edge_alpha <= 0.001) {
+        if (shadow_a <= 0.001) {
+            discard;
+        }
+        return float4(shadow_rgb, shadow_a);
+    }
+
+    bool is_glass = blur_refraction > 0.0005
+        || blur_specular > 0.0005
+        || blur_progressive_mode != 0u
+        || blur_tint_rgba.a > 0.0005
+        || blur_shadow_opacity > 0.0005;
+
+    if (!is_glass) {
+        float strength = saturate(blur_radius / 3.0);
+        float alpha = edge_alpha * strength;
+        if (alpha <= 0.001) {
+            discard;
+        }
+        float4 blurred = t_blur_src.SampleLevel(s_blur, saturate(input.uv), 0.0);
+        return float4(blurred.rgb, alpha);
+    }
+
+    float depth_in = max(-dist, 0.0);
+    float bevel = clamp(blur_bevel_width, 4.0 * scale, min(half_size.x, half_size.y));
+    float u = saturate(depth_in / max(bevel, 1.0));
+    float one_minus_u = 1.0 - u;
+
+    float2 sgn = float2(rel.x >= 0.0 ? 1.0 : -1.0, rel.y >= 0.0 ? 1.0 : -1.0);
+    float2 grad;
+    if (outside_len > 0.0001) {
+        grad = (q_pos / outside_len) * sgn;
+    } else {
+        float diag_blend = smoothstep(-2.5 * scale, 2.5 * scale, q.x - q.y);
+        grad = normalize(float2(sgn.x * diag_blend, sgn.y * (1.0 - diag_blend)) + float2(1e-5, 1e-5));
+    }
+
+    float rim_slope = pow(one_minus_u, 1.85);
+    float2 body_tilt = (rel / half_size) * (0.10 * min(blur_refraction, 1.5));
+    float2 xy_tilt = grad * (rim_slope * 0.76) + body_tilt;
+    float n_z = sqrt(max(1.0 - min(dot(xy_tilt, xy_tilt), 0.96), 0.04));
+    float3 normal = normalize(float3(xy_tilt, n_z));
+
+    float ior = 1.0 + 0.42 * blur_refraction;
+    float eta = 1.0 / ior;
+    float k = max(1.0 - eta * eta * (1.0 - normal.z * normal.z), 0.0);
+    float2 snell_xy = normal.xy * (eta * normal.z - sqrt(k));
+    float thickness_px = bevel * (1.05 * blur_refraction);
+    float border_dist = min(
+        min(frag_px.x, blur_viewport_size.x - frag_px.x),
+        min(frag_px.y, blur_viewport_size.y - frag_px.y)
+    );
+    float vp_edge_damp = smoothstep(0.0, 16.0 * scale, border_dist);
+    float2 refr_px = snell_xy * thickness_px * vp_edge_damp;
+
+    float disp_amt = blur_dispersion * (0.14 + 0.36 * rim_slope);
+    float2 uv_r = (frag_px + refr_px * (1.0 - disp_amt)) / blur_viewport_size;
+    float2 uv_g = (frag_px + refr_px) / blur_viewport_size;
+    float2 uv_b = (frag_px + refr_px * (1.0 + disp_amt * 1.25)) / blur_viewport_size;
+
+    float2 local_uv = saturate((frag_px - blur_bounds_origin) / max(blur_bounds_size, float2(1.0, 1.0)));
+    float prog = 1.0;
+    if (blur_progressive_mode == 1u) {
+        prog = smoothstep(0.0, 1.0, local_uv.y);
+    } else if (blur_progressive_mode == 2u) {
+        prog = smoothstep(1.0, 0.0, local_uv.y);
+    } else if (blur_progressive_mode == 3u) {
+        prog = smoothstep(0.0, 1.0, local_uv.x);
+    } else if (blur_progressive_mode == 4u) {
+        prog = smoothstep(1.0, 0.0, local_uv.x);
+    } else if (blur_progressive_mode == 5u) {
+        prog = smoothstep(0.10, 1.0, pow(one_minus_u, 0.85));
+    }
+    float blur_mix = saturate(blur_radius / 5.0) * prog;
+
+    float4 glass_sample = sample_glass_layer(uv_r, uv_g, uv_b, blur_mix);
+    float3 rgb = glass_sample.rgb;
+
+    float tint_a = blur_tint_rgba.a * (blur_progressive_mode == 0u ? 1.0 : (0.35 + 0.65 * prog));
+    rgb = lerp(rgb, blur_tint_rgba.rgb, tint_a);
+
+    float luma = dot(rgb, float3(0.299, 0.587, 0.114));
+    rgb = lerp(float3(luma, luma, luma), rgb, 1.0 + 0.12 * min(blur_refraction, 1.2));
+
+    float3 v_dir = float3(0.0, 0.0, 1.0);
+    float fresnel = pow(1.0 - saturate(normal.z), 2.2);
+
+    float3 key_l = normalize(float3(-0.55, -0.78, 0.65));
+    float3 key_h = normalize(key_l + v_dir);
+    float key_spec = pow(max(dot(normal, key_h), 0.0), 18.0);
+
+    float3 bounce_l = normalize(float3(0.55, 0.78, 0.45));
+    float3 bounce_h = normalize(bounce_l + v_dir);
+    float bounce_spec = pow(max(dot(normal, bounce_h), 0.0), 10.0) * 0.45;
+
+    float rim_line = smoothstep(2.4 * scale, 0.0, depth_in);
+    float rim_dir_weight = 0.42 + 0.58 * max(dot(grad, normalize(float2(-0.55, -0.83))), 0.0)
+        + 0.34 * max(dot(grad, normalize(float2(0.55, 0.83))), 0.0);
+    float inner_caustic = exp(-((u - 0.15) * (u - 0.15)) / (2.0 * 0.09 * 0.09))
+        * (0.24 + 0.56 * max(dot(grad, normalize(float2(-0.5, -0.86))), 0.0));
+
+    float ptr_spec = 0.0;
+    if (blur_pointer_pos.x >= -1000.0) {
+        float2 ptr_delta = blur_pointer_pos - frag_px;
+        float ptr_dist = length(ptr_delta);
+        float ptr_sigma = 210.0 * scale;
+        float ptr_falloff = exp(-(ptr_dist * ptr_dist) / (2.0 * ptr_sigma * ptr_sigma));
+        float3 ptr_l = normalize(float3(ptr_delta, 140.0 * scale));
+        float3 ptr_h = normalize(ptr_l + v_dir);
+        ptr_spec = pow(max(dot(normal, ptr_h), 0.0), 22.0)
+            * ptr_falloff
+            * (0.28 + 0.72 * fresnel + 0.35 * rim_line);
+    }
+
+    float spec_energy = (fresnel * 0.25
+        + key_spec * (0.24 + 0.44 * fresnel)
+        + bounce_spec * (0.14 + 0.28 * fresnel)
+        + rim_line * rim_dir_weight * 0.44
+        + inner_caustic * 0.18
+        + ptr_spec * 0.48)
+        * blur_specular;
+
+    float bright_bg = smoothstep(0.48, 0.92, luma);
+    float outer_bevel_shade = smoothstep(2.0 * scale, 0.0, depth_in)
+        * (0.07 + 0.22 * bright_bg)
+        * blur_specular;
+    float inner_rim_contrast = exp(-((depth_in - 2.6 * scale) * (depth_in - 2.6 * scale)) / (2.0 * (1.8 * scale) * (1.8 * scale)))
+        * 0.075 * bright_bg * blur_specular;
+
+    rgb = saturate(
+        rgb * (1.0 - outer_bevel_shade - inner_rim_contrast)
+        + float3(0.97, 0.99, 1.04) * spec_energy
+    );
+
+    float out_alpha = saturate(edge_alpha + shadow_a);
+    float3 premul_rgb = rgb * edge_alpha + shadow_rgb * shadow_a;
+    return float4(premul_rgb / max(out_alpha, 0.0001), out_alpha);
 }

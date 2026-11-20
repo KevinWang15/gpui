@@ -115,6 +115,7 @@ struct ViewTransitionPipeline {
     vertex: ID3D11VertexShader,
     fragment: ID3D11PixelShader,
     params: Option<ID3D11Buffer>,
+    clamp_sampler: Option<ID3D11SamplerState>,
 }
 
 /// `ViewTransitionParams` in shaders.hlsl.
@@ -125,7 +126,7 @@ struct ViewTransitionParams {
     feather: f32,
     progress: f32,
     kind: u32,
-    _pad: [u32; 2],
+    viewport_size: [f32; 2],
 }
 
 /// Lazy offscreen textures for Dual-Kawase backdrop blur (`scene` snapshot, `half`, `quarter`).
@@ -159,7 +160,7 @@ struct BackdropBlurPipeline {
     blend_state: ID3D11BlendState,
 }
 
-/// `BackdropBlurParams` in shaders.hlsl (80 bytes, 16-byte aligned).
+/// `BackdropBlurParams` in shaders.hlsl (128 bytes, 16-byte aligned).
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
 struct BackdropBlurParams {
@@ -167,12 +168,21 @@ struct BackdropBlurParams {
     texel_size: [f32; 2],
     blur_radius: f32,
     kawase_offset: f32,
-    _pad: [u32; 2],
+    premultiplied_alpha: u32,
+    progressive_mode: u32,
     bounds_origin: [f32; 2],
     bounds_size: [f32; 2],
     corner_radii: [f32; 4],
     mask_origin: [f32; 2],
     mask_size: [f32; 2],
+    refraction: f32,
+    dispersion: f32,
+    bevel_width: f32,
+    specular: f32,
+    pointer_pos: [f32; 2],
+    scale_factor: f32,
+    shadow_opacity: f32,
+    tint_rgba: [f32; 4],
 }
 
 struct DirectXGlobalElements {
@@ -510,7 +520,7 @@ impl DirectXRenderer {
                 feather: transition.feather.0,
                 progress: transition.progress,
                 kind: transition.kind as u32,
-                _pad: [0; 2],
+                viewport_size: [self.width.max(1) as f32, self.height.max(1) as f32],
             }],
         )?;
         unsafe {
@@ -525,6 +535,7 @@ impl DirectXRenderer {
             context.VSSetShader(&pipeline.vertex, None);
             context.PSSetShader(&pipeline.fragment, None);
             context.PSSetConstantBuffers(2, Some(slice::from_ref(&pipeline.params)));
+            context.PSSetSamplers(0, Some(slice::from_ref(&pipeline.clamp_sampler)));
             context.PSSetShaderResources(0, Some(&[frames.old_view.clone(), frames.new_view.clone()]));
             context.Draw(3, 0);
             // Unbound, so the frames can be copied into again next frame.
@@ -792,68 +803,74 @@ impl DirectXRenderer {
             context.PSSetSamplers(0, Some(slice::from_ref(&pipeline.clamp_sampler)));
             context.PSSetShaderResources(0, Some(&[None]));
 
-            // Pass 1: Downsample full -> half
-            update_buffer(
-                context,
-                params_buf,
-                &[BackdropBlurParams {
-                    texel_size: [1.0 / vw, 1.0 / vh],
-                    kawase_offset,
-                    ..Default::default()
-                }],
-            )?;
-            context.OMSetRenderTargets(Some(slice::from_ref(&targets.half_rtv)), None);
-            context.RSSetViewports(Some(slice::from_ref(&half_viewport)));
-            context.VSSetShader(&pipeline.downsample_vs, None);
-            context.PSSetShader(&pipeline.downsample_ps, None);
-            context.PSSetShaderResources(0, Some(slice::from_ref(&targets.scene_srv)));
-            context.Draw(3, 0);
-            context.PSSetShaderResources(0, Some(&[None]));
+            if max_radius > 0.05 {
+                // Pass 1: Downsample full -> half
+                update_buffer(
+                    context,
+                    params_buf,
+                    &[BackdropBlurParams {
+                        texel_size: [1.0 / vw, 1.0 / vh],
+                        kawase_offset,
+                        ..Default::default()
+                    }],
+                )?;
+                context.OMSetRenderTargets(Some(slice::from_ref(&targets.half_rtv)), None);
+                context.RSSetViewports(Some(slice::from_ref(&half_viewport)));
+                context.VSSetShader(&pipeline.downsample_vs, None);
+                context.PSSetShader(&pipeline.downsample_ps, None);
+                context.PSSetShaderResources(0, Some(slice::from_ref(&targets.scene_srv)));
+                context.Draw(3, 0);
+                context.PSSetShaderResources(0, Some(&[None]));
 
-            // Pass 2: Downsample half -> quarter
-            update_buffer(
-                context,
-                params_buf,
-                &[BackdropBlurParams {
-                    texel_size: [1.0 / hw, 1.0 / hh],
-                    kawase_offset,
-                    ..Default::default()
-                }],
-            )?;
-            context.OMSetRenderTargets(Some(slice::from_ref(&targets.quarter_rtv)), None);
-            context.RSSetViewports(Some(slice::from_ref(&quarter_viewport)));
-            context.PSSetShaderResources(0, Some(slice::from_ref(&targets.half_srv)));
-            context.Draw(3, 0);
-            context.PSSetShaderResources(0, Some(&[None]));
+                // Pass 2: Downsample half -> quarter
+                update_buffer(
+                    context,
+                    params_buf,
+                    &[BackdropBlurParams {
+                        texel_size: [1.0 / hw, 1.0 / hh],
+                        kawase_offset,
+                        ..Default::default()
+                    }],
+                )?;
+                context.OMSetRenderTargets(Some(slice::from_ref(&targets.quarter_rtv)), None);
+                context.RSSetViewports(Some(slice::from_ref(&quarter_viewport)));
+                context.PSSetShaderResources(0, Some(slice::from_ref(&targets.half_srv)));
+                context.Draw(3, 0);
+                context.PSSetShaderResources(0, Some(&[None]));
 
-            // Pass 3: Upsample quarter -> half
-            update_buffer(
-                context,
-                params_buf,
-                &[BackdropBlurParams {
-                    texel_size: [1.0 / qw, 1.0 / qh],
-                    kawase_offset,
-                    ..Default::default()
-                }],
-            )?;
-            context.OMSetRenderTargets(Some(slice::from_ref(&targets.half_rtv)), None);
-            context.RSSetViewports(Some(slice::from_ref(&half_viewport)));
-            context.VSSetShader(&pipeline.upsample_vs, None);
-            context.PSSetShader(&pipeline.upsample_ps, None);
-            context.PSSetShaderResources(0, Some(slice::from_ref(&targets.quarter_srv)));
-            context.Draw(3, 0);
-            context.PSSetShaderResources(0, Some(&[None]));
+                // Pass 3: Upsample quarter -> half
+                update_buffer(
+                    context,
+                    params_buf,
+                    &[BackdropBlurParams {
+                        texel_size: [1.0 / qw, 1.0 / qh],
+                        kawase_offset,
+                        ..Default::default()
+                    }],
+                )?;
+                context.OMSetRenderTargets(Some(slice::from_ref(&targets.half_rtv)), None);
+                context.RSSetViewports(Some(slice::from_ref(&half_viewport)));
+                context.VSSetShader(&pipeline.upsample_vs, None);
+                context.PSSetShader(&pipeline.upsample_ps, None);
+                context.PSSetShaderResources(0, Some(slice::from_ref(&targets.quarter_srv)));
+                context.Draw(3, 0);
+                context.PSSetShaderResources(0, Some(&[None]));
+            }
 
-            // Pass 4: Composite each rounded BackdropBlur region back onto render_target.
+            // Pass 4: Composite each rounded BackdropBlur / LiquidGlass region back onto render_target.
             context.OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
             context.RSSetViewports(Some(slice::from_ref(&resources.viewport)));
             context.OMSetBlendState(&pipeline.blend_state, None, 0xFFFFFFFF);
             context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
             context.VSSetShader(&pipeline.composite_vs, None);
             context.PSSetShader(&pipeline.composite_ps, None);
-            context.PSSetShaderResources(0, Some(slice::from_ref(&targets.half_srv)));
+            context.PSSetShaderResources(
+                0,
+                Some(&[targets.half_srv.clone(), targets.scene_srv.clone()]),
+            );
 
             for blur in blurs {
+                let tint = gpui::Rgba::from(blur.tint);
                 update_buffer(
                     context,
                     params_buf,
@@ -862,7 +879,8 @@ impl DirectXRenderer {
                         texel_size: [1.0 / hw, 1.0 / hh],
                         blur_radius: blur.blur_radius.0,
                         kawase_offset,
-                        _pad: [0; 2],
+                        premultiplied_alpha: 0,
+                        progressive_mode: blur.progressive_mode as u32,
                         bounds_origin: [blur.bounds.origin.x.0, blur.bounds.origin.y.0],
                         bounds_size: [blur.bounds.size.width.0, blur.bounds.size.height.0],
                         corner_radii: [
@@ -879,13 +897,21 @@ impl DirectXRenderer {
                             blur.content_mask.bounds.size.width.0,
                             blur.content_mask.bounds.size.height.0,
                         ],
+                        refraction: blur.refraction,
+                        dispersion: blur.dispersion,
+                        bevel_width: blur.bevel_width.0,
+                        specular: blur.specular,
+                        pointer_pos: [blur.pointer_pos.x.0, blur.pointer_pos.y.0],
+                        scale_factor: blur.scale_factor.max(1.0),
+                        shadow_opacity: blur.shadow_opacity,
+                        tint_rgba: [tint.r, tint.g, tint.b, tint.a],
                     }],
                 )?;
                 context.Draw(4, 0);
             }
 
-            // Unbind blur SRV and restore main scene render targets, depth buffer, and constant buffers.
-            context.PSSetShaderResources(0, Some(&[None]));
+            // Unbind blur & sharp SRVs and restore main scene render targets, depth buffer, and constant buffers.
+            context.PSSetShaderResources(0, Some(&[None, None]));
             context.OMSetRenderTargets(
                 Some(slice::from_ref(&resources.render_target_view)),
                 resources.depth_stencil_view.as_ref(),
@@ -1628,10 +1654,28 @@ impl ViewTransitionPipeline {
             let raw_shader = RawShaderBytes::new(ShaderModule::ViewTransition, ShaderTarget::Fragment)?;
             create_fragment_shader(device, raw_shader.as_bytes())?
         };
+        let clamp_sampler = unsafe {
+            let desc = D3D11_SAMPLER_DESC {
+                Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+                AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressV: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressW: D3D11_TEXTURE_ADDRESS_CLAMP,
+                MipLODBias: 0.0,
+                MaxAnisotropy: 1,
+                ComparisonFunc: D3D11_COMPARISON_ALWAYS,
+                BorderColor: [0.0; 4],
+                MinLOD: 0.0,
+                MaxLOD: D3D11_FLOAT32_MAX,
+            };
+            let mut output = None;
+            device.CreateSamplerState(&desc, Some(&mut output))?;
+            output
+        };
         Ok(Self {
             vertex,
             fragment,
             params: create_constant_buffer::<ViewTransitionParams>(device)?,
+            clamp_sampler,
         })
     }
 }

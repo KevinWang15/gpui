@@ -823,6 +823,117 @@ fn view_transition_radial_geometry_reaches_farthest_corner() {
     );
 }
 
+#[gpui::test]
+fn liquid_glass_composable_container_and_drag_state(cx: &mut TestAppContext) {
+    cx.update(init_components);
+
+    struct GlassView {
+        lens_drag: Entity<LiquidGlassDragState>,
+        bar_drag: Entity<LiquidGlassDragState>,
+    }
+    impl Render for GlassView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            liquid_glass_stage("test-lg-stage")
+                .track(&self.lens_drag)
+                .track(&self.bar_drag)
+                .w(px(640.))
+                .h(px(400.))
+                .child(crate::div().size_full().child("Live background UI"))
+                .child(
+                    liquid_glass("test-lg-prog")
+                        .progressive_panel(ProgressiveBlur::BottomToTop)
+                        .w_full()
+                        .h(px(48.))
+                        .child("Progressive Header"),
+                )
+                .child(
+                    liquid_glass("test-lg-lens")
+                        .lens()
+                        .draggable(&self.lens_drag)
+                        .w(px(160.))
+                        .h(px(100.))
+                        .rounded_full()
+                        .child("Lens"),
+                )
+                .child(
+                    liquid_glass("test-lg-bar")
+                        .floating_bar()
+                        .draggable(&self.bar_drag)
+                        .px(px(12.))
+                        .py(px(8.))
+                        .child(button("lg-btn").primary().label("Action")),
+                )
+        }
+    }
+
+    let (view, cx) = cx.add_window_view(|_, cx| GlassView {
+        lens_drag: cx.new(|cx| LiquidGlassDragState::new(crate::point(px(20.), px(60.)), cx)),
+        bar_drag: cx.new(|cx| LiquidGlassDragState::new(crate::point(px(180.), px(200.)), cx)),
+    });
+    cx.run_until_parked();
+
+    let lens_drag = view.read_with(cx, |v, _| v.lens_drag.clone());
+    // NaN positions are safely ignored and large coordinates clamp inside the 640x400 stage
+    cx.update(|_, cx| {
+        lens_drag.update(cx, |s, cx| {
+            s.set_position(crate::point(px(f32::NAN), px(10.)), cx);
+        });
+    });
+    assert!((lens_drag.read_with(cx, |s, _| s.position().x.0) - 20.0).abs() < 1e-3);
+
+    cx.update(|_, cx| {
+        lens_drag.update(cx, |s, cx| {
+            s.set_position(crate::point(px(9999.), px(9999.)), cx);
+        });
+    });
+    let clamped = lens_drag.read_with(cx, |s, _| s.position());
+    assert!(clamped.x <= px(640.) && clamped.y <= px(400.));
+    assert!(clamped.x >= px(0.) && clamped.y >= px(0.));
+    cx.run_until_parked();
+}
+
+#[test]
+fn view_transition_physical_shader_modes_evaluate_cleanly() {
+    let now = std::time::Instant::now();
+    let origin = crate::point(px(1200.), px(28.));
+    let vp = size(px(1280.), px(800.));
+
+    for (transition, expected_kind) in [
+        (
+            crate::ViewTransition::shockwave(origin),
+            crate::SceneTransitionKind::Shockwave,
+        ),
+        (
+            crate::ViewTransition::page_curl(origin),
+            crate::SceneTransitionKind::PageCurl,
+        ),
+        (
+            crate::ViewTransition::liquid_dissolve(origin),
+            crate::SceneTransitionKind::LiquidDissolve,
+        ),
+    ] {
+        let active = crate::ActiveViewTransition {
+            started_at: now,
+            transition,
+            viewport_size: vp,
+            scale_factor: 2.0,
+        };
+        let t0 = active.evaluate(now, vp, 2.0).expect("active at t=0");
+        assert_eq!(t0.kind, expected_kind);
+        assert_eq!(t0.progress, 0.0);
+        assert!((t0.feather.0 - 2.0).abs() < 1e-4);
+
+        let mid = active
+            .evaluate(now + transition.duration / 2, vp, 2.0)
+            .expect("active at midpoint");
+        assert_eq!(mid.kind, expected_kind);
+        assert!(mid.progress > 0.4 && mid.progress < 0.95);
+        assert!(mid.radius.0 > 1000.0);
+
+        assert!(active.evaluate(now + transition.duration, vp, 2.0).is_none());
+    }
+}
+
 struct AdvancedAnalyticsTestView {
     filter: Entity<FilterBarState>,
     time_range: Entity<TimeRangePickerState>,

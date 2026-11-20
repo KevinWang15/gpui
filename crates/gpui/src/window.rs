@@ -5175,9 +5175,9 @@ impl Window {
 
     /// Paints a GPU frosted-glass backdrop blur region behind subsequent primitives.
     ///
-    /// On GPU backends with backdrop-blur pipelines (`gpui_wgpu`), everything already painted
-    /// behind `bounds` is blurred via Dual-Kawase downsample/upsample passes and composited with
-    /// exact rounded-rectangle SDF antialiasing and the current content mask.
+    /// On GPU backends with backdrop-blur pipelines (`gpui_wgpu`, `gpui_windows`), everything
+    /// already painted behind `bounds` is blurred via Dual-Kawase downsample/upsample passes and
+    /// composited with exact rounded-rectangle SDF antialiasing and the current content mask.
     pub fn paint_backdrop_blur(
         &mut self,
         bounds: Bounds<Pixels>,
@@ -5185,7 +5185,7 @@ impl Window {
         blur_radius: Pixels,
     ) {
         self.invalidator.debug_assert_paint();
-        if blur_radius <= px(0.) {
+        if !blur_radius.0.is_finite() || blur_radius <= px(0.) {
             return;
         }
         let scale_factor = self.scale_factor();
@@ -5195,6 +5195,94 @@ impl Window {
             bounds: self.snap_bounds(bounds),
             corner_radii: corner_radii.scale(scale_factor),
             content_mask: self.snapped_content_mask(),
+            refraction: 0.0,
+            dispersion: 0.0,
+            bevel_width: ScaledPixels(0.0),
+            specular: 0.0,
+            progressive_mode: crate::ProgressiveBlur::None,
+            scale_factor,
+            pointer_pos: point(ScaledPixels(-10_000.0), ScaledPixels(-10_000.0)),
+            tint: Hsla::transparent_black(),
+            shadow_opacity: 0.0,
+        };
+        self.next_frame.scene.insert_primitive(blur);
+    }
+
+    /// Paints an optical liquid-glass surface behind subsequent primitives with Snell refraction,
+    /// RGB chromatic edge dispersion, analytical 3D Fresnel specular rim & cursor sheen, and
+    /// optional continuous progressive Dual-Kawase blur.
+    ///
+    /// Unlike [`Self::paint_backdrop_blur`], `blur_radius` may be `px(0.)` for crystal-clear
+    /// refracting optical lenses.
+    pub fn paint_liquid_glass(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        blur_radius: Pixels,
+        options: crate::LiquidGlassOptions,
+    ) {
+        self.invalidator.debug_assert_paint();
+        let scale_factor = self.scale_factor();
+        let safe_blur = if blur_radius.0.is_finite() {
+            blur_radius.0.max(0.0)
+        } else {
+            0.0
+        };
+        let safe_refraction = if options.refraction.is_finite() {
+            options.refraction.clamp(0.0, 2.0)
+        } else {
+            0.0
+        };
+        let safe_dispersion = if options.dispersion.is_finite() {
+            options.dispersion.clamp(0.0, 2.0)
+        } else {
+            0.0
+        };
+        let safe_bevel = if options.bevel_width.0.is_finite() {
+            options.bevel_width.0.max(0.0)
+        } else {
+            16.0
+        };
+        let safe_specular = if options.specular.is_finite() {
+            options.specular.clamp(0.0, 2.0)
+        } else {
+            0.0
+        };
+        let safe_shadow = if options.shadow_opacity.is_finite() {
+            options.shadow_opacity.clamp(0.0, 0.85)
+        } else {
+            0.0
+        };
+        if safe_blur <= 0.0
+            && safe_refraction <= 0.0005
+            && safe_specular <= 0.0005
+            && options.tint.a <= 0.0005
+            && safe_shadow <= 0.0005
+        {
+            return;
+        }
+        let pointer_pos = match options.pointer_position {
+            Some(p) if p.x.0.is_finite() && p.y.0.is_finite() => point(
+                ScaledPixels(p.x.0 * scale_factor),
+                ScaledPixels(p.y.0 * scale_factor),
+            ),
+            _ => point(ScaledPixels(-10_000.0), ScaledPixels(-10_000.0)),
+        };
+        let blur = BackdropBlur {
+            order: 0,
+            blur_radius: ScaledPixels(safe_blur * scale_factor),
+            bounds: self.snap_bounds(bounds),
+            corner_radii: corner_radii.scale(scale_factor),
+            content_mask: self.snapped_content_mask(),
+            refraction: safe_refraction,
+            dispersion: safe_dispersion,
+            bevel_width: ScaledPixels(safe_bevel * scale_factor),
+            specular: safe_specular,
+            progressive_mode: options.progressive_blur,
+            scale_factor,
+            pointer_pos,
+            tint: options.tint,
+            shadow_opacity: safe_shadow,
         };
         self.next_frame.scene.insert_primitive(blur);
     }

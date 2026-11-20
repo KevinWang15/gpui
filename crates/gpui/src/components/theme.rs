@@ -286,6 +286,67 @@ impl Default for Theme {
     }
 }
 
+/// Visual shader style used when transitioning between light and dark themes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ThemeTransitionStyle {
+    /// Crisp expanding circular reveal from the click point.
+    #[default]
+    RadialReveal,
+    /// Expanding refractive optical shockwave with RGB chromatic dispersion and caustic rim.
+    Shockwave,
+    /// 3D cylindrical page-curl with specular ridge, frosted underside, and cast shadow.
+    PageCurl,
+    /// Organic domain-warped liquid dissolve with edge refraction and iridescent meniscus.
+    LiquidDissolve,
+    /// Gentle full-window cross-fade.
+    CrossFade,
+}
+
+impl ThemeTransitionStyle {
+    /// All available transition styles in display order.
+    pub const ALL: [Self; 5] = [
+        Self::Shockwave,
+        Self::PageCurl,
+        Self::LiquidDissolve,
+        Self::RadialReveal,
+        Self::CrossFade,
+    ];
+
+    /// Short human-readable label for UI pickers.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::RadialReveal => "Radial",
+            Self::Shockwave => "Shockwave",
+            Self::PageCurl => "Page Curl",
+            Self::LiquidDissolve => "Liquid",
+            Self::CrossFade => "Cross-Fade",
+        }
+    }
+
+    /// Converts this style and optional click coordinate into a GPU [`ViewTransition`].
+    pub fn to_view_transition(self, origin: Option<Point<Pixels>>, window: &Window) -> ViewTransition {
+        let fallback_origin = || {
+            let vp = window.viewport_size();
+            crate::point(vp.width * 0.5, vp.height * 0.5)
+        };
+        match self {
+            Self::RadialReveal => match origin {
+                Some(pt) => ViewTransition::radial_reveal(pt),
+                None => ViewTransition::cross_fade(),
+            },
+            Self::Shockwave => ViewTransition::shockwave(origin.unwrap_or_else(fallback_origin)),
+            Self::PageCurl => ViewTransition::page_curl(origin.unwrap_or_else(|| {
+                let vp = window.viewport_size();
+                crate::point(vp.width, px(0.))
+            })),
+            Self::LiquidDissolve => {
+                ViewTransition::liquid_dissolve(origin.unwrap_or_else(fallback_origin))
+            }
+            Self::CrossFade => ViewTransition::cross_fade(),
+        }
+    }
+}
+
 impl Theme {
     /// Tailwind-inspired light theme.
     pub fn light() -> Self {
@@ -664,16 +725,31 @@ impl Theme {
         window: &mut Window,
         cx: &mut App,
     ) {
+        Self::switch_with_transition_style(
+            next_theme,
+            ThemeTransitionStyle::RadialReveal,
+            origin,
+            window,
+            cx,
+        );
+    }
+
+    /// Switches to `next_theme` using an explicit GPU [`ThemeTransitionStyle`]
+    /// (`Shockwave`, `PageCurl`, `LiquidDissolve`, `RadialReveal`, or `CrossFade`).
+    pub fn switch_with_transition_style(
+        next_theme: Self,
+        style: ThemeTransitionStyle,
+        origin: Option<Point<Pixels>>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
         let current_mode = Self::active(cx).mode;
         if current_mode == next_theme.mode {
             Self::set_global(next_theme, cx);
             cx.refresh_windows();
             return;
         }
-        let transition = match origin {
-            Some(point) => ViewTransition::radial_reveal(point),
-            None => ViewTransition::cross_fade(),
-        };
+        let transition = style.to_view_transition(origin, window);
         window.start_view_transition(transition, cx, move |_, cx| {
             Self::set_global(next_theme, cx);
             cx.refresh_windows();
@@ -688,13 +764,31 @@ impl Theme {
         window: &mut Window,
         cx: &mut App,
     ) {
+        Self::set_preference_with_transition_style(
+            preference,
+            ThemeTransitionStyle::RadialReveal,
+            origin,
+            window,
+            cx,
+        );
+    }
+
+    /// Applies `preference` (`Light`, `System`, or `Dark`) with an explicit GPU
+    /// [`ThemeTransitionStyle`].
+    pub fn set_preference_with_transition_style(
+        preference: ThemePreference,
+        style: ThemeTransitionStyle,
+        origin: Option<Point<Pixels>>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
         let mode = Self::resolve_mode(preference, window);
         let next = match mode {
             ThemeMode::Light => Self::light(),
             ThemeMode::Dark => Self::dark(),
         }
         .with_preference(preference);
-        Self::switch_with_transition(next, origin, window, cx);
+        Self::switch_with_transition_style(next, style, origin, window, cx);
     }
 
     /// Subscribes to OS appearance changes on `window` so [`ThemePreference::System`] updates live.
