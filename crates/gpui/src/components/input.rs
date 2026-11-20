@@ -18,6 +18,7 @@ use crate::{
 };
 use crate::icons::{Icon, IconSize, LucideIcon};
 
+use super::cursor_blink::{CursorBlink, is_mounted_and_focused};
 use super::layout::focus_ring_shadow;
 use super::theme::{ActiveTheme, ComponentSize};
 
@@ -164,6 +165,7 @@ pub struct InputState {
     redo_stack: Vec<UndoEntry>,
     was_focused: bool,
     tab_stop: bool,
+    blink: CursorBlink,
     frame_style: StyleRefinement,
 }
 
@@ -203,8 +205,21 @@ impl InputState {
             redo_stack: Vec::new(),
             was_focused: false,
             tab_stop: true,
+            blink: CursorBlink::new(),
             frame_style: StyleRefinement::default(),
         }
+    }
+
+    fn should_blink_cursor(&self, window: &Window) -> bool {
+        !self.disabled
+            && self.focus_handle.is_focused(window)
+            && window.is_window_active()
+            && (self.selected_range.is_empty() || self.content.is_empty())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn blink(&self) -> &CursorBlink {
+        &self.blink
     }
 
     /// Leaves the input out of the tab order, for a composite control whose
@@ -325,6 +340,7 @@ impl InputState {
         self.selection_reversed = false;
         self.marked_range = None;
         self.paint_cache.borrow_mut().scroll_offset = px(0.);
+        self.blink.reset(cx);
         cx.notify();
     }
 
@@ -359,6 +375,9 @@ impl InputState {
     /// Updates the disabled state dynamically.
     pub fn set_disabled(&mut self, disabled: bool, cx: &mut Context<Self>) {
         self.disabled = disabled;
+        if disabled {
+            self.blink.stop();
+        }
         cx.notify();
     }
 
@@ -435,6 +454,7 @@ impl InputState {
         let offset = clamp_char_boundary(&self.content, offset);
         self.selected_range = offset..offset;
         self.selection_reversed = false;
+        self.blink.reset(cx);
         window.notify_text_selection_changed(&self.focus_handle);
         cx.notify();
     }
@@ -450,6 +470,7 @@ impl InputState {
             self.selection_reversed = !self.selection_reversed;
             self.selected_range = self.selected_range.end..self.selected_range.start;
         }
+        self.blink.reset(cx);
         window.notify_text_selection_changed(&self.focus_handle);
         cx.notify();
     }
@@ -675,6 +696,9 @@ impl InputState {
         if self.selected_range.is_empty() {
             let prev = self.previous_boundary(self.cursor_offset());
             if prev == self.cursor_offset() {
+                if self.blink.reset(cx) {
+                    cx.notify();
+                }
                 return;
             }
             self.select_to(prev, window, cx);
@@ -689,6 +713,9 @@ impl InputState {
         if self.selected_range.is_empty() {
             let next = self.next_boundary(self.cursor_offset());
             if next == self.cursor_offset() {
+                if self.blink.reset(cx) {
+                    cx.notify();
+                }
                 return;
             }
             self.select_to(next, window, cx);
@@ -759,6 +786,7 @@ impl InputState {
             self.selected_range = entry.selected_range;
             self.selection_reversed = entry.selection_reversed;
             self.marked_range = None;
+            self.blink.reset(cx);
             window.notify_text_input_changed(&self.focus_handle);
             cx.emit(InputEvent::Change(SharedString::from(self.content.clone())));
             cx.notify();
@@ -779,6 +807,7 @@ impl InputState {
             self.selected_range = entry.selected_range;
             self.selection_reversed = entry.selection_reversed;
             self.marked_range = None;
+            self.blink.reset(cx);
             window.notify_text_input_changed(&self.focus_handle);
             cx.emit(InputEvent::Change(SharedString::from(self.content.clone())));
             cx.notify();
@@ -811,12 +840,14 @@ impl InputState {
                 let range = self.word_range_at(index);
                 self.selected_range = range;
                 self.selection_reversed = false;
+                self.blink.reset(cx);
                 window.notify_text_selection_changed(&self.focus_handle);
                 cx.notify();
             }
             3 => {
                 self.selected_range = 0..self.content.len();
                 self.selection_reversed = false;
+                self.blink.reset(cx);
                 window.notify_text_selection_changed(&self.focus_handle);
                 cx.notify();
             }
@@ -874,6 +905,7 @@ impl EntityInputHandler for InputState {
     ) {
         self.selected_range = self.range_from_utf16(&range_utf16);
         self.selection_reversed = false;
+        self.blink.reset(cx);
         window.notify_text_selection_changed(&self.focus_handle);
         cx.notify();
     }
@@ -898,6 +930,7 @@ impl EntityInputHandler for InputState {
 
     fn unmark_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.marked_range = None;
+        self.blink.reset(cx);
         window.notify_text_input_changed(&self.focus_handle);
         cx.notify();
     }
@@ -937,6 +970,7 @@ impl EntityInputHandler for InputState {
         self.selected_range = new_cursor..new_cursor;
         self.selection_reversed = false;
         self.marked_range = None;
+        self.blink.reset(cx);
         window.notify_text_input_changed(&self.focus_handle);
         cx.emit(InputEvent::Change(SharedString::from(self.content.clone())));
         cx.notify();
@@ -976,6 +1010,7 @@ impl EntityInputHandler for InputState {
             })
             .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
         self.selection_reversed = false;
+        self.blink.reset(cx);
         window.notify_text_input_changed(&self.focus_handle);
         cx.emit(InputEvent::Change(SharedString::from(self.content.clone())));
         cx.notify();
@@ -1243,9 +1278,13 @@ impl Element for InputTextElement {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let (focus_handle, disabled) = {
+        let (focus_handle, disabled, cursor_visible) = {
             let input = self.state.read(cx);
-            (input.focus_handle.clone(), input.disabled)
+            (
+                input.focus_handle.clone(),
+                input.disabled,
+                input.blink.is_visible(),
+            )
         };
         let focused = !disabled && focus_handle.is_focused(window);
         if focused {
@@ -1272,6 +1311,8 @@ impl Element for InputTextElement {
         );
 
         if focused
+            && window.is_window_active()
+            && cursor_visible
             && let Some(cursor) = prepaint.cursor.take()
         {
             window.paint_quad(cursor);
@@ -1299,6 +1340,17 @@ impl Render for InputState {
                 InputEvent::Blur
             });
         }
+        let should_blink = self.should_blink_cursor(window) && !cx.reduce_motion();
+        self.blink.sync(
+            should_blink,
+            window,
+            cx,
+            |this| &mut this.blink,
+            |this, window, _cx| {
+                is_mounted_and_focused(&this.focus_handle, window)
+                    && this.should_blink_cursor(window)
+            },
+        );
 
         let border_color = if self.invalid {
             theme.destructive
@@ -1486,6 +1538,7 @@ impl Render for InputState {
                     .on_click(move |_, _, cx| {
                         entity.update(cx, |state, cx| {
                             state.mask_revealed = !state.mask_revealed;
+                            state.blink.reset(cx);
                             cx.notify();
                         });
                     })

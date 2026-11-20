@@ -14,6 +14,7 @@ use crate::{
 };
 use crate::icons::{Icon, IconSize, LucideIcon};
 
+use super::cursor_blink::{CursorBlink, is_mounted_and_focused};
 use super::theme::{ANIM_FAST, ActiveTheme, Theme, tabular_numerals};
 
 /// Allocation-free ASCII case-insensitive substring check with Unicode fallback.
@@ -241,6 +242,7 @@ pub struct FilterBarState {
     cached_facets: RefCell<Option<CachedFacets>>,
     scroll_handle: UniformListScrollHandle,
     focus_handle: FocusHandle,
+    blink: CursorBlink,
 }
 
 impl EventEmitter<FilterBarEvent> for FilterBarState {}
@@ -270,7 +272,13 @@ impl FilterBarState {
             cached_facets: RefCell::new(None),
             scroll_handle: UniformListScrollHandle::new(),
             focus_handle: cx.focus_handle().tab_stop(true),
+            blink: CursorBlink::new(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn blink(&self) -> &CursorBlink {
+        &self.blink
     }
 
     /// Sets the placeholder text shown when no filters are active.
@@ -389,6 +397,7 @@ impl FilterBarState {
         self.query.clear();
         self.highlighted = 0;
         self.invalidate_facet_cache();
+        self.blink.reset(cx);
         if changed {
             cx.emit(FilterBarEvent::Change(self.clauses.clone()));
         }
@@ -399,6 +408,7 @@ impl FilterBarState {
         self.open = true;
         self.highlighted = 0;
         self.invalidate_facet_cache();
+        self.blink.reset(cx);
         window.focus(&self.focus_handle, cx);
         cx.notify();
     }
@@ -424,6 +434,7 @@ impl FilterBarState {
         self.highlighted = 0;
         self.open = true;
         self.invalidate_facet_cache();
+        self.blink.reset(cx);
         window.focus(&self.focus_handle, cx);
         cx.emit(FilterBarEvent::Change(self.clauses.clone()));
         cx.notify();
@@ -452,6 +463,7 @@ impl FilterBarState {
         self.highlighted = 0;
         self.open = true;
         self.invalidate_facet_cache();
+        self.blink.reset(cx);
         window.focus(&self.focus_handle, cx);
         cx.emit(FilterBarEvent::Change(self.clauses.clone()));
         cx.notify();
@@ -531,6 +543,7 @@ impl FilterBarState {
             };
         }
         self.open = true;
+        self.blink.reset(cx);
         cx.notify();
     }
 
@@ -557,6 +570,7 @@ impl FilterBarState {
             }
         };
         self.open = true;
+        self.blink.reset(cx);
         cx.notify();
     }
 
@@ -579,6 +593,7 @@ impl FilterBarState {
         self.query.clear();
         self.highlighted = 0;
         self.invalidate_facet_cache();
+        self.blink.reset(cx);
         cx.emit(FilterBarEvent::Change(self.clauses.clone()));
         cx.notify();
     }
@@ -590,6 +605,7 @@ impl FilterBarState {
             } else {
                 pending.push(value);
             }
+            self.blink.reset(cx);
             cx.notify();
         }
     }
@@ -629,11 +645,13 @@ impl FilterBarState {
         self.query.clear();
         self.highlighted = 0;
         self.invalidate_facet_cache();
+        self.blink.reset(cx);
         cx.emit(FilterBarEvent::Change(self.clauses.clone()));
         cx.notify();
     }
 
     fn step_back(&mut self, cx: &mut Context<Self>) {
+        let woke = self.blink.reset(cx);
         if !self.query.is_empty() {
             self.query.pop();
             self.highlighted = 0;
@@ -679,6 +697,8 @@ impl FilterBarState {
                     self.invalidate_facet_cache();
                     cx.emit(FilterBarEvent::Change(self.clauses.clone()));
                     cx.notify();
+                } else if woke {
+                    cx.notify();
                 }
             }
         }
@@ -716,6 +736,7 @@ impl FilterBarState {
                 self.query.clear();
                 self.highlighted = 0;
                 self.invalidate_facet_cache();
+                self.blink.reset(cx);
                 cx.notify();
             }
             "down" => {
@@ -726,6 +747,7 @@ impl FilterBarState {
                     self.scroll_handle
                         .scroll_to_item(self.highlighted, ScrollStrategy::Nearest);
                 }
+                self.blink.reset(cx);
                 cx.notify();
             }
             "up" => {
@@ -736,6 +758,7 @@ impl FilterBarState {
                     self.scroll_handle
                         .scroll_to_item(self.highlighted, ScrollStrategy::Nearest);
                 }
+                self.blink.reset(cx);
                 cx.notify();
             }
             "backspace" => self.step_back(cx),
@@ -757,6 +780,7 @@ impl FilterBarState {
                     self.open = true;
                     self.query.push_str(ch);
                     self.highlighted = 0;
+                    self.blink.reset(cx);
                     cx.notify();
                 }
             }
@@ -1005,6 +1029,7 @@ impl FilterBar {
     fn render_inline_input(
         query: String,
         focused: bool,
+        cursor_visible: bool,
         has_content: bool,
         placeholder: SharedString,
         theme: &Theme,
@@ -1017,14 +1042,25 @@ impl FilterBar {
                 .text_color(theme.foreground)
                 .child(query)
                 .when(focused, |el| {
-                    el.child(div().w(px(1.5)).h(px(15.)).ml(px(1.)).bg(theme.primary))
+                    el.child(
+                        div()
+                            .w(px(1.5))
+                            .h(px(15.))
+                            .ml(px(1.))
+                            .when(cursor_visible, |el| el.bg(theme.primary)),
+                    )
                 })
         } else if focused {
             div()
                 .flex()
                 .items_center()
                 .gap(px(4.))
-                .child(div().w(px(1.5)).h(px(15.)).bg(theme.primary))
+                .child(
+                    div()
+                        .w(px(1.5))
+                        .h(px(15.))
+                        .when(cursor_visible, |el| el.bg(theme.primary)),
+                )
                 .when(!has_content, |el| {
                     el.child(
                         div()
@@ -1482,42 +1518,98 @@ impl Styled for FilterBar {
 impl RenderOnce for FilterBar {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
-        let snap = self.state.read(cx);
-        let clauses = snap.clauses.clone();
-        let draft = snap.draft.clone();
-        let query = snap.query.clone();
-        let open = snap.open;
-        let highlighted = snap.highlighted;
-        let placeholder = snap.placeholder.clone();
-        let focus_handle = snap.focus_handle.clone();
-        let scroll_handle = snap.scroll_handle.clone();
-        let focused = focus_handle.is_focused(window);
-        let has_content = !clauses.is_empty()
-            || !matches!(draft, FilterDraft::Field)
-            || !query.is_empty();
+        let (
+            clauses,
+            draft,
+            query,
+            open,
+            highlighted,
+            placeholder,
+            focus_handle,
+            scroll_handle,
+            focused,
+            has_content,
+            field_options,
+            operator_options,
+            facet_options,
+            needs_blink_sync,
+            cursor_visible,
+        ) = {
+            let snap = self.state.read(cx);
+            let clauses = snap.clauses.clone();
+            let draft = snap.draft.clone();
+            let query = snap.query.clone();
+            let open = snap.open;
+            let highlighted = snap.highlighted;
+            let placeholder = snap.placeholder.clone();
+            let focus_handle = snap.focus_handle.clone();
+            let scroll_handle = snap.scroll_handle.clone();
+            let focused = focus_handle.is_focused(window);
+            let has_content = !clauses.is_empty()
+                || !matches!(draft, FilterDraft::Field)
+                || !query.is_empty();
 
-        // Snapshot popover suggestions up front so we don't re-borrow `state`.
-        let field_options = if open && matches!(draft, FilterDraft::Field) {
-            snap.matching_fields()
-        } else {
-            Vec::new()
-        };
-        let operator_options = if open
-            && let FilterDraft::Operator { field, .. } = &draft
-        {
-            snap.matching_operators(field.as_ref())
-        } else {
-            Vec::new()
-        };
-        let facet_options: Rc<[FilterFacetOption]> = if open {
-            match &draft {
-                FilterDraft::SingleValue { field, .. } | FilterDraft::MultiValue { field, .. } => {
-                    snap.matching_facets(field.as_ref())
+            // Snapshot popover suggestions up front so we don't re-borrow `state`.
+            let field_options = if open && matches!(draft, FilterDraft::Field) {
+                snap.matching_fields()
+            } else {
+                Vec::new()
+            };
+            let operator_options = if open
+                && let FilterDraft::Operator { field, .. } = &draft
+            {
+                snap.matching_operators(field.as_ref())
+            } else {
+                Vec::new()
+            };
+            let facet_options: Rc<[FilterFacetOption]> = if open {
+                match &draft {
+                    FilterDraft::SingleValue { field, .. }
+                    | FilterDraft::MultiValue { field, .. } => snap.matching_facets(field.as_ref()),
+                    _ => Rc::from([]),
                 }
-                _ => Rc::from([]),
-            }
+            } else {
+                Rc::from([])
+            };
+            let should_blink = focused && window.is_window_active() && !cx.reduce_motion();
+            let needs_blink_sync = snap.blink.needs_sync(should_blink, window);
+            let cursor_visible = window.is_window_active() && snap.blink.is_visible();
+            (
+                clauses,
+                draft,
+                query,
+                open,
+                highlighted,
+                placeholder,
+                focus_handle,
+                scroll_handle,
+                focused,
+                has_content,
+                field_options,
+                operator_options,
+                facet_options,
+                needs_blink_sync,
+                cursor_visible,
+            )
+        };
+
+        let cursor_visible = if needs_blink_sync {
+            let should_blink = focused && window.is_window_active() && !cx.reduce_motion();
+            self.state.update(cx, |s, cx| {
+                s.blink.sync(
+                    should_blink,
+                    window,
+                    cx,
+                    |this| &mut this.blink,
+                    |this, window, _cx| {
+                        is_mounted_and_focused(&this.focus_handle, window)
+                            && window.is_window_active()
+                    },
+                );
+                window.is_window_active() && s.blink.is_visible()
+            })
         } else {
-            Rc::from([])
+            cursor_visible
         };
 
         let hover_bg = theme.surface_hover;
@@ -1544,6 +1636,7 @@ impl RenderOnce for FilterBar {
         tokens_row = tokens_row.child(Self::render_inline_input(
             query,
             focused,
+            cursor_visible,
             has_content,
             placeholder,
             &theme,
