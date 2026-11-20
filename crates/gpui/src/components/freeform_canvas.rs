@@ -616,6 +616,123 @@ pub fn snap_move(
     (final_rect, guides)
 }
 
+/// Snaps a single moving edge along one 1D axis against canvas margins/center, sibling edges/gaps,
+/// and grid fallback, returning the snapped edge coordinate and any active [`SnapGuide`]s.
+#[allow(clippy::too_many_arguments)]
+fn snap_edge_1d(
+    axis: GuideAxis,
+    is_leading: bool,
+    raw: f32,
+    lo: f32,
+    hi: f32,
+    canvas_extent: f32,
+    cross_extent: f32,
+    cross_start: f32,
+    cross_end: f32,
+    siblings: &[CanvasRect],
+    config: &SnapConfig,
+) -> (f32, Vec<SnapGuide>) {
+    let mut val = raw.clamp(lo, hi);
+    let mut guides = Vec::new();
+    let mut guided = false;
+    let pad = config
+        .canvas_padding
+        .clamp(0.0, canvas_extent.min(cross_extent) * 0.45);
+    let gap = config.sibling_gap.max(0.0);
+
+    if config.snap_to_guides && config.threshold > 0.0 {
+        let mut cands = Vec::new();
+        let canvas_targets = if is_leading {
+            [
+                (pad, GuideKind::CanvasMargin),
+                (0.0, GuideKind::CanvasMargin),
+                (canvas_extent * 0.5, GuideKind::CanvasCenter),
+            ]
+        } else {
+            [
+                (canvas_extent - pad, GuideKind::CanvasMargin),
+                (canvas_extent, GuideKind::CanvasMargin),
+                (canvas_extent * 0.5, GuideKind::CanvasCenter),
+            ]
+        };
+        for (target, kind) in canvas_targets {
+            if target >= lo - 0.5 && target <= hi + 0.5 {
+                push_axis_candidate(
+                    &mut cands,
+                    target - val,
+                    config.threshold,
+                    1,
+                    SnapGuide {
+                        axis,
+                        position: target,
+                        span_start: 0.0,
+                        span_end: cross_extent,
+                        kind,
+                        label: None,
+                    },
+                );
+            }
+        }
+
+        for sib in siblings {
+            let (sib_a, sib_b, sib_cross_a, sib_cross_b) = match axis {
+                GuideAxis::Vertical => (sib.x, sib.right(), sib.y, sib.bottom()),
+                GuideAxis::Horizontal => (sib.y, sib.bottom(), sib.x, sib.right()),
+            };
+            let span_start = cross_start.min(sib_cross_a);
+            let span_end = cross_end.max(sib_cross_b);
+            let (gap_target, gap_mid) = if is_leading {
+                (sib_b + gap, sib_b + gap * 0.5)
+            } else {
+                (sib_a - gap, sib_a - gap * 0.5)
+            };
+            let sib_targets = [
+                (sib_a, sib_a, GuideKind::SiblingEdge, 0, None),
+                (sib_b, sib_b, GuideKind::SiblingEdge, 0, None),
+                (
+                    gap_target,
+                    gap_mid,
+                    GuideKind::SiblingGap,
+                    2,
+                    (gap > 0.5).then(|| format!("{}px", gap.round() as i32).into()),
+                ),
+            ];
+            for (target, guide_pos, kind, prio, label) in sib_targets {
+                if kind == GuideKind::SiblingGap && gap <= 0.5 {
+                    continue;
+                }
+                if target >= lo - 0.5 && target <= hi + 0.5 {
+                    push_axis_candidate(
+                        &mut cands,
+                        target - val,
+                        config.threshold,
+                        prio,
+                        SnapGuide {
+                            axis,
+                            position: guide_pos,
+                            span_start,
+                            span_end,
+                            kind,
+                            label,
+                        },
+                    );
+                }
+            }
+        }
+
+        if let Some((d, mut gs)) = select_best_axis(cands) {
+            val = (val + d).clamp(lo, hi);
+            guided = true;
+            guides.append(&mut gs);
+        }
+    }
+
+    if !guided && config.snap_to_grid && config.grid > 0.0 {
+        val = snap_to_step(val, config.grid).clamp(lo, hi);
+    }
+    (val.round().clamp(lo, hi), guides)
+}
+
 /// Snaps a resizing rectangle along the active [`ResizeHandle`] edges while keeping the
 /// opposite anchor edges fixed, respecting `min_size`, `max_size`, and `canvas` bounds.
 #[allow(clippy::too_many_arguments)]
@@ -635,9 +752,6 @@ pub fn snap_resize(
     let max_w = max_size.0.max(min_w).min(canvas.width.max(min_w));
     let max_h = max_size.1.max(min_h).min(canvas.height.max(min_h));
 
-    let pad = config.canvas_padding.clamp(0.0, canvas.width.min(canvas.height) * 0.45);
-    let gap = config.sibling_gap.max(0.0);
-
     let mut left = original.x;
     let mut right = original.right();
     let mut top = original.y;
@@ -647,317 +761,77 @@ pub fn snap_resize(
     if handle.moves_left() {
         let lo = (right - max_w).max(0.0);
         let hi = (right - min_w).max(lo);
-        let mut raw = (original.x + dx).clamp(lo, hi);
-        let mut guided = false;
-        if config.snap_to_guides && config.threshold > 0.0 {
-            let mut cands = Vec::new();
-            for (tx, kind) in [
-                (pad, GuideKind::CanvasMargin),
-                (0.0, GuideKind::CanvasMargin),
-                (canvas.width * 0.5, GuideKind::CanvasCenter),
-            ] {
-                if tx >= lo - 0.5 && tx <= hi + 0.5 {
-                    push_axis_candidate(
-                        &mut cands,
-                        tx - raw,
-                        config.threshold,
-                        1,
-                        SnapGuide {
-                            axis: GuideAxis::Vertical,
-                            position: tx,
-                            span_start: 0.0,
-                            span_end: canvas.height,
-                            kind,
-                            label: None,
-                        },
-                    );
-                }
-            }
-            for sib in siblings {
-                let v_start = top.min(sib.y);
-                let v_end = bottom.max(sib.bottom());
-                for (tx, kind, prio, label) in [
-                    (sib.x, GuideKind::SiblingEdge, 0, None),
-                    (sib.right(), GuideKind::SiblingEdge, 0, None),
-                    (
-                        sib.right() + gap,
-                        GuideKind::SiblingGap,
-                        2,
-                        (gap > 0.5).then(|| format!("{}px", gap.round() as i32).into()),
-                    ),
-                ] {
-                    if kind == GuideKind::SiblingGap && gap <= 0.5 {
-                        continue;
-                    }
-                    if tx >= lo - 0.5 && tx <= hi + 0.5 {
-                        let pos = if kind == GuideKind::SiblingGap {
-                            sib.right() + gap * 0.5
-                        } else {
-                            tx
-                        };
-                        push_axis_candidate(
-                            &mut cands,
-                            tx - raw,
-                            config.threshold,
-                            prio,
-                            SnapGuide {
-                                axis: GuideAxis::Vertical,
-                                position: pos,
-                                span_start: v_start,
-                                span_end: v_end,
-                                kind,
-                                label,
-                            },
-                        );
-                    }
-                }
-            }
-            if let Some((d, mut gs)) = select_best_axis(cands) {
-                raw = (raw + d).clamp(lo, hi);
-                guided = true;
-                guides.append(&mut gs);
-            }
-        }
-        if !guided && config.snap_to_grid && config.grid > 0.0 {
-            raw = snap_to_step(raw, config.grid).clamp(lo, hi);
-        }
-        left = raw.round().clamp(lo, hi);
+        let (snapped, mut gs) = snap_edge_1d(
+            GuideAxis::Vertical,
+            true,
+            original.x + dx,
+            lo,
+            hi,
+            canvas.width,
+            canvas.height,
+            top,
+            bottom,
+            siblings,
+            config,
+        );
+        left = snapped;
+        guides.append(&mut gs);
     } else if handle.moves_right() {
         let lo = (left + min_w).min(canvas.width);
         let hi = (left + max_w).min(canvas.width).max(lo);
-        let mut raw = (original.right() + dx).clamp(lo, hi);
-        let mut guided = false;
-        if config.snap_to_guides && config.threshold > 0.0 {
-            let mut cands = Vec::new();
-            for (tx, kind) in [
-                (canvas.width - pad, GuideKind::CanvasMargin),
-                (canvas.width, GuideKind::CanvasMargin),
-                (canvas.width * 0.5, GuideKind::CanvasCenter),
-            ] {
-                if tx >= lo - 0.5 && tx <= hi + 0.5 {
-                    push_axis_candidate(
-                        &mut cands,
-                        tx - raw,
-                        config.threshold,
-                        1,
-                        SnapGuide {
-                            axis: GuideAxis::Vertical,
-                            position: tx,
-                            span_start: 0.0,
-                            span_end: canvas.height,
-                            kind,
-                            label: None,
-                        },
-                    );
-                }
-            }
-            for sib in siblings {
-                let v_start = top.min(sib.y);
-                let v_end = bottom.max(sib.bottom());
-                for (tx, kind, prio, label) in [
-                    (sib.right(), GuideKind::SiblingEdge, 0, None),
-                    (sib.x, GuideKind::SiblingEdge, 0, None),
-                    (
-                        sib.x - gap,
-                        GuideKind::SiblingGap,
-                        2,
-                        (gap > 0.5).then(|| format!("{}px", gap.round() as i32).into()),
-                    ),
-                ] {
-                    if kind == GuideKind::SiblingGap && gap <= 0.5 {
-                        continue;
-                    }
-                    if tx >= lo - 0.5 && tx <= hi + 0.5 {
-                        let pos = if kind == GuideKind::SiblingGap {
-                            sib.x - gap * 0.5
-                        } else {
-                            tx
-                        };
-                        push_axis_candidate(
-                            &mut cands,
-                            tx - raw,
-                            config.threshold,
-                            prio,
-                            SnapGuide {
-                                axis: GuideAxis::Vertical,
-                                position: pos,
-                                span_start: v_start,
-                                span_end: v_end,
-                                kind,
-                                label,
-                            },
-                        );
-                    }
-                }
-            }
-            if let Some((d, mut gs)) = select_best_axis(cands) {
-                raw = (raw + d).clamp(lo, hi);
-                guided = true;
-                guides.append(&mut gs);
-            }
-        }
-        if !guided && config.snap_to_grid && config.grid > 0.0 {
-            raw = snap_to_step(raw, config.grid).clamp(lo, hi);
-        }
-        right = raw.round().clamp(lo, hi);
+        let (snapped, mut gs) = snap_edge_1d(
+            GuideAxis::Vertical,
+            false,
+            original.right() + dx,
+            lo,
+            hi,
+            canvas.width,
+            canvas.height,
+            top,
+            bottom,
+            siblings,
+            config,
+        );
+        right = snapped;
+        guides.append(&mut gs);
     }
 
     if handle.moves_top() {
         let lo = (bottom - max_h).max(0.0);
         let hi = (bottom - min_h).max(lo);
-        let mut raw = (original.y + dy).clamp(lo, hi);
-        let mut guided = false;
-        if config.snap_to_guides && config.threshold > 0.0 {
-            let mut cands = Vec::new();
-            for (ty, kind) in [
-                (pad, GuideKind::CanvasMargin),
-                (0.0, GuideKind::CanvasMargin),
-                (canvas.height * 0.5, GuideKind::CanvasCenter),
-            ] {
-                if ty >= lo - 0.5 && ty <= hi + 0.5 {
-                    push_axis_candidate(
-                        &mut cands,
-                        ty - raw,
-                        config.threshold,
-                        1,
-                        SnapGuide {
-                            axis: GuideAxis::Horizontal,
-                            position: ty,
-                            span_start: 0.0,
-                            span_end: canvas.width,
-                            kind,
-                            label: None,
-                        },
-                    );
-                }
-            }
-            for sib in siblings {
-                let h_start = left.min(sib.x);
-                let h_end = right.max(sib.right());
-                for (ty, kind, prio, label) in [
-                    (sib.y, GuideKind::SiblingEdge, 0, None),
-                    (sib.bottom(), GuideKind::SiblingEdge, 0, None),
-                    (
-                        sib.bottom() + gap,
-                        GuideKind::SiblingGap,
-                        2,
-                        (gap > 0.5).then(|| format!("{}px", gap.round() as i32).into()),
-                    ),
-                ] {
-                    if kind == GuideKind::SiblingGap && gap <= 0.5 {
-                        continue;
-                    }
-                    if ty >= lo - 0.5 && ty <= hi + 0.5 {
-                        let pos = if kind == GuideKind::SiblingGap {
-                            sib.bottom() + gap * 0.5
-                        } else {
-                            ty
-                        };
-                        push_axis_candidate(
-                            &mut cands,
-                            ty - raw,
-                            config.threshold,
-                            prio,
-                            SnapGuide {
-                                axis: GuideAxis::Horizontal,
-                                position: pos,
-                                span_start: h_start,
-                                span_end: h_end,
-                                kind,
-                                label,
-                            },
-                        );
-                    }
-                }
-            }
-            if let Some((d, mut gs)) = select_best_axis(cands) {
-                raw = (raw + d).clamp(lo, hi);
-                guided = true;
-                guides.append(&mut gs);
-            }
-        }
-        if !guided && config.snap_to_grid && config.grid > 0.0 {
-            raw = snap_to_step(raw, config.grid).clamp(lo, hi);
-        }
-        top = raw.round().clamp(lo, hi);
+        let (snapped, mut gs) = snap_edge_1d(
+            GuideAxis::Horizontal,
+            true,
+            original.y + dy,
+            lo,
+            hi,
+            canvas.height,
+            canvas.width,
+            left,
+            right,
+            siblings,
+            config,
+        );
+        top = snapped;
+        guides.append(&mut gs);
     } else if handle.moves_bottom() {
         let lo = (top + min_h).min(canvas.height);
         let hi = (top + max_h).min(canvas.height).max(lo);
-        let mut raw = (original.bottom() + dy).clamp(lo, hi);
-        let mut guided = false;
-        if config.snap_to_guides && config.threshold > 0.0 {
-            let mut cands = Vec::new();
-            for (ty, kind) in [
-                (canvas.height - pad, GuideKind::CanvasMargin),
-                (canvas.height, GuideKind::CanvasMargin),
-                (canvas.height * 0.5, GuideKind::CanvasCenter),
-            ] {
-                if ty >= lo - 0.5 && ty <= hi + 0.5 {
-                    push_axis_candidate(
-                        &mut cands,
-                        ty - raw,
-                        config.threshold,
-                        1,
-                        SnapGuide {
-                            axis: GuideAxis::Horizontal,
-                            position: ty,
-                            span_start: 0.0,
-                            span_end: canvas.width,
-                            kind,
-                            label: None,
-                        },
-                    );
-                }
-            }
-            for sib in siblings {
-                let h_start = left.min(sib.x);
-                let h_end = right.max(sib.right());
-                for (ty, kind, prio, label) in [
-                    (sib.bottom(), GuideKind::SiblingEdge, 0, None),
-                    (sib.y, GuideKind::SiblingEdge, 0, None),
-                    (
-                        sib.y - gap,
-                        GuideKind::SiblingGap,
-                        2,
-                        (gap > 0.5).then(|| format!("{}px", gap.round() as i32).into()),
-                    ),
-                ] {
-                    if kind == GuideKind::SiblingGap && gap <= 0.5 {
-                        continue;
-                    }
-                    if ty >= lo - 0.5 && ty <= hi + 0.5 {
-                        let pos = if kind == GuideKind::SiblingGap {
-                            sib.y - gap * 0.5
-                        } else {
-                            ty
-                        };
-                        push_axis_candidate(
-                            &mut cands,
-                            ty - raw,
-                            config.threshold,
-                            prio,
-                            SnapGuide {
-                                axis: GuideAxis::Horizontal,
-                                position: pos,
-                                span_start: h_start,
-                                span_end: h_end,
-                                kind,
-                                label,
-                            },
-                        );
-                    }
-                }
-            }
-            if let Some((d, mut gs)) = select_best_axis(cands) {
-                raw = (raw + d).clamp(lo, hi);
-                guided = true;
-                guides.append(&mut gs);
-            }
-        }
-        if !guided && config.snap_to_grid && config.grid > 0.0 {
-            raw = snap_to_step(raw, config.grid).clamp(lo, hi);
-        }
-        bottom = raw.round().clamp(lo, hi);
+        let (snapped, mut gs) = snap_edge_1d(
+            GuideAxis::Horizontal,
+            false,
+            original.bottom() + dy,
+            lo,
+            hi,
+            canvas.height,
+            canvas.width,
+            left,
+            right,
+            siblings,
+            config,
+        );
+        bottom = snapped;
+        guides.append(&mut gs);
     }
 
     (
@@ -1034,11 +908,16 @@ pub enum FreeformCanvasEvent {
         rect: CanvasRect,
     },
     /// An existing component resized to `rect`.
+    ///
+    /// Emitted with `committed: false` while dragging a resize handle and once with
+    /// `committed: true` on mouse-up if the geometry changed (ideal for Undo / persistence).
     Resize {
         /// Component ID.
         id: SharedString,
         /// New canvas-local rectangle.
         rect: CanvasRect,
+        /// `false` during live pointer drag, `true` when the resize completes on mouse-up.
+        committed: bool,
     },
     /// A new component from a [`CanvasPaletteItem`] was dropped onto the canvas at `rect`.
     DropNew {
@@ -1050,7 +929,15 @@ pub enum FreeformCanvasEvent {
     /// A component was removed (via `Delete`/`Backspace` or dragging outside the canvas).
     Remove(SharedString),
     /// The canvas frame itself was resized to `size`.
-    ResizeCanvas(CanvasSize),
+    ///
+    /// Emitted with `committed: false` while dragging a canvas handle and once with
+    /// `committed: true` on mouse-up if the size changed.
+    ResizeCanvas {
+        /// New logical canvas dimensions.
+        size: CanvasSize,
+        /// `false` during live pointer drag, `true` when the resize completes on mouse-up.
+        committed: bool,
+    },
 }
 
 #[derive(Clone)]
@@ -1348,7 +1235,11 @@ impl FreeformCanvasState {
         r.guides = guides;
         let id = r.id.clone();
         if changed {
-            cx.emit(FreeformCanvasEvent::Resize { id, rect: next });
+            cx.emit(FreeformCanvasEvent::Resize {
+                id,
+                rect: next,
+                committed: false,
+            });
             cx.notify();
         }
     }
@@ -1359,6 +1250,7 @@ impl FreeformCanvasState {
                 cx.emit(FreeformCanvasEvent::Resize {
                     id: r.id,
                     rect: r.live_rect,
+                    committed: true,
                 });
             }
             cx.notify();
@@ -1406,7 +1298,10 @@ impl FreeformCanvasState {
         let next = snap_canvas_resize(r.start_size, dx, dy, r.min_size, r.max_size, grid, snap);
         if next != r.live_size {
             r.live_size = next;
-            cx.emit(FreeformCanvasEvent::ResizeCanvas(next));
+            cx.emit(FreeformCanvasEvent::ResizeCanvas {
+                size: next,
+                committed: false,
+            });
             cx.notify();
         }
     }
@@ -1414,7 +1309,10 @@ impl FreeformCanvasState {
     fn end_canvas_resize(&mut self, cx: &mut Context<Self>) {
         if let Some(r) = self.active_canvas_resize.take() {
             if r.live_size != r.start_size {
-                cx.emit(FreeformCanvasEvent::ResizeCanvas(r.live_size));
+                cx.emit(FreeformCanvasEvent::ResizeCanvas {
+                    size: r.live_size,
+                    committed: true,
+                });
             }
             cx.notify();
         }
@@ -1973,39 +1871,7 @@ impl RenderOnce for FreeformCanvas {
             )
         });
 
-        // Guide distance badges (rendered cleanly as crisp pills over gap guides)
-        let guide_badges: Vec<AnyElement> = active_guides
-            .iter()
-            .filter_map(|g| {
-                let label = g.label.clone()?;
-                let (bx, by) = match g.axis {
-                    GuideAxis::Vertical => (
-                        (g.position - 14.0).clamp(2.0, (cw - 32.0).max(2.0)),
-                        ((g.span_start + g.span_end) * 0.5 - 8.0).clamp(2.0, (ch - 18.0).max(2.0)),
-                    ),
-                    GuideAxis::Horizontal => (
-                        ((g.span_start + g.span_end) * 0.5 - 14.0).clamp(2.0, (cw - 32.0).max(2.0)),
-                        (g.position - 8.0).clamp(2.0, (ch - 18.0).max(2.0)),
-                    ),
-                };
-                Some(
-                    div()
-                        .absolute()
-                        .left(px(bx))
-                        .top(px(by))
-                        .px(px(4.))
-                        .py(px(1.))
-                        .rounded(px(3.))
-                        .bg(guide_gap_color)
-                        .text_color(crate::white())
-                        .text_size(px(9.5))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .font_features(tabular_numerals())
-                        .child(label)
-                        .into_any_element(),
-                )
-            })
-            .collect();
+        let guide_badges = build_guide_badges(&active_guides, cw, ch, guide_gap_color);
 
         // Inner editable canvas box (exact 1:1 logical pixels of the floating pane)
         let bounds_measure = canvas_bounds_cell.clone();
@@ -2033,26 +1899,8 @@ impl RenderOnce for FreeformCanvas {
                         bounds_measure.set(Some(bounds));
                     },
                     move |bounds, _, window, _| {
-                        if show_grid && grid_step >= 4.0 {
-                            let step = if grid_step < 8.0 { grid_step * 2.0 } else { grid_step };
-                            let mut x = step;
-                            while x < bounds.size.width.0 - 2.0 {
-                                let mut y = step;
-                                while y < bounds.size.height.0 - 2.0 {
-                                    window.paint_quad(fill(
-                                        Bounds::new(
-                                            point(
-                                                px(bounds.origin.x.0 + x - 0.5),
-                                                px(bounds.origin.y.0 + y - 0.5),
-                                            ),
-                                            size(px(1.2), px(1.2)),
-                                        ),
-                                        grid_dot_color,
-                                    ));
-                                    y += step;
-                                }
-                                x += step;
-                            }
+                        if show_grid {
+                            paint_dot_grid(bounds, grid_step, grid_dot_color, window);
                         }
                     },
                 )
@@ -2079,37 +1927,14 @@ impl RenderOnce for FreeformCanvas {
                 canvas(
                     |_, _, _| {},
                     move |bounds, _, window, _| {
-                        for g in &guides_for_paint {
-                            let color = match g.kind {
-                                GuideKind::SiblingEdge | GuideKind::SiblingCenter => {
-                                    guide_edge_color
-                                }
-                                GuideKind::CanvasCenter | GuideKind::CanvasMargin => {
-                                    guide_center_color
-                                }
-                                GuideKind::SiblingGap => guide_gap_color,
-                            };
-                            match g.axis {
-                                GuideAxis::Vertical => {
-                                    let x = bounds.origin.x.0 + g.position;
-                                    let y0 = bounds.origin.y.0 + g.span_start;
-                                    let h = (g.span_end - g.span_start).max(1.0);
-                                    window.paint_quad(fill(
-                                        Bounds::new(point(px(x - 0.5), px(y0)), size(px(1.0), px(h))),
-                                        color.opacity(0.9),
-                                    ));
-                                }
-                                GuideAxis::Horizontal => {
-                                    let y = bounds.origin.y.0 + g.position;
-                                    let x0 = bounds.origin.x.0 + g.span_start;
-                                    let w = (g.span_end - g.span_start).max(1.0);
-                                    window.paint_quad(fill(
-                                        Bounds::new(point(px(x0), px(y - 0.5)), size(px(w), px(1.0))),
-                                        color.opacity(0.9),
-                                    ));
-                                }
-                            }
-                        }
+                        paint_snap_guides(
+                            bounds,
+                            &guides_for_paint,
+                            guide_edge_color,
+                            guide_center_color,
+                            guide_gap_color,
+                            window,
+                        );
                     },
                 )
                 .absolute()
@@ -2118,132 +1943,16 @@ impl RenderOnce for FreeformCanvas {
             .children(guide_badges);
 
         // Canvas-frame resize handles placed just outside the canvas right, bottom, and corner edges
-        let min_c = self.min_canvas_size;
-        let max_c = self.max_canvas_size;
-        let st_ce = self.state.clone();
-        let st_cs = self.state.clone();
-        let st_cse = self.state.clone();
-        let grip_idle = theme.muted_foreground.opacity(0.45);
-        let grip_active = theme.primary;
-
-        let canvas_east_handle = div()
-            .id((self.id.clone(), "canvas-resize-e"))
-            .absolute()
-            .left(px(cw + 4.))
-            .top(px((ch * 0.5 - 16.).max(0.)))
-            .w(px(10.))
-            .h(px(32.0_f32.min(ch)))
-            .flex()
-            .items_center()
-            .justify_center()
-            .cursor(CanvasResizeHandle::East.cursor())
-            .on_mouse_down(MouseButton::Left, move |ev, _, cx| {
-                st_ce.update(cx, |s, cx| {
-                    s.start_canvas_resize(
-                        CanvasResizeHandle::East,
-                        ev.position,
-                        canvas_size,
-                        min_c,
-                        max_c,
-                        cx,
-                    );
-                });
-                cx.stop_propagation();
-            })
-            .child(
-                div()
-                    .w(px(3.5))
-                    .h(px(22.0_f32.min((ch - 8.).max(8.))))
-                    .rounded_full()
-                    .bg(if matches!(
-                        active_canvas_resize.as_ref().map(|r| r.handle),
-                        Some(CanvasResizeHandle::East)
-                    ) {
-                        grip_active
-                    } else {
-                        grip_idle
-                    }),
-            );
-
-        let canvas_south_handle = div()
-            .id((self.id.clone(), "canvas-resize-s"))
-            .absolute()
-            .left(px((cw * 0.5 - 16.).max(0.)))
-            .top(px(ch + 4.))
-            .w(px(32.0_f32.min(cw)))
-            .h(px(10.))
-            .flex()
-            .items_center()
-            .justify_center()
-            .cursor(CanvasResizeHandle::South.cursor())
-            .on_mouse_down(MouseButton::Left, move |ev, _, cx| {
-                st_cs.update(cx, |s, cx| {
-                    s.start_canvas_resize(
-                        CanvasResizeHandle::South,
-                        ev.position,
-                        canvas_size,
-                        min_c,
-                        max_c,
-                        cx,
-                    );
-                });
-                cx.stop_propagation();
-            })
-            .child(
-                div()
-                    .w(px(22.0_f32.min((cw - 8.).max(8.))))
-                    .h(px(3.5))
-                    .rounded_full()
-                    .bg(if matches!(
-                        active_canvas_resize.as_ref().map(|r| r.handle),
-                        Some(CanvasResizeHandle::South)
-                    ) {
-                        grip_active
-                    } else {
-                        grip_idle
-                    }),
-            );
-
-        let canvas_se_handle = div()
-            .id((self.id.clone(), "canvas-resize-se"))
-            .absolute()
-            .left(px(cw + 3.))
-            .top(px(ch + 3.))
-            .w(px(12.))
-            .h(px(12.))
-            .flex()
-            .items_center()
-            .justify_center()
-            .cursor(CanvasResizeHandle::SouthEast.cursor())
-            .on_mouse_down(MouseButton::Left, move |ev, _, cx| {
-                st_cse.update(cx, |s, cx| {
-                    s.start_canvas_resize(
-                        CanvasResizeHandle::SouthEast,
-                        ev.position,
-                        canvas_size,
-                        min_c,
-                        max_c,
-                        cx,
-                    );
-                });
-                cx.stop_propagation();
-            })
-            .child(
-                div()
-                    .w(px(8.))
-                    .h(px(8.))
-                    .rounded_br(px(3.))
-                    .border_r_2()
-                    .border_b_2()
-                    .border_color(if matches!(
-                        active_canvas_resize.as_ref().map(|r| r.handle),
-                        Some(CanvasResizeHandle::SouthEast)
-                    ) {
-                        grip_active
-                    } else {
-                        grip_idle
-                    }),
-            );
+        let canvas_handles = build_canvas_resize_handles(
+            &self.id,
+            &self.state,
+            canvas_size,
+            self.min_canvas_size,
+            self.max_canvas_size,
+            active_canvas_resize.as_ref().map(|r| r.handle),
+            theme.muted_foreground.opacity(0.45),
+            theme.primary,
+        );
 
         // Window-level pointer capture for active item resize or canvas resize
         let capture_state = self.state.clone();
@@ -2265,9 +1974,7 @@ impl RenderOnce for FreeformCanvas {
             .w(px(cw + 18.))
             .h(px(ch + 18.))
             .child(inner_canvas)
-            .child(canvas_east_handle)
-            .child(canvas_south_handle)
-            .child(canvas_se_handle)
+            .children(canvas_handles)
             .when_some(hud_label, |el, label| {
                 el.child(
                     div()
@@ -2530,6 +2237,193 @@ impl RenderOnce for FreeformCanvas {
     }
 }
 
+fn paint_dot_grid(bounds: Bounds<Pixels>, grid_step: f32, color: Hsla, window: &mut Window) {
+    if grid_step < 4.0 {
+        return;
+    }
+    let step = if grid_step < 8.0 { grid_step * 2.0 } else { grid_step };
+    let mut x = step;
+    while x < bounds.size.width.0 - 2.0 {
+        let mut y = step;
+        while y < bounds.size.height.0 - 2.0 {
+            window.paint_quad(fill(
+                Bounds::new(
+                    point(
+                        px(bounds.origin.x.0 + x - 0.5),
+                        px(bounds.origin.y.0 + y - 0.5),
+                    ),
+                    size(px(1.2), px(1.2)),
+                ),
+                color,
+            ));
+            y += step;
+        }
+        x += step;
+    }
+}
+
+fn paint_snap_guides(
+    bounds: Bounds<Pixels>,
+    guides: &[SnapGuide],
+    edge_color: Hsla,
+    center_color: Hsla,
+    gap_color: Hsla,
+    window: &mut Window,
+) {
+    for g in guides {
+        let color = match g.kind {
+            GuideKind::SiblingEdge | GuideKind::SiblingCenter => edge_color,
+            GuideKind::CanvasCenter | GuideKind::CanvasMargin => center_color,
+            GuideKind::SiblingGap => gap_color,
+        };
+        let quad_bounds = match g.axis {
+            GuideAxis::Vertical => Bounds::new(
+                point(
+                    px(bounds.origin.x.0 + g.position - 0.5),
+                    px(bounds.origin.y.0 + g.span_start),
+                ),
+                size(px(1.0), px((g.span_end - g.span_start).max(1.0))),
+            ),
+            GuideAxis::Horizontal => Bounds::new(
+                point(
+                    px(bounds.origin.x.0 + g.span_start),
+                    px(bounds.origin.y.0 + g.position - 0.5),
+                ),
+                size(px((g.span_end - g.span_start).max(1.0)), px(1.0)),
+            ),
+        };
+        window.paint_quad(fill(quad_bounds, color.opacity(0.9)));
+    }
+}
+
+fn build_guide_badges(guides: &[SnapGuide], cw: f32, ch: f32, gap_color: Hsla) -> Vec<AnyElement> {
+    guides
+        .iter()
+        .filter_map(|g| {
+            let label = g.label.clone()?;
+            let (bx, by) = match g.axis {
+                GuideAxis::Vertical => (
+                    (g.position - 14.0).clamp(2.0, (cw - 32.0).max(2.0)),
+                    ((g.span_start + g.span_end) * 0.5 - 8.0).clamp(2.0, (ch - 18.0).max(2.0)),
+                ),
+                GuideAxis::Horizontal => (
+                    ((g.span_start + g.span_end) * 0.5 - 14.0).clamp(2.0, (cw - 32.0).max(2.0)),
+                    (g.position - 8.0).clamp(2.0, (ch - 18.0).max(2.0)),
+                ),
+            };
+            Some(
+                div()
+                    .absolute()
+                    .left(px(bx))
+                    .top(px(by))
+                    .px(px(4.))
+                    .py(px(1.))
+                    .rounded(px(3.))
+                    .bg(gap_color)
+                    .text_color(crate::white())
+                    .text_size(px(9.5))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .font_features(tabular_numerals())
+                    .child(label)
+                    .into_any_element(),
+            )
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_canvas_resize_handles(
+    id: &ElementId,
+    state: &Entity<FreeformCanvasState>,
+    canvas_size: CanvasSize,
+    min_c: CanvasSize,
+    max_c: CanvasSize,
+    active_handle: Option<CanvasResizeHandle>,
+    grip_idle: Hsla,
+    grip_active: Hsla,
+) -> [AnyElement; 3] {
+    let (cw, ch) = (canvas_size.width, canvas_size.height);
+    let color_for = |h: CanvasResizeHandle| {
+        if active_handle == Some(h) {
+            grip_active
+        } else {
+            grip_idle
+        }
+    };
+    let make_handle = |suffix: &'static str,
+                       handle: CanvasResizeHandle,
+                       left: f32,
+                       top: f32,
+                       w: f32,
+                       h: f32,
+                       grip: crate::Div| {
+        let st = state.clone();
+        div()
+            .id((id.clone(), suffix))
+            .absolute()
+            .left(px(left))
+            .top(px(top))
+            .w(px(w))
+            .h(px(h))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor(handle.cursor())
+            .on_mouse_down(MouseButton::Left, move |ev, _, cx| {
+                st.update(cx, |s, cx| {
+                    s.start_canvas_resize(handle, ev.position, canvas_size, min_c, max_c, cx);
+                });
+                cx.stop_propagation();
+            })
+            .child(grip)
+            .into_any_element()
+    };
+
+    [
+        make_handle(
+            "canvas-resize-e",
+            CanvasResizeHandle::East,
+            cw + 4.0,
+            (ch * 0.5 - 16.0).max(0.0),
+            10.0,
+            32.0_f32.min(ch),
+            div()
+                .w(px(3.5))
+                .h(px(22.0_f32.min((ch - 8.0).max(8.0))))
+                .rounded_full()
+                .bg(color_for(CanvasResizeHandle::East)),
+        ),
+        make_handle(
+            "canvas-resize-s",
+            CanvasResizeHandle::South,
+            (cw * 0.5 - 16.0).max(0.0),
+            ch + 4.0,
+            32.0_f32.min(cw),
+            10.0,
+            div()
+                .w(px(22.0_f32.min((cw - 8.0).max(8.0))))
+                .h(px(3.5))
+                .rounded_full()
+                .bg(color_for(CanvasResizeHandle::South)),
+        ),
+        make_handle(
+            "canvas-resize-se",
+            CanvasResizeHandle::SouthEast,
+            cw + 3.0,
+            ch + 3.0,
+            12.0,
+            12.0,
+            div()
+                .w(px(8.))
+                .h(px(8.))
+                .rounded_br(px(3.))
+                .border_r_2()
+                .border_b_2()
+                .border_color(color_for(CanvasResizeHandle::SouthEast)),
+        ),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2645,6 +2539,8 @@ mod tests {
         canvas: Entity<FreeformCanvasState>,
         items: Vec<(SharedString, CanvasRect)>,
         size: CanvasSize,
+        committed_resizes: usize,
+        committed_canvas_resizes: usize,
         _sub: crate::Subscription,
     }
 
@@ -2685,7 +2581,7 @@ mod tests {
                         this.items.push((format!("{kind}-1").into(), *rect));
                     }
                     FreeformCanvasEvent::Move { id, rect }
-                    | FreeformCanvasEvent::Resize { id, rect } => {
+                    | FreeformCanvasEvent::Resize { id, rect, .. } => {
                         if let Some(it) = this.items.iter_mut().find(|(k, _)| k == id) {
                             it.1 = *rect;
                         }
@@ -2693,8 +2589,8 @@ mod tests {
                     FreeformCanvasEvent::Remove(id) => {
                         this.items.retain(|(k, _)| k != id);
                     }
-                    FreeformCanvasEvent::ResizeCanvas(sz) => {
-                        this.size = *sz;
+                    FreeformCanvasEvent::ResizeCanvas { size, .. } => {
+                        this.size = *size;
                     }
                     FreeformCanvasEvent::Select(_) => {}
                 }
@@ -2704,6 +2600,8 @@ mod tests {
                 canvas,
                 items: vec![("existing".into(), CanvasRect::new(12.0, 12.0, 60.0, 24.0))],
                 size: CanvasSize::new(240.0, 120.0),
+                committed_resizes: 0,
+                committed_canvas_resizes: 0,
                 _sub: sub,
             }
         });
@@ -2799,13 +2697,23 @@ mod tests {
             let canvas = cx.new(FreeformCanvasState::new);
             let sub = cx.subscribe(&canvas, |this: &mut StudioView, _, ev: &FreeformCanvasEvent, cx| {
                 match ev {
-                    FreeformCanvasEvent::Resize { id, rect } => {
+                    FreeformCanvasEvent::Resize {
+                        id,
+                        rect,
+                        committed,
+                    } => {
                         if let Some(it) = this.items.iter_mut().find(|(k, _)| k == id) {
                             it.1 = *rect;
                         }
+                        if *committed {
+                            this.committed_resizes += 1;
+                        }
                     }
-                    FreeformCanvasEvent::ResizeCanvas(sz) => {
-                        this.size = *sz;
+                    FreeformCanvasEvent::ResizeCanvas { size, committed } => {
+                        this.size = *size;
+                        if *committed {
+                            this.committed_canvas_resizes += 1;
+                        }
                     }
                     _ => {}
                 }
@@ -2815,6 +2723,8 @@ mod tests {
                 canvas,
                 items: vec![("box".into(), CanvasRect::new(12.0, 12.0, 60.0, 40.0))],
                 size: CanvasSize::new(240.0, 120.0),
+                committed_resizes: 0,
+                committed_canvas_resizes: 0,
                 _sub: sub,
             }
         });
@@ -2865,9 +2775,11 @@ mod tests {
         });
         cx.run_until_parked();
 
-        let resized = view.read_with(cx, |v, _| v.items[0].1);
+        let (resized, committed_resizes) =
+            view.read_with(cx, |v, _| (v.items[0].1, v.committed_resizes));
         assert_eq!(resized.width, 92.0, "expected item width to grow by 32px, got {resized:?}");
         assert_eq!(resized.height, 56.0, "expected item height to grow by 16px, got {resized:?}");
+        assert_eq!(committed_resizes, 1, "resize drag should emit exactly one committed event");
 
         let c_se = point(cb.origin.x + px(248.), cb.origin.y + px(128.));
         let c_target = point(cb.origin.x + px(288.), cb.origin.y + px(152.));
@@ -2893,7 +2805,9 @@ mod tests {
         });
         cx.run_until_parked();
 
-        let next_size = view.read_with(cx, |v, _| v.size);
+        let (next_size, committed_canvas) =
+            view.read_with(cx, |v, _| (v.size, v.committed_canvas_resizes));
         assert_eq!(next_size, CanvasSize::new(280.0, 144.0));
+        assert_eq!(committed_canvas, 1, "canvas resize drag should emit exactly one committed event");
     }
 }
