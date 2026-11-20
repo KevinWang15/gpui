@@ -306,7 +306,7 @@ impl ColorPickerState {
                         this.sync_hex_input(cx);
                     }
                 }
-                InputEvent::Focus => {}
+                InputEvent::Focus | InputEvent::AcceptSuggestion(_) => {}
             }
         })
         .detach();

@@ -7,11 +7,12 @@ use std::rc::Rc;
 use crate::{
     Anchor, Animation, AnimationExt, App, Bounds, Context, Entity, EventEmitter, FocusHandle,
     Focusable, FontWeight, IntoElement, KeyDownEvent, MouseButton, Pixels, Render, RenderOnce,
-    SharedString, StyleRefinement, Styled, Window, anchored, canvas, deferred, div,
+    ScrollHandle, SharedString, StyleRefinement, Styled, Window, anchored, canvas, deferred, div,
     ease_out_quint, point, prelude::*, px,
 };
 use crate::icons::{Icon, IconSize, LucideIcon};
 
+use super::focus::{is_list_nav_key, list_step};
 use super::layout::focus_ring_shadow;
 use super::theme::{ANIM_FAST, ActiveTheme, ComponentSize};
 
@@ -94,6 +95,7 @@ pub struct SelectState<T: Clone + PartialEq + 'static> {
     invalid: bool,
     clearable: bool,
     max_menu_height: Pixels,
+    scroll_handle: ScrollHandle,
     trigger_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     frame_style: StyleRefinement,
 }
@@ -121,6 +123,7 @@ impl<T: Clone + PartialEq + 'static> SelectState<T> {
             invalid: false,
             clearable: false,
             max_menu_height: px(280.),
+            scroll_handle: ScrollHandle::new(),
             trigger_bounds: Rc::new(Cell::new(None)),
             frame_style: StyleRefinement::default(),
         }
@@ -211,6 +214,7 @@ impl<T: Clone + PartialEq + 'static> SelectState<T> {
         self.highlighted_index = self
             .selected_index
             .or_else(|| self.options.iter().position(|o| !o.disabled));
+        self.scroll_highlighted_into_view();
         cx.emit(SelectEvent::Open);
         cx.notify();
     }
@@ -269,28 +273,26 @@ impl<T: Clone + PartialEq + 'static> SelectState<T> {
         cx.notify();
     }
 
-    fn move_highlight(&mut self, delta: isize) {
-        if self.options.is_empty() {
-            return;
+    fn child_index_for_option(&self, target_idx: usize) -> usize {
+        let mut child_idx = 0usize;
+        let mut last_group: Option<&SharedString> = None;
+        for (idx, option) in self.options.iter().enumerate() {
+            if option.group.as_ref() != last_group && option.group.is_some() {
+                child_idx += 1;
+            }
+            last_group = option.group.as_ref();
+            if idx == target_idx {
+                return child_idx;
+            }
+            child_idx += 1;
         }
-        let len = self.options.len();
-        let start = match self.highlighted_index {
-            Some(idx) => idx,
-            None => {
-                self.highlighted_index = if delta > 0 {
-                    self.options.iter().position(|o| !o.disabled)
-                } else {
-                    self.options.iter().rposition(|o| !o.disabled)
-                };
-                return;
-            }
-        };
-        for step in 1..=len {
-            let candidate = ((start as isize + delta * step as isize).rem_euclid(len as isize)) as usize;
-            if !self.options[candidate].disabled {
-                self.highlighted_index = Some(candidate);
-                return;
-            }
+        child_idx
+    }
+
+    fn scroll_highlighted_into_view(&self) {
+        if let Some(idx) = self.highlighted_index {
+            self.scroll_handle
+                .scroll_to_item(self.child_index_for_option(idx));
         }
     }
 
@@ -303,35 +305,26 @@ impl<T: Clone + PartialEq + 'static> SelectState<T> {
         if self.disabled {
             return;
         }
-        match event.keystroke.key.as_str() {
-            "down" => {
-                if !self.open {
+        let mods = &event.keystroke.modifiers;
+        let key = event.keystroke.key.as_str();
+        if !mods.modified() && is_list_nav_key(key, self.open) {
+            if !self.open {
+                if matches!(key, "down" | "up") {
                     self.open_menu(cx);
-                } else {
-                    self.move_highlight(1);
-                    cx.notify();
+                    cx.stop_propagation();
                 }
-                cx.stop_propagation();
+                return;
             }
-            "up" => {
-                if !self.open {
-                    self.open_menu(cx);
-                } else {
-                    self.move_highlight(-1);
-                    cx.notify();
-                }
-                cx.stop_propagation();
-            }
-            "home" if self.open => {
-                self.highlighted_index = self.options.iter().position(|o| !o.disabled);
+            let enabled: Vec<bool> = self.options.iter().map(|o| !o.disabled).collect();
+            if let Some(next) = list_step(key, self.highlighted_index, &enabled, 6, true) {
+                self.highlighted_index = Some(next);
+                self.scroll_highlighted_into_view();
                 cx.notify();
-                cx.stop_propagation();
             }
-            "end" if self.open => {
-                self.highlighted_index = self.options.iter().rposition(|o| !o.disabled);
-                cx.notify();
-                cx.stop_propagation();
-            }
+            cx.stop_propagation();
+            return;
+        }
+        match key {
             "enter" | "space" => {
                 if !self.open {
                     self.open_menu(cx);
@@ -364,6 +357,7 @@ impl<T: Clone + PartialEq + 'static> SelectState<T> {
                             if !self.open {
                                 self.select_index(idx, cx);
                             } else {
+                                self.scroll_highlighted_into_view();
                                 cx.notify();
                             }
                             break;
@@ -528,14 +522,41 @@ impl<T: Clone + PartialEq + 'static> Render for SelectState<T> {
             );
 
         let menu = if self.open {
-            let mut list_items = div().flex().flex_col().w_full().p(px(4.));
+            let reduce_motion = cx.reduce_motion();
+            let mut list = div()
+                .id("gpui-select-menu")
+                .flex()
+                .flex_col()
+                .min_w(menu_min_w)
+                .max_h(self.max_menu_height)
+                .p(px(4.))
+                .overflow_y_scroll()
+                .track_scroll(&self.scroll_handle)
+                .rounded(theme.radius_lg)
+                .bg(theme.popover)
+                .text_color(theme.popover_foreground)
+                .border_1()
+                .border_color(theme.border)
+                .shadow_lg()
+                // Clicking an option keeps focus on the trigger, as a native select does.
+                .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
+                .on_mouse_down_out(cx.listener(|this, ev: &crate::MouseDownEvent, _, cx| {
+                    if this
+                        .trigger_bounds
+                        .get()
+                        .is_some_and(|b| b.contains(&ev.position))
+                    {
+                        return;
+                    }
+                    this.close_menu(cx);
+                }));
 
             let mut last_group: Option<SharedString> = None;
             for (index, option) in self.options.iter().enumerate() {
                 if option.group != last_group
                     && let Some(group_name) = option.group.clone()
                 {
-                    list_items = list_items.child(
+                    list = list.child(
                         div()
                             .px(px(10.))
                             .pt(px(6.))
@@ -557,7 +578,7 @@ impl<T: Clone + PartialEq + 'static> Render for SelectState<T> {
                 };
                 let entity_opt = entity.clone();
 
-                list_items = list_items.child(
+                list = list.child(
                     div()
                         .id(("gpui-select-option", index))
                         .flex()
@@ -638,35 +659,16 @@ impl<T: Clone + PartialEq + 'static> Render for SelectState<T> {
                 );
             }
 
-            let list = div()
-                .id("gpui-select-menu")
-                .min_w(menu_min_w)
-                .max_h(self.max_menu_height)
-                .overflow_y_scroll()
-                .rounded(theme.radius_lg)
-                .bg(theme.popover)
-                .text_color(theme.popover_foreground)
-                .border_1()
-                .border_color(theme.border)
-                .shadow_lg()
-                // Clicking an option keeps focus on the trigger, as a native select does.
-                .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
-                .on_mouse_down_out(cx.listener(|this, ev: &crate::MouseDownEvent, _, cx| {
-                    if this
-                        .trigger_bounds
-                        .get()
-                        .is_some_and(|b| b.contains(&ev.position))
-                    {
-                        return;
-                    }
-                    this.close_menu(cx);
-                }))
-                .child(list_items)
-                .with_animation(
+            let list_el = if reduce_motion {
+                list.into_any_element()
+            } else {
+                list.with_animation(
                     "gpui-select-menu-anim",
                     Animation::new(ANIM_FAST).with_easing(ease_out_quint()),
                     |el, delta| el.opacity(delta).mt(px(-6.0 * (1.0 - delta))),
-                );
+                )
+                .into_any_element()
+            };
 
             let mut anchor = anchored()
                 .anchor(Anchor::TopLeft)
@@ -679,7 +681,7 @@ impl<T: Clone + PartialEq + 'static> Render for SelectState<T> {
                 anchor = anchor.offset(point(px(0.), px(4.)));
             }
 
-            Some(deferred(anchor.child(list)).priority(20))
+            Some(deferred(anchor.child(list_el)).priority(20))
         } else {
             None
         };

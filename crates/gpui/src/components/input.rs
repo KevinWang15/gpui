@@ -11,13 +11,17 @@ use unicode_segmentation::UnicodeSegmentation;
 use crate::{
     App, Bounds, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler,
     Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, Font, GlobalElementId, Hsla,
-    InspectorElementId, IntoElement, KeyBinding, LayoutId, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, Render, RenderOnce, ShapedLine,
-    SharedString, Style, StyleRefinement, Styled, TextAlign, TextRun, UTF16Selection,
+    InspectorElementId, IntoElement, KeyBinding, KeyDownEvent, LayoutId, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, Render, RenderOnce,
+    ShapedLine, SharedString, Style, StyleRefinement, Styled, TextAlign, TextRun, UTF16Selection,
     UnderlineStyle, Window, div, fill, point, prelude::*, px, relative, size,
 };
 use crate::icons::{Icon, IconSize, LucideIcon};
 
+use super::completion::{
+    CompletionConfig, CompletionController, CompletionKeyOutcome, SuggestionItem, SuggestionSource,
+    run_completion_query,
+};
 use super::cursor_blink::{CursorBlink, is_mounted_and_focused};
 use super::layout::focus_ring_shadow;
 use super::theme::{ActiveTheme, ComponentSize};
@@ -109,6 +113,8 @@ pub enum InputEvent {
     Change(SharedString),
     /// Emitted when the user presses Enter inside the input.
     Submit(SharedString),
+    /// Emitted when the user accepts a completion suggestion via `Enter`, `Tab`, or mouse click.
+    AcceptSuggestion(SuggestionItem),
     /// Emitted when the input gains focus.
     Focus,
     /// Emitted when the input loses focus.
@@ -166,6 +172,8 @@ pub struct InputState {
     was_focused: bool,
     tab_stop: bool,
     blink: CursorBlink,
+    completions: Option<CompletionController>,
+    pending_completion_config: Option<Box<CompletionConfig>>,
     frame_style: StyleRefinement,
 }
 
@@ -206,6 +214,8 @@ impl InputState {
             was_focused: false,
             tab_stop: true,
             blink: CursorBlink::new(),
+            completions: None,
+            pending_completion_config: None,
             frame_style: StyleRefinement::default(),
         }
     }
@@ -309,6 +319,179 @@ impl InputState {
         self
     }
 
+    /// Enables live autocomplete / suggestion popups backed by `source` (sync or async).
+    ///
+    /// Uses [`CompletionConfig::search`] by default; customize via [`Self::completion_config`].
+    pub fn completions(mut self, source: SuggestionSource) -> Self {
+        let config = self
+            .pending_completion_config
+            .take()
+            .map(|c| *c)
+            .unwrap_or_else(CompletionConfig::search);
+        self.completions = Some(CompletionController::new(source, config));
+        self
+    }
+
+    /// Configures completion popover behavior (works before or after [`Self::completions`]).
+    pub fn completion_config(mut self, config: CompletionConfig) -> Self {
+        if let Some(ctrl) = self.completions.as_mut() {
+            ctrl.set_config(config);
+        } else {
+            self.pending_completion_config = Some(Box::new(config));
+        }
+        self
+    }
+
+    /// Replaces or disables the completion [`SuggestionSource`] dynamically.
+    pub fn set_completions(
+        &mut self,
+        source: Option<SuggestionSource>,
+        cx: &mut Context<Self>,
+    ) {
+        match source {
+            Some(src) => {
+                if let Some(ctrl) = self.completions.as_mut() {
+                    let was_open = ctrl.is_open();
+                    ctrl.set_source(src);
+                    if was_open {
+                        self.refresh_completions(true, cx);
+                    }
+                } else {
+                    let config = self
+                        .pending_completion_config
+                        .take()
+                        .map(|c| *c)
+                        .unwrap_or_else(CompletionConfig::search);
+                    self.completions = Some(CompletionController::new(src, config));
+                }
+            }
+            None => {
+                if let Some(mut ctrl) = self.completions.take() {
+                    ctrl.close();
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Updates completion behavior configuration dynamically.
+    pub fn set_completion_config(&mut self, config: CompletionConfig, cx: &mut Context<Self>) {
+        if let Some(ctrl) = self.completions.as_mut() {
+            ctrl.set_config(config);
+            if ctrl.is_open() {
+                self.refresh_completions(true, cx);
+            }
+        } else {
+            self.pending_completion_config = Some(Box::new(config));
+        }
+        cx.notify();
+    }
+
+    /// Returns `true` if a completion popover is currently visible.
+    pub fn is_completions_open(&self) -> bool {
+        self.completions
+            .as_ref()
+            .is_some_and(CompletionController::is_visible_popover)
+    }
+
+    /// Returns `true` while an asynchronous completion query is in flight.
+    pub fn is_completions_loading(&self) -> bool {
+        self.completions
+            .as_ref()
+            .is_some_and(CompletionController::is_loading)
+    }
+
+    /// Returns the last asynchronous completion error message, if any.
+    pub fn completion_error(&self) -> Option<&SharedString> {
+        self.completions
+            .as_ref()
+            .and_then(CompletionController::error)
+    }
+
+    /// Returns the currently displayed completion suggestions in visual order.
+    pub fn completion_items(&self) -> &[SuggestionItem] {
+        self.completions
+            .as_ref()
+            .map(CompletionController::items)
+            .unwrap_or(&[])
+    }
+
+    /// Returns the currently highlighted completion item index, if any.
+    pub fn highlighted_completion_index(&self) -> Option<usize> {
+        self.completions
+            .as_ref()
+            .and_then(CompletionController::highlighted_index)
+    }
+
+    /// Programmatically opens completions and queries the configured source.
+    pub fn open_completions(&mut self, cx: &mut Context<Self>) {
+        if self.completions.is_some() && self.can_edit() {
+            self.refresh_completions(true, cx);
+            cx.notify();
+        }
+    }
+
+    /// Closes the completion popover and cancels any pending async fetch.
+    pub fn close_completions(&mut self, cx: &mut Context<Self>) {
+        if let Some(ctrl) = self.completions.as_mut()
+            && ctrl.is_open()
+        {
+            ctrl.close();
+            cx.notify();
+        }
+    }
+
+    fn refresh_completions(&mut self, open_if_eligible: bool, cx: &mut Context<Self>) {
+        if self.completions.is_none() || !self.can_edit() {
+            return;
+        }
+        let query = self.content.clone();
+        run_completion_query(
+            self,
+            &query,
+            open_if_eligible,
+            cx,
+            |this| this.completions.as_mut(),
+            |_, _| false,
+        );
+    }
+
+    fn accept_suggestion(
+        &mut self,
+        item: SuggestionItem,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.can_edit() {
+            return;
+        }
+        self.push_undo();
+        let mut next = item.value.to_string();
+        if let Some(max) = self.max_length {
+            next = next.chars().take(max).collect();
+        }
+        self.content = next;
+        let len = self.content.len();
+        self.selected_range = len..len;
+        self.selection_reversed = false;
+        self.marked_range = None;
+        self.paint_cache.borrow_mut().scroll_offset = px(0.);
+        self.blink.reset(cx);
+        if let Some(window) = window {
+            window.notify_text_input_changed(&self.focus_handle);
+        }
+        if let Some(ctrl) = self.completions.as_mut() {
+            if ctrl.config().close_on_accept {
+                ctrl.close();
+            } else {
+                self.refresh_completions(true, cx);
+            }
+        }
+        cx.emit(InputEvent::Change(SharedString::from(self.content.clone())));
+        cx.emit(InputEvent::AcceptSuggestion(item));
+        cx.notify();
+    }
+
     /// Returns the current text value.
     pub fn value(&self) -> &str {
         &self.content
@@ -341,6 +524,7 @@ impl InputState {
         self.marked_range = None;
         self.paint_cache.borrow_mut().scroll_offset = px(0.);
         self.blink.reset(cx);
+        self.refresh_completions(false, cx);
         cx.notify();
     }
 
@@ -358,7 +542,14 @@ impl InputState {
             return;
         }
         self.push_undo();
+        let reopen = self
+            .completions
+            .as_ref()
+            .is_some_and(|c| c.is_open() || c.config().open_on_focus);
         self.set_value(String::new(), cx);
+        if reopen {
+            self.refresh_completions(true, cx);
+        }
     }
 
     /// Updates the invalid error state dynamically.
@@ -377,6 +568,9 @@ impl InputState {
         self.disabled = disabled;
         if disabled {
             self.blink.stop();
+            if let Some(ctrl) = self.completions.as_mut() {
+                ctrl.close();
+            }
         }
         cx.notify();
     }
@@ -787,6 +981,7 @@ impl InputState {
             self.selection_reversed = entry.selection_reversed;
             self.marked_range = None;
             self.blink.reset(cx);
+            self.refresh_completions(true, cx);
             window.notify_text_input_changed(&self.focus_handle);
             cx.emit(InputEvent::Change(SharedString::from(self.content.clone())));
             cx.notify();
@@ -808,17 +1003,70 @@ impl InputState {
             self.selection_reversed = entry.selection_reversed;
             self.marked_range = None;
             self.blink.reset(cx);
+            self.refresh_completions(true, cx);
             window.notify_text_input_changed(&self.focus_handle);
             cx.emit(InputEvent::Change(SharedString::from(self.content.clone())));
             cx.notify();
         }
     }
 
-    fn submit(&mut self, _: &Submit, _window: &mut Window, cx: &mut Context<Self>) {
+    fn submit(&mut self, _: &Submit, window: &mut Window, cx: &mut Context<Self>) {
         if self.disabled {
             return;
         }
+        if let Some(item) = self
+            .completions
+            .as_ref()
+            .filter(|c| c.is_visible_popover())
+            .and_then(|c| c.highlighted_item().cloned())
+        {
+            self.accept_suggestion(item, Some(window), cx);
+            return;
+        }
+        if let Some(ctrl) = self.completions.as_mut()
+            && ctrl.is_open()
+        {
+            ctrl.close();
+            cx.notify();
+        }
         cx.emit(InputEvent::Submit(SharedString::from(self.content.clone())));
+    }
+
+    fn on_completion_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.can_edit() {
+            return;
+        }
+        let Some(ctrl) = self.completions.as_mut() else {
+            return;
+        };
+        match ctrl.handle_key_down(event) {
+            CompletionKeyOutcome::Ignored => {}
+            CompletionKeyOutcome::ClosedPassThrough => {
+                cx.notify();
+            }
+            CompletionKeyOutcome::Consumed => {
+                cx.stop_propagation();
+                cx.notify();
+            }
+            CompletionKeyOutcome::RequestOpen(edge) => {
+                let query = self.content.clone();
+                if query.trim().chars().count() >= ctrl.config().min_chars {
+                    ctrl.set_pending_highlight(edge);
+                    self.refresh_completions(true, cx);
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }
+            CompletionKeyOutcome::Accept(item) => {
+                self.accept_suggestion(item, Some(window), cx);
+                cx.stop_propagation();
+            }
+        }
     }
 
     fn on_mouse_down(
@@ -833,6 +1081,14 @@ impl InputState {
         window.focus(&self.focus_handle, cx);
         window.request_virtual_keyboard();
         self.is_selecting = true;
+
+        if self.can_edit()
+            && let Some(ctrl) = self.completions.as_ref()
+            && ctrl.config().open_on_focus
+            && !ctrl.is_open()
+        {
+            self.refresh_completions(true, cx);
+        }
 
         let index = self.index_for_mouse_position(event.position);
         match event.click_count {
@@ -971,6 +1227,7 @@ impl EntityInputHandler for InputState {
         self.selection_reversed = false;
         self.marked_range = None;
         self.blink.reset(cx);
+        self.refresh_completions(true, cx);
         window.notify_text_input_changed(&self.focus_handle);
         cx.emit(InputEvent::Change(SharedString::from(self.content.clone())));
         cx.notify();
@@ -1011,6 +1268,7 @@ impl EntityInputHandler for InputState {
             .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
         self.selection_reversed = false;
         self.blink.reset(cx);
+        self.refresh_completions(true, cx);
         window.notify_text_input_changed(&self.focus_handle);
         cx.emit(InputEvent::Change(SharedString::from(self.content.clone())));
         cx.notify();
@@ -1334,11 +1592,22 @@ impl Render for InputState {
         let focused = self.focus_handle.is_focused(window);
         if focused != self.was_focused {
             self.was_focused = focused;
-            cx.emit(if focused {
-                InputEvent::Focus
+            if focused {
+                if self.can_edit()
+                    && self
+                        .completions
+                        .as_ref()
+                        .is_some_and(|c| c.config().open_on_focus)
+                {
+                    self.refresh_completions(true, cx);
+                }
+                cx.emit(InputEvent::Focus);
             } else {
-                InputEvent::Blur
-            });
+                if let Some(ctrl) = self.completions.as_mut() {
+                    ctrl.close();
+                }
+                cx.emit(InputEvent::Blur);
+            }
         }
         let should_blink = self.should_blink_cursor(window) && !cx.reduce_motion();
         self.blink.sync(
@@ -1469,6 +1738,9 @@ impl Render for InputState {
                     .on_action(cx.listener(Self::undo))
                     .on_action(cx.listener(Self::redo))
                     .on_action(cx.listener(Self::submit))
+                    .when(self.completions.is_some(), |el| {
+                        el.on_key_down(cx.listener(Self::on_completion_key_down))
+                    })
             })
             .when(!self.disabled && (focused || self.is_selecting), |el| {
                 el.on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
@@ -1582,7 +1854,31 @@ impl Render for InputState {
         }
 
         crate::Refineable::refine(frame.style(), &self.frame_style);
-        frame
+        if let Some(ctrl) = self.completions.as_ref() {
+            let popover = ctrl.render_popover(
+                "gpui-input-completion",
+                cx.entity(),
+                cx,
+                |this| this.completions.as_mut(),
+                |this, item, window, cx| this.accept_suggestion(item, Some(window), cx),
+                |this, cx| this.close_completions(cx),
+            );
+            frame = frame.relative().child(ctrl.bounds_canvas());
+            let mut wrapper = div().flex().flex_col();
+            if self.frame_style.size.width.is_none() {
+                wrapper = wrapper.w_full();
+            }
+            wrapper.style().flex_grow = self.frame_style.flex_grow;
+            wrapper.style().flex_shrink = self.frame_style.flex_shrink;
+            wrapper.style().flex_basis = self.frame_style.flex_basis;
+            wrapper.style().min_size.width = self.frame_style.min_size.width;
+            wrapper
+                .child(frame)
+                .when_some(popover, |el, pop| el.child(div().h_0().w_full().child(pop)))
+                .into_any_element()
+        } else {
+            frame.into_any_element()
+        }
     }
 }
 

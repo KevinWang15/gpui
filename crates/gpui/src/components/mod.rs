@@ -19,6 +19,7 @@ pub mod checkbox;
 pub mod color_picker;
 pub mod combobox;
 pub mod command_palette;
+pub mod completion;
 pub mod context_menu;
 pub(crate) mod cursor_blink;
 pub mod date_time_picker;
@@ -97,6 +98,9 @@ pub use color_picker::{
 pub use combobox::{ComboBox, ComboBoxEvent, ComboBoxOption, ComboBoxState, combo_box};
 pub use command_palette::{
     CommandItem, CommandPalette, CommandPaletteEvent, CommandPaletteState, command_palette,
+};
+pub use completion::{
+    CompletionConfig, SuggestionItem, SuggestionSource, filter_suggestions, fuzzy_match_score,
 };
 pub use context_menu::{ContextMenu, context_menu};
 pub use date_time_picker::{

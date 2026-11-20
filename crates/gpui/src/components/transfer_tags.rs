@@ -15,6 +15,10 @@ use crate::{
 
 use super::badge::{BadgeColor, badge};
 use super::button::button;
+use super::completion::{
+    CompletionConfig, CompletionController, CompletionKeyOutcome, SuggestionItem, SuggestionSource,
+    run_completion_query,
+};
 use super::input::{Input, InputEvent, InputState, input_actions};
 use super::theme::{ActiveTheme, ComponentSize, focus_ring_shadow, tabular_numerals};
 
@@ -756,8 +760,11 @@ pub struct TagInputState {
     input: Entity<InputState>,
     max_tags: Option<usize>,
     allow_duplicates: bool,
+    allow_custom: bool,
     tag_color: BadgeColor,
     disabled: bool,
+    suggestions: Option<CompletionController>,
+    pending_suggestion_config: Option<Box<CompletionConfig>>,
     frame_style: StyleRefinement,
 }
 
@@ -784,13 +791,27 @@ impl TagInputState {
         });
         cx.subscribe(&input, |this, inp, ev: &InputEvent, cx| match ev {
             InputEvent::Submit(text) => {
+                if !this.allow_custom {
+                    return;
+                }
                 let raw = text.to_string();
                 if this.add_tag_str(&raw, cx) {
                     inp.update(cx, |s, cx| s.set_value_silent(String::new(), cx));
+                    if this.is_at_cap() {
+                        this.close_suggestions(cx);
+                    } else if this
+                        .suggestions
+                        .as_ref()
+                        .is_some_and(CompletionController::is_open)
+                    {
+                        this.refresh_suggestions(false, cx);
+                    }
                 }
             }
             InputEvent::Change(text) => {
-                if let Some((before_comma, tail)) = text.rsplit_once(',') {
+                if this.allow_custom
+                    && let Some((before_comma, tail)) = text.rsplit_once(',')
+                {
                     for part in before_comma.split(',') {
                         let cleaned = part.trim();
                         if !cleaned.is_empty() {
@@ -801,11 +822,37 @@ impl TagInputState {
                     // so rejected duplicates never poison subsequent keystrokes.
                     let remainder = tail.trim_start().to_owned();
                     inp.update(cx, |s, cx| s.set_value_silent(remainder, cx));
+                    if this.is_at_cap() {
+                        this.close_suggestions(cx);
+                    } else if this.suggestions.is_some() {
+                        this.refresh_suggestions(true, cx);
+                    }
+                    return;
+                }
+                if !this.disabled && !this.is_at_cap() && this.suggestions.is_some() {
+                    this.refresh_suggestions(true, cx);
+                    cx.notify();
                 }
             }
-            InputEvent::Focus | InputEvent::Blur => {
+            InputEvent::Focus => {
+                if !this.disabled
+                    && !this.is_at_cap()
+                    && this
+                        .suggestions
+                        .as_ref()
+                        .is_some_and(|c| c.config().open_on_focus)
+                {
+                    this.refresh_suggestions(true, cx);
+                }
                 cx.notify();
             }
+            InputEvent::Blur => {
+                if let Some(ctrl) = this.suggestions.as_mut() {
+                    ctrl.close();
+                }
+                cx.notify();
+            }
+            InputEvent::AcceptSuggestion(_) => {}
         })
         .detach();
 
@@ -815,10 +862,25 @@ impl TagInputState {
             input,
             max_tags: None,
             allow_duplicates: false,
+            allow_custom: true,
             tag_color: BadgeColor::Indigo,
             disabled: false,
+            suggestions: None,
+            pending_suggestion_config: None,
             frame_style: StyleRefinement::default(),
         }
+    }
+
+    fn is_at_cap(&self) -> bool {
+        self.max_tags.is_some_and(|m| self.tags.len() >= m)
+    }
+
+    fn should_exclude_suggestion(this: &Self, item: &SuggestionItem) -> bool {
+        if this.allow_duplicates {
+            return false;
+        }
+        let val_lower = item.value.trim().to_lowercase();
+        this.tags.iter().any(|t| t.to_lowercase() == val_lower)
     }
 
     fn normalize_existing_tags(&mut self) {
@@ -871,10 +933,187 @@ impl TagInputState {
         self
     }
 
+    /// Controls whether free-form custom tags (not chosen from suggestions) can be created
+    /// via `Enter` or `,` (default `true`).
+    pub fn allow_custom(mut self, allow: bool) -> Self {
+        self.allow_custom = allow;
+        self
+    }
+
+    /// Dynamically updates whether custom free-form tags are allowed.
+    pub fn set_allow_custom(&mut self, allow: bool, cx: &mut Context<Self>) {
+        self.allow_custom = allow;
+        cx.notify();
+    }
+
+    /// Enables live autocomplete suggestions backed by `source` (sync or async).
+    ///
+    /// Uses [`CompletionConfig::tags`] by default; customize via [`Self::suggestion_config`].
+    pub fn suggestions(mut self, source: SuggestionSource) -> Self {
+        let config = self
+            .pending_suggestion_config
+            .take()
+            .map(|c| *c)
+            .unwrap_or_else(CompletionConfig::tags);
+        self.suggestions = Some(CompletionController::new(source, config));
+        self
+    }
+
+    /// Configures suggestion popover behavior (works before or after [`Self::suggestions`]).
+    pub fn suggestion_config(mut self, config: CompletionConfig) -> Self {
+        if let Some(ctrl) = self.suggestions.as_mut() {
+            ctrl.set_config(config);
+        } else {
+            self.pending_suggestion_config = Some(Box::new(config));
+        }
+        self
+    }
+
+    /// Replaces or disables the suggestion [`SuggestionSource`] dynamically.
+    pub fn set_suggestions(
+        &mut self,
+        source: Option<SuggestionSource>,
+        cx: &mut Context<Self>,
+    ) {
+        match source {
+            Some(src) => {
+                if let Some(ctrl) = self.suggestions.as_mut() {
+                    let was_open = ctrl.is_open();
+                    ctrl.set_source(src);
+                    if was_open && !self.disabled && !self.is_at_cap() {
+                        self.refresh_suggestions(true, cx);
+                    }
+                } else {
+                    let config = self
+                        .pending_suggestion_config
+                        .take()
+                        .map(|c| *c)
+                        .unwrap_or_else(CompletionConfig::tags);
+                    self.suggestions = Some(CompletionController::new(src, config));
+                }
+            }
+            None => {
+                if let Some(mut ctrl) = self.suggestions.take() {
+                    ctrl.close();
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Updates suggestion behavior configuration dynamically.
+    pub fn set_suggestion_config(&mut self, config: CompletionConfig, cx: &mut Context<Self>) {
+        if let Some(ctrl) = self.suggestions.as_mut() {
+            ctrl.set_config(config);
+            if ctrl.is_open() && !self.disabled && !self.is_at_cap() {
+                self.refresh_suggestions(true, cx);
+            }
+        } else {
+            self.pending_suggestion_config = Some(Box::new(config));
+        }
+        cx.notify();
+    }
+
+    /// Returns `true` if a suggestion popover is currently visible.
+    pub fn is_suggestions_open(&self) -> bool {
+        self.suggestions
+            .as_ref()
+            .is_some_and(CompletionController::is_visible_popover)
+    }
+
+    /// Returns `true` while an asynchronous suggestion query is in flight.
+    pub fn is_suggestions_loading(&self) -> bool {
+        self.suggestions
+            .as_ref()
+            .is_some_and(CompletionController::is_loading)
+    }
+
+    /// Returns the last asynchronous suggestion error message, if any.
+    pub fn suggestion_error(&self) -> Option<&SharedString> {
+        self.suggestions
+            .as_ref()
+            .and_then(CompletionController::error)
+    }
+
+    /// Returns the currently displayed suggestions in visual order.
+    pub fn suggestion_items(&self) -> &[SuggestionItem] {
+        self.suggestions
+            .as_ref()
+            .map(CompletionController::items)
+            .unwrap_or(&[])
+    }
+
+    /// Returns the currently highlighted suggestion index, if any.
+    pub fn highlighted_suggestion_index(&self) -> Option<usize> {
+        self.suggestions
+            .as_ref()
+            .and_then(CompletionController::highlighted_index)
+    }
+
+    /// Closes the suggestion popover and cancels any in-flight async fetch.
+    pub fn close_suggestions(&mut self, cx: &mut Context<Self>) {
+        if let Some(ctrl) = self.suggestions.as_mut()
+            && ctrl.is_open()
+        {
+            ctrl.close();
+            cx.notify();
+        }
+    }
+
+    fn refresh_suggestions(&mut self, open_if_eligible: bool, cx: &mut Context<Self>) {
+        if self.suggestions.is_none() || self.disabled || self.is_at_cap() {
+            return;
+        }
+        let query = self.input.read(cx).value().to_owned();
+        run_completion_query(
+            self,
+            &query,
+            open_if_eligible,
+            cx,
+            |this| this.suggestions.as_mut(),
+            Self::should_exclude_suggestion,
+        );
+    }
+
+    fn accept_suggestion(
+        &mut self,
+        item: SuggestionItem,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.disabled || self.is_at_cap() {
+            return;
+        }
+        let added = self.add_tag_str(item.value.as_ref(), cx);
+        self.input
+            .update(cx, |s, cx| s.set_value_silent(String::new(), cx));
+        let now_at_cap = self.is_at_cap();
+        if now_at_cap {
+            if let Some(ctrl) = self.suggestions.as_mut() {
+                ctrl.close();
+            }
+            if let Some(window) = window {
+                window.focus(&self.focus_handle, cx);
+            }
+        } else if let Some(ctrl) = self.suggestions.as_mut() {
+            if ctrl.config().close_on_accept {
+                ctrl.close();
+            } else {
+                self.refresh_suggestions(true, cx);
+            }
+        }
+        if added {
+            cx.notify();
+        }
+    }
+
     /// Disables adding or removing tags.
     pub fn disabled(mut self, disabled: bool, cx: &mut Context<Self>) -> Self {
         self.disabled = disabled;
         self.input.update(cx, |s, cx| s.set_disabled(disabled, cx));
+        if disabled && let Some(ctrl) = self.suggestions.as_mut() {
+            ctrl.close();
+        }
         self
     }
 
@@ -883,6 +1122,9 @@ impl TagInputState {
         if self.disabled != disabled {
             self.disabled = disabled;
             self.input.update(cx, |s, cx| s.set_disabled(disabled, cx));
+            if disabled && let Some(ctrl) = self.suggestions.as_mut() {
+                ctrl.close();
+            }
             cx.notify();
         }
     }
@@ -895,6 +1137,17 @@ impl TagInputState {
     ) {
         self.tags = tags.into_iter().map(Into::into).collect();
         self.normalize_existing_tags();
+        if self.is_at_cap() {
+            if let Some(ctrl) = self.suggestions.as_mut() {
+                ctrl.close();
+            }
+        } else if self
+            .suggestions
+            .as_ref()
+            .is_some_and(CompletionController::is_open)
+        {
+            self.refresh_suggestions(false, cx);
+        }
         cx.emit(TagInputEvent::Change(self.tags.clone()));
         cx.notify();
     }
@@ -903,6 +1156,13 @@ impl TagInputState {
     pub fn clear(&mut self, cx: &mut Context<Self>) {
         if !self.tags.is_empty() {
             self.tags.clear();
+            if self
+                .suggestions
+                .as_ref()
+                .is_some_and(CompletionController::is_open)
+            {
+                self.refresh_suggestions(false, cx);
+            }
             cx.emit(TagInputEvent::Change(Vec::new()));
             cx.notify();
         }
@@ -947,7 +1207,15 @@ impl TagInputState {
     /// Removes the tag at `index`.
     pub fn remove_at(&mut self, index: usize, cx: &mut Context<Self>) {
         if !self.disabled && index < self.tags.len() {
+            let was_at_cap = self.is_at_cap();
             self.tags.remove(index);
+            let should_refresh = self
+                .suggestions
+                .as_ref()
+                .is_some_and(|c| c.is_open() || (was_at_cap && c.config().open_on_focus));
+            if should_refresh {
+                self.refresh_suggestions(was_at_cap, cx);
+            }
             cx.emit(TagInputEvent::Change(self.tags.clone()));
             cx.notify();
         }
@@ -1024,6 +1292,14 @@ impl Render for TagInputState {
                             } else {
                                 let fh = this.input.read(cx).focus_handle(cx);
                                 window.focus(&fh, cx);
+                                if this
+                                    .suggestions
+                                    .as_ref()
+                                    .is_some_and(|c| c.config().open_on_focus && !c.is_open())
+                                {
+                                    this.refresh_suggestions(true, cx);
+                                    cx.notify();
+                                }
                             }
                         }),
                     )
@@ -1035,12 +1311,56 @@ impl Render for TagInputState {
                             }
                         },
                     ))
-                    // Also handle raw `backspace` keydown when `at_cap` (inner Input unmounted) or unbound.
+                    // Intercept Submit action in Capture phase when a suggestion is highlighted.
+                    .capture_action(cx.listener(
+                        |this, _: &input_actions::Submit, window, cx| {
+                            if let Some(item) = this
+                                .suggestions
+                                .as_ref()
+                                .filter(|c| c.is_visible_popover())
+                                .and_then(|c| c.highlighted_item().cloned())
+                            {
+                                this.accept_suggestion(item, Some(window), cx);
+                                cx.stop_propagation();
+                            }
+                        },
+                    ))
+                    // Also handle raw `backspace` (when `at_cap` or unbound) and suggestion arrow keys.
                     .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                         if ev.keystroke.key == "backspace"
                             && this.remove_last_if_input_empty(window, cx)
                         {
                             cx.stop_propagation();
+                            return;
+                        }
+                        if this.is_at_cap() {
+                            return;
+                        }
+                        let Some(ctrl) = this.suggestions.as_mut() else {
+                            return;
+                        };
+                        match ctrl.handle_key_down(ev) {
+                            CompletionKeyOutcome::Ignored => {}
+                            CompletionKeyOutcome::ClosedPassThrough => {
+                                cx.notify();
+                            }
+                            CompletionKeyOutcome::Consumed => {
+                                cx.stop_propagation();
+                                cx.notify();
+                            }
+                            CompletionKeyOutcome::RequestOpen(edge) => {
+                                let query = this.input.read(cx).value().to_owned();
+                                if query.trim().chars().count() >= ctrl.config().min_chars {
+                                    ctrl.set_pending_highlight(edge);
+                                    this.refresh_suggestions(true, cx);
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                }
+                            }
+                            CompletionKeyOutcome::Accept(item) => {
+                                this.accept_suggestion(item, Some(window), cx);
+                                cx.stop_propagation();
+                            }
                         }
                     }))
             })
@@ -1070,7 +1390,31 @@ impl Render for TagInputState {
             });
 
         crate::Refineable::refine(root.style(), &self.frame_style);
-        root
+        if let Some(ctrl) = self.suggestions.as_ref() {
+            let popover = ctrl.render_popover(
+                "gpui-tag-suggestions",
+                cx.entity(),
+                cx,
+                |this| this.suggestions.as_mut(),
+                |this, item, window, cx| this.accept_suggestion(item, Some(window), cx),
+                |this, cx| this.close_suggestions(cx),
+            );
+            root = root.relative().child(ctrl.bounds_canvas());
+            let mut wrapper = div().flex().flex_col();
+            if self.frame_style.size.width.is_none() {
+                wrapper = wrapper.w_full();
+            }
+            wrapper.style().flex_grow = self.frame_style.flex_grow;
+            wrapper.style().flex_shrink = self.frame_style.flex_shrink;
+            wrapper.style().flex_basis = self.frame_style.flex_basis;
+            wrapper.style().min_size.width = self.frame_style.min_size.width;
+            wrapper
+                .child(root)
+                .when_some(popover, |el, pop| el.child(div().h_0().w_full().child(pop)))
+                .into_any_element()
+        } else {
+            root.into_any_element()
+        }
     }
 }
 

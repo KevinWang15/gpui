@@ -172,6 +172,36 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
                         ),
                 ),
         )
+        // Autocomplete & Suggestions Showcase (Sync & Async)
+        .child(
+            card()
+                .child(
+                    card_header()
+                        .bordered()
+                        .child(card_title("Autocomplete & Suggestions (Sync & Async)"))
+                        .child(card_description(
+                            "On-type fuzzy filtering, grouped virtualized popovers, debounced async loading with cancellation, and ↑/↓/PgUp/PgDn/Enter/Esc keyboard navigation.",
+                        )),
+                )
+                .child(
+                    card_content().child(
+                        grid(2)
+                            .spacing(px(16.))
+                            .child(
+                                field()
+                                    .label("Sync Local Fuzzy Search")
+                                    .description("Opens on focus, filters immediately on type, keeps ←/→ caret editing.")
+                                    .child(input(&app.sync_completion_input)),
+                            )
+                            .child(
+                                field()
+                                    .label("Async Debounced Search")
+                                    .description("180ms debounce + simulated remote latency. Type \"error\" to preview error state.")
+                                    .child(input(&app.async_completion_input)),
+                            ),
+                    ),
+                ),
+        )
         // Multi-line TextBox Workbench
         .child(
             grid(2)

@@ -8,11 +8,12 @@ use std::rc::Rc;
 use crate::{
     Anchor, Animation, AnimationExt, App, Bounds, Context, Entity, EventEmitter, FocusHandle,
     Focusable, FontWeight, IntoElement, KeyDownEvent, MouseButton, Pixels, Render, RenderOnce,
-    SharedString, StyleRefinement, Styled, Subscription, Window, anchored, canvas, deferred, div,
-    ease_out_quint, point, prelude::*, px,
+    ScrollHandle, SharedString, StyleRefinement, Styled, Subscription, Window, anchored, canvas,
+    deferred, div, ease_out_quint, point, prelude::*, px,
 };
 use crate::icons::{Icon, IconSize, LucideIcon};
 
+use super::focus::{is_list_nav_key, list_step};
 use super::input::{InputEvent, InputState};
 use super::layout::focus_ring_shadow;
 use super::theme::{ANIM_FAST, ActiveTheme, ComponentSize};
@@ -126,6 +127,7 @@ pub struct ComboBoxState<T: Clone + PartialEq + 'static> {
     invalid: bool,
     clearable: bool,
     max_menu_height: Pixels,
+    scroll_handle: ScrollHandle,
     trigger_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     frame_style: StyleRefinement,
 }
@@ -172,7 +174,7 @@ impl<T: Clone + PartialEq + 'static> ComboBoxState<T> {
                         this.close_menu(cx);
                     }
                 }
-                InputEvent::Focus | InputEvent::Blur => {}
+                InputEvent::Focus | InputEvent::Blur | InputEvent::AcceptSuggestion(_) => {}
             }
         });
 
@@ -194,6 +196,7 @@ impl<T: Clone + PartialEq + 'static> ComboBoxState<T> {
             invalid: false,
             clearable: true,
             max_menu_height: px(280.),
+            scroll_handle: ScrollHandle::new(),
             trigger_bounds: Rc::new(Cell::new(None)),
             frame_style: StyleRefinement::default(),
         }
@@ -420,22 +423,21 @@ impl<T: Clone + PartialEq + 'static> ComboBoxState<T> {
         cx.notify();
     }
 
-    fn move_highlight(&mut self, delta: isize, cx: &Context<Self>) {
-        let filtered = self.filtered_option_indices(cx);
-        if filtered.is_empty() {
-            self.highlighted_filtered_pos = None;
-            return;
-        }
-        let len = filtered.len();
-        let start = self.highlighted_filtered_pos.unwrap_or(0).min(len - 1);
-        for step in 1..=len {
-            let candidate =
-                ((start as isize + delta * step as isize).rem_euclid(len as isize)) as usize;
-            if !self.options[filtered[candidate]].disabled {
-                self.highlighted_filtered_pos = Some(candidate);
-                return;
+    fn child_index_for_filtered_pos(&self, filtered: &[usize], target_pos: usize) -> usize {
+        let mut child_idx = 0usize;
+        let mut last_group: Option<&SharedString> = None;
+        for (pos, &opt_idx) in filtered.iter().enumerate() {
+            let option = &self.options[opt_idx];
+            if option.group.as_ref() != last_group && option.group.is_some() {
+                child_idx += 1;
             }
+            last_group = option.group.as_ref();
+            if pos == target_pos {
+                return child_idx;
+            }
+            child_idx += 1;
         }
+        child_idx
     }
 
     fn on_key_down(
@@ -447,25 +449,37 @@ impl<T: Clone + PartialEq + 'static> ComboBoxState<T> {
         if self.disabled {
             return;
         }
-        match event.keystroke.key.as_str() {
-            "down" => {
-                if !self.open {
+        let mods = &event.keystroke.modifiers;
+        let key = event.keystroke.key.as_str();
+        if !mods.modified() && is_list_nav_key(key, false) {
+            if !self.open {
+                if matches!(key, "down" | "up") {
                     self.open_menu(window, cx);
-                } else {
-                    self.move_highlight(1, cx);
-                    cx.notify();
+                    cx.stop_propagation();
                 }
-                cx.stop_propagation();
+                return;
             }
-            "up" => {
-                if !self.open {
-                    self.open_menu(window, cx);
-                } else {
-                    self.move_highlight(-1, cx);
-                    cx.notify();
+            let filtered = self.filtered_option_indices(cx);
+            if filtered.is_empty() {
+                self.highlighted_filtered_pos = None;
+            } else {
+                let enabled: Vec<bool> = filtered
+                    .iter()
+                    .map(|&idx| !self.options[idx].disabled)
+                    .collect();
+                if let Some(next) =
+                    list_step(key, self.highlighted_filtered_pos, &enabled, 6, false)
+                {
+                    self.highlighted_filtered_pos = Some(next);
+                    self.scroll_handle
+                        .scroll_to_item(self.child_index_for_filtered_pos(&filtered, next));
                 }
-                cx.stop_propagation();
             }
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
+        match key {
             "enter" => {
                 if !self.open {
                     self.open_menu(window, cx);
@@ -739,13 +753,22 @@ impl<T: Clone + PartialEq + 'static> Render for ComboBoxState<T> {
             );
 
         let menu = if self.open {
+            let reduce_motion = cx.reduce_motion();
             let filtered = self.filtered_option_indices(cx);
             let query_text = self.search_input.read(cx).value().trim().to_owned();
 
-            let mut list_items = div().flex().flex_col().w_full().p(px(4.));
+            let mut list_body = div()
+                .id("gpui-combobox-list")
+                .flex()
+                .flex_col()
+                .w_full()
+                .max_h(self.max_menu_height)
+                .p(px(4.))
+                .overflow_y_scroll()
+                .track_scroll(&self.scroll_handle);
 
             if filtered.is_empty() {
-                list_items = list_items.child(
+                list_body = list_body.child(
                     div()
                         .flex()
                         .flex_col()
@@ -762,7 +785,7 @@ impl<T: Clone + PartialEq + 'static> Render for ComboBoxState<T> {
                     let create_label = SharedString::from(format!("Create \"{query_text}\""));
                     let create_value = SharedString::from(query_text);
                     let entity_create = entity;
-                    list_items = list_items.child(
+                    list_body = list_body.child(
                         div()
                             .id("gpui-combobox-create")
                             .flex()
@@ -800,7 +823,7 @@ impl<T: Clone + PartialEq + 'static> Render for ComboBoxState<T> {
                     if option.group != last_group
                         && let Some(group_name) = option.group.clone()
                     {
-                        list_items = list_items.child(
+                        list_body = list_body.child(
                             div()
                                 .px(px(10.))
                                 .pt(px(6.))
@@ -817,7 +840,7 @@ impl<T: Clone + PartialEq + 'static> Render for ComboBoxState<T> {
                     let is_highlighted = self.highlighted_filtered_pos == Some(filtered_pos);
                     let entity_opt = entity.clone();
 
-                    list_items = list_items.child(
+                    list_body = list_body.child(
                         div()
                             .id(("gpui-combobox-option", opt_idx))
                             .flex()
@@ -899,12 +922,6 @@ impl<T: Clone + PartialEq + 'static> Render for ComboBoxState<T> {
                 }
             }
 
-            let list_body = div()
-                .id("gpui-combobox-list")
-                .max_h(self.max_menu_height)
-                .overflow_y_scroll()
-                .child(list_items);
-
             let panel = div()
                 .flex()
                 .flex_col()
@@ -928,12 +945,19 @@ impl<T: Clone + PartialEq + 'static> Render for ComboBoxState<T> {
                         .border_color(theme.border)
                         .child(self.search_input.clone()),
                 )
-                .child(list_body)
-                .with_animation(
-                    "gpui-combobox-menu-anim",
-                    Animation::new(ANIM_FAST).with_easing(ease_out_quint()),
-                    |el, delta| el.opacity(delta).mt(px(-6.0 * (1.0 - delta))),
-                );
+                .child(list_body);
+
+            let panel_el = if reduce_motion {
+                panel.into_any_element()
+            } else {
+                panel
+                    .with_animation(
+                        "gpui-combobox-menu-anim",
+                        Animation::new(ANIM_FAST).with_easing(ease_out_quint()),
+                        |el, delta| el.opacity(delta).mt(px(-6.0 * (1.0 - delta))),
+                    )
+                    .into_any_element()
+            };
 
             let mut anchor = anchored()
                 .anchor(Anchor::TopLeft)
@@ -946,7 +970,7 @@ impl<T: Clone + PartialEq + 'static> Render for ComboBoxState<T> {
                 anchor = anchor.offset(point(px(0.), px(4.)));
             }
 
-            Some(deferred(anchor.child(panel)).priority(20))
+            Some(deferred(anchor.child(panel_el)).priority(20))
         } else {
             None
         };

@@ -233,9 +233,9 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
                 .child(
                     card_header()
                         .bordered()
-                        .child(card_title("TagInput (Free-Form Chips) & FormState Validation"))
+                        .child(card_title("TagInput (Chips + Suggestions) & FormState Validation"))
                         .child(card_description(
-                            "Type comma or Enter to add tags, Backspace to pop last tag, and test live FormRule validation.",
+                            "Type to filter tag suggestions, ↑/↓ + Enter to accept, comma for custom tags, Backspace to pop, and test live FormRule validation.",
                         )),
                 )
                 .child(

@@ -13,7 +13,9 @@ use crate::{
     ease_out_quint, prelude::*, px, uniform_list,
 };
 
+use super::completion::fuzzy_match_score_lower;
 use super::field::kbd;
+use super::focus::{is_list_nav_key, list_step, step_enabled};
 use super::input::{Input, InputEvent, InputState};
 use super::theme::{ANIM_FAST, ActiveTheme, ComponentSize};
 
@@ -164,57 +166,10 @@ impl Focusable for CommandPaletteState {
     }
 }
 
-/// Scores a fuzzy subsequence / substring match where `q_low` and `hay_low` are already lowercased.
-fn fuzzy_match_score_lower(q_low: &str, hay_low: &str) -> Option<i32> {
-    if q_low.is_empty() {
-        return Some(0);
-    }
-    if hay_low == q_low {
-        return Some(1000);
-    }
-    if let Some(pos) = hay_low.find(q_low) {
-        let base = if pos == 0 { 600 } else { 350 };
-        return Some(base - (pos as i32).min(80));
-    }
-    // Ordered character subsequence match with bounded bonus so contiguous matches always outrank.
-    let mut score = 0i32;
-    let mut q_chars = q_low.chars().peekable();
-    let mut prev_matched = false;
-    let mut prev_char = ' ';
-    for ch in hay_low.chars() {
-        if let Some(&target) = q_chars.peek()
-            && ch == target
-        {
-            q_chars.next();
-            score += 10;
-            if prev_matched {
-                score += 8;
-            }
-            if prev_char == ' ' || prev_char == '-' || prev_char == '_' || prev_char == '/' {
-                score += 6;
-            }
-            prev_matched = true;
-        } else {
-            prev_matched = false;
-        }
-        prev_char = ch;
-    }
-    if q_chars.peek().is_none() {
-        Some(score.min(240))
-    } else {
-        None
-    }
-}
-
 /// Scores a fuzzy subsequence / substring match. Returns `None` if `query` does not match `text`.
 #[cfg(test)]
 pub(crate) fn fuzzy_match_score(query: &str, text: &str) -> Option<i32> {
-    let q = query.trim().to_lowercase();
-    if q.is_empty() {
-        return Some(0);
-    }
-    let hay = text.to_lowercase();
-    fuzzy_match_score_lower(&q, &hay)
+    super::completion::fuzzy_match_score(query, text)
 }
 
 impl CommandPaletteState {
@@ -458,28 +413,46 @@ impl CommandPaletteState {
         self.compute_grouped_for_query(query).0
     }
 
+    fn enabled_visual_flags(&self) -> Vec<bool> {
+        self.cached_visual_items
+            .iter()
+            .map(|&item_idx| !self.items[item_idx].item.disabled)
+            .collect()
+    }
+
+    fn apply_visual_selection(&mut self, next: Option<usize>, cx: &mut Context<Self>) {
+        if let Some(next) = next {
+            self.selected_idx = next;
+            if let Some(&row_idx) = self.cached_row_indices.get(next) {
+                self.scroll_handle
+                    .scroll_to_item(row_idx, ScrollStrategy::Nearest);
+            }
+            cx.notify();
+        }
+    }
+
     fn move_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
         let query = self.search_input.read(cx).value().to_string();
         self.ensure_cache(&query);
-        let count = self.cached_visual_items.len();
-        if count == 0 {
+        if self.cached_visual_items.is_empty() {
             self.selected_idx = 0;
             return;
         }
-        let len = count as isize;
-        let mut next = (self.selected_idx as isize + delta).rem_euclid(len) as usize;
-        for _ in 0..count {
-            if !self.items[self.cached_visual_items[next]].item.disabled {
-                break;
-            }
-            next = (next as isize + delta.signum()).rem_euclid(len) as usize;
+        let enabled = self.enabled_visual_flags();
+        let next = step_enabled(Some(self.selected_idx), delta, &enabled);
+        self.apply_visual_selection(next, cx);
+    }
+
+    fn step_selection_key(&mut self, key: &str, cx: &mut Context<Self>) {
+        let query = self.search_input.read(cx).value().to_string();
+        self.ensure_cache(&query);
+        if self.cached_visual_items.is_empty() {
+            self.selected_idx = 0;
+            return;
         }
-        self.selected_idx = next;
-        if let Some(&row_idx) = self.cached_row_indices.get(next) {
-            self.scroll_handle
-                .scroll_to_item(row_idx, ScrollStrategy::Nearest);
-        }
-        cx.notify();
+        let enabled = self.enabled_visual_flags();
+        let next = list_step(key, Some(self.selected_idx), &enabled, 6, false);
+        self.apply_visual_selection(next, cx);
     }
 
     fn execute_at(&mut self, visual_pos: usize, window: Option<&mut Window>, cx: &mut Context<Self>) {
@@ -521,17 +494,15 @@ impl CommandPaletteState {
         if !self.open {
             return;
         }
-        match event.keystroke.key.as_str() {
+        let key = event.keystroke.key.as_str();
+        if !event.keystroke.modifiers.modified() && is_list_nav_key(key, false) {
+            self.step_selection_key(key, cx);
+            cx.stop_propagation();
+            return;
+        }
+        match key {
             "escape" => {
                 self.close_in(window, cx);
-                cx.stop_propagation();
-            }
-            "down" => {
-                self.move_selection(1, cx);
-                cx.stop_propagation();
-            }
-            "up" => {
-                self.move_selection(-1, cx);
                 cx.stop_propagation();
             }
             "enter" => {

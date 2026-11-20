@@ -128,6 +128,8 @@ pub struct PlaygroundApp {
 
     // Input & TextBox workbench state
     pub sandbox_input: Entity<InputState>,
+    pub sync_completion_input: Entity<InputState>,
+    pub async_completion_input: Entity<InputState>,
     pub input_size: ComponentSize,
     pub input_masked: bool,
     pub input_clearable: bool,
@@ -349,6 +351,151 @@ impl PlaygroundApp {
             false,
             cx,
         );
+
+        let sync_completion_input = cx.new(|cx| {
+            InputState::new(cx)
+                .placeholder("Search crates, docs, or components (try 'gpui', 'blur', 'tag')...")
+                .leading_icon(LucideIcon::Search)
+                .clearable(true)
+                .completions(SuggestionSource::items([
+                    SuggestionItem::new("gpui::components::Input")
+                        .label("Input & Completions")
+                        .description("Single-line editor with IME, blinking caret, and sync/async suggestions")
+                        .group("Components")
+                        .icon(LucideIcon::TextCursorInput)
+                        .badge("sync")
+                        .keywords(["search", "autocomplete", "field"]),
+                    SuggestionItem::new("gpui::components::TagInput")
+                        .label("TagInput")
+                        .description("Free-form chip input with live tag suggestions & arrow navigation")
+                        .group("Components")
+                        .icon(LucideIcon::Tags)
+                        .badge("chips")
+                        .keywords(["tags", "pills", "labels"]),
+                    SuggestionItem::new("gpui::components::CommandPalette")
+                        .label("CommandPalette")
+                        .description("Spotlight-style fuzzy command launcher with uniform_list virtualization")
+                        .group("Components")
+                        .icon(LucideIcon::Terminal)
+                        .badge("⌘K")
+                        .keywords(["spotlight", "fuzzy", "modal"]),
+                    SuggestionItem::new("gpui::components::LiquidGlass")
+                        .label("LiquidGlass")
+                        .description("Dual-Kawase GPU backdrop blur with Snell refraction & dispersion")
+                        .group("Graphics")
+                        .icon(LucideIcon::Sparkles)
+                        .keywords(["blur", "shader", "frost"]),
+                    SuggestionItem::new("gpui::components::VirtualTable")
+                        .label("VirtualTable")
+                        .description("10,000+ row virtualized table with sticky headers & sorting")
+                        .group("Data")
+                        .icon(LucideIcon::Table)
+                        .keywords(["table", "grid", "rows"]),
+                    SuggestionItem::new("gpui::ArrowNavigation")
+                        .label("ArrowNavigation")
+                        .description("Container-level Vertical/Horizontal/Both keyboard focus stepping")
+                        .group("Keyboard")
+                        .icon(LucideIcon::Keyboard)
+                        .keywords(["arrows", "focus", "a11y"]),
+                ]))
+                .completion_config(
+                    CompletionConfig::search()
+                        .open_on_focus(true)
+                        .empty_message(Some("No matching catalog entries.".into())),
+                )
+        });
+        cx.subscribe(&sync_completion_input, |this, _, ev: &InputEvent, cx| {
+            match ev {
+                InputEvent::AcceptSuggestion(item) => {
+                    this.log_event(
+                        "Search(Sync)",
+                        format!("AcceptSuggestion(\"{}\")", item.value),
+                        cx,
+                    );
+                }
+                InputEvent::Submit(val) => {
+                    this.log_event("Search(Sync)", format!("Submit(\"{val}\")"), cx);
+                }
+                _ => {}
+            }
+        })
+        .detach();
+
+        let async_completion_input = cx.new(|cx| {
+            InputState::new(cx)
+                .placeholder("Async debounced search (type 'rust', 'gpu', or 'error')...")
+                .leading_icon(LucideIcon::Globe)
+                .clearable(true)
+                .completions(
+                    SuggestionSource::async_loader(|query, cx| {
+                        let q = query.trim().to_owned();
+                        let bg = cx.background_executor().clone();
+                        cx.background_spawn(async move {
+                            bg.timer(Duration::from_millis(280)).await;
+                            if q.eq_ignore_ascii_case("error") {
+                                return Err(SharedString::from(
+                                    "Simulated remote search error (try another query)",
+                                ));
+                            }
+                            let remote_catalog = vec![
+                                SuggestionItem::new("gpui")
+                                    .description("GPU-accelerated UI framework in Rust")
+                                    .group("Crates")
+                                    .icon(LucideIcon::Zap)
+                                    .badge("0.2"),
+                                SuggestionItem::new("wgpu")
+                                    .description("Portable Vulkan / Metal / DX12 graphics API")
+                                    .group("Crates")
+                                    .icon(LucideIcon::Cpu)
+                                    .badge("24.0"),
+                                SuggestionItem::new("taffy")
+                                    .description("High-performance Flexbox & CSS Grid layout")
+                                    .group("Crates")
+                                    .icon(LucideIcon::LayoutGrid)
+                                    .badge("0.7"),
+                                SuggestionItem::new("rust-analyzer")
+                                    .description("LSP server & incremental compiler frontend")
+                                    .group("Tooling")
+                                    .icon(LucideIcon::CodeXml)
+                                    .badge("lsp"),
+                                SuggestionItem::new("cargo-nextest")
+                                    .description("Next-generation test runner for Rust")
+                                    .group("Tooling")
+                                    .icon(LucideIcon::Check)
+                                    .badge("test"),
+                                SuggestionItem::new("tokio")
+                                    .description("Async runtime for reliable network services")
+                                    .group("Async")
+                                    .icon(LucideIcon::Activity)
+                                    .badge("1.44"),
+                            ];
+                            Ok(filter_suggestions(&q, remote_catalog))
+                        })
+                    })
+                    .debounce(Duration::from_millis(180)),
+                )
+                .completion_config(
+                    CompletionConfig::search()
+                        .loading_message("Querying remote index...")
+                        .empty_message(Some("No remote results found.".into())),
+                )
+        });
+        cx.subscribe(&async_completion_input, |this, _, ev: &InputEvent, cx| {
+            match ev {
+                InputEvent::AcceptSuggestion(item) => {
+                    this.log_event(
+                        "Search(Async)",
+                        format!("AcceptSuggestion(\"{}\")", item.value),
+                        cx,
+                    );
+                }
+                InputEvent::Submit(val) => {
+                    this.log_event("Search(Async)", format!("Submit(\"{val}\")"), cx);
+                }
+                _ => {}
+            }
+        })
+        .detach();
 
         let form_email = cx.new(|cx| {
             InputState::new(cx)
@@ -1136,6 +1283,38 @@ impl PlaygroundApp {
             TagInputState::new(cx)
                 .default_tags(["rust", "gpui", "directx11", "vulkan"])
                 .max_tags(8)
+                .suggestions(SuggestionSource::items([
+                    SuggestionItem::new("rust")
+                        .description("Systems programming language")
+                        .icon(LucideIcon::Flame),
+                    SuggestionItem::new("gpui")
+                        .description("GPU-accelerated UI framework")
+                        .icon(LucideIcon::Zap),
+                    SuggestionItem::new("directx11")
+                        .description("Windows graphics backend")
+                        .icon(LucideIcon::Cpu),
+                    SuggestionItem::new("vulkan")
+                        .description("Cross-platform explicit GPU API")
+                        .icon(LucideIcon::Cpu),
+                    SuggestionItem::new("metal")
+                        .description("Apple GPU rendering backend")
+                        .icon(LucideIcon::Sparkles),
+                    SuggestionItem::new("wayland")
+                        .description("Modern Linux compositor protocol")
+                        .icon(LucideIcon::AppWindow),
+                    SuggestionItem::new("wgpu")
+                        .description("Portable WebGPU implementation")
+                        .icon(LucideIcon::Layers),
+                    SuggestionItem::new("taffy")
+                        .description("Flexbox & Grid layout engine")
+                        .icon(LucideIcon::LayoutGrid),
+                    SuggestionItem::new("lucide")
+                        .description("Bundled stroke SVG icon set")
+                        .icon(LucideIcon::Shapes),
+                    SuggestionItem::new("a11y")
+                        .description("Keyboard navigation & focus rules")
+                        .icon(LucideIcon::Keyboard),
+                ]))
         });
         cx.subscribe(&demo_tag_input, |this, _, ev: &TagInputEvent, cx| {
             let TagInputEvent::Change(tags) = ev;
@@ -1472,6 +1651,8 @@ impl PlaygroundApp {
             fmt_align: 0,
 
             sandbox_input,
+            sync_completion_input,
+            async_completion_input,
             input_size: ComponentSize::Md,
             input_masked: false,
             input_clearable: true,
@@ -1694,6 +1875,13 @@ impl PlaygroundApp {
                     ToastVariant::Info,
                     "Input submitted",
                     Some(val.as_ref()),
+                    cx,
+                );
+            }
+            InputEvent::AcceptSuggestion(item) => {
+                this.log_event(
+                    "Input",
+                    format!("AcceptSuggestion(\"{}\")", item.value),
                     cx,
                 );
             }

@@ -9,6 +9,14 @@
 //! - **One tab stop per choice group.** A group that holds one choice (tabs,
 //!   a segmented control, a radio group) is a single tab stop, its selected
 //!   item; the arrow keys move the choice, and focus with it.
+//! - **Real focus vs. active-descendant lists.** Toolbars, sidebars, calendars,
+//!   and roving lists move real window focus with
+//!   [`crate::InteractiveElement::arrow_navigation`] or [`roving_keys`]. Text
+//!   inputs with completion popups (`Input`, `TagInput`) and dropdown listboxes
+//!   (`Select`, `ComboBox`, `CommandPalette`) keep real focus on the input or
+//!   trigger and step a highlighted index with [`list_step`] / [`step_enabled`],
+//!   stopping arrow propagation so an enclosing `.arrow_navigation(...)`
+//!   container never steals focus while suggestions are active.
 //! - **Enter and Space activate** the focused control (a focused element's
 //!   `on_click` gets a `ClickEvent::Keyboard`).
 //! - **Escape** closes the overlay or menu that has focus.
@@ -212,6 +220,104 @@ pub(crate) fn roving_keys(
     }
 }
 
+/// Steps an active-descendant highlight index by `delta` (`+1` or `-1` for
+/// arrows, or larger signed offsets), wrapping around the list and skipping
+/// disabled items (`enabled[i] == false`).
+///
+/// When `current` is `None`, a positive `delta` selects the first enabled item
+/// and a negative `delta` selects the last enabled item. Returns `None` if no
+/// item is enabled.
+pub(crate) fn step_enabled(
+    current: Option<usize>,
+    delta: isize,
+    enabled: &[bool],
+) -> Option<usize> {
+    let n = enabled.len();
+    if n == 0 {
+        return None;
+    }
+    if delta == 0 {
+        return current
+            .filter(|&i| enabled.get(i).copied().unwrap_or(false))
+            .or_else(|| enabled.iter().position(|&e| e));
+    }
+    let Some(from) = current else {
+        return if delta > 0 {
+            enabled.iter().position(|&e| e)
+        } else {
+            enabled.iter().rposition(|&e| e)
+        };
+    };
+    let from = from.min(n - 1);
+    let len = n as isize;
+    let dir = delta.signum();
+    let start = (from as isize + delta).rem_euclid(len) as usize;
+    for offset in 0..n {
+        let candidate = (start as isize + dir * offset as isize).rem_euclid(len) as usize;
+        if enabled[candidate] {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Returns `true` if `key` is a vertical active-descendant list navigation key.
+///
+/// Pass `home_end = false` when focus is inside a text input so `Home` and
+/// `End` continue moving the text caret.
+pub(crate) fn is_list_nav_key(key: &str, home_end: bool) -> bool {
+    matches!(key, "down" | "up" | "pagedown" | "pageup")
+        || (home_end && matches!(key, "home" | "end"))
+}
+
+/// Computes the next active-descendant highlight index for a vertical list.
+///
+/// - `"down"` / `"up"` wrap around and skip disabled items.
+/// - `"pagedown"` / `"pageup"` jump by `page_size` and clamp to the last /
+///   first enabled item rather than wrapping.
+/// - `"home"` / `"end"` jump to the first / last enabled item when `home_end`
+///   is `true`.
+///
+/// Returns `None` for unrelated keys or when no enabled item exists.
+pub(crate) fn list_step(
+    key: &str,
+    current: Option<usize>,
+    enabled: &[bool],
+    page_size: usize,
+    home_end: bool,
+) -> Option<usize> {
+    let n = enabled.len();
+    if n == 0 {
+        return None;
+    }
+    match key {
+        "down" => step_enabled(current, 1, enabled),
+        "up" => step_enabled(current, -1, enabled),
+        "pagedown" => {
+            let Some(from) = current else {
+                return enabled.iter().position(|&e| e);
+            };
+            let target = (from.min(n - 1) + page_size.max(1)).min(n - 1);
+            (target..n)
+                .find(|&i| enabled[i])
+                .or_else(|| (0..=target).rev().find(|&i| enabled[i]))
+        }
+        "pageup" => {
+            let Some(from) = current else {
+                return enabled.iter().rposition(|&e| e);
+            };
+            let target = from.min(n - 1).saturating_sub(page_size.max(1));
+            (0..=target)
+                .rev()
+                .find(|&i| enabled[i])
+                .or_else(|| (target..n).find(|&i| enabled[i]))
+        }
+        "home" if home_end => enabled.iter().position(|&e| e),
+        "end" if home_end => enabled.iter().rposition(|&e| e),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,5 +335,31 @@ mod tests {
         assert_eq!(choice_tab_item(Some(1), &enabled), Some(0));
         assert_eq!(choice_tab_item(Some(2), &enabled), Some(2));
         assert_eq!(choice_tab_item(None, &[false, false]), None);
+    }
+
+    #[test]
+    fn list_step_handles_none_disabled_wrap_and_paging() {
+        let enabled = [false, true, false, true, true, false, true];
+        // Starting from None: Down picks first enabled, Up picks last enabled.
+        assert_eq!(list_step("down", None, &enabled, 3, false), Some(1));
+        assert_eq!(list_step("up", None, &enabled, 3, false), Some(6));
+        // Arrow wrapping skips disabled items.
+        assert_eq!(list_step("down", Some(1), &enabled, 3, false), Some(3));
+        assert_eq!(list_step("down", Some(6), &enabled, 3, false), Some(1));
+        assert_eq!(list_step("up", Some(1), &enabled, 3, false), Some(6));
+        assert_eq!(list_step("up", Some(3), &enabled, 3, false), Some(1));
+        // PageDown / PageUp clamp instead of wrapping, skipping disabled landings.
+        assert_eq!(list_step("pagedown", Some(1), &enabled, 3, false), Some(4));
+        assert_eq!(list_step("pagedown", Some(4), &enabled, 5, false), Some(6));
+        assert_eq!(list_step("pageup", Some(6), &enabled, 3, false), Some(3));
+        assert_eq!(list_step("pageup", Some(3), &enabled, 10, false), Some(1));
+        // Home/End only active when home_end = true.
+        assert_eq!(list_step("home", Some(4), &enabled, 3, false), None);
+        assert_eq!(list_step("end", Some(1), &enabled, 3, false), None);
+        assert_eq!(list_step("home", Some(4), &enabled, 3, true), Some(1));
+        assert_eq!(list_step("end", Some(1), &enabled, 3, true), Some(6));
+        // All-disabled / empty lists always return None.
+        assert_eq!(list_step("down", None, &[false, false], 3, true), None);
+        assert_eq!(list_step("down", Some(0), &[], 3, true), None);
     }
 }

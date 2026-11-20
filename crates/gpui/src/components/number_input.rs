@@ -87,7 +87,7 @@ impl NumberInputState {
             InputEvent::Submit(_) => {
                 this.commit_text(cx, true);
             }
-            InputEvent::Focus => {
+            InputEvent::Focus | InputEvent::AcceptSuggestion(_) => {
                 cx.notify();
             }
         })

@@ -52,7 +52,8 @@ Native desktop file dropzone (`ExternalPaths` drag-over highlight + drop) and na
 - **`List` & `VirtualList`** (`components/list.rs`): Action rows (avatar/icon, title, subtitle, trailing badges/buttons) plus `uniform_list` virtual scrolling for thousands of rows.
 - **`Typography`** (`components/typography.rs`): `Heading` (`H1`–`H5`), `Text` (`ui_text` with `.code()`, `.copyable(...)`, tones), click-to-edit inline `EditableText`, expandable `TruncatedText` (`"Show more"`), and `CodeBlock` with line numbers & copy.
 - **`ResultView`** (`components/result.rs`): Outcome screens for `Success`, `Error`, `Warning`, `Info`, `Forbidden` (403), `NotFound` (404), and `ServerError` (500).
-- **`Transfer` & `TagInput`** (`components/transfer_tags.rs`): Dual-column searchable shuttle (`Available ⇄ Selected`) and free-form pill chip input (`Enter`/`,` to add, `Backspace` to pop, deduplication, max cap).
+- **`Transfer` & `TagInput`** (`components/transfer_tags.rs`): Dual-column searchable shuttle (`Available ⇄ Selected`) and pill chip input (`Enter`/`,` to add, `Backspace` to pop, deduplication, max cap, plus sync/async `.suggestions(SuggestionSource)` autocomplete with live exclusion of selected tags and arrow-key navigation).
+- **Completions & Suggestions** (`components/completion.rs`): Shared sync/dynamic/async `SuggestionSource`, `SuggestionItem`, `CompletionConfig`, and fuzzy matcher (`fuzzy_match_score`, `filter_suggestions`) attachable to both `InputState::completions(...)` and `TagInputState::suggestions(...)` with debouncing, generation-guarded stale cancellation, grouped virtualized popovers, and unified active-descendant keyboard navigation (`Up`/`Down`/`PageUp`/`PageDown`/`Enter`/`Escape`/`Tab`).
 
 ---
 
