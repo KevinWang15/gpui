@@ -358,7 +358,7 @@ fn vt_spectrum_weight(s: f32, chroma: f32) -> vec3<f32> {
 fn vt_chromatic_warp_layer(
     use_new: bool,
     p_rel: vec2<f32>,
-    r: f32,
+    r_eff: f32,
     aspect: f32,
     pivot: vec2<f32>,
     base_zoom: f32,
@@ -379,13 +379,18 @@ fn vt_chromatic_warp_layer(
     for (var i = 0; i < 24; i += 1) {
         let s = ((f32(i) + jitter) / 24.0) - 0.5;
         let tap_zoom = max(base_zoom * exp(s * blur_radial), 0.06);
-        let tap_angle = base_angle + s * blur_rot + swirl * r;
+        let tap_angle = base_angle + s * blur_rot + swirl * r_eff;
         let p_rot = vt_rotate2d(p_rel, tap_angle);
-        let radial_k = 1.0 / max(1.0 + barrel * r * r, 0.25);
+        let radial_k = 1.0 / max(1.0 + barrel * r_eff * r_eff, 0.25);
         let p_warped = (p_rot * radial_k) / tap_zoom;
         let sample_uv = vt_mirror_uv(p_warped * inv_aspect + pivot);
 
-        let tex = select(vt_sample_old(sample_uv), vt_sample_new(sample_uv), use_new);
+        var tex: vec4<f32>;
+        if (use_new) {
+            tex = vt_sample_new(sample_uv);
+        } else {
+            tex = vt_sample_old(sample_uv);
+        }
         let spec_w = vt_spectrum_weight(s, chroma);
         let bell = exp(-(s * s) / (2.0 * 0.34 * 0.34));
         acc_rgb += tex.rgb * spec_w;
@@ -410,10 +415,16 @@ fn vt_chromatic_warp(frag_pos: vec2<f32>, dims: vec2<f32>, dims_i: vec2<i32>) ->
 
     let uv = frag_pos / dims;
     let aspect = dims.x / max(dims.y, 1.0);
-    let norm_origin = clamp(params.origin_px / dims, vec2<f32>(0.0), vec2<f32>(1.0));
-    let pivot = mix(vec2<f32>(0.5, 0.5), norm_origin, 0.14);
+    // Anchor the hyper-zoom / whip-spin vortex directly at the user's click position.
+    let pivot = clamp(params.origin_px / dims, vec2<f32>(0.0), vec2<f32>(1.0));
     let p_rel = (uv - pivot) * vec2<f32>(aspect, 1.0);
     let r = length(p_rel);
+    // Scale radial falloff by farthest-corner distance from `pivot` so corner clicks keep
+    // the same silky dispersion & lens curvature as center clicks without over-stretching.
+    let far_delta = max(pivot, vec2<f32>(1.0) - pivot) * vec2<f32>(aspect, 1.0);
+    let max_r = max(length(far_delta), 0.5);
+    let center_max_r = length(vec2<f32>(0.5 * aspect, 0.5));
+    let r_eff = r * (center_max_r / max_r);
 
     // Blue-noise-like screen-space dither yields ultra-smooth streaks with zero grain.
     let jitter = vt_ign(floor(frag_pos) + vec2<f32>(floor(p * 120.0) * 5.588238, 0.0));
@@ -430,8 +441,8 @@ fn vt_chromatic_warp(frag_pos: vec2<f32>, dims: vec2<f32>, dims_i: vec2<i32>) ->
     let ang_old = 0.62 * e_out;
     let swirl_old = 0.34 * e_out;
     let barrel_old = 1.18 * e_out;
-    let blur_r_old = vel * (0.20 + 0.92 * r);
-    let blur_rot_old = vel * (0.24 + 0.12 * r);
+    let blur_r_old = vel * (0.20 + 0.92 * r_eff);
+    let blur_rot_old = vel * (0.24 + 0.12 * r_eff);
 
     // Incoming hyper-zoom from mirrored tunnel + continuous CCW whip-spin settle (frames 4 -> 5 -> 6).
     let b = clamp((1.0 - p) / 0.55, 0.0, 1.0);
@@ -440,32 +451,32 @@ fn vt_chromatic_warp(frag_pos: vec2<f32>, dims: vec2<f32>, dims_i: vec2<i32>) ->
     let ang_new = -0.68 * e_in;
     let swirl_new = -0.30 * e_in;
     let barrel_new = 0.80 * e_in;
-    let blur_r_new = vel * (0.22 + 0.96 * r);
-    let blur_rot_new = vel * (0.22 + 0.10 * r);
+    let blur_r_new = vel * (0.22 + 0.96 * r_eff);
+    let blur_rot_new = vel * (0.22 + 0.10 * r_eff);
 
     // Tight whip-cut right through peak velocity so neither frame washes into flat grey.
     let mix_new = smoothstep(0.44, 0.54, p);
     var color: vec4<f32>;
     if (mix_new <= 0.0005) {
         color = vt_chromatic_warp_layer(
-            false, p_rel, r, aspect, pivot,
+            false, p_rel, r_eff, aspect, pivot,
             zoom_old, ang_old, swirl_old, barrel_old,
             blur_r_old, blur_rot_old, chroma, jitter,
         );
     } else if (mix_new >= 0.9995) {
         color = vt_chromatic_warp_layer(
-            true, p_rel, r, aspect, pivot,
+            true, p_rel, r_eff, aspect, pivot,
             zoom_new, ang_new, swirl_new, barrel_new,
             blur_r_new, blur_rot_new, chroma, jitter,
         );
     } else {
         let old_col = vt_chromatic_warp_layer(
-            false, p_rel, r, aspect, pivot,
+            false, p_rel, r_eff, aspect, pivot,
             zoom_old, ang_old, swirl_old, barrel_old,
             blur_r_old, blur_rot_old, chroma, jitter,
         );
         let new_col = vt_chromatic_warp_layer(
-            true, p_rel, r, aspect, pivot,
+            true, p_rel, r_eff, aspect, pivot,
             zoom_new, ang_new, swirl_new, barrel_new,
             blur_r_new, blur_rot_new, chroma, jitter,
         );
@@ -476,8 +487,8 @@ fn vt_chromatic_warp(frag_pos: vec2<f32>, dims: vec2<f32>, dims_i: vec2<i32>) ->
     let luma = dot(color.rgb, vec3<f32>(0.299, 0.587, 0.114));
     let sat_boost = 1.0 + 0.28 * vel;
     let boosted = mix(vec3<f32>(luma), color.rgb, sat_boost);
-    let vignette = 1.0 - 0.12 * vel * clamp(r * r, 0.0, 1.4);
-    let core_glow = apex * smoothstep(0.95, 0.0, r) * 0.06 * color.a;
+    let vignette = 1.0 - 0.12 * vel * clamp(r_eff * r_eff, 0.0, 1.4);
+    let core_glow = apex * (1.0 - smoothstep(0.0, 0.95, r_eff)) * 0.06 * color.a;
     let final_rgb = clamp(boosted * vignette + vec3<f32>(core_glow), vec3<f32>(0.0), vec3<f32>(1.0));
     return vec4<f32>(final_rgb, color.a);
 }

@@ -1708,7 +1708,7 @@ float3 vt_spectrum_weight(float s, float chroma) {
 float4 vt_chromatic_warp_layer(
     bool use_new,
     float2 p_rel,
-    float r,
+    float r_eff,
     float aspect,
     float2 pivot,
     float base_zoom,
@@ -1730,9 +1730,9 @@ float4 vt_chromatic_warp_layer(
     for (int i = 0; i < 24; i++) {
         float s = ((float(i) + jitter) / 24.0) - 0.5;
         float tap_zoom = max(base_zoom * exp(s * blur_radial), 0.06);
-        float tap_angle = base_angle + s * blur_rot + swirl * r;
+        float tap_angle = base_angle + s * blur_rot + swirl * r_eff;
         float2 p_rot = vt_rotate2d(p_rel, tap_angle);
-        float radial_k = 1.0 / max(1.0 + barrel * r * r, 0.25);
+        float radial_k = 1.0 / max(1.0 + barrel * r_eff * r_eff, 0.25);
         float2 p_warped = (p_rot * radial_k) / tap_zoom;
         float2 sample_uv = vt_mirror_uv(p_warped * inv_aspect + pivot);
 
@@ -1761,10 +1761,13 @@ float4 vt_chromatic_warp(float2 frag_pos, float2 dims) {
 
     float2 uv = frag_pos / dims;
     float aspect = dims.x / max(dims.y, 1.0);
-    float2 norm_origin = saturate(vt_origin / dims);
-    float2 pivot = lerp(float2(0.5, 0.5), norm_origin, 0.14);
+    float2 pivot = saturate(vt_origin / dims);
     float2 p_rel = (uv - pivot) * float2(aspect, 1.0);
     float r = length(p_rel);
+    float2 far_delta = max(pivot, float2(1.0, 1.0) - pivot) * float2(aspect, 1.0);
+    float max_r = max(length(far_delta), 0.5);
+    float center_max_r = length(float2(0.5 * aspect, 0.5));
+    float r_eff = r * (center_max_r / max_r);
 
     float jitter = vt_ign(floor(frag_pos) + float2(floor(p * 120.0) * 5.588238, 0.0));
 
@@ -1778,8 +1781,8 @@ float4 vt_chromatic_warp(float2 frag_pos, float2 dims) {
     float ang_old = 0.62 * e_out;
     float swirl_old = 0.34 * e_out;
     float barrel_old = 1.18 * e_out;
-    float blur_r_old = vel * (0.20 + 0.92 * r);
-    float blur_rot_old = vel * (0.24 + 0.12 * r);
+    float blur_r_old = vel * (0.20 + 0.92 * r_eff);
+    float blur_rot_old = vel * (0.24 + 0.12 * r_eff);
 
     float b = saturate((1.0 - p) / 0.55);
     float e_in = pow(b, 1.95);
@@ -1787,31 +1790,31 @@ float4 vt_chromatic_warp(float2 frag_pos, float2 dims) {
     float ang_new = -0.68 * e_in;
     float swirl_new = -0.30 * e_in;
     float barrel_new = 0.80 * e_in;
-    float blur_r_new = vel * (0.22 + 0.96 * r);
-    float blur_rot_new = vel * (0.22 + 0.10 * r);
+    float blur_r_new = vel * (0.22 + 0.96 * r_eff);
+    float blur_rot_new = vel * (0.22 + 0.10 * r_eff);
 
     float mix_new = smoothstep(0.44, 0.54, p);
     float4 color;
     if (mix_new <= 0.0005) {
         color = vt_chromatic_warp_layer(
-            false, p_rel, r, aspect, pivot,
+            false, p_rel, r_eff, aspect, pivot,
             zoom_old, ang_old, swirl_old, barrel_old,
             blur_r_old, blur_rot_old, chroma, jitter
         );
     } else if (mix_new >= 0.9995) {
         color = vt_chromatic_warp_layer(
-            true, p_rel, r, aspect, pivot,
+            true, p_rel, r_eff, aspect, pivot,
             zoom_new, ang_new, swirl_new, barrel_new,
             blur_r_new, blur_rot_new, chroma, jitter
         );
     } else {
         float4 old_col = vt_chromatic_warp_layer(
-            false, p_rel, r, aspect, pivot,
+            false, p_rel, r_eff, aspect, pivot,
             zoom_old, ang_old, swirl_old, barrel_old,
             blur_r_old, blur_rot_old, chroma, jitter
         );
         float4 new_col = vt_chromatic_warp_layer(
-            true, p_rel, r, aspect, pivot,
+            true, p_rel, r_eff, aspect, pivot,
             zoom_new, ang_new, swirl_new, barrel_new,
             blur_r_new, blur_rot_new, chroma, jitter
         );
@@ -1821,8 +1824,8 @@ float4 vt_chromatic_warp(float2 frag_pos, float2 dims) {
     float luma = dot(color.rgb, float3(0.299, 0.587, 0.114));
     float sat_boost = 1.0 + 0.28 * vel;
     float3 boosted = lerp(float3(luma, luma, luma), color.rgb, sat_boost);
-    float vignette = 1.0 - 0.12 * vel * clamp(r * r, 0.0, 1.4);
-    float core_glow = apex * smoothstep(0.95, 0.0, r) * 0.06 * color.a;
+    float vignette = 1.0 - 0.12 * vel * clamp(r_eff * r_eff, 0.0, 1.4);
+    float core_glow = apex * (1.0 - smoothstep(0.0, 0.95, r_eff)) * 0.06 * color.a;
     float3 final_rgb = saturate(boosted * vignette + float3(core_glow, core_glow, core_glow));
     return float4(final_rgb, color.a);
 }
