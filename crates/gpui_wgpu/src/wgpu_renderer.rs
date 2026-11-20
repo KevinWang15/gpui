@@ -92,37 +92,24 @@ struct ViewTransitionParams {
     feather_px: f32,
     progress: f32,
     kind: u32,
-    _pad: [u32; 2],
+    viewport_px: [f32; 2],
 }
 
-impl From<SceneTransition> for ViewTransitionParams {
-    fn from(transition: SceneTransition) -> Self {
+impl ViewTransitionParams {
+    fn from_transition(transition: SceneTransition, size: Size<DevicePixels>) -> Self {
         Self {
             origin_px: [transition.origin.x.0, transition.origin.y.0],
             radius_px: transition.radius.0,
             feather_px: transition.feather.0,
             progress: transition.progress,
             kind: transition.kind as u32,
-            _pad: [0, 0],
+            viewport_px: [size.width.0.max(1) as f32, size.height.0.max(1) as f32],
         }
     }
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct BackdropBlurParams {
-    viewport_size: [f32; 2],
-    texel_size: [f32; 2],
-    offset: f32,
-    straight_alpha: u32,
-    from_snapshot: u32,
-    _pad: u32,
-    bounds_origin: [f32; 2],
-    bounds_size: [f32; 2],
-    corner_radii: [f32; 4],
-    mask_origin: [f32; 2],
-    mask_size: [f32; 2],
-}
+/// The blur shaders' uniform (`gpui::backdrop_blur::BlurParams`).
+use gpui::backdrop_blur::BlurParams as BackdropBlurParams;
 
 /// The frame is drawn into `scene` while it has blurs; each blur batch copies
 /// it into `snapshot` (level 0) and runs its passes through `levels`
@@ -792,7 +779,7 @@ impl WgpuRendererCore {
                     binding: 1,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
                         view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: false,
                     },
@@ -802,10 +789,16 @@ impl WgpuRendererCore {
                     binding: 2,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
                         view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: false,
                     },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
             ],
@@ -1845,12 +1838,18 @@ impl WgpuRendererCore {
                                 binding: 2,
                                 resource: wgpu::BindingResource::TextureView(new_view),
                             },
+                            wgpu::BindGroupEntry {
+                                binding: 3,
+                                resource: wgpu::BindingResource::Sampler(
+                                    &self.resources.atlas_sampler,
+                                ),
+                            },
                         ],
                     }),
             );
         }
 
-        let params = ViewTransitionParams::from(transition);
+        let params = ViewTransitionParams::from_transition(transition, size);
         self.resources.queue.write_buffer(
             &self.resources.view_transition_buffer,
             0,
@@ -2249,7 +2248,7 @@ impl WgpuRendererCore {
         for batch in &batches {
             if let PrimitiveBatch::BackdropBlurs(range) = batch {
                 for (plan, blurs) in gpui::backdrop_blur::group_by_plan(&scene.backdrop_blurs[range.clone()]) {
-                    required_slots += plan.passes().count() + blurs.len();
+                    required_slots += plan.map_or(0, |plan| plan.passes().count()) + blurs.len();
                 }
             }
         }
@@ -2257,15 +2256,15 @@ impl WgpuRendererCore {
 
         let viewport_width = size.width.0 as f32;
         let viewport_height = size.height.0 as f32;
-        let straight_alpha = !self.resources.pipelines.premultiplied_alpha as u32;
+        let straight_alpha = !self.resources.pipelines.premultiplied_alpha;
         let stride = self.backdrop_blur_stride;
 
         // Write slot 0 (bit-exact final blit params).
-        let zero_params = BackdropBlurParams::zeroed();
+        let zero_params = BackdropBlurParams::default();
         self.resources.queue.write_buffer(
             &self.resources.backdrop_blur_buffer,
             0,
-            bytemuck::bytes_of(&zero_params),
+            zero_params.as_bytes(),
         );
 
         let mut next_slot: u32 = 1;
@@ -2390,21 +2389,16 @@ impl WgpuRendererCore {
                 );
                 let (full_w, full_h) = (size.width.0 as u32, size.height.0 as u32);
                 for (plan, blurs) in gpui::backdrop_blur::group_by_plan(&scene.backdrop_blurs[blur_range]) {
-                    for blur_pass in plan.passes() {
+                    for blur_pass in plan.iter().flat_map(|plan| plan.passes()) {
+                        let plan = plan.expect("passes come from a plan");
                         let slot = next_slot;
                         next_slot += 1;
                         let (sw, sh) = gpui::backdrop_blur::level_size(full_w, full_h, blur_pass.source);
-                        let params = BackdropBlurParams {
-                            texel_size: [1.0 / sw as f32, 1.0 / sh as f32],
-                            offset: plan.offset,
-                            straight_alpha,
-                            from_snapshot: (blur_pass.source == 0) as u32,
-                            ..zero_params
-                        };
+                        let params = BackdropBlurParams::pass(plan, sw, sh, blur_pass.source == 0, straight_alpha);
                         self.resources.queue.write_buffer(
                             &self.resources.backdrop_blur_buffer,
                             u64::from(slot) * stride,
-                            bytemuck::bytes_of(&params),
+                            params.as_bytes(),
                         );
                         let source_group = if blur_pass.source == 0 {
                             &targets.snapshot_bind_group
@@ -2434,9 +2428,14 @@ impl WgpuRendererCore {
                         pass.draw(0..3, 0..1);
                     }
 
-                    // Composite: the last upsample, from level 1, mixed into
-                    // the scene by each blur's coverage.
-                    let (l1w, l1h) = gpui::backdrop_blur::level_size(full_w, full_h, 1);
+                    // Composite: the last upsample from level 1 (clear glass
+                    // has none and reads the snapshot), mixed into the scene
+                    // by each blur's coverage.
+                    let composite_group = if plan.is_some() {
+                        &targets.level_bind_groups[0]
+                    } else {
+                        &targets.snapshot_bind_group
+                    };
                     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("backdrop_blur_composite_pass"),
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -2455,36 +2454,13 @@ impl WgpuRendererCore {
                     for blur in blurs {
                         let slot = next_slot;
                         next_slot += 1;
-                        let params = BackdropBlurParams {
-                            viewport_size: [viewport_width, viewport_height],
-                            texel_size: [1.0 / l1w as f32, 1.0 / l1h as f32],
-                            offset: plan.offset,
-                            straight_alpha,
-                            from_snapshot: 0,
-                            _pad: 0,
-                            bounds_origin: [blur.bounds.origin.x.0, blur.bounds.origin.y.0],
-                            bounds_size: [blur.bounds.size.width.0, blur.bounds.size.height.0],
-                            corner_radii: [
-                                blur.corner_radii.top_left.0,
-                                blur.corner_radii.top_right.0,
-                                blur.corner_radii.bottom_right.0,
-                                blur.corner_radii.bottom_left.0,
-                            ],
-                            mask_origin: [
-                                blur.content_mask.bounds.origin.x.0,
-                                blur.content_mask.bounds.origin.y.0,
-                            ],
-                            mask_size: [
-                                blur.content_mask.bounds.size.width.0,
-                                blur.content_mask.bounds.size.height.0,
-                            ],
-                        };
+                        let params = BackdropBlurParams::composite(blur, plan, full_w, full_h, straight_alpha);
                         self.resources.queue.write_buffer(
                             &self.resources.backdrop_blur_buffer,
                             u64::from(slot) * stride,
-                            bytemuck::bytes_of(&params),
+                            params.as_bytes(),
                         );
-                        pass.set_bind_group(0, &targets.level_bind_groups[0], &[slot_offset(slot)]);
+                        pass.set_bind_group(0, composite_group, &[slot_offset(slot)]);
                         pass.draw(0..4, 0..1);
                     }
                 }
@@ -3859,13 +3835,13 @@ mod tests {
         let backdrop = renderer.render_scene_to_image(&plain, device_size(w, h))?;
         let mut blurred = Scene::default();
         stripes(&mut blurred);
-        blurred.insert_primitive(gpui::BackdropBlur {
-            order: 0,
-            blur_radius: radius.into(),
-            bounds: region,
-            corner_radii: Corners { top_left: 10.0.into(), top_right: 4.0.into(), bottom_right: 10.0.into(), bottom_left: 0.0.into() },
-            content_mask: ContentMask { bounds: Bounds { origin: Point::default(), size: Size { width: 96.0.into(), height: 96.0.into() } } },
-        });
+        blurred.insert_primitive(gpui::BackdropBlur::plain(
+            region,
+            Corners { top_left: 10.0.into(), top_right: 4.0.into(), bottom_right: 10.0.into(), bottom_left: 0.0.into() },
+            radius.into(),
+            ContentMask { bounds: Bounds { origin: Point::default(), size: Size { width: 96.0.into(), height: 96.0.into() } } },
+            1.0,
+        ));
         blurred.finish();
         let actual = renderer.render_scene_to_image(&blurred, device_size(w, h))?;
 
@@ -4056,6 +4032,335 @@ mod tests {
     #[test]
     fn view_transition_shader_is_valid_wgsl() {
         validate_wgsl(VIEW_TRANSITION_SHADER, naga::valid::Capabilities::empty());
+    }
+
+    #[test]
+    fn physical_shader_view_transitions_render_cleanly_on_wgpu() {
+        use gpui::{
+            BorderStyle, Bounds, ContentMask, Corners, Edges, Hsla, PaddedBool32, Point, Quad,
+            ScaledPixels, SceneTransition, SceneTransitionKind, Shadow, Size,
+        };
+
+        let mut headless = WgpuHeadlessRenderer::new().expect("headless wgpu renderer");
+        let w = 960u32;
+        let h = 600u32;
+        let size = Size {
+            width: DevicePixels(w as i32),
+            height: DevicePixels(h as i32),
+        };
+        headless.ensure_render_target(size).expect("render target");
+        let target_view = headless
+            .render_target
+            .as_ref()
+            .expect("target")
+            .view
+            .clone();
+
+        let full_mask = ContentMask {
+            bounds: Bounds {
+                origin: Point {
+                    x: ScaledPixels(0.0),
+                    y: ScaledPixels(0.0),
+                },
+                size: Size {
+                    width: ScaledPixels(w as f32),
+                    height: ScaledPixels(h as f32),
+                },
+            },
+        };
+
+        let hsla = |h: f32, s: f32, l: f32, a: f32| Hsla { h, s, l, a };
+        let build_dashboard = |dark: bool| {
+            let mut scene = Scene::default();
+            let bg = if dark {
+                hsla(222.0 / 360.0, 0.45, 0.08, 1.0)
+            } else {
+                hsla(210.0 / 360.0, 0.35, 0.97, 1.0)
+            };
+            let sidebar_bg = if dark {
+                hsla(222.0 / 360.0, 0.40, 0.11, 1.0)
+            } else {
+                hsla(0.0, 0.0, 1.0, 1.0)
+            };
+            let card_bg = if dark {
+                hsla(220.0 / 360.0, 0.34, 0.14, 1.0)
+            } else {
+                hsla(0.0, 0.0, 1.0, 1.0)
+            };
+            let border = if dark {
+                hsla(218.0 / 360.0, 0.28, 0.24, 1.0)
+            } else {
+                hsla(215.0 / 360.0, 0.24, 0.86, 1.0)
+            };
+            let text_bar = if dark {
+                hsla(215.0 / 360.0, 0.22, 0.78, 1.0)
+            } else {
+                hsla(222.0 / 360.0, 0.30, 0.24, 1.0)
+            };
+            let muted_bar = if dark {
+                hsla(218.0 / 360.0, 0.20, 0.35, 1.0)
+            } else {
+                hsla(215.0 / 360.0, 0.18, 0.74, 1.0)
+            };
+            let accent_indigo = hsla(239.0 / 360.0, 0.84, if dark { 0.66 } else { 0.58 }, 1.0);
+            let accent_emerald = hsla(158.0 / 360.0, 0.72, if dark { 0.50 } else { 0.42 }, 1.0);
+            let accent_amber = hsla(38.0 / 360.0, 0.92, if dark { 0.58 } else { 0.50 }, 1.0);
+            let accent_rose = hsla(348.0 / 360.0, 0.82, if dark { 0.62 } else { 0.54 }, 1.0);
+
+            let add_rect =
+                |scene: &mut Scene,
+                 x: f32,
+                 y: f32,
+                 rw: f32,
+                 rh: f32,
+                 fill: Hsla,
+                 bcol: Hsla,
+                 r: f32,
+                 bw: f32| {
+                    scene.insert_primitive(Quad {
+                        order: 0,
+                        border_style: BorderStyle::Solid,
+                        bounds: Bounds {
+                            origin: Point {
+                                x: ScaledPixels(x),
+                                y: ScaledPixels(y),
+                            },
+                            size: Size {
+                                width: ScaledPixels(rw),
+                                height: ScaledPixels(rh),
+                            },
+                        },
+                        content_mask: full_mask,
+                        background: fill.into(),
+                        border_color: bcol,
+                        corner_radii: Corners::all(ScaledPixels(r)),
+                        border_widths: Edges::all(ScaledPixels(bw)),
+                    });
+                };
+
+            // Full window background
+            add_rect(&mut scene, 0.0, 0.0, w as f32, h as f32, bg, bg, 0.0, 0.0);
+            // Sidebar
+            add_rect(&mut scene, 0.0, 0.0, 190.0, h as f32, sidebar_bg, border, 0.0, 1.0);
+            // Sidebar logo badge + nav pills
+            add_rect(&mut scene, 20.0, 20.0, 34.0, 34.0, accent_indigo, accent_indigo, 9.0, 0.0);
+            add_rect(&mut scene, 64.0, 26.0, 96.0, 10.0, text_bar, text_bar, 5.0, 0.0);
+            add_rect(&mut scene, 64.0, 42.0, 68.0, 7.0, muted_bar, muted_bar, 4.0, 0.0);
+            for i in 0..8 {
+                let py = 82.0 + i as f32 * 42.0;
+                let active = i == 1;
+                if active {
+                    add_rect(
+                        &mut scene,
+                        14.0,
+                        py,
+                        162.0,
+                        32.0,
+                        accent_indigo.opacity(if dark { 0.24 } else { 0.14 }),
+                        accent_indigo.opacity(0.4),
+                        8.0,
+                        1.0,
+                    );
+                }
+                add_rect(
+                    &mut scene,
+                    26.0,
+                    py + 9.0,
+                    14.0,
+                    14.0,
+                    if active { accent_indigo } else { muted_bar },
+                    muted_bar,
+                    4.0,
+                    0.0,
+                );
+                add_rect(
+                    &mut scene,
+                    50.0,
+                    py + 12.0,
+                    82.0 + ((i * 19) % 38) as f32,
+                    8.0,
+                    if active { accent_indigo } else { text_bar },
+                    text_bar,
+                    4.0,
+                    0.0,
+                );
+            }
+
+            // Top navbar + ThemeSwitcher pill in top-right
+            add_rect(&mut scene, 190.0, 0.0, (w - 190) as f32, 56.0, sidebar_bg, border, 0.0, 1.0);
+            add_rect(&mut scene, 214.0, 14.0, 240.0, 28.0, bg, border, 8.0, 1.0);
+            add_rect(&mut scene, 828.0, 14.0, 108.0, 28.0, bg, border, 8.0, 1.0);
+            add_rect(
+                &mut scene,
+                if dark { 898.0 } else { 832.0 },
+                17.0,
+                34.0,
+                22.0,
+                accent_indigo,
+                accent_indigo,
+                6.0,
+                0.0,
+            );
+
+            // 4 KPI stat cards with shadows & colored accents
+            let accents = [accent_indigo, accent_emerald, accent_amber, accent_rose];
+            for i in 0..4 {
+                let cx = 214.0 + i as f32 * 184.0;
+                let cy = 80.0;
+                let card_rect = Bounds {
+                    origin: Point {
+                        x: ScaledPixels(cx),
+                        y: ScaledPixels(cy),
+                    },
+                    size: Size {
+                        width: ScaledPixels(168.0),
+                        height: ScaledPixels(108.0),
+                    },
+                };
+                scene.insert_primitive(Shadow {
+                    order: 0,
+                    blur_radius: ScaledPixels(14.0),
+                    bounds: card_rect,
+                    corner_radii: Corners::all(ScaledPixels(12.0)),
+                    content_mask: full_mask,
+                    color: hsla(0.0, 0.0, 0.0, if dark { 0.35 } else { 0.09 }),
+                    shape_bounds: card_rect,
+                    shape_corner_radii: Corners::all(ScaledPixels(12.0)),
+                    inset: PaddedBool32::from(false),
+                    pad: 0,
+                });
+                add_rect(&mut scene, cx, cy, 168.0, 108.0, card_bg, border, 12.0, 1.0);
+                add_rect(&mut scene, cx + 16.0, cy + 16.0, 72.0, 8.0, muted_bar, muted_bar, 4.0, 0.0);
+                add_rect(&mut scene, cx + 132.0, cy + 14.0, 22.0, 22.0, accents[i], accents[i], 6.0, 0.0);
+                add_rect(&mut scene, cx + 16.0, cy + 44.0, 96.0, 18.0, text_bar, text_bar, 5.0, 0.0);
+                add_rect(&mut scene, cx + 16.0, cy + 78.0, 136.0, 8.0, accents[i].opacity(0.30), accents[i], 4.0, 0.0);
+                add_rect(&mut scene, cx + 16.0, cy + 78.0, 62.0 + i as f32 * 18.0, 8.0, accents[i], accents[i], 4.0, 0.0);
+            }
+
+            // Main analytics bar-chart card (left) + stacked cards (right)
+            add_rect(&mut scene, 214.0, 210.0, 468.0, 362.0, card_bg, border, 14.0, 1.0);
+            add_rect(&mut scene, 236.0, 232.0, 180.0, 14.0, text_bar, text_bar, 5.0, 0.0);
+            add_rect(&mut scene, 236.0, 254.0, 260.0, 8.0, muted_bar, muted_bar, 4.0, 0.0);
+            // Horizontal gridlines
+            for g in 0..5 {
+                let gy = 296.0 + g as f32 * 56.0;
+                add_rect(&mut scene, 236.0, gy, 424.0, 1.0, border, border, 0.0, 0.0);
+            }
+            // Crisp colorful chart bars
+            for b in 0..14 {
+                let bx = 246.0 + b as f32 * 29.0;
+                let bh = 55.0 + (((b * 47 + 23) % 165) as f32);
+                let col = accents[b % 4];
+                add_rect(&mut scene, bx, 520.0 - bh, 19.0, bh, col, col, 5.0, 0.0);
+            }
+
+            // Right column: two rich cards with crisp stripes & pills
+            add_rect(&mut scene, 702.0, 210.0, 234.0, 170.0, card_bg, border, 14.0, 1.0);
+            add_rect(&mut scene, 722.0, 232.0, 128.0, 12.0, text_bar, text_bar, 4.0, 0.0);
+            for r in 0..4 {
+                let ry = 262.0 + r as f32 * 26.0;
+                add_rect(&mut scene, 722.0, ry, 194.0, 16.0, bg, border, 6.0, 1.0);
+                add_rect(&mut scene, 728.0, ry + 4.0, 48.0 + (r as f32 * 22.0), 8.0, accents[r], accents[r], 4.0, 0.0);
+            }
+
+            add_rect(&mut scene, 702.0, 398.0, 234.0, 174.0, card_bg, border, 14.0, 1.0);
+            add_rect(&mut scene, 722.0, 420.0, 144.0, 12.0, text_bar, text_bar, 4.0, 0.0);
+            for c in 0..3 {
+                let cx = 722.0 + c as f32 * 66.0;
+                add_rect(&mut scene, cx, 452.0, 56.0, 56.0, accents[(c + 1) % 4], accents[(c + 1) % 4], 12.0, 0.0);
+            }
+            add_rect(&mut scene, 722.0, 526.0, 194.0, 24.0, accent_indigo, accent_indigo, 8.0, 0.0);
+
+            scene.finish();
+            scene
+        };
+
+        let light_scene = build_dashboard(false);
+        let dark_scene = build_dashboard(true);
+
+        headless
+            .core
+            .capture_transition_snapshot(&light_scene, size)
+            .expect("capture light snapshot");
+
+        let origin = Point {
+            x: ScaledPixels(882.0),
+            y: ScaledPixels(28.0),
+        };
+        let diag = (w as f32).hypot(h as f32);
+        let dump_dir = std::env::var_os("GPUI_DUMP_TRANSITION_PREVIEWS");
+
+        for (name, kind, mid_radius) in [
+            ("shockwave", SceneTransitionKind::Shockwave, diag * 0.48),
+            ("page_curl", SceneTransitionKind::PageCurl, diag),
+            ("liquid_dissolve", SceneTransitionKind::LiquidDissolve, diag),
+        ] {
+            // p = 0.0 -> pure light scene
+            let start_t = SceneTransition {
+                kind,
+                origin,
+                radius: ScaledPixels(0.0),
+                feather: ScaledPixels(1.0),
+                progress: 0.0,
+            };
+            headless
+                .core
+                .render_frame_with_transition(&dark_scene, start_t, &target_view, size)
+                .expect("p=0 frame");
+            let img_start = headless.read_image().expect("read p=0");
+            let p0 = img_start.get_pixel(400, 300);
+            assert!(
+                p0[0] > 200 && p0[1] > 200 && p0[2] > 200,
+                "{name} at p=0 must match light_scene, got {p0:?}"
+            );
+
+            // p = 0.45 -> dramatic mid-transition optical effect
+            let mid_t = SceneTransition {
+                kind,
+                origin,
+                radius: ScaledPixels(mid_radius),
+                feather: ScaledPixels(1.0),
+                progress: 0.45,
+            };
+            headless
+                .core
+                .render_frame_with_transition(&dark_scene, mid_t, &target_view, size)
+                .expect("p=0.45 frame");
+            let img_mid = headless.read_image().expect("read p=0.45");
+            // Top-right corner (near origin) should now be dark theme, bottom-left still light theme
+            let near_origin = img_mid.get_pixel(880, 28);
+            let far_corner = img_mid.get_pixel(24, 575);
+            let luma_near = near_origin[0] as u32 + near_origin[1] as u32 + near_origin[2] as u32;
+            let luma_far = far_corner[0] as u32 + far_corner[1] as u32 + far_corner[2] as u32;
+            assert!(
+                luma_near < luma_far,
+                "{name} at p=0.45: near origin ({near_origin:?}) should be darker than far corner ({far_corner:?})"
+            );
+
+            if let Some(ref dir) = dump_dir {
+                let path = std::path::Path::new(dir).join(format!("transition_{name}.png"));
+                img_mid.save(&path).expect("save transition preview png");
+            }
+
+            // p = 1.0 -> pure dark scene
+            let end_t = SceneTransition {
+                kind,
+                origin,
+                radius: ScaledPixels(diag * 1.25),
+                feather: ScaledPixels(1.0),
+                progress: 1.0,
+            };
+            headless
+                .core
+                .render_frame_with_transition(&dark_scene, end_t, &target_view, size)
+                .expect("p=1 frame");
+            let img_end = headless.read_image().expect("read p=1");
+            let p1 = img_end.get_pixel(24, 575);
+            assert!(
+                p1[0] < 60 && p1[1] < 60 && p1[2] < 80,
+                "{name} at p=1 must match dark_scene, got {p1:?}"
+            );
+        }
     }
 
     #[test]
@@ -4285,6 +4590,530 @@ mod tests {
     }
 
     #[test]
+    fn liquid_glass_refraction_dispersion_and_progressive_blur_on_wgpu() {
+        use gpui::{
+            BackdropBlur, BorderStyle, Bounds, ContentMask, Corners, Edges, Hsla, Point,
+            ProgressiveBlur, Quad, ScaledPixels, Size,
+        };
+
+        let mut headless = WgpuHeadlessRenderer::new().expect("headless wgpu renderer");
+        let w = 960u32;
+        let h = 540u32;
+        let size = Size {
+            width: DevicePixels(w as i32),
+            height: DevicePixels(h as i32),
+        };
+        let full_mask = ContentMask {
+            bounds: Bounds {
+                origin: Point {
+                    x: ScaledPixels(0.0),
+                    y: ScaledPixels(0.0),
+                },
+                size: Size {
+                    width: ScaledPixels(w as f32),
+                    height: ScaledPixels(h as f32),
+                },
+            },
+        };
+        let hsla = |h: f32, s: f32, l: f32, a: f32| Hsla { h, s, l, a };
+        let build_scene = |dark: bool| {
+            let mut scene = Scene::default();
+            let bg = if dark {
+                hsla(222.0 / 360.0, 0.45, 0.09, 1.0)
+            } else {
+                hsla(210.0 / 360.0, 0.35, 0.96, 1.0)
+            };
+            let card_bg = if dark {
+                hsla(220.0 / 360.0, 0.34, 0.15, 1.0)
+            } else {
+                hsla(0.0, 0.0, 1.0, 1.0)
+            };
+            let border = if dark {
+                hsla(218.0 / 360.0, 0.28, 0.26, 1.0)
+            } else {
+                hsla(215.0 / 360.0, 0.24, 0.85, 1.0)
+            };
+            let text_bar = if dark {
+                hsla(215.0 / 360.0, 0.25, 0.84, 1.0)
+            } else {
+                hsla(222.0 / 360.0, 0.35, 0.20, 1.0)
+            };
+            let colors = [
+                hsla(239.0 / 360.0, 0.85, 0.60, 1.0),
+                hsla(158.0 / 360.0, 0.74, 0.46, 1.0),
+                hsla(38.0 / 360.0, 0.94, 0.54, 1.0),
+                hsla(348.0 / 360.0, 0.84, 0.58, 1.0),
+                hsla(198.0 / 360.0, 0.88, 0.52, 1.0),
+                hsla(266.0 / 360.0, 0.82, 0.62, 1.0),
+            ];
+            let add_rect =
+                |scene: &mut Scene,
+                 x: f32,
+                 y: f32,
+                 rw: f32,
+                 rh: f32,
+                 fill: Hsla,
+                 bcol: Hsla,
+                 r: f32,
+                 bw: f32| {
+                    scene.insert_primitive(Quad {
+                        order: 0,
+                        border_style: BorderStyle::Solid,
+                        bounds: Bounds {
+                            origin: Point {
+                                x: ScaledPixels(x),
+                                y: ScaledPixels(y),
+                            },
+                            size: Size {
+                                width: ScaledPixels(rw),
+                                height: ScaledPixels(rh),
+                            },
+                        },
+                        content_mask: full_mask,
+                        background: fill.into(),
+                        border_color: bcol,
+                        corner_radii: Corners::all(ScaledPixels(r)),
+                        border_widths: Edges::all(ScaledPixels(bw)),
+                    });
+                };
+
+            // Rich colorful dashboard background with crisp gridlines, typography bars & chart columns
+            add_rect(&mut scene, 0.0, 0.0, w as f32, h as f32, bg, bg, 0.0, 0.0);
+            for gx in 0..24 {
+                add_rect(
+                    &mut scene,
+                    gx as f32 * 40.0,
+                    0.0,
+                    1.0,
+                    h as f32,
+                    border.opacity(0.45),
+                    border,
+                    0.0,
+                    0.0,
+                );
+            }
+            for gy in 0..14 {
+                add_rect(
+                    &mut scene,
+                    0.0,
+                    gy as f32 * 40.0,
+                    w as f32,
+                    1.0,
+                    border.opacity(0.45),
+                    border,
+                    0.0,
+                    0.0,
+                );
+            }
+            // Top headline & pills
+            add_rect(&mut scene, 36.0, 26.0, 340.0, 20.0, text_bar, text_bar, 6.0, 0.0);
+            add_rect(&mut scene, 36.0, 56.0, 480.0, 10.0, border, border, 4.0, 0.0);
+            for i in 0..4 {
+                add_rect(
+                    &mut scene,
+                    640.0 + i as f32 * 72.0,
+                    28.0,
+                    62.0,
+                    24.0,
+                    colors[i],
+                    colors[i],
+                    12.0,
+                    0.0,
+                );
+            }
+            // Chart card with crisp vertical rainbow bars (ideal for visualizing Snell refraction + prism!)
+            add_rect(&mut scene, 36.0, 96.0, 580.0, 410.0, card_bg, border, 16.0, 1.5);
+            for b in 0..16 {
+                let bx = 60.0 + b as f32 * 33.5;
+                let bh = 95.0 + (((b * 53 + 31) % 245) as f32);
+                add_rect(
+                    &mut scene,
+                    bx,
+                    472.0 - bh,
+                    22.0,
+                    bh,
+                    colors[b % colors.len()],
+                    colors[b % colors.len()],
+                    6.0,
+                    0.0,
+                );
+            }
+            // Right column colorful metric tiles
+            for r in 0..3 {
+                let ry = 96.0 + r as f32 * 142.0;
+                add_rect(&mut scene, 640.0, ry, 284.0, 126.0, card_bg, border, 16.0, 1.5);
+                add_rect(
+                    &mut scene,
+                    662.0,
+                    ry + 22.0,
+                    44.0,
+                    44.0,
+                    colors[(r * 2) % colors.len()],
+                    colors[0],
+                    12.0,
+                    0.0,
+                );
+                add_rect(&mut scene, 720.0, ry + 26.0, 164.0, 16.0, text_bar, text_bar, 5.0, 0.0);
+                add_rect(&mut scene, 720.0, ry + 52.0, 118.0, 10.0, border, border, 4.0, 0.0);
+                add_rect(
+                    &mut scene,
+                    662.0,
+                    ry + 88.0,
+                    240.0,
+                    14.0,
+                    colors[(r * 2 + 1) % colors.len()].opacity(0.32),
+                    border,
+                    7.0,
+                    0.0,
+                );
+                add_rect(
+                    &mut scene,
+                    662.0,
+                    ry + 88.0,
+                    110.0 + r as f32 * 45.0,
+                    14.0,
+                    colors[(r * 2 + 1) % colors.len()],
+                    border,
+                    7.0,
+                    0.0,
+                );
+            }
+
+            // 1. Progressive-blur header strip at the top (BottomToTop: frosted top -> crystal clear bottom)
+            scene.insert_primitive(BackdropBlur {
+                order: 0,
+                blur_radius: ScaledPixels(18.0),
+                bounds: Bounds {
+                    origin: Point {
+                        x: ScaledPixels(0.0),
+                        y: ScaledPixels(0.0),
+                    },
+                    size: Size {
+                        width: ScaledPixels(w as f32),
+                        height: ScaledPixels(84.0),
+                    },
+                },
+                corner_radii: Corners::default(),
+                content_mask: full_mask,
+                refraction: 0.35,
+                dispersion: 0.22,
+                bevel_width: ScaledPixels(10.0),
+                specular: 0.40,
+                progressive_mode: ProgressiveBlur::BottomToTop,
+                scale_factor: 1.0,
+                pointer_pos: Point {
+                    x: ScaledPixels(260.0),
+                    y: ScaledPixels(210.0),
+                },
+                tint: if dark {
+                    hsla(222.0 / 360.0, 0.30, 0.14, 0.22)
+                } else {
+                    hsla(210.0 / 360.0, 0.35, 0.99, 0.18)
+                },
+                shadow_opacity: 0.0,
+            });
+
+            // 2. Crystal-clear Optical LiquidGlass Lens floating over the colorful bar chart!
+            let lens_bounds = Bounds {
+                origin: Point {
+                    x: ScaledPixels(120.0),
+                    y: ScaledPixels(145.0),
+                },
+                size: Size {
+                    width: ScaledPixels(260.0),
+                    height: ScaledPixels(170.0),
+                },
+            };
+            scene.insert_primitive(BackdropBlur {
+                order: 0,
+                blur_radius: ScaledPixels(0.0),
+                bounds: lens_bounds,
+                corner_radii: Corners::all(ScaledPixels(85.0)),
+                content_mask: full_mask,
+                refraction: 1.20,
+                dispersion: 0.85,
+                bevel_width: ScaledPixels(26.0),
+                specular: 1.0,
+                progressive_mode: ProgressiveBlur::None,
+                scale_factor: 1.0,
+                pointer_pos: Point {
+                    x: ScaledPixels(200.0),
+                    y: ScaledPixels(170.0),
+                },
+                tint: Hsla::transparent_black(),
+                shadow_opacity: if dark { 0.48 } else { 0.20 },
+            });
+
+            // 3. Floating LiquidGlass Action Pill straddling the chart + right KPI cards, with crisp buttons inside!
+            let bar_bounds = Bounds {
+                origin: Point {
+                    x: ScaledPixels(430.0),
+                    y: ScaledPixels(325.0),
+                },
+                size: Size {
+                    width: ScaledPixels(360.0),
+                    height: ScaledPixels(76.0),
+                },
+            };
+            scene.insert_primitive(BackdropBlur {
+                order: 0,
+                blur_radius: ScaledPixels(7.0),
+                bounds: bar_bounds,
+                corner_radii: Corners::all(ScaledPixels(38.0)),
+                content_mask: full_mask,
+                refraction: 1.0,
+                dispersion: 0.65,
+                bevel_width: ScaledPixels(20.0),
+                specular: 0.95,
+                progressive_mode: ProgressiveBlur::None,
+                scale_factor: 1.0,
+                pointer_pos: Point {
+                    x: ScaledPixels(540.0),
+                    y: ScaledPixels(345.0),
+                },
+                tint: if dark {
+                    hsla(222.0 / 360.0, 0.25, 0.18, 0.22)
+                } else {
+                    hsla(210.0 / 360.0, 0.35, 0.99, 0.14)
+                },
+                shadow_opacity: if dark { 0.48 } else { 0.20 },
+            });
+            // Crisp UI controls painted INSIDE the floating LiquidGlass bar (must remain 100% razor-sharp!)
+            add_rect(&mut scene, 456.0, 345.0, 96.0, 36.0, colors[0], colors[0], 18.0, 0.0);
+            add_rect(&mut scene, 564.0, 345.0, 96.0, 36.0, card_bg.opacity(0.75), border, 18.0, 1.0);
+            add_rect(&mut scene, 672.0, 345.0, 92.0, 36.0, colors[1], colors[1], 18.0, 0.0);
+
+            scene.finish();
+            scene
+        };
+
+        let dump_dir = std::env::var_os("GPUI_DUMP_TRANSITION_PREVIEWS");
+        for (tag, dark) in [("light", false), ("dark", true)] {
+            let scene = build_scene(dark);
+            let img = headless
+                .render_scene_to_image(&scene, size)
+                .expect("render liquid glass scene");
+
+            // Foreground button inside the floating glass bar must remain crisp indigo (not blurred!)
+            let btn_px = img.get_pixel(504, 363);
+            assert!(
+                btn_px[2] > 180 && btn_px[0] < 140,
+                "{tag}: foreground button inside LiquidGlass bar must stay crisp indigo, got {btn_px:?}"
+            );
+
+            if let Some(ref dir) = dump_dir {
+                let path = std::path::Path::new(dir).join(format!("liquid_glass_{tag}.png"));
+                img.save(&path).expect("save liquid glass preview png");
+            }
+        }
+    }
+
+    #[test]
+    fn liquid_glass_blur_radius_is_invariant_to_batch_grouping_and_overlap() {
+        use gpui::{
+            BackdropBlur, BorderStyle, Bounds, ContentMask, Corners, Edges, Hsla, Point,
+            ProgressiveBlur, Quad, ScaledPixels, Size,
+        };
+
+        let mut headless = WgpuHeadlessRenderer::new().expect("headless wgpu renderer");
+        let w = 480u32;
+        let h = 320u32;
+        let size = Size {
+            width: DevicePixels(w as i32),
+            height: DevicePixels(h as i32),
+        };
+        let full_mask = ContentMask {
+            bounds: Bounds {
+                origin: Point {
+                    x: ScaledPixels(0.0),
+                    y: ScaledPixels(0.0),
+                },
+                size: Size {
+                    width: ScaledPixels(w as f32),
+                    height: ScaledPixels(h as f32),
+                },
+            },
+        };
+        let bg = Hsla { h: 222.0 / 360.0, s: 0.45, l: 0.10, a: 1.0 };
+        let stripe_a = Hsla { h: 350.0 / 360.0, s: 0.90, l: 0.56, a: 1.0 };
+        let stripe_b = Hsla { h: 155.0 / 360.0, s: 0.85, l: 0.48, a: 1.0 };
+        let tint = Hsla { h: 220.0 / 360.0, s: 0.25, l: 0.16, a: 0.18 };
+
+        let build_scene = |force_separate_batch: bool, overlapping_lens: bool| {
+            let mut scene = Scene::default();
+            scene.insert_primitive(Quad {
+                order: 0,
+                border_style: BorderStyle::Solid,
+                bounds: full_mask.bounds,
+                content_mask: full_mask,
+                background: bg.into(),
+                border_color: bg,
+                corner_radii: Corners::default(),
+                border_widths: Edges::default(),
+            });
+            // High-contrast vertical stripes under the floating glass bar
+            for i in 0..8 {
+                let col = if i % 2 == 0 { stripe_a } else { stripe_b };
+                scene.insert_primitive(Quad {
+                    order: 0,
+                    border_style: BorderStyle::Solid,
+                    bounds: Bounds {
+                        origin: Point {
+                            x: ScaledPixels(40.0 + i as f32 * 44.0),
+                            y: ScaledPixels(60.0),
+                        },
+                        size: Size {
+                            width: ScaledPixels(22.0),
+                            height: ScaledPixels(220.0),
+                        },
+                    },
+                    content_mask: full_mask,
+                    background: col.into(),
+                    border_color: col,
+                    corner_radii: Corners::default(),
+                    border_widths: Edges::default(),
+                });
+            }
+            // Heavy 18px progressive header at top (non-overlapping with bar)
+            scene.insert_primitive(BackdropBlur {
+                order: 0,
+                blur_radius: ScaledPixels(18.0),
+                bounds: Bounds {
+                    origin: Point { x: ScaledPixels(0.0), y: ScaledPixels(0.0) },
+                    size: Size { width: ScaledPixels(w as f32), height: ScaledPixels(44.0) },
+                },
+                corner_radii: Corners::default(),
+                content_mask: full_mask,
+                refraction: 0.35,
+                dispersion: 0.20,
+                bevel_width: ScaledPixels(10.0),
+                specular: 0.40,
+                progressive_mode: ProgressiveBlur::BottomToTop,
+                scale_factor: 1.0,
+                pointer_pos: Point { x: ScaledPixels(-10_000.0), y: ScaledPixels(-10_000.0) },
+                tint,
+                shadow_opacity: 0.0,
+            });
+            if overlapping_lens {
+                // Crystal optical lens underneath the floating bar
+                scene.insert_primitive(BackdropBlur {
+                    order: 0,
+                    blur_radius: ScaledPixels(0.0),
+                    bounds: Bounds {
+                        origin: Point { x: ScaledPixels(220.0), y: ScaledPixels(140.0) },
+                        size: Size { width: ScaledPixels(180.0), height: ScaledPixels(120.0) },
+                    },
+                    corner_radii: Corners::all(ScaledPixels(60.0)),
+                    content_mask: full_mask,
+                    refraction: 1.2,
+                    dispersion: 0.8,
+                    bevel_width: ScaledPixels(22.0),
+                    specular: 1.0,
+                    progressive_mode: ProgressiveBlur::None,
+                    scale_factor: 1.0,
+                    pointer_pos: Point { x: ScaledPixels(-10_000.0), y: ScaledPixels(-10_000.0) },
+                    tint: Hsla::transparent_black(),
+                    shadow_opacity: 0.45,
+                });
+            }
+            if force_separate_batch {
+                // Force a higher DrawOrder (order = 2) on the far-right tip of the floating bar
+                // (e.g. a text underline + overlay badge), splitting the bar into its own batch.
+                let tip_bounds = Bounds {
+                    origin: Point { x: ScaledPixels(360.0), y: ScaledPixels(170.0) },
+                    size: Size { width: ScaledPixels(16.0), height: ScaledPixels(16.0) },
+                };
+                scene.insert_primitive(gpui::Underline {
+                    order: 0,
+                    pad: 0,
+                    bounds: tip_bounds,
+                    content_mask: full_mask,
+                    color: bg,
+                    thickness: ScaledPixels(1.0),
+                    wavy: false.into(),
+                });
+                scene.insert_primitive(Quad {
+                    order: 0,
+                    border_style: BorderStyle::Solid,
+                    bounds: tip_bounds,
+                    content_mask: full_mask,
+                    background: bg.into(),
+                    border_color: bg,
+                    corner_radii: Corners::default(),
+                    border_widths: Edges::default(),
+                });
+            }
+            // Floating 6px glass bar
+            scene.insert_primitive(BackdropBlur {
+                order: 0,
+                blur_radius: ScaledPixels(6.0),
+                bounds: Bounds {
+                    origin: Point { x: ScaledPixels(60.0), y: ScaledPixels(150.0) },
+                    size: Size { width: ScaledPixels(320.0), height: ScaledPixels(64.0) },
+                },
+                corner_radii: Corners::all(ScaledPixels(32.0)),
+                content_mask: full_mask,
+                refraction: 0.95,
+                dispersion: 0.60,
+                bevel_width: ScaledPixels(16.0),
+                specular: 0.90,
+                progressive_mode: ProgressiveBlur::None,
+                scale_factor: 1.0,
+                pointer_pos: Point { x: ScaledPixels(-10_000.0), y: ScaledPixels(-10_000.0) },
+                tint,
+                shadow_opacity: 0.45,
+            });
+            scene.finish();
+            scene
+        };
+
+        // 1. Floating 6px bar must render BIT-FOR-BIT identically whether it shares a batch
+        //    with the 18px progressive header OR splits into its own BackdropBlurs batch!
+        let scene_shared = build_scene(false, false);
+        let scene_split = build_scene(true, false);
+        assert_eq!(
+            scene_shared.backdrop_blurs[0].order,
+            scene_shared.backdrop_blurs[1].order,
+            "sanity: non-overlapping header and bar should share a batch"
+        );
+        assert!(
+            scene_split.backdrop_blurs[1].order > scene_split.backdrop_blurs[0].order,
+            "sanity: bar overlapping higher-order quad should split into its own batch"
+        );
+        let img_shared = headless
+            .render_scene_to_image(&scene_shared, size)
+            .expect("render shared batch");
+        let img_split = headless
+            .render_scene_to_image(&scene_split, size)
+            .expect("render split batch");
+
+        let mut max_diff = 0u8;
+        for y in 156..208 {
+            for x in 80..240 {
+                let a = img_shared.get_pixel(x, y);
+                let b = img_split.get_pixel(x, y);
+                for c in 0..4 {
+                    max_diff = max_diff.max(a[c].abs_diff(b[c]));
+                }
+            }
+        }
+        assert_eq!(
+            max_diff, 0,
+            "LiquidGlass 6px bar flashed/changed blur radius when grouped with 18px header vs separate batch (max channel diff={max_diff})"
+        );
+
+        // 2. Overlapping BackdropBlur primitives (Floating Bar over Crystal Lens) must NEVER
+        //    share a DrawOrder even with zero intermediate quads between them.
+        let scene_overlap = build_scene(false, true);
+        let lens_order = scene_overlap.backdrop_blurs[1].order;
+        let bar_order = scene_overlap.backdrop_blurs[2].order;
+        assert!(
+            bar_order > lens_order,
+            "overlapping LiquidGlass bar (order={bar_order}) must strictly sort after underlying lens (order={lens_order})"
+        );
+    }
+
+    #[test]
     fn backdrop_blur_renders_softened_glass_pixels_on_wgpu() {
         use gpui::{
             BackdropBlur, BorderStyle, Bounds, ContentMask, Corners, Edges, Hsla, Point, Quad,
@@ -4354,6 +5183,15 @@ mod tests {
             },
             corner_radii: Corners::all(ScaledPixels(16.0)),
             content_mask: full_mask,
+            refraction: 0.0,
+            dispersion: 0.0,
+            bevel_width: ScaledPixels(0.0),
+            specular: 0.0,
+            progressive_mode: gpui::ProgressiveBlur::None,
+            scale_factor: 1.0,
+            pointer_pos: Point { x: ScaledPixels(-10_000.0), y: ScaledPixels(-10_000.0) },
+            tint: Hsla::transparent_black(),
+            shadow_opacity: 0.0,
         });
         // Opaque green badge painted AFTER the BackdropBlur (must stay razor-sharp, never blurred
         // into Segment 0, and must never overwrite Segment 0's earlier opaque rectangles!)
@@ -4638,6 +5476,15 @@ mod tests {
                     },
                     corner_radii: Corners::all(ScaledPixels(16.0)),
                     content_mask: full_mask,
+                    refraction: 0.0,
+                    dispersion: 0.0,
+                    bevel_width: ScaledPixels(0.0),
+                    specular: 0.0,
+                    progressive_mode: gpui::ProgressiveBlur::None,
+                    scale_factor: 1.0,
+                    pointer_pos: Point { x: ScaledPixels(-10_000.0), y: ScaledPixels(-10_000.0) },
+                    tint: Hsla::transparent_black(),
+                    shadow_opacity: 0.0,
                 });
             }
             scene.finish();

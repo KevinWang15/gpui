@@ -180,18 +180,214 @@ impl BlurPlan {
     }
 }
 
-/// A batch's blurs grouped by plan, each group in paint order; blurs too
-/// small to see are left out. Each group runs its plan's passes once.
-pub fn group_by_plan(blurs: &[crate::BackdropBlur]) -> Vec<(BlurPlan, Vec<&crate::BackdropBlur>)> {
-    let mut groups: Vec<(BlurPlan, Vec<&crate::BackdropBlur>)> = Vec::new();
+/// A batch's blurs grouped by plan, each group in paint order; blurs that
+/// draw nothing are left out. A group without a plan is clear glass (no
+/// passes; the composite reads the snapshot only). Each plan's passes run
+/// once.
+pub fn group_by_plan(blurs: &[crate::BackdropBlur]) -> Vec<(Option<BlurPlan>, Vec<&crate::BackdropBlur>)> {
+    let mut groups: Vec<(Option<BlurPlan>, Vec<&crate::BackdropBlur>)> = Vec::new();
     for blur in blurs {
-        let Some(plan) = BlurPlan::for_radius(blur.blur_radius.0) else { continue };
+        if !blur.is_drawn() {
+            continue;
+        }
+        let plan = blur.plan();
         match groups.iter_mut().find(|(p, _)| *p == plan) {
             Some((_, members)) => members.push(blur),
             None => groups.push((plan, vec![blur])),
         }
     }
     groups
+}
+
+/// The uniform every blur shader reads (WGSL `BlurParams`, HLSL cbuffer
+/// `BackdropBlurParams`, MSL `BlurParams`): 128 bytes of 4-byte fields, no
+/// padding, in this order.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[repr(C)]
+pub struct BlurParams {
+    /// Composite: the target's size in pixels.
+    pub viewport_size: [f32; 2],
+    /// The source level's texel size, in UV.
+    pub texel_size: [f32; 2],
+    /// The plan's sample offset, in source texels.
+    pub offset: f32,
+    /// 1 when the target holds straight (not premultiplied) alpha.
+    pub straight_alpha: u32,
+    /// 1 when the pass reads level 0.
+    pub from_snapshot: u32,
+    /// [`BlurParams::BLURRED`], [`BlurParams::GLASS`], and the progressive
+    /// mode shifted by [`BlurParams::PROGRESSIVE_SHIFT`].
+    pub flags: u32,
+    /// The blur's bounds, in device pixels.
+    pub bounds_origin: [f32; 2],
+    /// The blur's size, in device pixels.
+    pub bounds_size: [f32; 2],
+    /// Top left, top right, bottom right, bottom left.
+    pub corner_radii: [f32; 4],
+    /// The content mask's origin.
+    pub mask_origin: [f32; 2],
+    /// The content mask's size.
+    pub mask_size: [f32; 2],
+    /// Glass: refraction strength.
+    pub refraction: f32,
+    /// Glass: chromatic dispersion.
+    pub dispersion: f32,
+    /// Glass: bevel width in device pixels.
+    pub bevel_width: f32,
+    /// Glass: specular strength.
+    pub specular: f32,
+    /// Glass: pointer position in device pixels (x below -1000: none).
+    pub pointer_pos: [f32; 2],
+    /// The display's scale factor (at least 1).
+    pub scale_factor: f32,
+    /// Glass: drop shadow opacity.
+    pub shadow_opacity: f32,
+    /// Glass: tint, straight RGBA.
+    pub tint_rgba: [f32; 4],
+}
+
+impl BlurParams {
+    /// The composite has a blurred backdrop (level 1) to read.
+    pub const BLURRED: u32 = 1;
+    /// The blur is liquid glass.
+    pub const GLASS: u32 = 2;
+    /// Where the [`crate::ProgressiveBlur`] mode sits in `flags`.
+    pub const PROGRESSIVE_SHIFT: u32 = 8;
+
+    /// For a pass reading a level of `source_width` by `source_height`.
+    pub fn pass(plan: BlurPlan, source_width: u32, source_height: u32, from_snapshot: bool, straight_alpha: bool) -> Self {
+        BlurParams {
+            texel_size: [1.0 / source_width as f32, 1.0 / source_height as f32],
+            offset: plan.offset,
+            straight_alpha: straight_alpha as u32,
+            from_snapshot: from_snapshot as u32,
+            ..Default::default()
+        }
+    }
+
+    /// For compositing `blur` into a `width` by `height` target.
+    pub fn composite(blur: &crate::BackdropBlur, plan: Option<BlurPlan>, width: u32, height: u32, straight_alpha: bool) -> Self {
+        let (l1w, l1h) = level_size(width, height, 1);
+        let mut flags = (blur.progressive_mode as u32) << Self::PROGRESSIVE_SHIFT;
+        if plan.is_some() {
+            flags |= Self::BLURRED;
+        }
+        if blur.is_liquid_glass() {
+            flags |= Self::GLASS;
+        }
+        let tint = crate::Rgba::from(blur.tint);
+        let mask = blur.content_mask.bounds;
+        BlurParams {
+            viewport_size: [width as f32, height as f32],
+            texel_size: [1.0 / l1w as f32, 1.0 / l1h as f32],
+            offset: plan.map_or(0.0, |p| p.offset),
+            straight_alpha: straight_alpha as u32,
+            from_snapshot: 0,
+            flags,
+            bounds_origin: [blur.bounds.origin.x.0, blur.bounds.origin.y.0],
+            bounds_size: [blur.bounds.size.width.0, blur.bounds.size.height.0],
+            corner_radii: [
+                blur.corner_radii.top_left.0,
+                blur.corner_radii.top_right.0,
+                blur.corner_radii.bottom_right.0,
+                blur.corner_radii.bottom_left.0,
+            ],
+            mask_origin: [mask.origin.x.0, mask.origin.y.0],
+            mask_size: [mask.size.width.0, mask.size.height.0],
+            refraction: blur.refraction,
+            dispersion: blur.dispersion,
+            bevel_width: blur.bevel_width.0,
+            specular: blur.specular,
+            pointer_pos: [blur.pointer_pos.x.0, blur.pointer_pos.y.0],
+            scale_factor: blur.scale_factor.max(1.0),
+            shadow_opacity: blur.shadow_opacity,
+            tint_rgba: [tint.r, tint.g, tint.b, tint.a],
+        }
+    }
+
+    /// The bytes to upload.
+    pub fn as_bytes(&self) -> &[u8] {
+        // SAFETY: `repr(C)` of 4-byte fields only, so no padding; every byte
+        // is initialized.
+        unsafe { std::slice::from_raw_parts((self as *const Self).cast::<u8>(), std::mem::size_of::<Self>()) }
+    }
+}
+
+const _: () = assert!(std::mem::size_of::<BlurParams>() == 128);
+
+/// The drop shadow's extent beyond a glass surface's bounds, in device
+/// pixels: (left and right, top, bottom). The composite shaders draw it there.
+pub fn shadow_extent(scale_factor: f32) -> (f32, f32, f32) {
+    let scale = scale_factor.max(1.0);
+    (40.0 * scale, 32.0 * scale, 52.0 * scale)
+}
+
+impl crate::BackdropBlur {
+    /// A plain blur (no glass), as `Window::paint_backdrop_blur` paints it.
+    pub fn plain(
+        bounds: crate::Bounds<crate::ScaledPixels>,
+        corner_radii: crate::Corners<crate::ScaledPixels>,
+        blur_radius: crate::ScaledPixels,
+        content_mask: crate::ContentMask<crate::ScaledPixels>,
+        scale_factor: f32,
+    ) -> Self {
+        crate::BackdropBlur {
+            order: 0,
+            blur_radius,
+            bounds,
+            corner_radii,
+            content_mask,
+            refraction: 0.0,
+            dispersion: 0.0,
+            bevel_width: crate::ScaledPixels(0.0),
+            specular: 0.0,
+            progressive_mode: crate::ProgressiveBlur::None,
+            scale_factor,
+            pointer_pos: crate::point(crate::ScaledPixels(-10_000.0), crate::ScaledPixels(-10_000.0)),
+            tint: crate::Hsla::transparent_black(),
+            shadow_opacity: 0.0,
+        }
+    }
+
+    /// The blur's plan; `None` when the radius is too small to see.
+    pub fn plan(&self) -> Option<BlurPlan> {
+        BlurPlan::for_radius(self.blur_radius.0)
+    }
+
+    /// Whether renderers draw anything: it blurs, or it's glass.
+    pub fn is_drawn(&self) -> bool {
+        self.plan().is_some() || self.is_liquid_glass()
+    }
+
+    /// How far beyond a pixel the composite reads the backdrop, in device
+    /// pixels: the blur's [`BlurPlan::reach`] plus the farthest the glass
+    /// refracts a sample (the lens offset at its largest dispersion).
+    pub fn reach(&self) -> f32 {
+        let blur = self.plan().map_or(0.0, |plan| plan.reach());
+        let refraction = if self.refraction > 0.0 {
+            let bevel = self.bevel_width.0.max(4.0 * self.scale_factor.max(1.0));
+            // Offset ≤ bevel · 1.05 · refraction; red/blue spread it by up to
+            // 1 + 1.25 · dispersion · 0.5 (dispersion ≤ 2).
+            bevel * 1.05 * self.refraction * (1.0 + 1.25 * 0.5 * self.dispersion.min(2.0)) + 1.0
+        } else {
+            0.0
+        };
+        blur + refraction
+    }
+
+    /// The pixels the composite may change: the bounds, plus the drop
+    /// shadow's extent when there is one.
+    pub fn painted_bounds(&self) -> crate::Bounds<crate::ScaledPixels> {
+        if self.shadow_opacity <= 0.0005 {
+            return self.bounds;
+        }
+        let (x, top, bottom) = shadow_extent(self.scale_factor);
+        let b = self.bounds;
+        crate::Bounds {
+            origin: crate::point(b.origin.x - crate::ScaledPixels(x), b.origin.y - crate::ScaledPixels(top)),
+            size: crate::size(b.size.width + crate::ScaledPixels(2.0 * x), b.size.height + crate::ScaledPixels(top + bottom)),
+        }
+    }
 }
 
 /// The size of level `level` for a target of `width` by `height`: halved
@@ -489,13 +685,7 @@ mod tests {
             }
         }
         fn blur(b: Bounds<ScaledPixels>, radius: f32) -> BackdropBlur {
-            BackdropBlur {
-                order: 0,
-                blur_radius: ScaledPixels(radius),
-                bounds: b,
-                corner_radii: Corners::default(),
-                content_mask: ContentMask { bounds: rect(0.0, 0.0, 1000.0, 1000.0) },
-            }
+            BackdropBlur::plain(b, Corners::default(), ScaledPixels(radius), ContentMask { bounds: rect(0.0, 0.0, 1000.0, 1000.0) }, 1.0)
         }
         /// Batch kinds in draw order: 'b' blur, 'q' quads.
         fn kinds(scene: &Scene) -> String {

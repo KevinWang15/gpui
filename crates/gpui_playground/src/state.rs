@@ -101,6 +101,7 @@ pub enum TableSortCol {
 pub struct PlaygroundApp {
     pub page: Page,
     pub accent: AccentPreset,
+    pub theme_transition_style: ThemeTransitionStyle,
     pub show_event_log: bool,
     pub event_log: Vec<EventLogEntry>,
     pub next_event_seq: usize,
@@ -184,6 +185,13 @@ pub struct PlaygroundApp {
     pub dialog_presentation: OverlayPresentation,
     pub dialog_native_titlebar: bool,
     pub glass_blur_px: f32,
+    pub glass_lens_drag: Entity<LiquidGlassDragState>,
+    pub glass_bar_drag: Entity<LiquidGlassDragState>,
+    pub glass_refraction_slider: Entity<SliderState>,
+    pub glass_dispersion_slider: Entity<SliderState>,
+    pub glass_frost_slider: Entity<SliderState>,
+    pub glass_progressive_mode: ProgressiveBlur,
+    pub glass_bar_clicks: usize,
     pub active_native_dialog: Option<WindowHandle<DialogWindowView>>,
     pub toast_presentation: OverlayPresentation,
     pub toast_position: ToastPosition,
@@ -1306,9 +1314,48 @@ impl PlaygroundApp {
         cx.subscribe(&demo_qr_input, |_, _, _: &InputEvent, cx| cx.notify())
             .detach();
 
+        let glass_lens_drag =
+            cx.new(|cx| LiquidGlassDragState::new(gpui::point(gpui::px(36.), gpui::px(82.)), cx));
+        let glass_bar_drag =
+            cx.new(|cx| LiquidGlassDragState::new(gpui::point(gpui::px(290.), gpui::px(210.)), cx));
+        let glass_refraction_slider = cx.new(|cx| {
+            SliderState::new(cx)
+                .range(0.0, 1.6)
+                .step(0.05)
+                .default_value(1.1)
+                .label("Snell Refraction")
+        });
+        cx.subscribe(&glass_refraction_slider, |_, _, _: &SliderEvent, cx| {
+            cx.notify();
+        })
+        .detach();
+        let glass_dispersion_slider = cx.new(|cx| {
+            SliderState::new(cx)
+                .range(0.0, 1.5)
+                .step(0.05)
+                .default_value(0.75)
+                .label("RGB Dispersion")
+        });
+        cx.subscribe(&glass_dispersion_slider, |_, _, _: &SliderEvent, cx| {
+            cx.notify();
+        })
+        .detach();
+        let glass_frost_slider = cx.new(|cx| {
+            SliderState::new(cx)
+                .range(0.0, 20.0)
+                .step(1.0)
+                .default_value(6.0)
+                .label("Bar Frost (px)")
+        });
+        cx.subscribe(&glass_frost_slider, |_, _, _: &SliderEvent, cx| {
+            cx.notify();
+        })
+        .detach();
+
         let mut app = Self {
             page: Page::InteractiveBlur,
             accent: AccentPreset::Indigo,
+            theme_transition_style: ThemeTransitionStyle::Shockwave,
             show_event_log: false,
             event_log: Vec::new(),
             next_event_seq: 1,
@@ -1386,6 +1433,13 @@ impl PlaygroundApp {
             dialog_presentation: OverlayPresentation::InWindow,
             dialog_native_titlebar: false,
             glass_blur_px: 12.0,
+            glass_lens_drag,
+            glass_bar_drag,
+            glass_refraction_slider,
+            glass_dispersion_slider,
+            glass_frost_slider,
+            glass_progressive_mode: ProgressiveBlur::BottomToTop,
+            glass_bar_clicks: 0,
             active_native_dialog: None,
             toast_presentation: OverlayPresentation::InWindow,
             toast_position: ToastPosition::BottomRight,

@@ -9,6 +9,18 @@ pub fn view_transition_ease_out(t: f32) -> f32 {
     1.0 - inv * inv * inv
 }
 
+/// Smooth cubic ease-in-out curve for physical shader transitions (`PageCurl`, `LiquidDissolve`).
+#[inline]
+pub fn view_transition_ease_in_out(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    if t < 0.5 {
+        4.0 * t * t * t
+    } else {
+        let f = -2.0 * t + 2.0;
+        1.0 - (f * f * f) * 0.5
+    }
+}
+
 /// The visual geometry of a GPU-composited full-window view transition.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ViewTransitionKind {
@@ -24,6 +36,27 @@ pub enum ViewTransitionKind {
     },
     /// Cross-fades smoothly from the previous frame snapshot into the new live scene.
     CrossFade,
+    /// Expanding refractive optical shockwave / water ripple originating at `origin`.
+    ///
+    /// Physically displaces both frames radially along the wave crest with RGB chromatic
+    /// dispersion, a trailing harmonic wake, and a specular caustic ridge.
+    Shockwave {
+        /// Logical pixel coordinate inside the window where the optical shockwave erupts.
+        origin: Point<Pixels>,
+    },
+    /// 3D cylindrical page-curl folding the previous frame back from the corner nearest `origin`
+    /// toward the opposite corner with specular ridge shading, frosted page underside, and cast
+    /// shadow onto the newly revealed scene.
+    PageCurl {
+        /// Logical pixel coordinate inside the window selecting the nearest peel corner.
+        origin: Point<Pixels>,
+    },
+    /// Organic domain-warped liquid dissolve blooming outward from `origin` with surface-tension
+    /// refraction and an iridescent meniscus frontier.
+    LiquidDissolve {
+        /// Logical pixel coordinate inside the window where the liquid bloom starts.
+        origin: Point<Pixels>,
+    },
 }
 
 /// Configuration for a GPU-composited full-window view transition started via
@@ -80,6 +113,39 @@ impl ViewTransition {
         }
     }
 
+    /// Creates an expanding refractive optical shockwave / water ripple originating at `origin`.
+    pub fn shockwave(origin: Point<Pixels>) -> Self {
+        Self {
+            kind: ViewTransitionKind::Shockwave { origin },
+            duration: Duration::from_millis(620),
+            easing: view_transition_ease_out,
+            feather: px(2.0),
+            reduce_motion_crossfade: false,
+        }
+    }
+
+    /// Creates a 3D cylindrical page-curl peeling diagonally from the corner nearest `origin`.
+    pub fn page_curl(origin: Point<Pixels>) -> Self {
+        Self {
+            kind: ViewTransitionKind::PageCurl { origin },
+            duration: Duration::from_millis(680),
+            easing: view_transition_ease_in_out,
+            feather: px(1.5),
+            reduce_motion_crossfade: false,
+        }
+    }
+
+    /// Creates an organic liquid-ink dissolve blooming outward from `origin` with edge refraction.
+    pub fn liquid_dissolve(origin: Point<Pixels>) -> Self {
+        Self {
+            kind: ViewTransitionKind::LiquidDissolve { origin },
+            duration: Duration::from_millis(660),
+            easing: view_transition_ease_in_out,
+            feather: px(2.0),
+            reduce_motion_crossfade: false,
+        }
+    }
+
     /// Overrides the transition duration.
     pub fn duration(mut self, duration: Duration) -> Self {
         self.duration = duration;
@@ -115,6 +181,12 @@ pub enum SceneTransitionKind {
     RadialCollapse = 1,
     /// Full-viewport cross-fade driven by `progress`.
     CrossFade = 2,
+    /// Expanding refractive optical shockwave with RGB chromatic dispersion and caustic crest.
+    Shockwave = 3,
+    /// 3D cylindrical page-curl with specular ridge, frosted underside, and cast shadow.
+    PageCurl = 4,
+    /// Organic domain-warped liquid dissolve with gradient refraction and luminous meniscus rim.
+    LiquidDissolve = 5,
 }
 
 /// GPU-ready per-frame transition parameters attached to a [`Scene`](crate::Scene).
@@ -208,6 +280,49 @@ impl ActiveViewTransition {
                 feather,
                 progress: eased,
             }),
+            ViewTransitionKind::Shockwave { origin } => {
+                let origin_px = point(
+                    ScaledPixels(origin.x.0 * scale_factor),
+                    ScaledPixels(origin.y.0 * scale_factor),
+                );
+                let wave_margin = (viewport_w.hypot(viewport_h) * 0.14).max(110.0 * scale_factor);
+                let max_radius = max_corner_distance(origin_px, viewport_w, viewport_h) + wave_margin;
+                Some(SceneTransition {
+                    kind: SceneTransitionKind::Shockwave,
+                    origin: origin_px,
+                    radius: ScaledPixels(max_radius * eased),
+                    feather: ScaledPixels(scale_factor.max(0.5)),
+                    progress: eased,
+                })
+            }
+            ViewTransitionKind::PageCurl { origin } => {
+                let origin_px = point(
+                    ScaledPixels(origin.x.0 * scale_factor),
+                    ScaledPixels(origin.y.0 * scale_factor),
+                );
+                let max_radius = max_corner_distance(origin_px, viewport_w, viewport_h);
+                Some(SceneTransition {
+                    kind: SceneTransitionKind::PageCurl,
+                    origin: origin_px,
+                    radius: ScaledPixels(max_radius),
+                    feather: ScaledPixels(scale_factor.max(0.5)),
+                    progress: eased,
+                })
+            }
+            ViewTransitionKind::LiquidDissolve { origin } => {
+                let origin_px = point(
+                    ScaledPixels(origin.x.0 * scale_factor),
+                    ScaledPixels(origin.y.0 * scale_factor),
+                );
+                let max_radius = max_corner_distance(origin_px, viewport_w, viewport_h).max(1.0);
+                Some(SceneTransition {
+                    kind: SceneTransitionKind::LiquidDissolve,
+                    origin: origin_px,
+                    radius: ScaledPixels(max_radius),
+                    feather: ScaledPixels(scale_factor.max(0.5)),
+                    progress: eased,
+                })
+            }
         }
     }
 }

@@ -172,20 +172,9 @@ struct BlurTargets {
     levels: Vec<Retained<ProtocolObject<dyn MTLTexture>>>,
 }
 
-/// `BlurParams` in shaders.metal (80 bytes).
-#[derive(Clone, Copy, Default)]
-#[repr(C)]
-struct BlurParams {
-    viewport_size: [f32; 2],
-    texel_size: [f32; 2],
-    offset: f32,
-    pad: [u32; 3],
-    bounds_origin: [f32; 2],
-    bounds_size: [f32; 2],
-    corner_radii: [f32; 4],
-    mask_origin: [f32; 2],
-    mask_size: [f32; 2],
-}
+/// The blur shaders' uniform (`gpui::backdrop_blur::BlurParams`, `BlurParams` in
+/// shaders.metal).
+use gpui::backdrop_blur::BlurParams;
 
 impl MetalRenderer {
     /// Creates a new MetalRenderer with a CAMetalLayer for window-based rendering.
@@ -1039,13 +1028,10 @@ impl MetalRenderer {
         let (width, height) = (targets.scene.width() as u32, targets.scene.height() as u32);
         let pipelines = &self.blur_pipelines;
         for (plan, members) in groups {
-            for pass in plan.passes() {
+            for pass in plan.iter().flat_map(|plan| plan.passes()) {
+                let plan = plan.expect("passes come from a plan");
                 let (sw, sh) = level_size(width, height, pass.source);
-                let params = BlurParams {
-                    texel_size: [1.0 / sw as f32, 1.0 / sh as f32],
-                    offset: plan.offset,
-                    ..BlurParams::default()
-                };
+                let params = BlurParams::pass(plan, sw, sh, pass.source == 0, false);
                 let source = if pass.source == 0 {
                     &targets.snapshot
                 } else {
@@ -1074,33 +1060,19 @@ impl MetalRenderer {
                 encoder.endEncoding();
             }
 
-            // Composite: the last upsample, from level 1, mixed into the
-            // frame by each blur's coverage.
-            let (l1w, l1h) = level_size(width, height, 1);
+            // Composite: the last upsample from level 1 (clear glass has none
+            // and reads the snapshot), mixed into the frame by each blur's
+            // coverage.
+            let source = if plan.is_some() { &targets.levels[0] } else { &targets.snapshot };
             let encoder = new_color_encoder(command_buffer, &targets.scene, MTLLoadAction::Load)?;
             encoder.setRenderPipelineState(&pipelines.composite);
             // SAFETY: The textures match the shader's `texture(0)` and `texture(1)`.
             unsafe {
-                encoder.setFragmentTexture_atIndex(Some(&targets.levels[0]), 0);
+                encoder.setFragmentTexture_atIndex(Some(source), 0);
                 encoder.setFragmentTexture_atIndex(Some(&targets.snapshot), 1);
             }
             for blur in members {
-                let params = BlurParams {
-                    viewport_size: [width as f32, height as f32],
-                    texel_size: [1.0 / l1w as f32, 1.0 / l1h as f32],
-                    offset: plan.offset,
-                    pad: [0; 3],
-                    bounds_origin: [blur.bounds.origin.x.0, blur.bounds.origin.y.0],
-                    bounds_size: [blur.bounds.size.width.0, blur.bounds.size.height.0],
-                    corner_radii: [
-                        blur.corner_radii.top_left.0,
-                        blur.corner_radii.top_right.0,
-                        blur.corner_radii.bottom_right.0,
-                        blur.corner_radii.bottom_left.0,
-                    ],
-                    mask_origin: [blur.content_mask.bounds.origin.x.0, blur.content_mask.bounds.origin.y.0],
-                    mask_size: [blur.content_mask.bounds.size.width.0, blur.content_mask.bounds.size.height.0],
-                };
+                let params = BlurParams::composite(blur, plan, width, height, false);
                 // SAFETY: The bytes are `BlurParams`, which matches the
                 // vertex and fragment shaders' `buffer(0)`.
                 unsafe {
@@ -2137,18 +2109,18 @@ mod tests {
             let backdrop = renderer.render_scene_to_image(&plain, size(DevicePixels(w), DevicePixels(h)))?;
             let mut blurred = Scene::default();
             stripes(&mut blurred);
-            blurred.insert_primitive(BackdropBlur {
-                order: 0,
-                blur_radius: ScaledPixels(radius),
-                bounds: rect(16.0, 20.0, 64.0, 56.0),
-                corner_radii: Corners {
+            blurred.insert_primitive(BackdropBlur::plain(
+                rect(16.0, 20.0, 64.0, 56.0),
+                Corners {
                     top_left: ScaledPixels(10.0),
                     top_right: ScaledPixels(4.0),
                     bottom_right: ScaledPixels(10.0),
                     bottom_left: ScaledPixels(0.0),
                 },
-                content_mask: everything.clone(),
-            });
+                ScaledPixels(radius),
+                everything.clone(),
+                1.0,
+            ));
             blurred.finish();
             let actual = renderer.render_scene_to_image(&blurred, size(DevicePixels(w), DevicePixels(h)))?;
 

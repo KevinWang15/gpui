@@ -1333,26 +1333,35 @@ bool is_shaped(Quad quad) {
 
 /*
 **
-**              Backdrop blur (gpui::backdrop_blur)
+**              Backdrop blur and liquid glass (gpui::backdrop_blur)
 **
 */
 
-// The dual-Kawase passes, the composite and the final blit, as
+// The dual-Kawase passes, the composite, the glass and the final blit, as
 // `gpui::backdrop_blur` defines them (the WGSL in gpui_wgpu and the HLSL in
-// gpui_windows are the same). The target holds premultiplied alpha.
-// Scalar padding keeps this layout equal to the Rust `BlurParams` (80 bytes).
+// gpui_windows are the same). The target holds premultiplied alpha. The
+// layout is `gpui::backdrop_blur::BlurParams` (128 bytes; scalars only, so no
+// padding).
 struct BlurParams {
   float2 viewport_size; // composite: the target's size in pixels
   float2 texel_size;    // the source level's texel size, in UV
   float offset;         // the plan's sample offset, in source texels
-  uint pad0;
-  uint pad1;
-  uint pad2;
+  uint straight_alpha;  // always 0 here
+  uint from_snapshot;
+  uint flags;           // 1: blurred, 2: glass, bits 8+: progressive mode
   float2 bounds_origin;
   float2 bounds_size;
   float4 corner_radii; // (top_left, top_right, bottom_right, bottom_left)
   float2 mask_origin;
   float2 mask_size;
+  float refraction;
+  float dispersion;
+  float bevel_width;
+  float specular;
+  float2 pointer_pos;
+  float scale_factor;
+  float shadow_opacity;
+  float4 tint_rgba;
 };
 
 struct BlurVarying {
@@ -1404,12 +1413,17 @@ fragment float4 kawase_upsample_fragment(BlurVarying in [[stage_in]],
   return blur_tent(src, params, in.uv);
 }
 
-// One quad over the blur's bounds within its content mask.
+// One quad over the blur's painted bounds (`BackdropBlur::painted_bounds`)
+// within its content mask.
 vertex BlurVarying backdrop_blur_vertex(uint vertex_id [[vertex_id]],
                                         constant BlurParams &params [[buffer(0)]]) {
   float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
-  float2 clip_min = max(params.bounds_origin, params.mask_origin);
-  float2 clip_max = min(params.bounds_origin + params.bounds_size,
+  float scale = max(params.scale_factor, 1.0);
+  bool has_shadow = params.shadow_opacity > 0.0005;
+  float2 pad_min = has_shadow ? float2(40.0, 32.0) * scale : float2(0.0, 0.0);
+  float2 pad_max = has_shadow ? float2(40.0, 52.0) * scale : float2(0.0, 0.0);
+  float2 clip_min = max(params.bounds_origin - pad_min, params.mask_origin);
+  float2 clip_max = min(params.bounds_origin + params.bounds_size + pad_max,
                         params.mask_origin + params.mask_size);
   float2 clipped_size = max(clip_max - clip_min, float2(0.0, 0.0));
   float2 px_pos = clip_min + unit_vertex * clipped_size;
@@ -1420,36 +1434,165 @@ vertex BlurVarying backdrop_blur_vertex(uint vertex_id [[vertex_id]],
   return out;
 }
 
-// `gpui::backdrop_blur::rounded_rect_coverage`.
-float blur_coverage(constant BlurParams &params, float2 pixel) {
-  float2 half_size = params.bounds_size * 0.5;
-  float2 rel = pixel - (params.bounds_origin + half_size);
-  float corner = params.corner_radii.w; // bottom_left
-  if (rel.x < 0.0 && rel.y < 0.0) {
-    corner = params.corner_radii.x;
-  } else if (rel.x >= 0.0 && rel.y < 0.0) {
-    corner = params.corner_radii.y;
-  } else if (rel.x >= 0.0 && rel.y >= 0.0) {
-    corner = params.corner_radii.z;
+float blur_pick_corner_radius(float2 pos, float4 radii) {
+  if (pos.x < 0.0) {
+    return pos.y < 0.0 ? radii.x : radii.w;
   }
-  float r = min(corner, min(half_size.x, half_size.y));
-  float2 q = abs(rel) - (half_size - float2(r, r));
-  float dist = length(max(q, float2(0.0, 0.0))) + min(max(q.x, q.y), 0.0) - r;
-  return saturate(0.5 - dist);
+  return pos.y < 0.0 ? radii.y : radii.z;
 }
 
-// mix(snapshot, blurred, coverage), written with blending off.
+float blur_rounded_rect_sdf(float2 rel, float2 half_size, float4 radii) {
+  float r = min(blur_pick_corner_radius(rel, radii), min(half_size.x, half_size.y));
+  float2 q = abs(rel) - (half_size - float2(r, r));
+  return length(max(q, float2(0.0, 0.0))) + min(max(q.x, q.y), 0.0) - r;
+}
+
+// The backdrop through the glass at three refracted positions, `blur_mix`
+// of the way from sharp to blurred.
+float4 glass_backdrop(texture2d<float> level1, texture2d<float> snapshot,
+                      constant BlurParams &params, float2 uv_r, float2 uv_g,
+                      float2 uv_b, float blur_mix, bool blurred) {
+  float4 sg = snapshot.sample(blur_sampler, saturate(uv_g));
+  float4 sharp = float4(snapshot.sample(blur_sampler, saturate(uv_r)).r, sg.g,
+                        snapshot.sample(blur_sampler, saturate(uv_b)).b, sg.a);
+  float4 bg = blur_tent(level1, params, saturate(uv_g));
+  float4 soft = float4(blur_tent(level1, params, saturate(uv_r)).r, bg.g,
+                       blur_tent(level1, params, saturate(uv_b)).b, bg.a);
+  return blurred ? mix(sharp, soft, blur_mix) : sharp;
+}
+
+// The glass color (premultiplied): refraction, dispersion, progressive blur,
+// tint and the lit bevel.
+float4 glass_color(texture2d<float> level1, texture2d<float> snapshot,
+                   constant BlurParams &params, float2 frag_px, float2 rel,
+                   float2 half_size, float2 q, float dist, bool blurred) {
+  float scale = max(params.scale_factor, 1.0);
+  float2 q_pos = max(q, float2(0.0, 0.0));
+  float outside_len = length(q_pos);
+  float depth_in = max(-dist, 0.0);
+  float bevel = clamp(params.bevel_width, 4.0 * scale, min(half_size.x, half_size.y));
+  float u = saturate(depth_in / max(bevel, 1.0));
+  float one_minus_u = 1.0 - u;
+  float2 sgn = float2(rel.x >= 0.0 ? 1.0 : -1.0, rel.y >= 0.0 ? 1.0 : -1.0);
+  float2 grad;
+  if (outside_len > 0.0001) {
+    grad = (q_pos / outside_len) * sgn;
+  } else {
+    float diag_blend = smoothstep(-2.5 * scale, 2.5 * scale, q.x - q.y);
+    grad = normalize(float2(sgn.x * diag_blend, sgn.y * (1.0 - diag_blend)) + float2(1e-5, 1e-5));
+  }
+  float rim_slope = pow(one_minus_u, 1.85);
+  float2 body_tilt = (rel / half_size) * (0.10 * min(params.refraction, 1.5));
+  float2 xy_tilt = grad * (rim_slope * 0.76) + body_tilt;
+  float n_z = sqrt(max(1.0 - min(dot(xy_tilt, xy_tilt), 0.96), 0.04));
+  float3 normal = normalize(float3(xy_tilt, n_z));
+  float ior = 1.0 + 0.42 * params.refraction;
+  float eta = 1.0 / ior;
+  float k = max(1.0 - eta * eta * (1.0 - normal.z * normal.z), 0.0);
+  float2 snell_xy = normal.xy * (eta * normal.z - sqrt(k));
+  float thickness_px = bevel * (1.05 * params.refraction);
+  float border_dist = min(min(frag_px.x, params.viewport_size.x - frag_px.x),
+                          min(frag_px.y, params.viewport_size.y - frag_px.y));
+  float2 refr_px = snell_xy * thickness_px * smoothstep(0.0, 16.0 * scale, border_dist);
+  float disp_amt = params.dispersion * (0.14 + 0.36 * rim_slope);
+  float2 uv_r = (frag_px + refr_px * (1.0 - disp_amt)) / params.viewport_size;
+  float2 uv_g = (frag_px + refr_px) / params.viewport_size;
+  float2 uv_b = (frag_px + refr_px * (1.0 + disp_amt * 1.25)) / params.viewport_size;
+  uint mode = params.flags >> 8u;
+  float2 local_uv = saturate((frag_px - params.bounds_origin) / max(params.bounds_size, float2(1.0, 1.0)));
+  float prog = 1.0;
+  if (mode == 1u) {
+    prog = smoothstep(0.0, 1.0, local_uv.y);
+  } else if (mode == 2u) {
+    prog = smoothstep(1.0, 0.0, local_uv.y);
+  } else if (mode == 3u) {
+    prog = smoothstep(0.0, 1.0, local_uv.x);
+  } else if (mode == 4u) {
+    prog = smoothstep(1.0, 0.0, local_uv.x);
+  } else if (mode == 5u) {
+    prog = smoothstep(0.10, 1.0, pow(one_minus_u, 0.85));
+  }
+  float4 backdrop = glass_backdrop(level1, snapshot, params, uv_r, uv_g, uv_b, prog, blurred);
+  float a = backdrop.a;
+  float3 rgb = a > 0.0 ? backdrop.rgb / max(a, 1e-4) : float3(0.0, 0.0, 0.0);
+  float tint_a = params.tint_rgba.a * (mode == 0u ? 1.0 : 0.35 + 0.65 * prog);
+  rgb = mix(rgb, params.tint_rgba.rgb, tint_a);
+  float luma = dot(rgb, float3(0.299, 0.587, 0.114));
+  rgb = mix(float3(luma), rgb, 1.0 + 0.12 * min(params.refraction, 1.2));
+  float3 v_dir = float3(0.0, 0.0, 1.0);
+  float fresnel = pow(1.0 - saturate(normal.z), 2.2);
+  float3 key_h = normalize(normalize(float3(-0.55, -0.78, 0.65)) + v_dir);
+  float key_spec = pow(max(dot(normal, key_h), 0.0), 18.0);
+  float3 bounce_h = normalize(normalize(float3(0.55, 0.78, 0.45)) + v_dir);
+  float bounce_spec = pow(max(dot(normal, bounce_h), 0.0), 10.0) * 0.45;
+  float rim_line = smoothstep(2.4 * scale, 0.0, depth_in);
+  float rim_dir_weight = 0.42 + 0.58 * max(dot(grad, normalize(float2(-0.55, -0.83))), 0.0) +
+                         0.34 * max(dot(grad, normalize(float2(0.55, 0.83))), 0.0);
+  float inner_caustic = exp(-((u - 0.15) * (u - 0.15)) / (2.0 * 0.09 * 0.09)) *
+                        (0.24 + 0.56 * max(dot(grad, normalize(float2(-0.5, -0.86))), 0.0));
+  float ptr_spec = 0.0;
+  if (params.pointer_pos.x >= -1000.0) {
+    float2 ptr_delta = params.pointer_pos - frag_px;
+    float ptr_dist = length(ptr_delta);
+    float ptr_sigma = 210.0 * scale;
+    float ptr_falloff = exp(-(ptr_dist * ptr_dist) / (2.0 * ptr_sigma * ptr_sigma));
+    float3 ptr_h = normalize(normalize(float3(ptr_delta, 140.0 * scale)) + v_dir);
+    ptr_spec = pow(max(dot(normal, ptr_h), 0.0), 22.0) * ptr_falloff *
+               (0.28 + 0.72 * fresnel + 0.35 * rim_line);
+  }
+  float spec_energy = (fresnel * 0.25 + key_spec * (0.24 + 0.44 * fresnel) +
+                       bounce_spec * (0.14 + 0.28 * fresnel) +
+                       rim_line * rim_dir_weight * 0.44 + inner_caustic * 0.18 +
+                       ptr_spec * 0.48) * params.specular;
+  float bright_bg = smoothstep(0.48, 0.92, luma);
+  float outer_bevel_shade = smoothstep(2.0 * scale, 0.0, depth_in) * (0.07 + 0.22 * bright_bg) * params.specular;
+  float inner_rim_contrast =
+      exp(-((depth_in - 2.6 * scale) * (depth_in - 2.6 * scale)) / (2.0 * (1.8 * scale) * (1.8 * scale))) *
+      0.075 * bright_bg * params.specular;
+  rgb = rgb * (1.0 - outer_bevel_shade - inner_rim_contrast) + float3(0.97, 0.99, 1.04) * spec_energy;
+  rgb = saturate(rgb);
+  return float4(rgb * a, a);
+}
+
+// The glass's drop shadow, outside the shape only.
+float blur_shadow_alpha(constant BlurParams &params, float2 rel, float2 half_size, float outside) {
+  if (params.shadow_opacity <= 0.0005 || outside <= 0.001) {
+    return 0.0;
+  }
+  float scale = max(params.scale_factor, 1.0);
+  float d_amb = max(blur_rounded_rect_sdf(rel - float2(0.0, 9.0 * scale), half_size, params.corner_radii) + 3.0 * scale, 0.0);
+  float amb = exp(-(d_amb * d_amb) / (2.0 * (12.5 * scale) * (12.5 * scale))) *
+              smoothstep(38.0 * scale, 16.0 * scale, d_amb);
+  float d_con = max(blur_rounded_rect_sdf(rel - float2(0.0, 2.5 * scale), half_size, params.corner_radii) + 0.5 * scale, 0.0);
+  float con = exp(-(d_con * d_con) / (2.0 * (3.6 * scale) * (3.6 * scale)));
+  return clamp((amb * 0.72 + con * 0.34) * params.shadow_opacity * outside, 0.0, 0.85);
+}
+
+// The snapshot with the blur (or glass) mixed in by coverage, and the
+// glass's shadow over it outside the shape; written with blending off.
 fragment float4 backdrop_blur_fragment(BlurVarying in [[stage_in]],
                                        constant BlurParams &params [[buffer(0)]],
                                        texture2d<float> level1 [[texture(0)]],
                                        texture2d<float> snapshot [[texture(1)]]) {
-  float4 blurred = blur_tent(level1, params, in.uv);
-  float4 backdrop = snapshot.read(uint2(in.position.xy));
-  float cov = blur_coverage(params, in.position.xy);
-  if (cov <= 0.0) {
+  float2 frag_px = in.position.xy;
+  bool blurred = (params.flags & 1u) != 0u;
+  bool glass = (params.flags & 2u) != 0u;
+  float2 half_size = max(params.bounds_size * 0.5, float2(0.5, 0.5));
+  float2 rel = frag_px - (params.bounds_origin + half_size);
+  float r = min(blur_pick_corner_radius(rel, params.corner_radii), min(half_size.x, half_size.y));
+  float2 q = abs(rel) - (half_size - float2(r, r));
+  float dist = length(max(q, float2(0.0, 0.0))) + min(max(q.x, q.y), 0.0) - r;
+  float cov = saturate(0.5 - dist);
+  float shadow_a = blur_shadow_alpha(params, rel, half_size, 1.0 - cov);
+  if (cov <= 0.0 && shadow_a <= 0.0) {
     discard_fragment();
   }
-  return mix(backdrop, blurred, cov);
+  float4 inside = glass ? glass_color(level1, snapshot, params, frag_px, rel, half_size, q, dist, blurred)
+                        : blur_tent(level1, params, saturate(in.uv));
+  float4 backdrop = snapshot.read(uint2(frag_px));
+  float4 result = mix(backdrop, inside, cov);
+  float4 shadow = float4(float3(0.02, 0.04, 0.09) * shadow_a, shadow_a);
+  return shadow + result * (1.0 - shadow_a);
 }
 
 // Exact copy of the offscreen frame to the drawable.

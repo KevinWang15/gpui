@@ -115,6 +115,7 @@ struct ViewTransitionPipeline {
     vertex: ID3D11VertexShader,
     fragment: ID3D11PixelShader,
     params: Option<ID3D11Buffer>,
+    clamp_sampler: Option<ID3D11SamplerState>,
 }
 
 /// `ViewTransitionParams` in shaders.hlsl.
@@ -125,7 +126,7 @@ struct ViewTransitionParams {
     feather: f32,
     progress: f32,
     kind: u32,
-    _pad: [u32; 2],
+    viewport_size: [f32; 2],
 }
 
 /// Offscreen textures for backdrop blurs (`gpui::backdrop_blur`): `snapshot`
@@ -159,20 +160,9 @@ struct BackdropBlurPipeline {
     clamp_sampler: Option<ID3D11SamplerState>,
 }
 
-/// `BackdropBlurParams` in shaders.hlsl (80 bytes, 16-byte aligned).
-#[derive(Clone, Copy, Default)]
-#[repr(C)]
-struct BackdropBlurParams {
-    viewport_size: [f32; 2],
-    texel_size: [f32; 2],
-    offset: f32,
-    _pad: [u32; 3],
-    bounds_origin: [f32; 2],
-    bounds_size: [f32; 2],
-    corner_radii: [f32; 4],
-    mask_origin: [f32; 2],
-    mask_size: [f32; 2],
-}
+/// The blur shaders' uniform (`gpui::backdrop_blur::BlurParams`, the cbuffer
+/// `BackdropBlurParams` in shaders.hlsl).
+use gpui::backdrop_blur::BlurParams as BackdropBlurParams;
 
 struct DirectXGlobalElements {
     global_params_buffer: Option<ID3D11Buffer>,
@@ -509,7 +499,7 @@ impl DirectXRenderer {
                 feather: transition.feather.0,
                 progress: transition.progress,
                 kind: transition.kind as u32,
-                _pad: [0; 2],
+                viewport_size: [self.width.max(1) as f32, self.height.max(1) as f32],
             }],
         )?;
         unsafe {
@@ -524,6 +514,7 @@ impl DirectXRenderer {
             context.VSSetShader(&pipeline.vertex, None);
             context.PSSetShader(&pipeline.fragment, None);
             context.PSSetConstantBuffers(2, Some(slice::from_ref(&pipeline.params)));
+            context.PSSetSamplers(0, Some(slice::from_ref(&pipeline.clamp_sampler)));
             context.PSSetShaderResources(0, Some(&[frames.old_view.clone(), frames.new_view.clone()]));
             context.Draw(3, 0);
             // Unbound, so the frames can be copied into again next frame.
@@ -1292,7 +1283,6 @@ fn draw_blur_batch(
             MinDepth: 0.0,
             MaxDepth: 1.0,
         };
-        let (vw, vh) = (targets.width as f32, targets.height as f32);
         let unbind_inputs = || unsafe { context.PSSetShaderResources(0, Some(&[None, None])) };
 
         unsafe {
@@ -1307,7 +1297,8 @@ fn draw_blur_batch(
 
             for (plan, members) in &groups {
                 context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-                for pass in plan.passes() {
+                for pass in plan.iter().flat_map(|plan| plan.passes()) {
+                    let plan = plan.expect("passes come from a plan");
                     let (source_srv, sw, sh) = if pass.source == 0 {
                         (&targets.snapshot_srv, targets.width, targets.height)
                     } else {
@@ -1315,15 +1306,7 @@ fn draw_blur_batch(
                         (&l.srv, l.width, l.height)
                     };
                     let target = &targets.levels[pass.target as usize - 1];
-                    update_buffer(
-                        context,
-                        params_buf,
-                        &[BackdropBlurParams {
-                            texel_size: [1.0 / sw as f32, 1.0 / sh as f32],
-                            offset: plan.offset,
-                            ..Default::default()
-                        }],
-                    )?;
+                    update_buffer(context, params_buf, &[BackdropBlurParams::pass(plan, sw, sh, pass.source == 0, false)])?;
                     unbind_inputs();
                     context.OMSetRenderTargets(Some(slice::from_ref(&target.rtv)), None);
                     context.RSSetViewports(Some(&[viewport(target.width, target.height)]));
@@ -1337,46 +1320,27 @@ fn draw_blur_batch(
                     context.Draw(3, 0);
                 }
 
-                // Composite: the last upsample, from level 1, mixed into the
-                // target by each blur's coverage.
-                let level1 = &targets.levels[0];
+                // Composite: the last upsample from level 1 (clear glass has
+                // none and reads the snapshot), mixed into the target by each
+                // blur's coverage.
+                let source = if plan.is_some() { targets.levels[0].srv.clone() } else { targets.snapshot_srv.clone() };
                 unbind_inputs();
                 context.OMSetRenderTargets(Some(slice::from_ref(render_target_view)), None);
                 context.RSSetViewports(Some(slice::from_ref(target_viewport)));
                 context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
                 context.VSSetShader(&pipeline.composite_vs, None);
                 context.PSSetShader(&pipeline.composite_ps, None);
-                context.PSSetShaderResources(0, Some(&[level1.srv.clone(), targets.snapshot_srv.clone()]));
+                context.PSSetShaderResources(0, Some(&[source, targets.snapshot_srv.clone()]));
                 for blur in members {
                     update_buffer(
                         context,
                         params_buf,
-                        &[BackdropBlurParams {
-                            viewport_size: [vw, vh],
-                            texel_size: [1.0 / level1.width as f32, 1.0 / level1.height as f32],
-                            offset: plan.offset,
-                            _pad: [0; 3],
-                            bounds_origin: [blur.bounds.origin.x.0, blur.bounds.origin.y.0],
-                            bounds_size: [blur.bounds.size.width.0, blur.bounds.size.height.0],
-                            corner_radii: [
-                                blur.corner_radii.top_left.0,
-                                blur.corner_radii.top_right.0,
-                                blur.corner_radii.bottom_right.0,
-                                blur.corner_radii.bottom_left.0,
-                            ],
-                            mask_origin: [
-                                blur.content_mask.bounds.origin.x.0,
-                                blur.content_mask.bounds.origin.y.0,
-                            ],
-                            mask_size: [
-                                blur.content_mask.bounds.size.width.0,
-                                blur.content_mask.bounds.size.height.0,
-                            ],
-                        }],
+                        &[BackdropBlurParams::composite(blur, *plan, targets.width, targets.height, false)],
                     )?;
                     context.Draw(4, 0);
                 }
             }
+
             unbind_inputs();
         }
         Ok(())
@@ -1566,10 +1530,28 @@ impl ViewTransitionPipeline {
             let raw_shader = RawShaderBytes::new(ShaderModule::ViewTransition, ShaderTarget::Fragment)?;
             create_fragment_shader(device, raw_shader.as_bytes())?
         };
+        let clamp_sampler = unsafe {
+            let desc = D3D11_SAMPLER_DESC {
+                Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+                AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressV: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressW: D3D11_TEXTURE_ADDRESS_CLAMP,
+                MipLODBias: 0.0,
+                MaxAnisotropy: 1,
+                ComparisonFunc: D3D11_COMPARISON_ALWAYS,
+                BorderColor: [0.0; 4],
+                MinLOD: 0.0,
+                MaxLOD: D3D11_FLOAT32_MAX,
+            };
+            let mut output = None;
+            device.CreateSamplerState(&desc, Some(&mut output))?;
+            output
+        };
         Ok(Self {
             vertex,
             fragment,
             params: create_constant_buffer::<ViewTransitionParams>(device)?,
+            clamp_sampler,
         })
     }
 }
@@ -2787,18 +2769,18 @@ mod backdrop_blur_tests {
         let pipeline = BackdropBlurPipeline::new(&device).unwrap();
         let mut targets = None;
         let rect = |x: f32, y: f32, w: f32, h: f32| Bounds { origin: point(ScaledPixels(x), ScaledPixels(y)), size: size(ScaledPixels(w), ScaledPixels(h)) };
-        let blur = BackdropBlur {
-            order: 0,
-            blur_radius: ScaledPixels(radius),
-            bounds: rect(16.0, 20.0, 64.0, 56.0),
-            corner_radii: Corners {
+        let blur = BackdropBlur::plain(
+            rect(16.0, 20.0, 64.0, 56.0),
+            Corners {
                 top_left: ScaledPixels(10.0),
                 top_right: ScaledPixels(4.0),
                 bottom_right: ScaledPixels(10.0),
                 bottom_left: ScaledPixels(0.0),
             },
-            content_mask: ContentMask { bounds: rect(0.0, 0.0, W as f32, H as f32) },
-        };
+            ScaledPixels(radius),
+            ContentMask { bounds: rect(0.0, 0.0, W as f32, H as f32) },
+            1.0,
+        );
         draw_blur_batch(&device, &context, &pipeline, &mut targets, &target, &rtv, &viewport, &[blur]).unwrap();
         let actual = read_back(&device, &context, &target);
 
@@ -2822,6 +2804,58 @@ mod backdrop_blur_tests {
         let at = |x: u32, y: u32, img: &[u8]| img[((y * W + x) * 4) as usize..][..4].to_vec();
         assert_ne!(at(48, 48, &actual), at(48, 48, &initial), "the inside is blurred");
         assert_eq!(at(4, 4, &actual), at(4, 4, &initial), "the outside is untouched");
+    }
+
+    /// A clear lens (no blur: the composite reads only the snapshot) with a
+    /// drop shadow: the inside is refracted near the rim, the shadow darkens
+    /// just below it, and far away nothing changes.
+    #[core::prelude::v1::test]
+    fn clear_glass_refracts_and_casts_its_shadow() {
+        let (device, context) = warp();
+        let initial = stripes();
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: W,
+            Height: H,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: (D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE).0 as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let data = D3D11_SUBRESOURCE_DATA { pSysMem: initial.as_ptr().cast(), SysMemPitch: W * 4, SysMemSlicePitch: 0 };
+        let mut target = None;
+        unsafe { device.CreateTexture2D(&desc, Some(&data), Some(&mut target)).unwrap() };
+        let target = target.unwrap();
+        let mut rtv = None;
+        unsafe { device.CreateRenderTargetView(&target, None, Some(&mut rtv)).unwrap() };
+        let viewport = D3D11_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: W as f32, Height: H as f32, MinDepth: 0.0, MaxDepth: 1.0 };
+        let pipeline = BackdropBlurPipeline::new(&device).unwrap();
+        let mut targets = None;
+        let rect = |x: f32, y: f32, w: f32, h: f32| Bounds { origin: point(ScaledPixels(x), ScaledPixels(y)), size: size(ScaledPixels(w), ScaledPixels(h)) };
+        let mut lens = BackdropBlur::plain(
+            rect(20.0, 16.0, 56.0, 40.0),
+            Corners::all(ScaledPixels(12.0)),
+            ScaledPixels(0.0),
+            ContentMask { bounds: rect(0.0, 0.0, W as f32, H as f32) },
+            1.0,
+        );
+        lens.refraction = 1.2;
+        lens.dispersion = 0.6;
+        lens.bevel_width = ScaledPixels(10.0);
+        lens.shadow_opacity = 0.45;
+        assert!(lens.is_drawn() && lens.plan().is_none());
+        draw_blur_batch(&device, &context, &pipeline, &mut targets, &target, &rtv, &viewport, &[lens]).unwrap();
+        let actual = read_back(&device, &context, &target);
+        let at = |x: u32, y: u32, img: &[u8]| -> [u8; 4] { img[((y * W + x) * 4) as usize..][..4].try_into().unwrap() };
+        let rim_changed = (22..74).any(|x| at(x, 20, &actual) != at(x, 20, &initial));
+        assert!(rim_changed, "the rim refracts");
+        let luma = |p: [u8; 4]| p[0] as u32 + p[1] as u32 + p[2] as u32;
+        assert!(luma(at(48, 62, &actual)) < luma(at(48, 62, &initial)), "the shadow darkens below the lens");
+        assert_eq!(at(2, 94, &actual), at(2, 94, &initial), "far away nothing changes");
+        assert!(actual.chunks_exact(4).all(|p| p[3] == 255), "an opaque target stays opaque");
     }
 
     // `#[test]` alone is gpui's test macro here (the module imports gpui's).

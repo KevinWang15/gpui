@@ -352,16 +352,52 @@ impl Render for PlaygroundApp {
                                                 })),
                                         )
                                         .child({
+                                            let active_style = self.theme_transition_style;
+                                            let next_style = match active_style {
+                                                ThemeTransitionStyle::Shockwave => {
+                                                    ThemeTransitionStyle::PageCurl
+                                                }
+                                                ThemeTransitionStyle::PageCurl => {
+                                                    ThemeTransitionStyle::LiquidDissolve
+                                                }
+                                                ThemeTransitionStyle::LiquidDissolve => {
+                                                    ThemeTransitionStyle::RadialReveal
+                                                }
+                                                ThemeTransitionStyle::RadialReveal => {
+                                                    ThemeTransitionStyle::CrossFade
+                                                }
+                                                ThemeTransitionStyle::CrossFade => {
+                                                    ThemeTransitionStyle::Shockwave
+                                                }
+                                            };
+                                            button("nav-transition-fx-btn")
+                                                .soft()
+                                                .size(ComponentSize::Sm)
+                                                .leading_icon(LucideIcon::Sparkles)
+                                                .label(format!("FX: {}", active_style.label()))
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.theme_transition_style = next_style;
+                                                    this.log_event(
+                                                        "Transition FX",
+                                                        format!("style -> {}", next_style.label()),
+                                                        cx,
+                                                    );
+                                                }))
+                                        })
+                                        .child({
                                             let accent = self.accent;
+                                            let transition_style = self.theme_transition_style;
                                             let app_handle = cx.entity().downgrade();
-                                            theme_switcher("nav-theme-switcher").on_change(
-                                                move |pref, origin, window, cx| {
+                                            theme_switcher("nav-theme-switcher")
+                                                .transition_style(transition_style)
+                                                .on_change(move |pref, origin, window, cx| {
                                                     let mode = Theme::resolve_mode(pref, window);
                                                     let next_theme = accent
                                                         .build_theme(mode)
                                                         .with_preference(pref);
-                                                    Theme::switch_with_transition(
+                                                    Theme::switch_with_transition_style(
                                                         next_theme,
+                                                        transition_style,
                                                         Some(origin),
                                                         window,
                                                         cx,
@@ -370,13 +406,15 @@ impl Render for PlaygroundApp {
                                                         app.update(cx, |this, cx| {
                                                             this.log_event(
                                                                 "Theme",
-                                                                format!("preference -> {pref:?}"),
+                                                                format!(
+                                                                    "preference -> {pref:?} ({})",
+                                                                    transition_style.label()
+                                                                ),
                                                                 cx,
                                                             );
                                                         });
                                                     }
-                                                },
-                                            )
+                                                })
                                         }),
                                 ),
                         )

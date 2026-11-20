@@ -1075,12 +1075,559 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
                 ),
         );
 
+    // 0. Physical GPU Shader View Transitions Lab
+    let active_fx = app.theme_transition_style;
+    let accent = app.accent;
+    let fx_cards: &[(ThemeTransitionStyle, LucideIcon, &str, &str)] = &[
+        (
+            ThemeTransitionStyle::Shockwave,
+            LucideIcon::WavesHorizontal,
+            "Shockwave",
+            "Refractive optical ripple + RGB chromatic dispersion + caustic crest",
+        ),
+        (
+            ThemeTransitionStyle::PageCurl,
+            LucideIcon::BookOpen,
+            "Page Curl",
+            "3D cylindrical page turn + specular ridge + frosted vellum + cast shadow",
+        ),
+        (
+            ThemeTransitionStyle::LiquidDissolve,
+            LucideIcon::Droplets,
+            "Liquid Dissolve",
+            "Domain-warped FBM liquid melt + surface-tension refraction + meniscus rim",
+        ),
+        (
+            ThemeTransitionStyle::RadialReveal,
+            LucideIcon::CircleDot,
+            "Radial Reveal",
+            "Crisp circular wipe expanding from the exact pointer click coordinate",
+        ),
+        (
+            ThemeTransitionStyle::CrossFade,
+            LucideIcon::Blend,
+            "Cross-Fade",
+            "Smooth full-window opacity dissolve between live frames",
+        ),
+    ];
+
+    let shader_transitions_section = card()
+        .child(
+            card_header().bordered().child(
+                h_stack()
+                    .justify_between()
+                    .child(
+                        v_stack()
+                            .spacing(px(3.))
+                            .child(
+                                h_stack()
+                                    .spacing(px(8.))
+                                    .child(card_title("Physical GPU Shader View Transitions"))
+                                    .child(
+                                        badge("1-Pass Fullscreen Shader")
+                                            .color(BadgeColor::Indigo)
+                                            .pill(true),
+                                    ),
+                            )
+                            .child(card_description(
+                                "Click any effect below to select it for the navbar theme switcher and immediately trigger a live Light ↔ Dark shader transition from your cursor.",
+                            )),
+                    )
+                    .child(
+                        badge(format!("Active: {}", active_fx.label()))
+                            .color(BadgeColor::Green),
+                    ),
+            ),
+        )
+        .child(
+            card_content().child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .gap(px(10.))
+                    .children(fx_cards.iter().enumerate().map(|(idx, &(style, ic, title, desc))| {
+                        let is_selected = active_fx == style;
+                        div()
+                            .id(("fx-transition-tile", idx))
+                            .flex()
+                            .flex_col()
+                            .gap(px(6.))
+                            .flex_1()
+                            .min_w(px(176.))
+                            .p(px(12.))
+                            .rounded(theme.radius_lg)
+                            .border_1()
+                            .border_color(if is_selected {
+                                theme.primary
+                            } else {
+                                theme.border
+                            })
+                            .bg(if is_selected {
+                                theme.primary_soft.opacity(0.65)
+                            } else {
+                                theme.surface_muted.opacity(0.45)
+                            })
+                            .cursor_pointer()
+                            .hover(|s| {
+                                s.border_color(theme.primary)
+                                    .bg(theme.primary_soft.opacity(0.45))
+                            })
+                            .on_click(cx.listener(move |this, ev: &gpui::ClickEvent, window, cx| {
+                                this.theme_transition_style = style;
+                                let next_mode = match cx.theme().mode {
+                                    ThemeMode::Light => ThemeMode::Dark,
+                                    ThemeMode::Dark => ThemeMode::Light,
+                                };
+                                let next_pref = match next_mode {
+                                    ThemeMode::Light => ThemePreference::Light,
+                                    ThemeMode::Dark => ThemePreference::Dark,
+                                };
+                                let next_theme =
+                                    accent.build_theme(next_mode).with_preference(next_pref);
+                                Theme::switch_with_transition_style(
+                                    next_theme,
+                                    style,
+                                    Some(ev.position()),
+                                    window,
+                                    cx,
+                                );
+                                this.log_event(
+                                    "ViewTransition",
+                                    format!("{} -> {next_mode:?}", style.label()),
+                                    cx,
+                                );
+                            }))
+                            .child(
+                                h_stack()
+                                    .justify_between()
+                                    .child(
+                                        h_stack()
+                                            .spacing(px(8.))
+                                            .child(
+                                                Icon::new(ic)
+                                                    .size(IconSize::Sm)
+                                                    .color(if is_selected {
+                                                        theme.primary_soft_foreground
+                                                    } else {
+                                                        theme.primary
+                                                    }),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(px(13.5))
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .text_color(theme.foreground)
+                                                    .child(title),
+                                            ),
+                                    )
+                                    .when(is_selected, |el| {
+                                        el.child(
+                                            Icon::new(LucideIcon::Check)
+                                                .size(IconSize::Xs)
+                                                .color(theme.primary),
+                                        )
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.5))
+                                    .text_color(theme.muted_foreground)
+                                    .child(desc),
+                            )
+                    })),
+            ),
+        );
+
+    // 0b. Composable Optical LiquidGlass Lens, Floating Bar & Progressive Blur Lab
+    let glass_refraction = app.glass_refraction_slider.read(cx).value();
+    let glass_dispersion = app.glass_dispersion_slider.read(cx).value();
+    let glass_frost = app.glass_frost_slider.read(cx).value();
+    let glass_prog = app.glass_progressive_mode;
+    let bar_clicks = app.glass_bar_clicks;
+
+    let prog_options: &[(ProgressiveBlur, &str)] = &[
+        (ProgressiveBlur::BottomToTop, "Header Fade"),
+        (ProgressiveBlur::TopToBottom, "Footer Fade"),
+        (ProgressiveBlur::Edges, "Clear Center"),
+        (ProgressiveBlur::None, "Uniform"),
+    ];
+
+    let bar_colors = [
+        tw::INDIGO_500,
+        tw::EMERALD_500,
+        tw::AMBER_500,
+        tw::ROSE_500,
+        tw::SKY_500,
+        tw::VIOLET_500,
+    ];
+
+    let liquid_glass_section = card()
+        .child(
+            card_header().bordered().child(
+                h_stack()
+                    .justify_between()
+                    .child(
+                        v_stack()
+                            .spacing(px(3.))
+                            .child(
+                                h_stack()
+                                    .spacing(px(8.))
+                                    .child(card_title("Composable LiquidGlass — Optical Lens, Floating Bar & Progressive Blur"))
+                                    .child(
+                                        badge("GPU Snell + Prism + Fresnel")
+                                            .color(BadgeColor::Blue)
+                                            .pill(true),
+                                    ),
+                            )
+                            .child(card_description(
+                                "Drag either LiquidGlass container freely over live typography & charts — or click the buttons inside the floating glass bar. Everything is a normal ParentElement + Styled container.",
+                            )),
+                    )
+                    .child(
+                        button("lg-reset-pos")
+                            .outline()
+                            .size(ComponentSize::Xs)
+                            .leading_icon(LucideIcon::RotateCcw)
+                            .label("Reset Positions")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.glass_lens_drag.update(cx, |s, cx| {
+                                    s.set_position(gpui::point(px(36.), px(82.)), cx);
+                                });
+                                this.glass_bar_drag.update(cx, |s, cx| {
+                                    s.set_position(gpui::point(px(290.), px(210.)), cx);
+                                });
+                            })),
+                    ),
+            ),
+        )
+        .child(
+            card_content()
+                .child(
+                    grid(3)
+                        .spacing(px(14.))
+                        .child(slider(&app.glass_refraction_slider))
+                        .child(slider(&app.glass_dispersion_slider))
+                        .child(slider(&app.glass_frost_slider)),
+                )
+                .child(
+                    h_stack()
+                        .spacing(px(8.))
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(theme.muted_foreground)
+                                .child("Header Progressive Blur:"),
+                        )
+                        .children(prog_options.iter().enumerate().map(|(i, &(mode, lbl))| {
+                            let active = glass_prog == mode;
+                            button(("lg-prog", i))
+                                .size(ComponentSize::Xs)
+                                .variant(if active {
+                                    ButtonVariant::Primary
+                                } else {
+                                    ButtonVariant::Outline
+                                })
+                                .label(lbl)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.glass_progressive_mode = mode;
+                                    cx.notify();
+                                }))
+                        })),
+                )
+                .child(
+                    liquid_glass_stage("pg-liquid-glass-stage")
+                        .track(&app.glass_lens_drag)
+                        .track(&app.glass_bar_drag)
+                        .w_full()
+                        .h(px(340.))
+                        .rounded(theme.radius_xl)
+                        .border_1()
+                        .border_color(theme.border)
+                        .bg(theme.background)
+                        // Rich live UI scene underneath the optical glass containers
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .justify_between()
+                                .size_full()
+                                .p(px(20.))
+                                .pt(px(58.))
+                                .gap(px(14.))
+                                .child(
+                                    h_stack()
+                                        .justify_between()
+                                        .items_start()
+                                        .child(
+                                            v_stack()
+                                                .spacing(px(4.))
+                                                .child(
+                                                    div()
+                                                        .text_size(px(20.))
+                                                        .font_weight(FontWeight::BOLD)
+                                                        .text_color(theme.foreground)
+                                                        .child("Live Subpixel Typography & GPU Telemetry"),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_size(px(13.))
+                                                        .text_color(theme.muted_foreground)
+                                                        .child("Drag the magnifying lens or floating toolbar directly across these headings, colored badges, and bars to inspect real-time Snell refraction & RGB prism dispersion."),
+                                                ),
+                                        )
+                                        .child(
+                                            h_stack()
+                                                .spacing(px(6.))
+                                                .child(badge("120 Hz").color(BadgeColor::Green).dot(true))
+                                                .child(badge("0-Frame Lag").color(BadgeColor::Indigo))
+                                                .child(badge("VRAM Pass").color(BadgeColor::Amber)),
+                                        ),
+                                )
+                                // Crisp multi-color live bar chart + KPI cards underneath
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_end()
+                                        .gap(px(16.))
+                                        .flex_1()
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .flex_row()
+                                                .items_end()
+                                                .justify_between()
+                                                .flex_1()
+                                                .h(px(172.))
+                                                .p(px(14.))
+                                                .rounded(theme.radius_lg)
+                                                .bg(theme.surface)
+                                                .border_1()
+                                                .border_color(theme.border)
+                                                .children((0..16).map(|b| {
+                                                    let h_px = 38.0 + ((b * 43 + 19) % 108) as f32;
+                                                    let col: Hsla =
+                                                        bar_colors[b % bar_colors.len()].into();
+                                                    div()
+                                                        .w(px(18.))
+                                                        .h(px(h_px))
+                                                        .rounded_t(px(5.))
+                                                        .bg(col)
+                                                })),
+                                        )
+                                        .child(
+                                            v_stack()
+                                                .w(px(220.))
+                                                .spacing(px(10.))
+                                                .child(
+                                                    div()
+                                                        .p(px(12.))
+                                                        .rounded(theme.radius_lg)
+                                                        .bg(theme.surface)
+                                                        .border_1()
+                                                        .border_color(theme.border)
+                                                        .child(
+                                                            v_stack()
+                                                                .spacing(px(4.))
+                                                                .child(
+                                                                    div()
+                                                                        .text_size(px(11.5))
+                                                                        .text_color(theme.muted_foreground)
+                                                                        .child("OPTICAL PASS BUDGET"),
+                                                                )
+                                                                .child(
+                                                                    div()
+                                                                        .text_size(px(22.))
+                                                                        .font_weight(FontWeight::BOLD)
+                                                                        .text_color(theme.primary)
+                                                                        .child("0.11 ms"),
+                                                                ),
+                                                        ),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .p(px(12.))
+                                                        .rounded(theme.radius_lg)
+                                                        .bg(theme.surface)
+                                                        .border_1()
+                                                        .border_color(theme.border)
+                                                        .child(
+                                                            v_stack()
+                                                                .spacing(px(4.))
+                                                                .child(
+                                                                    div()
+                                                                        .text_size(px(11.5))
+                                                                        .text_color(theme.muted_foreground)
+                                                                        .child("FLOATING BAR CLICKS"),
+                                                                )
+                                                                .child(
+                                                                    div()
+                                                                        .text_size(px(22.))
+                                                                        .font_weight(FontWeight::BOLD)
+                                                                        .text_color(theme.foreground)
+                                                                        .child(format!("{bar_clicks}")),
+                                                                ),
+                                                        ),
+                                                ),
+                                        ),
+                                ),
+                        )
+                        // 1. Docked Continuous Progressive-Blur Header (composed with normal children!)
+                        .child(
+                            liquid_glass("pg-glass-progressive-hdr")
+                                .progressive_panel(glass_prog)
+                                .blur(px(16.))
+                                .elevation_shadow(false)
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .right_0()
+                                .h(px(46.))
+                                .rounded_none()
+                                .px(px(18.))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    h_stack()
+                                        .spacing(px(8.))
+                                        .child(
+                                            Icon::new(LucideIcon::Sparkles)
+                                                .size(IconSize::Sm)
+                                                .color(theme.primary),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(12.5))
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(theme.foreground)
+                                                .child("Continuous Progressive-Blur Header"),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(11.5))
+                                        .text_color(theme.muted_foreground)
+                                        .child("Zero banding seams · single GPU pass"),
+                                ),
+                        )
+                        // 2. Composable Draggable Crystal Optical Magnifying Lens
+                        .child(
+                            liquid_glass("pg-glass-lens")
+                                .lens()
+                                .refraction(glass_refraction)
+                                .dispersion(glass_dispersion)
+                                .draggable(&app.glass_lens_drag)
+                                .w(px(210.))
+                                .h(px(132.))
+                                .rounded_full()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(
+                                    h_stack()
+                                        .spacing(px(6.))
+                                        .px(px(10.))
+                                        .py(px(4.))
+                                        .rounded_full()
+                                        .bg(theme.surface.opacity(0.45))
+                                        .child(
+                                            Icon::new(LucideIcon::Move)
+                                                .size(IconSize::Xs)
+                                                .color(theme.foreground),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(11.5))
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(theme.foreground)
+                                                .child("Drag Optical Lens"),
+                                        ),
+                                ),
+                        )
+                        // 3. Composable Draggable Floating LiquidGlass Action Bar with live interactive buttons!
+                        .child(
+                            liquid_glass("pg-glass-floating-bar")
+                                .floating_bar()
+                                .refraction((glass_refraction * 0.85).min(1.4))
+                                .dispersion(glass_dispersion)
+                                .blur(px(glass_frost))
+                                .draggable(&app.glass_bar_drag)
+                                .px(px(14.))
+                                .py(px(8.))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(8.))
+                                .child(
+                                    Icon::new(LucideIcon::GripVertical)
+                                        .size(IconSize::Sm)
+                                        .color(theme.muted_foreground),
+                                )
+                                .child(
+                                    button("lg-bar-action")
+                                        .primary()
+                                        .size(ComponentSize::Xs)
+                                        .pill(true)
+                                        .leading_icon(LucideIcon::Zap)
+                                        .label(format!("Pulse ({bar_clicks})"))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.glass_bar_clicks += 1;
+                                            this.log_event(
+                                                "LiquidGlass",
+                                                format!(
+                                                    "floating bar button clicked ({})",
+                                                    this.glass_bar_clicks
+                                                ),
+                                                cx,
+                                            );
+                                        })),
+                                )
+                                .child(
+                                    button("lg-bar-fx")
+                                        .soft()
+                                        .size(ComponentSize::Xs)
+                                        .pill(true)
+                                        .leading_icon(LucideIcon::SunMoon)
+                                        .label("Flip Theme")
+                                        .on_click(cx.listener(move |this, ev: &gpui::ClickEvent, window, cx| {
+                                            let next_mode = match cx.theme().mode {
+                                                ThemeMode::Light => ThemeMode::Dark,
+                                                ThemeMode::Dark => ThemeMode::Light,
+                                            };
+                                            let next_pref = match next_mode {
+                                                ThemeMode::Light => ThemePreference::Light,
+                                                ThemeMode::Dark => ThemePreference::Dark,
+                                            };
+                                            let next_theme = this
+                                                .accent
+                                                .build_theme(next_mode)
+                                                .with_preference(next_pref);
+                                            Theme::switch_with_transition_style(
+                                                next_theme,
+                                                this.theme_transition_style,
+                                                Some(ev.position()),
+                                                window,
+                                                cx,
+                                            );
+                                        })),
+                                )
+                                .child(
+                                    badge("Draggable").color(BadgeColor::Blue).pill(true),
+                                ),
+                        ),
+                ),
+        );
+
     v_stack()
         .spacing(px(22.))
         .w_full()
         .child(
             page_header("Interactive & Blur Components")
-                .description("GPU-blurred LoadingOverlay & BlurContainer, multi-variant Spinners, ProgressRing, CommandPalette (⌘K), Drawer, ContextMenu, SplitPane, NumberInput, Stepper, Rating, CopyButton, and PinInput.")
+                .description("Composable LiquidGlass optical lens & floating bar, physical GPU ViewTransitions, BlurContainer, LoadingOverlay, Spinners, CommandPalette (⌘K), Drawer, ContextMenu, SplitPane, NumberInput, Stepper, Rating, CopyButton, and PinInput.")
                 .action(
                     button("hdr-cmd-k")
                         .secondary()
@@ -1104,6 +1651,8 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
                         })),
                 ),
         )
+        .child(liquid_glass_section)
+        .child(shader_transitions_section)
         .child(blur_loading_section)
         .child(spinners_and_rings)
         .child(overlays_section)

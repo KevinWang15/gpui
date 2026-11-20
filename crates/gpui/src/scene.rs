@@ -327,13 +327,11 @@ impl Scene {
         if clipped_bounds.is_empty() {
             return false;
         }
-        // A blur reads beyond its bounds: it must come after everything
+        // A blur reads beyond what it paints: it comes after everything
         // painted before it within that reach.
-        let clipped_bounds = match &primitive {
-            Primitive::BackdropBlur(blur) => match crate::backdrop_blur::BlurPlan::for_radius(blur.blur_radius.0) {
-                Some(plan) => clipped_bounds.dilate(ScaledPixels(plan.reach())),
-                None => return false,
-            },
+        let read_bounds = match &primitive {
+            Primitive::BackdropBlur(blur) if !blur.is_drawn() => return false,
+            Primitive::BackdropBlur(blur) => clipped_bounds.dilate(ScaledPixels(blur.reach())),
             _ => clipped_bounds,
         };
 
@@ -350,9 +348,12 @@ impl Scene {
                 _ => layer.primitives.push(index..index + 1),
             }
         } else {
-            let order = self
-                .primitive_bounds
-                .insert(clipped_bounds, kind, kind.max_shared_kind());
+            let order = self.primitive_bounds.insert_reading(
+                clipped_bounds,
+                read_bounds,
+                kind,
+                kind.max_shared_kind(),
+            );
             self.push_primitive(primitive.clone(), order);
         }
         self.paint_operations
@@ -713,9 +714,12 @@ impl Primitive {
     }
 
     fn clipped_bounds(&self) -> Bounds<ScaledPixels> {
-        self.transformation()
-            .transform_bounds(*self.bounds())
-            .intersect(&self.content_mask().bounds)
+        let raw_bounds = match self {
+            // The composite also draws the glass's drop shadow around it.
+            Primitive::BackdropBlur(blur) => blur.painted_bounds(),
+            _ => self.transformation().transform_bounds(*self.bounds()),
+        };
+        raw_bounds.intersect(&self.content_mask().bounds)
     }
 
     pub fn content_mask(&self) -> &ContentMask<ScaledPixels> {
@@ -1033,16 +1037,73 @@ impl PrimitiveBatch {
     }
 }
 
-/// GPU frosted-glass backdrop blur primitive (`backdrop-filter: blur(...)`): everything
-/// already painted behind `bounds`, blurred, in the rounded region. What renderers draw, and how,
-/// is in [`crate::backdrop_blur`].
+/// Directional gradient controlling continuous variable-radius blur inside a
+/// [`BackdropBlur`] / `LiquidGlass` surface.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[repr(u32)]
+pub enum ProgressiveBlur {
+    /// Uniform blur across the entire region (default).
+    #[default]
+    None = 0,
+    /// Crystal-clear at the top (`0%` blur), ramping smoothly to full blur at the bottom.
+    TopToBottom = 1,
+    /// Full blur at the top, clearing smoothly to `0%` at the bottom (ideal for sticky headers).
+    BottomToTop = 2,
+    /// Crystal-clear on the left, ramping smoothly to full blur on the right.
+    LeftToRight = 3,
+    /// Full blur on the left, clearing smoothly to `0%` on the right.
+    RightToLeft = 4,
+    /// Crystal-clear optical center smoothly frosting outward toward the curved bevel rim.
+    Edges = 5,
+}
+
+/// Configuration for [`Window::paint_liquid_glass`](crate::Window::paint_liquid_glass).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LiquidGlassOptions {
+    /// Optical Snell refraction strength (`0.0` = flat blur, `~0.6..1.4` = liquid glass lens).
+    pub refraction: f32,
+    /// RGB chromatic dispersion intensity along curved glass bevels (`0.0..=1.5`).
+    pub dispersion: f32,
+    /// Analytical 3D curved bevel width in logical pixels (default `16px`).
+    pub bevel_width: Pixels,
+    /// Fresnel specular rim & live cursor sheen intensity (`0.0..=1.5`).
+    pub specular: f32,
+    /// Continuous progressive blur gradient across the glass surface.
+    pub progressive_blur: ProgressiveBlur,
+    /// Optional pointer coordinate in logical window pixels for live 3D bevel sheen.
+    pub pointer_position: Option<Point<Pixels>>,
+    /// Subtle glass body tint blended over the refracted backdrop.
+    pub tint: Hsla,
+    /// Opacity of the exterior-only analytical glass elevation drop shadow (`0.0..=0.8`).
+    /// Rendered strictly outside the rounded-rectangle SDF so no shadow darkens the glass interior.
+    pub shadow_opacity: f32,
+}
+
+impl Default for LiquidGlassOptions {
+    fn default() -> Self {
+        Self {
+            refraction: 0.9,
+            dispersion: 0.6,
+            bevel_width: Pixels(16.0),
+            specular: 0.85,
+            progressive_blur: ProgressiveBlur::None,
+            pointer_position: None,
+            tint: Hsla::transparent_black(),
+            shadow_opacity: 0.0,
+        }
+    }
+}
+
+/// GPU frosted-glass backdrop blur primitive (`backdrop-filter: blur(...)`), optionally an optical
+/// liquid-glass lens: everything already painted behind `bounds`, blurred (and refracted, tinted,
+/// lit), in the rounded region. What renderers draw, and how, is in [`crate::backdrop_blur`].
 #[derive(Debug, Copy, Clone)]
 #[repr(C)]
 pub struct BackdropBlur {
     /// Draw order assigned by [`Scene`].
     pub order: DrawOrder,
-    /// Blur radius in scaled device pixels: the blur's standard deviation, as in CSS
-    /// (see [`crate::backdrop_blur::BlurPlan`]).
+    /// Blur radius in scaled device pixels: the blur's standard deviation, as in CSS (see
+    /// [`crate::backdrop_blur::BlurPlan`]); `0.0` for a clear refracting lens.
     pub blur_radius: ScaledPixels,
     /// Region bounds in scaled device pixels.
     pub bounds: Bounds<ScaledPixels>,
@@ -1050,6 +1111,38 @@ pub struct BackdropBlur {
     pub corner_radii: Corners<ScaledPixels>,
     /// Clipping content mask in scaled device pixels.
     pub content_mask: ContentMask<ScaledPixels>,
+    /// Optical Snell refraction strength (`0.0` = classic flat backdrop blur).
+    pub refraction: f32,
+    /// Chromatic RGB prism dispersion along curved bevels (`0.0..=1.5`).
+    pub dispersion: f32,
+    /// Analytical 3D bevel rim thickness in scaled device pixels.
+    pub bevel_width: ScaledPixels,
+    /// Fresnel specular rim & cursor sheen intensity (`0.0..=1.5`).
+    pub specular: f32,
+    /// Continuous progressive blur gradient mode.
+    pub progressive_mode: ProgressiveBlur,
+    /// Display scale factor (used for DPI-consistent rim highlights and bevel widths).
+    pub scale_factor: f32,
+    /// Pointer position in scaled device pixels (`< 0.0` disables live cursor sheen).
+    pub pointer_pos: Point<ScaledPixels>,
+    /// Subtle glass body tint.
+    pub tint: Hsla,
+    /// Opacity of the exterior-only analytical glass elevation drop shadow (`0.0..=0.8`).
+    pub shadow_opacity: f32,
+}
+
+impl BackdropBlur {
+    /// Returns `true` when this primitive activates optical liquid-glass effects (refraction,
+    /// chromatic dispersion, Fresnel specular bevel, progressive blur, glass tint, or exterior
+    /// glass elevation shadow) rather than classic uniform frosted blur.
+    #[inline]
+    pub fn is_liquid_glass(&self) -> bool {
+        self.refraction > 0.0005
+            || self.specular > 0.0005
+            || self.progressive_mode != ProgressiveBlur::None
+            || self.tint.a > 0.0005
+            || self.shadow_opacity > 0.0005
+    }
 }
 
 impl From<BackdropBlur> for Primitive {
