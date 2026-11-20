@@ -1377,9 +1377,9 @@ float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Targe
 **
 */
 
-// A full-window transition between two frames: `t_transition_old` (the frame
-// captured before the change) and `t_transition_new` (this frame), matching
-// gpui_wgpu's shaders_view_transition.wgsl pixel-for-pixel across all modes:
+// Full-window and component-scoped transitions between `t_transition_old` (cropped
+// to the transition's old region) and `t_transition_new` (the full live frame),
+// matching gpui_wgpu's shaders_view_transition.wgsl pixel-for-pixel across all modes:
 //   0: RadialExpand, 1: RadialCollapse, 2: CrossFade,
 //   3: Shockwave (optical refraction + RGB dispersion + caustic ridge),
 //   4: PageCurl (3D cylindrical curl + specular ridge + cast shadow),
@@ -1395,6 +1395,15 @@ cbuffer ViewTransitionParams: register(b2) {
     float vt_progress;
     uint vt_kind;
     float2 vt_viewport_size;
+    float2 vt_region_origin;
+    float2 vt_region_size;
+    float2 vt_clip_min;
+    float2 vt_clip_max;
+    float4 vt_corner_radii;
+    uint vt_overlay_pass;
+    uint vt_pad0;
+    uint vt_pad1;
+    uint vt_pad2;
 };
 
 Texture2D<float4> t_transition_old: register(t0);
@@ -1407,20 +1416,66 @@ float4 view_transition_vertex(uint vertex_id: SV_VertexID): SV_Position {
     return float4(p * 2.0 - 1.0, 0.0, 1.0);
 }
 
-float4 vt_sample_old(float2 uv) {
-    return t_transition_old.SampleLevel(s_transition, saturate(uv), 0.0);
+float4 vt_sample_old(float2 local_uv) {
+    uint ow, oh;
+    t_transition_old.GetDimensions(ow, oh);
+    float2 old_dims = max(float2(float(ow), float(oh)), float2(1.0, 1.0));
+    float2 half_tex = float2(0.5, 0.5) / old_dims;
+    float2 uv = clamp(local_uv, half_tex, float2(1.0, 1.0) - half_tex);
+    return t_transition_old.SampleLevel(s_transition, uv, 0.0);
 }
 
-float4 vt_sample_new(float2 uv) {
-    return t_transition_new.SampleLevel(s_transition, saturate(uv), 0.0);
+float4 vt_sample_new(float2 local_uv) {
+    float2 inv_vp = float2(1.0, 1.0) / max(vt_viewport_size, float2(1.0, 1.0));
+    float2 min_px = vt_region_origin + float2(0.5, 0.5);
+    float2 max_px = max(vt_region_origin + vt_region_size - float2(0.5, 0.5), min_px);
+    float2 px = clamp(vt_region_origin + saturate(local_uv) * vt_region_size, min_px, max_px);
+    return t_transition_new.SampleLevel(s_transition, px * inv_vp, 0.0);
 }
 
-float4 vt_load_old(float2 frag_pos) {
-    return t_transition_old.Load(int3(int2(frag_pos), 0));
+float4 vt_load_old(float2 local_pos) {
+    uint ow, oh;
+    t_transition_old.GetDimensions(ow, oh);
+    int2 old_dims_i = max(int2(int(ow), int(oh)), int2(1, 1));
+    float2 old_dims = float2(old_dims_i);
+    float2 local_dims = max(vt_region_size, float2(1.0, 1.0));
+    if (abs(old_dims.x - local_dims.x) <= 1.0 && abs(old_dims.y - local_dims.y) <= 1.0) {
+        int2 coord = clamp(int2(local_pos), int2(0, 0), old_dims_i - int2(1, 1));
+        return t_transition_old.Load(int3(coord, 0));
+    }
+    return vt_sample_old(local_pos / local_dims);
 }
 
-float4 vt_load_new(float2 frag_pos) {
-    return t_transition_new.Load(int3(int2(frag_pos), 0));
+float4 vt_load_new(float2 local_pos) {
+    uint nw, nh;
+    t_transition_new.GetDimensions(nw, nh);
+    int2 new_dims_i = max(int2(int(nw), int(nh)), int2(1, 1));
+    int2 min_i = clamp(int2(floor(vt_region_origin)), int2(0, 0), new_dims_i - int2(1, 1));
+    int2 max_i = clamp(
+        int2(ceil(vt_region_origin + vt_region_size)) - int2(1, 1),
+        min_i,
+        new_dims_i - int2(1, 1)
+    );
+    int2 coord = clamp(int2(vt_region_origin + local_pos), min_i, max_i);
+    return t_transition_new.Load(int3(coord, 0));
+}
+
+float4 vt_load_new_raw(float2 frag_pos) {
+    uint nw, nh;
+    t_transition_new.GetDimensions(nw, nh);
+    int2 dims_i = max(int2(int(nw), int(nh)), int2(1, 1));
+    int2 coord = clamp(int2(frag_pos), int2(0, 0), dims_i - int2(1, 1));
+    return t_transition_new.Load(int3(coord, 0));
+}
+
+float vt_rounded_rect_sdf(float2 local_pos, float2 size, float4 radii) {
+    float2 half_size = size * 0.5;
+    float2 p = local_pos - half_size;
+    float r_top = p.x > 0.0 ? radii.y : radii.x;
+    float r_bot = p.x > 0.0 ? radii.z : radii.w;
+    float r = min(p.y > 0.0 ? r_bot : r_top, min(half_size.x, half_size.y));
+    float2 q = abs(p) - (half_size - float2(r, r));
+    return length(max(q, float2(0.0, 0.0))) + min(max(q.x, q.y), 0.0) - r;
 }
 
 float vt_rect_sdf(float2 p, float2 dims) {
@@ -1469,10 +1524,11 @@ float4 vt_shockwave(float2 frag_pos, float2 dims) {
     float dist = length(delta);
     float2 dir = delta / max(dist, 0.001);
 
-    float band = 82.0 * scale;
+    float band = min(82.0 * scale, max(min(dims.x, dims.y) * 0.28, 16.0 * scale));
+    float disp_scale = band / (82.0 * scale);
     float d = dist - vt_radius;
     float wake_d = d + band * 0.88;
-    float time_env = smoothstep(0.0, 0.07, p) * smoothstep(1.0, 0.84, p);
+    float time_env = smoothstep(0.0, 0.07, p) * (1.0 - smoothstep(0.84, 1.0, p));
 
     if ((abs(d) > band * 2.4 && abs(wake_d) > band * 1.8) || time_env <= 0.0005) {
         return d < 0.0 ? vt_load_new(frag_pos) : vt_load_old(frag_pos);
@@ -1487,9 +1543,9 @@ float4 vt_shockwave(float2 frag_pos, float2 dims) {
     float wake_ripple = sin((wake_d / band) * 4.8) * wake_env;
 
     float border_dist = min(min(frag_pos.x, dims.x - frag_pos.x), min(frag_pos.y, dims.y - frag_pos.y));
-    float edge_damp = smoothstep(0.0, 22.0 * scale, border_dist);
+    float edge_damp = smoothstep(0.0, 22.0 * scale * disp_scale, border_dist);
 
-    float disp_px = (ripple + wake_ripple) * (20.0 * scale) * edge_damp;
+    float disp_px = (ripple + wake_ripple) * (20.0 * scale * disp_scale) * edge_damp;
     float2 uv_r = (frag_pos - dir * disp_px * 0.76) / dims;
     float2 uv_g = (frag_pos - dir * disp_px * 1.00) / dims;
     float2 uv_b = (frag_pos - dir * disp_px * 1.28) / dims;
@@ -1499,7 +1555,7 @@ float4 vt_shockwave(float2 frag_pos, float2 dims) {
     float4 new_g = vt_sample_new(uv_g);
     float4 new_col = float4(vt_sample_new(uv_r).r, new_g.g, vt_sample_new(uv_b).b, new_g.a);
 
-    float mix_w = 18.0 * scale;
+    float mix_w = 18.0 * scale * disp_scale;
     float show_old = smoothstep(-mix_w * 0.5, mix_w * 0.5, d);
     float4 color = lerp(new_col, old_col, show_old);
 
@@ -1546,7 +1602,7 @@ float4 vt_page_curl(float2 frag_pos, float2 dims) {
     float diag = max(length(diag_vec), 1.0);
     float2 curl_dir = diag_vec / diag;
 
-    float R = clamp(min(dims.x, dims.y) * 0.135, 48.0 * scale, 148.0 * scale);
+    float R = clamp(min(dims.x, dims.y) * 0.135, 16.0 * scale, 148.0 * scale);
     float start_fade = smoothstep(0.0, 0.07, p);
     float end_fade = smoothstep(1.0, 0.88, p);
     float axis_s = lerp(0.0, diag + R * 2.65, p);
@@ -1639,13 +1695,15 @@ float4 vt_liquid_dissolve(float2 frag_pos, float2 dims) {
         return vt_load_new(frag_pos);
     }
 
-    float2 q = frag_pos / (120.0 * scale);
+    float cell = clamp(min(dims.x, dims.y) * 0.22, 36.0 * scale, 120.0 * scale);
+    float disp_scale = cell / (120.0 * scale);
+    float2 q = frag_pos / cell;
     float norm_dist = saturate(length(frag_pos - vt_origin) / max(vt_radius, 1.0));
     float n = vt_warped_fbm(q);
     float field = norm_dist * 0.66 + n * 0.34;
     float threshold = lerp(-0.11, 1.11, p);
     float diff = field - threshold;
-    float time_env = smoothstep(0.0, 0.07, p) * smoothstep(1.0, 0.88, p);
+    float time_env = smoothstep(0.0, 0.07, p) * (1.0 - smoothstep(0.88, 1.0, p));
 
     if (abs(diff) > 0.095 || time_env <= 0.0005) {
         return diff < 0.0 ? vt_load_new(frag_pos) : vt_load_old(frag_pos);
@@ -1657,10 +1715,10 @@ float4 vt_liquid_dissolve(float2 frag_pos, float2 dims) {
     float2 grad = float2(nx, ny) / (2.0 * eps);
 
     float border_dist = min(min(frag_pos.x, dims.x - frag_pos.x), min(frag_pos.y, dims.y - frag_pos.y));
-    float edge_damp = smoothstep(0.0, 20.0 * scale, border_dist);
+    float edge_damp = smoothstep(0.0, 20.0 * scale * disp_scale, border_dist);
 
     float meniscus = exp(-(diff * diff) / (2.0 * 0.028 * 0.028)) * time_env;
-    float2 disp_px = grad * meniscus * (18.0 * scale) * edge_damp;
+    float2 disp_px = grad * meniscus * (18.0 * scale * disp_scale) * edge_damp;
 
     float2 uv_r = (frag_pos + disp_px * 0.80) / dims;
     float2 uv_g = (frag_pos + disp_px * 1.00) / dims;
@@ -1865,7 +1923,7 @@ float4 vt_blur_fade(float2 frag_pos, float2 dims) {
         return vt_load_new(frag_pos);
     }
 
-    float max_radius = 26.0 * scale;
+    float max_radius = min(26.0 * scale, max(min(dims.x, dims.y) * 0.12, 6.0 * scale));
     float t_one_third = 1.0 / 3.0;
     float t_two_thirds = 2.0 / 3.0;
 
@@ -1930,12 +1988,13 @@ float4 vt_glitch(float2 frag_pos, float2 dims) {
         show_new = !show_new;
     }
 
+    float g_scale = scale * clamp(min(dims.x, dims.y) / (320.0 * scale), 0.35, 1.0);
     float dir_sign = vt_hash21(mid_cell + float2(step_t * 2.1, 9.4)) > 0.5 ? 1.0 : -1.0;
     float slice_burst = sliver_h > 0.62 ? 1.0 : 0.35;
-    float shift_px = dir_sign * glitch_amt * (16.0 + 48.0 * slice_burst * block_flicker) * scale;
-    float v_jitter_px = (vt_hash21(float2(mid_row, step_t * 4.7)) - 0.5) * 6.0 * glitch_amt * scale * (sliver_h > 0.78 ? 1.0 : 0.0);
+    float shift_px = dir_sign * glitch_amt * (16.0 + 48.0 * slice_burst * block_flicker) * g_scale;
+    float v_jitter_px = (vt_hash21(float2(mid_row, step_t * 4.7)) - 0.5) * 6.0 * glitch_amt * g_scale * (sliver_h > 0.78 ? 1.0 : 0.0);
 
-    float ca_px = glitch_amt * (9.0 + 22.0 * slice_burst) * scale;
+    float ca_px = glitch_amt * (9.0 + 22.0 * slice_burst) * g_scale;
     float2 base_p = frag_pos + float2(shift_px, v_jitter_px);
     float2 uv_r = (base_p - float2(ca_px, 0.0)) / dims;
     float2 uv_g = base_p / dims;
@@ -1982,7 +2041,8 @@ float4 vt_prismatic_blob(float2 frag_pos, float2 dims) {
 
     float2 seed = frac(vt_origin * float2(0.0137, 0.0193) + float2(0.37, 0.71));
 
-    float band = clamp(min(dims.x, dims.y) * 0.135, 64.0 * scale, 140.0 * scale);
+    float band = clamp(min(dims.x, dims.y) * 0.135, 22.0 * scale, 140.0 * scale);
+    float disp_scale = clamp(band / (80.0 * scale), 0.35, 1.0);
     float max_r = max(vt_radius, 1.0);
     float r_base_out = lerp(-band * 0.35, max_r + band * 2.15, p);
     float r_base_in = lerp(-band * 1.45, max_r + band * 1.15, p);
@@ -2036,11 +2096,11 @@ float4 vt_prismatic_blob(float2 frag_pos, float2 dims) {
     float edge_damp = smoothstep(0.0, 24.0 * scale, border_dist);
 
     float2 swirl_dir = normalize(dir + perp * ((shape_out - shape_in) * 0.58));
-    float max_disp = (32.0 * scale) * (0.26 + 0.74 * ribbon) * edge_damp;
+    float max_disp = (32.0 * scale * disp_scale) * (0.26 + 0.74 * ribbon) * edge_damp;
     float blend_old = smoothstep(0.10, 0.90, u);
     float2 inv_dims = 1.0 / dims;
     float jitter = vt_ign(floor(frag_pos)) - 0.5;
-    float tang_wave = sin(u * M_PI_F * 2.0 + (n_out + n_in) * 3.0) * 8.0 * scale * ribbon * edge_damp;
+    float tang_wave = sin(u * M_PI_F * 2.0 + (n_out + n_in) * 3.0) * (8.0 * scale * disp_scale) * ribbon * edge_damp;
 
     float3 acc_rgb = float3(0.0, 0.0, 0.0);
     float3 w_sum = float3(0.0, 0.0, 0.0);
@@ -2083,42 +2143,84 @@ float4 vt_prismatic_blob(float2 frag_pos, float2 dims) {
     return result;
 }
 
-float4 view_transition_fragment(float4 position: SV_Position): SV_Target {
-    float2 dims = max(vt_viewport_size, float2(1.0, 1.0));
+float4 vt_eval_transition(float2 local_pos, float2 local_dims) {
     if (vt_kind == 3u) {
-        return vt_shockwave(position.xy, dims);
+        return vt_shockwave(local_pos, local_dims);
     }
     if (vt_kind == 4u) {
-        return vt_page_curl(position.xy, dims);
+        return vt_page_curl(local_pos, local_dims);
     }
     if (vt_kind == 5u) {
-        return vt_liquid_dissolve(position.xy, dims);
+        return vt_liquid_dissolve(local_pos, local_dims);
     }
     if (vt_kind == 6u) {
-        return vt_chromatic_warp(position.xy, dims);
+        return vt_chromatic_warp(local_pos, local_dims);
     }
     if (vt_kind == 7u) {
-        return vt_blur_fade(position.xy, dims);
+        return vt_blur_fade(local_pos, local_dims);
     }
     if (vt_kind == 8u) {
-        return vt_glitch(position.xy, dims);
+        return vt_glitch(local_pos, local_dims);
     }
     if (vt_kind == 9u) {
-        return vt_prismatic_blob(position.xy, dims);
+        return vt_prismatic_blob(local_pos, local_dims);
     }
 
-    float4 old_color = vt_load_old(position.xy);
-    float4 new_color = vt_load_new(position.xy);
+    float4 old_color = vt_load_old(local_pos);
+    float4 new_color = vt_load_new(local_pos);
     float show_old;
     if (vt_kind == 2u) {
         // Cross-fade.
         show_old = 1.0 - saturate(vt_progress);
     } else {
-        float edge = smoothstep(vt_radius - max(vt_feather, 0.5), vt_radius + max(vt_feather, 0.5), length(position.xy - vt_origin));
+        float edge = smoothstep(vt_radius - max(vt_feather, 0.5), vt_radius + max(vt_feather, 0.5), length(local_pos - vt_origin));
         // 0: the new frame inside a growing circle; 1: the old frame inside a shrinking one.
         show_old = vt_kind == 0u ? edge : 1.0 - edge;
     }
     return lerp(new_color, old_color, show_old);
+}
+
+float4 view_transition_fragment(float4 position: SV_Position): SV_Target {
+    float2 vp_dims = max(vt_viewport_size, float2(1.0, 1.0));
+    float2 local_dims = max(vt_region_size, float2(1.0, 1.0));
+    float2 local_pos = position.xy - vt_region_origin;
+
+    bool outside_clip = position.x < vt_clip_min.x
+        || position.x > vt_clip_max.x
+        || position.y < vt_clip_min.y
+        || position.y > vt_clip_max.y;
+    bool is_scoped = vt_region_origin.x > 0.5
+        || vt_region_origin.y > 0.5
+        || local_dims.x < vp_dims.x - 0.5
+        || local_dims.y < vp_dims.y - 0.5
+        || vt_corner_radii.x > 0.0
+        || vt_corner_radii.y > 0.0
+        || vt_corner_radii.z > 0.0
+        || vt_corner_radii.w > 0.0
+        || outside_clip;
+
+    float mask = 1.0;
+    if (is_scoped) {
+        if (outside_clip) {
+            mask = 0.0;
+        } else {
+            float sdf = vt_rounded_rect_sdf(local_pos, local_dims, vt_corner_radii);
+            mask = 1.0 - smoothstep(-0.75, 0.75, sdf);
+        }
+    }
+
+    if (mask <= 0.001) {
+        if (vt_overlay_pass != 0u) {
+            discard;
+        }
+        return vt_load_new_raw(position.xy);
+    }
+
+    float4 effect_col = vt_eval_transition(local_pos, local_dims);
+    if (mask >= 0.999) {
+        return effect_col;
+    }
+    return lerp(vt_load_new_raw(position.xy), effect_col, mask);
 }
 
 /*

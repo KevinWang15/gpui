@@ -1009,20 +1009,25 @@ impl PlatformWindow for WebWindow {
         self.inner.state.borrow_mut().renderer.draw(scene);
     }
 
-    fn capture_transition_snapshot(&self, scene: &Scene) -> bool {
+    fn capture_transition_snapshot(
+        &self,
+        id: u64,
+        scene: &Scene,
+        region: Option<gpui::Bounds<gpui::ScaledPixels>>,
+    ) -> bool {
         self.inner
             .state
             .borrow_mut()
             .renderer
-            .capture_transition_snapshot(scene)
+            .capture_transition_snapshot(id, scene, region)
     }
 
-    fn clear_transition_snapshot(&self) {
+    fn clear_transition_snapshot(&self, id: Option<u64>) {
         self.inner
             .state
             .borrow_mut()
             .renderer
-            .clear_transition_snapshot();
+            .clear_transition_snapshot(id);
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {

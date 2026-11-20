@@ -76,6 +76,7 @@ pub mod toggle;
 pub mod tooltip;
 pub mod tour;
 pub mod transfer_tags;
+pub mod transition_view;
 pub mod tree;
 pub mod typography;
 
@@ -186,7 +187,8 @@ pub use textbox::{
 };
 pub use theme::{
     ANIM_FAST, ANIM_NORMAL, ActiveTheme, ComponentSize, GlobalTheme, SPRING_SMOOTH, SPRING_SNAPPY,
-    Theme, ThemeMode, ThemePreference, ThemeTransitionStyle, init_components, tabular_numerals,
+    Theme, ThemeMode, ThemePreference, ThemeTransitionStyle, TransitionStyle, init_components,
+    tabular_numerals,
 };
 pub use theme_switcher::{ThemeSwitcher, theme_switcher};
 pub use time_range::{
@@ -205,6 +207,7 @@ pub use transfer_tags::{
     TagInput, TagInputEvent, TagInputState, Transfer, TransferEvent, TransferItem, TransferState,
     tag_input, transfer,
 };
+pub use transition_view::{TransitionOrigin, TransitionView, transition_view};
 pub use tree::{Tree, TreeEvent, TreeNode, TreeState, tree};
 pub use typography::{
     CodeBlock, EditableText, EditableTextEvent, EditableTextState, Heading, HeadingLevel, Text,

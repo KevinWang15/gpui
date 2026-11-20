@@ -1,6 +1,18 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::{Pixels, Point, ScaledPixels, Size, point, px};
+use crate::{Bounds, Corners, DevicePixels, Pixels, Point, ScaledPixels, Size, point, px};
+
+/// Reserved transition identifier for full-window transitions started via
+/// [`Window::start_view_transition`](crate::Window::start_view_transition).
+pub const FULL_WINDOW_TRANSITION_ID: u64 = 0;
+
+static NEXT_REGION_TRANSITION_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Allocates a unique non-zero identifier for a component-scoped transition.
+pub fn next_region_transition_id() -> u64 {
+    NEXT_REGION_TRANSITION_ID.fetch_add(1, Ordering::Relaxed)
+}
 
 /// Default cubic ease-out curve for view transitions (`1 - (1 - t)^3`).
 #[inline]
@@ -28,7 +40,25 @@ pub fn view_transition_linear(t: f32) -> f32 {
     t.clamp(0.0, 1.0)
 }
 
-/// The visual geometry of a GPU-composited full-window view transition.
+/// Target area affected by a [`ViewTransition`].
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum ViewTransitionScope {
+    /// Transitions the entire window viewport.
+    #[default]
+    Window,
+    /// Transitions only a bounded sub-region (e.g. a single UI component or card),
+    /// leaving the rest of the window live and interactive.
+    Region {
+        /// Bounding rectangle of the component in logical window pixels.
+        bounds: Bounds<Pixels>,
+        /// Corner radii of the component mask in logical pixels.
+        corner_radii: Corners<Pixels>,
+        /// Optional outer clip rectangle (for example, a parent scroll container's content mask).
+        clip_bounds: Option<Bounds<Pixels>>,
+    },
+}
+
+/// The visual geometry of a GPU-composited view or component transition.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ViewTransitionKind {
     /// Expands a circular reveal of the new scene outward from `origin` (in logical window pixels).
@@ -67,7 +97,7 @@ pub enum ViewTransitionKind {
     /// High-energy cinema hyper-zoom & whip-spin warp with mirror-tiled radial streaks and
     /// heavy prismatic RGB chromatic aberration.
     ChromaticWarp {
-        /// Logical pixel coordinate gently biasing the optical warp pivot.
+        /// Logical pixel coordinate anchoring the optical warp vortex center.
         origin: Point<Pixels>,
     },
     /// Smooth photographic blur-out (0–0.2s), opacity cross-fade (0.1–0.2s), and blur-in (0.1–0.3s).
@@ -83,12 +113,15 @@ pub enum ViewTransitionKind {
     },
 }
 
-/// Configuration for a GPU-composited full-window view transition started via
-/// [`Window::start_view_transition`](crate::Window::start_view_transition).
+/// Configuration for a GPU-composited full-window or component-scoped transition started via
+/// [`Window::start_view_transition`](crate::Window::start_view_transition) or a declarative
+/// component wrapper such as `TransitionView`.
 #[derive(Clone, Copy, Debug)]
 pub struct ViewTransition {
-    /// Geometry of the transition mask.
+    /// Geometry of the transition effect.
     pub kind: ViewTransitionKind,
+    /// Whether the transition affects the whole window or a single component region.
+    pub scope: ViewTransitionScope,
     /// Total transition duration.
     pub duration: Duration,
     /// Easing function mapping linear progress in `0.0..=1.0` to eased progress in `0.0..=1.0`.
@@ -103,11 +136,12 @@ pub struct ViewTransition {
 impl ViewTransition {
     /// Creates an expanding circular reveal originating at `origin` (logical window coordinates).
     ///
-    /// This is the standard transition for click-origin theme switches: the new theme radiates
-    /// outward from the exact pointer click coordinate until it covers the farthest window corner.
+    /// Works seamlessly for both full-window transitions and component-scoped transitions via
+    /// [`Self::in_bounds`].
     pub fn radial_reveal(origin: Point<Pixels>) -> Self {
         Self {
             kind: ViewTransitionKind::RadialExpand { origin },
+            scope: ViewTransitionScope::Window,
             duration: Duration::from_millis(420),
             easing: view_transition_ease_out,
             feather: px(1.5),
@@ -119,6 +153,7 @@ impl ViewTransition {
     pub fn radial_collapse(origin: Point<Pixels>) -> Self {
         Self {
             kind: ViewTransitionKind::RadialCollapse { origin },
+            scope: ViewTransitionScope::Window,
             duration: Duration::from_millis(420),
             easing: view_transition_ease_out,
             feather: px(1.5),
@@ -126,10 +161,11 @@ impl ViewTransition {
         }
     }
 
-    /// Creates a full-window cross-fade between the previous and new scenes.
+    /// Creates a cross-fade between the previous snapshot and the new live view.
     pub fn cross_fade() -> Self {
         Self {
             kind: ViewTransitionKind::CrossFade,
+            scope: ViewTransitionScope::Window,
             duration: Duration::from_millis(220),
             easing: view_transition_ease_out,
             feather: px(1.0),
@@ -141,6 +177,7 @@ impl ViewTransition {
     pub fn shockwave(origin: Point<Pixels>) -> Self {
         Self {
             kind: ViewTransitionKind::Shockwave { origin },
+            scope: ViewTransitionScope::Window,
             duration: Duration::from_millis(620),
             easing: view_transition_ease_out,
             feather: px(2.0),
@@ -152,6 +189,7 @@ impl ViewTransition {
     pub fn page_curl(origin: Point<Pixels>) -> Self {
         Self {
             kind: ViewTransitionKind::PageCurl { origin },
+            scope: ViewTransitionScope::Window,
             duration: Duration::from_millis(680),
             easing: view_transition_ease_in_out,
             feather: px(1.5),
@@ -163,6 +201,7 @@ impl ViewTransition {
     pub fn liquid_dissolve(origin: Point<Pixels>) -> Self {
         Self {
             kind: ViewTransitionKind::LiquidDissolve { origin },
+            scope: ViewTransitionScope::Window,
             duration: Duration::from_millis(660),
             easing: view_transition_ease_in_out,
             feather: px(2.0),
@@ -171,10 +210,11 @@ impl ViewTransition {
     }
 
     /// Creates a cinema hyper-zoom & whip-spin warp with mirror-tiled radial streaks and heavy
-    /// prismatic RGB chromatic aberration.
+    /// prismatic RGB chromatic aberration centered at `origin`.
     pub fn chromatic_warp(origin: Point<Pixels>) -> Self {
         Self {
             kind: ViewTransitionKind::ChromaticWarp { origin },
+            scope: ViewTransitionScope::Window,
             duration: Duration::from_millis(740),
             easing: view_transition_linear,
             feather: px(1.5),
@@ -186,6 +226,7 @@ impl ViewTransition {
     pub fn blur_fade() -> Self {
         Self {
             kind: ViewTransitionKind::BlurFade,
+            scope: ViewTransitionScope::Window,
             duration: Duration::from_millis(300),
             easing: view_transition_linear,
             feather: px(1.5),
@@ -197,6 +238,7 @@ impl ViewTransition {
     pub fn glitch() -> Self {
         Self {
             kind: ViewTransitionKind::Glitch,
+            scope: ViewTransitionScope::Window,
             duration: Duration::from_millis(300),
             easing: view_transition_linear,
             feather: px(1.5),
@@ -209,11 +251,58 @@ impl ViewTransition {
     pub fn prismatic_blob(origin: Point<Pixels>) -> Self {
         Self {
             kind: ViewTransitionKind::PrismaticBlob { origin },
+            scope: ViewTransitionScope::Window,
             duration: Duration::from_millis(640),
             easing: view_transition_ease_out,
             feather: px(2.0),
             reduce_motion_crossfade: false,
         }
+    }
+
+    /// Restricts this transition to a component bounding rectangle (in logical window pixels),
+    /// leaving everything outside `bounds` live and interactive.
+    pub fn in_bounds(mut self, bounds: Bounds<Pixels>) -> Self {
+        let (corner_radii, clip_bounds) = match self.scope {
+            ViewTransitionScope::Region {
+                corner_radii,
+                clip_bounds,
+                ..
+            } => (corner_radii, clip_bounds),
+            ViewTransitionScope::Window => (Corners::default(), None),
+        };
+        self.scope = ViewTransitionScope::Region {
+            bounds,
+            corner_radii,
+            clip_bounds,
+        };
+        self
+    }
+
+    /// Sets rounded-rectangle corner radii for a region-scoped transition mask.
+    ///
+    /// Has no effect if the transition remains full-window.
+    pub fn with_corner_radii(mut self, corner_radii: Corners<Pixels>) -> Self {
+        if let ViewTransitionScope::Region {
+            corner_radii: ref mut existing,
+            ..
+        } = self.scope
+        {
+            *existing = corner_radii;
+        }
+        self
+    }
+
+    /// Sets an outer clip rectangle (such as a scroll viewport's `ContentMask`) for a
+    /// region-scoped transition.
+    pub fn with_clip_bounds(mut self, clip_bounds: Bounds<Pixels>) -> Self {
+        if let ViewTransitionScope::Region {
+            clip_bounds: ref mut existing,
+            ..
+        } = self.scope
+        {
+            *existing = Some(clip_bounds);
+        }
+        self
     }
 
     /// Overrides the transition duration.
@@ -249,7 +338,7 @@ pub enum SceneTransitionKind {
     RadialExpand = 0,
     /// Shrinking circle collapsing the old scene inside `radius`.
     RadialCollapse = 1,
-    /// Full-viewport cross-fade driven by `progress`.
+    /// Cross-fade driven by `progress`.
     CrossFade = 2,
     /// Expanding refractive optical shockwave with RGB chromatic dispersion and caustic crest.
     Shockwave = 3,
@@ -269,21 +358,79 @@ pub enum SceneTransitionKind {
 
 /// GPU-ready per-frame transition parameters attached to a [`Scene`](crate::Scene).
 ///
-/// Backends that captured a snapshot via
-/// [`PlatformWindow::capture_transition_snapshot`](crate::PlatformWindow::capture_transition_snapshot)
-/// composite the live scene with the captured snapshot using these coordinates in device pixels.
+/// Shared identically by both full-window transitions (`id == FULL_WINDOW_TRANSITION_ID`) and
+/// component-scoped transitions (`id >= 1`). All spatial geometry (`origin`, `radius`) is
+/// expressed in region-local device pixels relative to `bounds.origin`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SceneTransition {
-    /// Transition geometry mode.
+    /// Unique snapshot identifier (`FULL_WINDOW_TRANSITION_ID` for full-window transitions,
+    /// or a non-zero component transition ID for concurrent region-scoped transitions).
+    pub id: u64,
+    /// Transition shader mode.
     pub kind: SceneTransitionKind,
-    /// Transition origin in device pixels.
+    /// Transition origin in device pixels **relative to `bounds.origin`**.
     pub origin: Point<ScaledPixels>,
-    /// Current circle radius in device pixels.
+    /// Current effect radius in device pixels (relative to `bounds.size`).
     pub radius: ScaledPixels,
-    /// Edge anti-aliasing feather width in device pixels.
+    /// Edge anti-aliasing feather / DPI scale factor in device pixels.
     pub feather: ScaledPixels,
     /// Normalized eased progress in `0.0..=1.0`.
     pub progress: f32,
+    /// Destination region bounds in device pixels (full viewport for full-window mode).
+    pub bounds: Bounds<ScaledPixels>,
+    /// Outer scissor/clip bounds in device pixels (intersection of `content_mask` and viewport).
+    pub clip_bounds: Bounds<ScaledPixels>,
+    /// Rounded-rectangle corner radii in device pixels (`0` for sharp or full-window rects).
+    pub corner_radii: Corners<ScaledPixels>,
+}
+
+impl SceneTransition {
+    /// Builds a full-viewport [`SceneTransition`] covering `viewport_size` with sharp corners.
+    pub fn full_viewport(
+        kind: SceneTransitionKind,
+        origin: Point<ScaledPixels>,
+        radius: ScaledPixels,
+        feather: ScaledPixels,
+        progress: f32,
+        viewport_size: Size<DevicePixels>,
+    ) -> Self {
+        let bounds = Bounds {
+            origin: point(ScaledPixels(0.0), ScaledPixels(0.0)),
+            size: Size {
+                width: ScaledPixels(viewport_size.width.0.max(1) as f32),
+                height: ScaledPixels(viewport_size.height.0.max(1) as f32),
+            },
+        };
+        Self {
+            id: FULL_WINDOW_TRANSITION_ID,
+            kind,
+            origin,
+            radius,
+            feather,
+            progress,
+            bounds,
+            clip_bounds: bounds,
+            corner_radii: Corners::default(),
+        }
+    }
+
+    /// Returns `true` if this transition covers the entire viewport with zero corner rounding.
+    pub fn is_full_viewport(&self, viewport: Size<DevicePixels>) -> bool {
+        let vw = viewport.width.0 as f32;
+        let vh = viewport.height.0 as f32;
+        self.bounds.origin.x.0 <= 0.5
+            && self.bounds.origin.y.0 <= 0.5
+            && (self.bounds.size.width.0 - vw).abs() <= 1.0
+            && (self.bounds.size.height.0 - vh).abs() <= 1.0
+            && self.clip_bounds.origin.x.0 <= 0.5
+            && self.clip_bounds.origin.y.0 <= 0.5
+            && (self.clip_bounds.size.width.0 - vw).abs() <= 1.0
+            && (self.clip_bounds.size.height.0 - vh).abs() <= 1.0
+            && self.corner_radii.top_left.0 <= 0.0
+            && self.corner_radii.top_right.0 <= 0.0
+            && self.corner_radii.bottom_right.0 <= 0.0
+            && self.corner_radii.bottom_left.0 <= 0.0
+    }
 }
 
 pub(crate) struct ActiveViewTransition {
@@ -294,7 +441,7 @@ pub(crate) struct ActiveViewTransition {
 }
 
 impl ActiveViewTransition {
-    /// Evaluates the GPU transition parameters at `now`.
+    /// Evaluates the full-window GPU transition parameters at `now`.
     ///
     /// Returns `None` once the transition has finished or if the viewport dimensions/scale changed.
     pub(crate) fn evaluate(
@@ -308,149 +455,221 @@ impl ActiveViewTransition {
         {
             return None;
         }
-        let duration_secs = self.transition.duration.as_secs_f32();
-        if duration_secs <= 0.0 {
-            return None;
-        }
-        let elapsed = now.saturating_duration_since(self.started_at);
-        if elapsed >= self.transition.duration {
-            return None;
-        }
-        let raw_t = (elapsed.as_secs_f32() / duration_secs).clamp(0.0, 1.0);
-        let eased = (self.transition.easing)(raw_t).clamp(0.0, 1.0);
-        let feather = ScaledPixels((self.transition.feather.0 * scale_factor).max(0.75));
-        let viewport_w = viewport_size.width.0 * scale_factor;
-        let viewport_h = viewport_size.height.0 * scale_factor;
-
-        match self.transition.kind {
-            ViewTransitionKind::RadialExpand { origin } => {
-                let origin_px = point(
-                    ScaledPixels(origin.x.0 * scale_factor),
-                    ScaledPixels(origin.y.0 * scale_factor),
-                );
-                let max_radius = max_corner_distance(origin_px, viewport_w, viewport_h) + feather.0;
-                Some(SceneTransition {
-                    kind: SceneTransitionKind::RadialExpand,
-                    origin: origin_px,
-                    radius: ScaledPixels(max_radius * eased),
-                    feather,
-                    progress: eased,
-                })
-            }
-            ViewTransitionKind::RadialCollapse { origin } => {
-                let origin_px = point(
-                    ScaledPixels(origin.x.0 * scale_factor),
-                    ScaledPixels(origin.y.0 * scale_factor),
-                );
-                let max_radius = max_corner_distance(origin_px, viewport_w, viewport_h) + feather.0;
-                Some(SceneTransition {
-                    kind: SceneTransitionKind::RadialCollapse,
-                    origin: origin_px,
-                    radius: ScaledPixels(max_radius * (1.0 - eased)),
-                    feather,
-                    progress: eased,
-                })
-            }
-            ViewTransitionKind::CrossFade => Some(SceneTransition {
-                kind: SceneTransitionKind::CrossFade,
-                origin: point(ScaledPixels(0.0), ScaledPixels(0.0)),
-                radius: ScaledPixels(0.0),
-                feather,
-                progress: eased,
-            }),
-            ViewTransitionKind::Shockwave { origin } => {
-                let origin_px = point(
-                    ScaledPixels(origin.x.0 * scale_factor),
-                    ScaledPixels(origin.y.0 * scale_factor),
-                );
-                let wave_margin = (viewport_w.hypot(viewport_h) * 0.14).max(110.0 * scale_factor);
-                let max_radius = max_corner_distance(origin_px, viewport_w, viewport_h) + wave_margin;
-                Some(SceneTransition {
-                    kind: SceneTransitionKind::Shockwave,
-                    origin: origin_px,
-                    radius: ScaledPixels(max_radius * eased),
-                    feather: ScaledPixels(scale_factor.max(0.5)),
-                    progress: eased,
-                })
-            }
-            ViewTransitionKind::PageCurl { origin } => {
-                let origin_px = point(
-                    ScaledPixels(origin.x.0 * scale_factor),
-                    ScaledPixels(origin.y.0 * scale_factor),
-                );
-                let max_radius = max_corner_distance(origin_px, viewport_w, viewport_h);
-                Some(SceneTransition {
-                    kind: SceneTransitionKind::PageCurl,
-                    origin: origin_px,
-                    radius: ScaledPixels(max_radius),
-                    feather: ScaledPixels(scale_factor.max(0.5)),
-                    progress: eased,
-                })
-            }
-            ViewTransitionKind::LiquidDissolve { origin } => {
-                let origin_px = point(
-                    ScaledPixels(origin.x.0 * scale_factor),
-                    ScaledPixels(origin.y.0 * scale_factor),
-                );
-                let max_radius = max_corner_distance(origin_px, viewport_w, viewport_h).max(1.0);
-                Some(SceneTransition {
-                    kind: SceneTransitionKind::LiquidDissolve,
-                    origin: origin_px,
-                    radius: ScaledPixels(max_radius),
-                    feather: ScaledPixels(scale_factor.max(0.5)),
-                    progress: eased,
-                })
-            }
-            ViewTransitionKind::ChromaticWarp { origin } => {
-                let origin_px = point(
-                    ScaledPixels(origin.x.0 * scale_factor),
-                    ScaledPixels(origin.y.0 * scale_factor),
-                );
-                let max_radius = max_corner_distance(origin_px, viewport_w, viewport_h).max(1.0);
-                Some(SceneTransition {
-                    kind: SceneTransitionKind::ChromaticWarp,
-                    origin: origin_px,
-                    radius: ScaledPixels(max_radius),
-                    feather: ScaledPixels(scale_factor.max(0.5)),
-                    progress: eased,
-                })
-            }
-            ViewTransitionKind::BlurFade => Some(SceneTransition {
-                kind: SceneTransitionKind::BlurFade,
-                origin: point(
-                    ScaledPixels(viewport_w * 0.5),
-                    ScaledPixels(viewport_h * 0.5),
-                ),
-                radius: ScaledPixels(0.0),
-                feather: ScaledPixels(scale_factor.max(0.5)),
-                progress: eased,
-            }),
-            ViewTransitionKind::Glitch => Some(SceneTransition {
-                kind: SceneTransitionKind::Glitch,
-                origin: point(
-                    ScaledPixels(viewport_w * 0.5),
-                    ScaledPixels(viewport_h * 0.5),
-                ),
-                radius: ScaledPixels(0.0),
-                feather: ScaledPixels(scale_factor.max(0.5)),
-                progress: eased,
-            }),
-            ViewTransitionKind::PrismaticBlob { origin } => {
-                let origin_px = point(
-                    ScaledPixels(origin.x.0 * scale_factor),
-                    ScaledPixels(origin.y.0 * scale_factor),
-                );
-                let max_radius = max_corner_distance(origin_px, viewport_w, viewport_h).max(1.0);
-                Some(SceneTransition {
-                    kind: SceneTransitionKind::PrismaticBlob,
-                    origin: origin_px,
-                    radius: ScaledPixels(max_radius),
-                    feather: ScaledPixels(scale_factor.max(0.5)),
-                    progress: eased,
-                })
-            }
-        }
+        let full_bounds = Bounds {
+            origin: point(px(0.0), px(0.0)),
+            size: viewport_size,
+        };
+        evaluate_transition_in_region(
+            FULL_WINDOW_TRANSITION_ID,
+            &self.transition,
+            self.started_at,
+            now,
+            full_bounds,
+            full_bounds,
+            Corners::default(),
+            viewport_size,
+            scale_factor,
+        )
     }
+}
+
+pub(crate) struct ActiveRegionTransition {
+    pub id: u64,
+    pub started_at: Instant,
+    pub transition: ViewTransition,
+    pub bounds: Bounds<Pixels>,
+    pub clip_bounds: Bounds<Pixels>,
+    pub corner_radii: Corners<Pixels>,
+    pub scale_factor: f32,
+    /// `true` for transitions owned by a declarative element (e.g. `TransitionView`) so unmounting
+    /// the element cancels the transition cleanly; `false` for imperative region transitions.
+    pub auto_track_element: bool,
+    pub seen_in_draw: bool,
+}
+
+impl ActiveRegionTransition {
+    pub(crate) fn evaluate(
+        &self,
+        now: Instant,
+        viewport_size: Size<Pixels>,
+        scale_factor: f32,
+    ) -> Option<SceneTransition> {
+        if (scale_factor - self.scale_factor).abs() > f32::EPSILON {
+            return None;
+        }
+        evaluate_transition_in_region(
+            self.id,
+            &self.transition,
+            self.started_at,
+            now,
+            self.bounds,
+            self.clip_bounds,
+            self.corner_radii,
+            viewport_size,
+            scale_factor,
+        )
+    }
+}
+
+/// Shared parameter evaluation for BOTH full-window and component-scoped transitions.
+///
+/// Converts logical window coordinates into region-local device pixels so every GPU shader mode
+/// runs identically at window scale or inside an individual rounded component.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn evaluate_transition_in_region(
+    id: u64,
+    transition: &ViewTransition,
+    started_at: Instant,
+    now: Instant,
+    region_bounds: Bounds<Pixels>,
+    clip_bounds: Bounds<Pixels>,
+    corner_radii: Corners<Pixels>,
+    viewport_size: Size<Pixels>,
+    scale_factor: f32,
+) -> Option<SceneTransition> {
+    let duration_secs = transition.duration.as_secs_f32();
+    if duration_secs <= 0.0 {
+        return None;
+    }
+    let elapsed = now.saturating_duration_since(started_at);
+    if elapsed >= transition.duration {
+        return None;
+    }
+
+    let viewport_bounds = Bounds {
+        origin: point(px(0.0), px(0.0)),
+        size: viewport_size,
+    };
+    let effective_clip = clip_bounds.intersect(&viewport_bounds);
+    if region_bounds.size.width.0 <= 0.5
+        || region_bounds.size.height.0 <= 0.5
+        || effective_clip.is_empty()
+    {
+        return None;
+    }
+
+    let raw_t = (elapsed.as_secs_f32() / duration_secs).clamp(0.0, 1.0);
+    let eased = (transition.easing)(raw_t).clamp(0.0, 1.0);
+    let feather = ScaledPixels((transition.feather.0 * scale_factor).max(0.75));
+
+    let scaled_bounds = region_bounds.scale(scale_factor);
+    let scaled_clip = effective_clip.scale(scale_factor);
+    let scaled_radii = corner_radii.scale(scale_factor);
+    let region_w = scaled_bounds.size.width.0.max(1.0);
+    let region_h = scaled_bounds.size.height.0.max(1.0);
+
+    let to_local_origin = |origin: Point<Pixels>| -> Point<ScaledPixels> {
+        point(
+            ScaledPixels((origin.x.0 - region_bounds.origin.x.0) * scale_factor),
+            ScaledPixels((origin.y.0 - region_bounds.origin.y.0) * scale_factor),
+        )
+    };
+
+    let (kind, origin, radius, effective_feather) = match transition.kind {
+        ViewTransitionKind::RadialExpand { origin } => {
+            let local = to_local_origin(origin);
+            let max_radius = max_corner_distance(local, region_w, region_h) + feather.0;
+            (
+                SceneTransitionKind::RadialExpand,
+                local,
+                ScaledPixels(max_radius * eased),
+                feather,
+            )
+        }
+        ViewTransitionKind::RadialCollapse { origin } => {
+            let local = to_local_origin(origin);
+            let max_radius = max_corner_distance(local, region_w, region_h) + feather.0;
+            (
+                SceneTransitionKind::RadialCollapse,
+                local,
+                ScaledPixels(max_radius * (1.0 - eased)),
+                feather,
+            )
+        }
+        ViewTransitionKind::CrossFade => (
+            SceneTransitionKind::CrossFade,
+            point(ScaledPixels(0.0), ScaledPixels(0.0)),
+            ScaledPixels(0.0),
+            feather,
+        ),
+        ViewTransitionKind::Shockwave { origin } => {
+            let local = to_local_origin(origin);
+            let diag = region_w.hypot(region_h);
+            let wave_margin = (diag * 0.14)
+                .max((110.0 * scale_factor).min(diag * 0.35));
+            let max_radius = max_corner_distance(local, region_w, region_h) + wave_margin;
+            (
+                SceneTransitionKind::Shockwave,
+                local,
+                ScaledPixels(max_radius * eased),
+                ScaledPixels(scale_factor.max(0.5)),
+            )
+        }
+        ViewTransitionKind::PageCurl { origin } => {
+            let local = to_local_origin(origin);
+            let max_radius = max_corner_distance(local, region_w, region_h);
+            (
+                SceneTransitionKind::PageCurl,
+                local,
+                ScaledPixels(max_radius),
+                ScaledPixels(scale_factor.max(0.5)),
+            )
+        }
+        ViewTransitionKind::LiquidDissolve { origin } => {
+            let local = to_local_origin(origin);
+            let max_radius = max_corner_distance(local, region_w, region_h).max(1.0);
+            (
+                SceneTransitionKind::LiquidDissolve,
+                local,
+                ScaledPixels(max_radius),
+                ScaledPixels(scale_factor.max(0.5)),
+            )
+        }
+        ViewTransitionKind::ChromaticWarp { origin } => {
+            let local = to_local_origin(origin);
+            let max_radius = max_corner_distance(local, region_w, region_h).max(1.0);
+            (
+                SceneTransitionKind::ChromaticWarp,
+                local,
+                ScaledPixels(max_radius),
+                ScaledPixels(scale_factor.max(0.5)),
+            )
+        }
+        ViewTransitionKind::BlurFade => (
+            SceneTransitionKind::BlurFade,
+            point(ScaledPixels(region_w * 0.5), ScaledPixels(region_h * 0.5)),
+            ScaledPixels(0.0),
+            ScaledPixels(scale_factor.max(0.5)),
+        ),
+        ViewTransitionKind::Glitch => (
+            SceneTransitionKind::Glitch,
+            point(ScaledPixels(region_w * 0.5), ScaledPixels(region_h * 0.5)),
+            ScaledPixels(0.0),
+            ScaledPixels(scale_factor.max(0.5)),
+        ),
+        ViewTransitionKind::PrismaticBlob { origin } => {
+            let local = to_local_origin(origin);
+            let max_radius = max_corner_distance(local, region_w, region_h).max(1.0);
+            (
+                SceneTransitionKind::PrismaticBlob,
+                local,
+                ScaledPixels(max_radius),
+                ScaledPixels(scale_factor.max(0.5)),
+            )
+        }
+    };
+
+    Some(SceneTransition {
+        id,
+        kind,
+        origin,
+        radius,
+        feather: effective_feather,
+        progress: eased,
+        bounds: scaled_bounds,
+        clip_bounds: scaled_clip,
+        corner_radii: scaled_radii,
+    })
 }
 
 fn max_corner_distance(origin: Point<ScaledPixels>, width: f32, height: f32) -> f32 {

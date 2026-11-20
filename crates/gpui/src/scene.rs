@@ -91,8 +91,8 @@ pub struct Scene {
     animated_quad_range: Option<Range<usize>>,
     /// Contiguous range in [`Self::monochrome_sprites`] covering every sprite mutated by [`Self::animations`].
     animated_monochrome_sprite_range: Option<Range<usize>>,
-    /// Optional active full-window GPU view transition evaluated for the current frame.
-    pub transition: Option<SceneTransition>,
+    /// Active GPU view and component transitions evaluated for the current frame.
+    pub transitions: Vec<SceneTransition>,
     /// See [`Scene::paint_id`].
     paint_id: u64,
 }
@@ -121,7 +121,7 @@ impl Scene {
         self.generation = 0;
         self.animated_quad_range = None;
         self.animated_monochrome_sprite_range = None;
-        self.transition = None;
+        self.transitions.clear();
     }
 
     /// Returns the structural scene generation stamped in [`Self::finish`] (`0` if not finished).

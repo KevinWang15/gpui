@@ -7,11 +7,13 @@ use crate::profiler;
 use crate::subscription::SingleSubscriberSet;
 use crate::taffy::TaffyLayoutEngine;
 use crate::{
-    Action, ActiveViewTransition, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App,
+    Action, ActiveRegionTransition, ActiveViewTransition, AnyDrag, AnyElement, AnyImageCache,
+    AnyTooltip, AnyView, App,
     AppContext, Arena, Asset, AsyncWindowContext, AtlasTile, AvailableSpace, BackdropBlur,
     Background, BorderStyle, Bounds, BoxShadow, Capslock, Context, Corners, CursorHideMode,
     CursorStyle, Decorations, DevicePixels, DispatchActionListener, DispatchNodeId, DispatchTree,
-    DisplayId, Edges, Effect, Entity, EntityId, EventEmitter, FileDropEvent, FontId, Global,
+    DisplayId, Edges, Effect, Entity, EntityId, EventEmitter, FULL_WINDOW_TRANSITION_ID,
+    FileDropEvent, FontId, Global,
     GlobalElementId, GlyphId, GpuSpecs, Hsla, InputHandler, InputPreference, IsZero, KeyBinding,
     KeyContext, KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex,
     Modifiers, ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent,
@@ -23,10 +25,10 @@ use crate::{
     SpriteAnimation, SpriteAnimationId, StrikethroughStyle, Style, SubpixelSprite, Subscription,
     SystemWindowTab, SystemWindowTabController, TabStopMap, Task, TextInputConfiguration,
     TextInputStateChange, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
-    TransformationMatrix, Underline, UnderlineStyle, ViewTransition, WindowAppearance,
-    WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations, WindowInsets,
-    WindowOptions, WindowParams, WindowTextSystem, WindowVisibility, point, prelude::*, px, rems,
-    size, transparent_black,
+    TransformationMatrix, Underline, UnderlineStyle, ViewTransition, ViewTransitionScope,
+    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
+    WindowInsets, WindowOptions, WindowParams, WindowTextSystem, WindowVisibility,
+    next_region_transition_id, point, prelude::*, px, rems, size, transparent_black,
 };
 
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
@@ -1371,6 +1373,8 @@ pub struct Window {
     scene_animation_interval: Rc<Cell<Option<Duration>>>,
     /// Active full-window GPU view transition (e.g., radial theme reveal), if any.
     active_view_transition: Option<ActiveViewTransition>,
+    /// Active component-scoped GPU transitions (may run concurrently across distinct components).
+    active_region_transitions: Vec<ActiveRegionTransition>,
     /// Tracks recent input event timestamps to determine if input is arriving at a high rate.
     /// Used to selectively enable VRR optimization only when input rate exceeds 60fps.
     pub(crate) input_rate_tracker: Rc<RefCell<InputRateTracker>>,
@@ -2541,6 +2545,7 @@ impl Window {
             needs_present,
             scene_animation_interval,
             active_view_transition: None,
+            active_region_transitions: Vec::new(),
             input_rate_tracker,
             #[cfg(feature = "profiler")]
             window_profiler: profiler::WindowProfiler::new(handle.window_id())?,
@@ -3217,12 +3222,20 @@ impl Window {
         self.on_next_frame(move |_, cx| cx.notify(entity));
     }
 
-    /// Starts a GPU-composited full-window view transition (such as a click-origin radial
-    /// theme reveal) around the state change performed by `update`.
+    /// Starts a GPU-composited full-window or component-scoped view transition around the state
+    /// change performed by `update`.
     ///
-    /// 1. Captures the currently displayed scene into a GPU offscreen snapshot texture (zero CPU readback).
+    /// - When `transition.scope` is [`ViewTransitionScope::Window`] (the default), transitions the
+    ///   entire viewport.
+    /// - When `transition.scope` is [`ViewTransitionScope::Region`] (via
+    ///   [`ViewTransition::in_bounds`]), transitions only that component bounding box (with
+    ///   optional rounded corners and scroll clip) while leaving the rest of the window live.
+    ///
+    /// 1. Captures the currently displayed scene (or region sub-rect) into a GPU offscreen snapshot
+    ///    texture (zero CPU readback).
     /// 2. Runs `update(self, cx)` immediately so the new UI becomes interactive on the next frame.
-    /// 3. Animates the transition mask across subsequent frames without triggering extra layout passes.
+    /// 3. Animates the transition shader across subsequent frames without triggering extra layout
+    ///    passes.
     /// 4. Automatically falls back to an immediate update when [`App::reduce_motion`] is active
     ///    (unless [`ViewTransition::reduce_motion_crossfade`] is enabled) or on backends without
     ///    snapshot support.
@@ -3234,83 +3247,309 @@ impl Window {
     ) {
         if cx.reduce_motion() {
             if transition.reduce_motion_crossfade {
+                let scope = transition.scope;
                 transition = ViewTransition::cross_fade().duration(Duration::from_millis(140));
+                transition.scope = scope;
             } else {
-                self.cancel_view_transition();
+                if matches!(transition.scope, ViewTransitionScope::Window) {
+                    self.cancel_view_transition();
+                }
                 update(self, cx);
                 return;
             }
         }
 
         let now = cx.background_executor().now();
-        // If another transition is already mid-flight, evaluate its current mask so the backend
-        // snapshots the currently visible composite (smooth mid-flight interruption).
-        if let Some(active) = &self.active_view_transition {
-            self.rendered_frame.scene.transition =
-                active.evaluate(now, self.viewport_size, self.scale_factor);
-        } else {
-            self.rendered_frame.scene.transition = None;
-        }
+        // Stamp currently visible transitions onto `rendered_frame.scene` so mid-flight
+        // interruption snapshots the currently displayed composite cleanly.
+        self.populate_rendered_scene_transitions(now);
 
-        let captured = !self.rendered_frame.scene.paint_operations.is_empty()
-            && self
-                .platform_window
-                .capture_transition_snapshot(&self.rendered_frame.scene);
+        match transition.scope {
+            ViewTransitionScope::Window => {
+                let captured = !self.rendered_frame.scene.paint_operations.is_empty()
+                    && self.platform_window.capture_transition_snapshot(
+                        FULL_WINDOW_TRANSITION_ID,
+                        &self.rendered_frame.scene,
+                        None,
+                    );
 
-        update(self, cx);
+                update(self, cx);
 
-        if captured {
-            self.active_view_transition = Some(ActiveViewTransition {
-                started_at: now,
-                transition,
-                viewport_size: self.viewport_size,
-                scale_factor: self.scale_factor,
-            });
-            self.scene_animation_interval.set(Some(Duration::ZERO));
-            self.refresh();
-            self.platform_window.schedule_frame();
-            self.invalidator.wake_platform();
-        } else {
-            self.active_view_transition = None;
-            self.rendered_frame.scene.transition = None;
+                // Full-window transitions supersede any in-flight component transitions.
+                for region in self.active_region_transitions.drain(..) {
+                    self.platform_window
+                        .clear_transition_snapshot(Some(region.id));
+                }
+
+                if captured {
+                    self.active_view_transition = Some(ActiveViewTransition {
+                        started_at: now,
+                        transition,
+                        viewport_size: self.viewport_size,
+                        scale_factor: self.scale_factor,
+                    });
+                    self.scene_animation_interval.set(Some(Duration::ZERO));
+                    self.refresh();
+                    self.platform_window.schedule_frame();
+                    self.invalidator.wake_platform();
+                } else {
+                    self.active_view_transition = None;
+                    self.rendered_frame.scene.transitions.clear();
+                }
+            }
+            ViewTransitionScope::Region {
+                bounds,
+                corner_radii,
+                clip_bounds,
+            } => {
+                let viewport_bounds = Bounds {
+                    origin: point(px(0.0), px(0.0)),
+                    size: self.viewport_size,
+                };
+                let effective_clip = clip_bounds
+                    .unwrap_or(viewport_bounds)
+                    .intersect(&viewport_bounds);
+                let id = next_region_transition_id();
+                let scaled_bounds = bounds.scale(self.scale_factor);
+                let captured = !self.rendered_frame.scene.paint_operations.is_empty()
+                    && bounds.size.width.0 > 0.5
+                    && bounds.size.height.0 > 0.5
+                    && !effective_clip.is_empty()
+                    && self.platform_window.capture_transition_snapshot(
+                        id,
+                        &self.rendered_frame.scene,
+                        Some(scaled_bounds),
+                    );
+
+                update(self, cx);
+
+                if captured {
+                    self.active_region_transitions.push(ActiveRegionTransition {
+                        id,
+                        started_at: now,
+                        transition,
+                        bounds,
+                        clip_bounds: effective_clip,
+                        corner_radii,
+                        scale_factor: self.scale_factor,
+                        auto_track_element: false,
+                        seen_in_draw: true,
+                    });
+                    self.scene_animation_interval.set(Some(Duration::ZERO));
+                    self.refresh();
+                    self.platform_window.schedule_frame();
+                    self.invalidator.wake_platform();
+                }
+            }
         }
     }
 
-    /// Cancels any active full-window view transition and releases its GPU snapshot resources.
+    /// Starts (or smoothly interrupts) a component-scoped GPU transition keyed by `id`,
+    /// capturing `old_bounds` from the previous frame while painting the new frame.
+    ///
+    /// Designed for declarative wrapper elements such as `TransitionView` that detect content key
+    /// changes during `Element::paint` (when `self.rendered_frame.scene` still holds the previous
+    /// frame). Multiple components with distinct `id`s can transition concurrently.
+    pub fn start_element_transition(
+        &mut self,
+        id: u64,
+        old_bounds: Bounds<Pixels>,
+        new_bounds: Bounds<Pixels>,
+        clip_bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        mut transition: ViewTransition,
+        cx: &App,
+    ) -> bool {
+        debug_assert!(
+            id != FULL_WINDOW_TRANSITION_ID,
+            "element transitions must use non-zero IDs from `next_region_transition_id()`"
+        );
+        if self.active_view_transition.is_some() {
+            return false;
+        }
+        if cx.reduce_motion() {
+            if transition.reduce_motion_crossfade {
+                transition = ViewTransition::cross_fade().duration(Duration::from_millis(140));
+            } else {
+                self.cancel_region_transition(id);
+                return false;
+            }
+        }
+
+        let viewport_bounds = Bounds {
+            origin: point(px(0.0), px(0.0)),
+            size: self.viewport_size,
+        };
+        let effective_clip = clip_bounds.intersect(&viewport_bounds);
+        if old_bounds.size.width.0 <= 0.5
+            || old_bounds.size.height.0 <= 0.5
+            || new_bounds.size.width.0 <= 0.5
+            || new_bounds.size.height.0 <= 0.5
+            || effective_clip.is_empty()
+            || self.rendered_frame.scene.paint_operations.is_empty()
+        {
+            return false;
+        }
+
+        let now = cx.background_executor().now();
+        // Evaluate any in-flight transitions onto the previous scene so rapidly re-triggering
+        // the same component snapshots its currently visible mid-flight pixels.
+        self.populate_rendered_scene_transitions(now);
+
+        let scaled_old = old_bounds.scale(self.scale_factor);
+        let captured = self.platform_window.capture_transition_snapshot(
+            id,
+            &self.rendered_frame.scene,
+            Some(scaled_old),
+        );
+        if !captured {
+            return false;
+        }
+
+        let entry = ActiveRegionTransition {
+            id,
+            started_at: now,
+            transition,
+            bounds: new_bounds,
+            clip_bounds: effective_clip,
+            corner_radii,
+            scale_factor: self.scale_factor,
+            auto_track_element: true,
+            seen_in_draw: true,
+        };
+        if let Some(existing) = self
+            .active_region_transitions
+            .iter_mut()
+            .find(|item| item.id == id)
+        {
+            *existing = entry;
+        } else {
+            self.active_region_transitions.push(entry);
+        }
+        self.scene_animation_interval.set(Some(Duration::ZERO));
+        self.platform_window.schedule_frame();
+        self.invalidator.wake_platform();
+        true
+    }
+
+    /// Updates the live bounds, clip rectangle, and corner radii of an active element-tracked
+    /// region transition during `Element::paint` so it follows scrolling and layout shifts.
+    pub fn touch_region_transition(
+        &mut self,
+        id: u64,
+        bounds: Bounds<Pixels>,
+        clip_bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+    ) {
+        if let Some(active) = self
+            .active_region_transitions
+            .iter_mut()
+            .find(|item| item.id == id)
+        {
+            active.bounds = bounds;
+            active.clip_bounds = clip_bounds;
+            active.corner_radii = corner_radii;
+            active.seen_in_draw = true;
+        }
+    }
+
+    /// Returns `true` if a component-scoped transition with `id` is currently animating.
+    pub fn has_active_region_transition(&self, id: u64) -> bool {
+        self.active_region_transitions
+            .iter()
+            .any(|item| item.id == id)
+    }
+
+    /// Cancels a single component-scoped transition and releases its snapshot texture.
+    pub fn cancel_region_transition(&mut self, id: u64) {
+        let before = self.active_region_transitions.len();
+        self.active_region_transitions.retain(|item| item.id != id);
+        if self.active_region_transitions.len() != before {
+            self.platform_window.clear_transition_snapshot(Some(id));
+            self.rendered_frame.scene.transitions.retain(|t| t.id != id);
+            if !self.has_active_view_transition() {
+                self.scene_animation_interval
+                    .set(self.rendered_frame.scene.animation_frame_interval());
+            }
+        }
+    }
+
+    /// Cancels all active full-window and component-scoped transitions and releases their GPU
+    /// snapshot resources.
     pub fn cancel_view_transition(&mut self) {
-        if self.active_view_transition.take().is_some() {
-            self.rendered_frame.scene.transition = None;
-            self.platform_window.clear_transition_snapshot();
+        let had_any = self.active_view_transition.take().is_some()
+            || !self.active_region_transitions.is_empty();
+        self.active_region_transitions.clear();
+        if had_any {
+            self.rendered_frame.scene.transitions.clear();
+            self.platform_window.clear_transition_snapshot(None);
             self.scene_animation_interval
                 .set(self.rendered_frame.scene.animation_frame_interval());
         }
     }
 
-    /// Returns `true` if a full-window GPU view transition is currently animating.
+    /// Returns `true` if any full-window or component-scoped GPU view transition is animating.
     pub fn has_active_view_transition(&self) -> bool {
-        self.active_view_transition.is_some()
+        self.active_view_transition.is_some() || !self.active_region_transitions.is_empty()
+    }
+
+    fn populate_rendered_scene_transitions(&mut self, now: Instant) {
+        self.rendered_frame.scene.transitions.clear();
+        if let Some(active) = &self.active_view_transition {
+            if let Some(scene_transition) =
+                active.evaluate(now, self.viewport_size, self.scale_factor)
+            {
+                self.rendered_frame.scene.transitions.push(scene_transition);
+            }
+        }
+        for active in &self.active_region_transitions {
+            if let Some(scene_transition) =
+                active.evaluate(now, self.viewport_size, self.scale_factor)
+            {
+                self.rendered_frame.scene.transitions.push(scene_transition);
+            }
+        }
     }
 
     pub(crate) fn advance_scene_animations(&mut self, cx: &App) {
         let now = cx.background_executor().now();
         let elapsed = now - cx.synced_animation_epoch;
         self.rendered_frame.scene.advance_animations(now, elapsed);
+        self.rendered_frame.scene.transitions.clear();
 
         if let Some(active) = &self.active_view_transition {
             if let Some(scene_transition) =
                 active.evaluate(now, self.viewport_size, self.scale_factor)
             {
-                self.rendered_frame.scene.transition = Some(scene_transition);
-                self.scene_animation_interval.set(Some(Duration::ZERO));
+                self.rendered_frame.scene.transitions.push(scene_transition);
             } else {
                 self.active_view_transition = None;
-                self.rendered_frame.scene.transition = None;
-                self.platform_window.clear_transition_snapshot();
-                self.scene_animation_interval
-                    .set(self.rendered_frame.scene.animation_frame_interval());
+                self.platform_window
+                    .clear_transition_snapshot(Some(FULL_WINDOW_TRANSITION_ID));
             }
+        }
+
+        let mut finished_ids: SmallVec<[u64; 4]> = SmallVec::new();
+        for active in &self.active_region_transitions {
+            if let Some(scene_transition) =
+                active.evaluate(now, self.viewport_size, self.scale_factor)
+            {
+                self.rendered_frame.scene.transitions.push(scene_transition);
+            } else {
+                finished_ids.push(active.id);
+            }
+        }
+        if !finished_ids.is_empty() {
+            self.active_region_transitions
+                .retain(|item| !finished_ids.contains(&item.id));
+            for id in finished_ids {
+                self.platform_window.clear_transition_snapshot(Some(id));
+            }
+        }
+
+        if self.has_active_view_transition() {
+            self.scene_animation_interval.set(Some(Duration::ZERO));
         } else {
-            self.rendered_frame.scene.transition = None;
             self.scene_animation_interval
                 .set(self.rendered_frame.scene.animation_frame_interval());
         }
@@ -4086,7 +4325,25 @@ impl Window {
             }
         }
         if !cx.mode.skip_drawing() {
+            for region in &mut self.active_region_transitions {
+                if region.auto_track_element {
+                    region.seen_in_draw = false;
+                }
+            }
             self.draw_roots(cx);
+            let mut unmounted_ids: SmallVec<[u64; 4]> = SmallVec::new();
+            for region in &self.active_region_transitions {
+                if region.auto_track_element && !region.seen_in_draw {
+                    unmounted_ids.push(region.id);
+                }
+            }
+            if !unmounted_ids.is_empty() {
+                self.active_region_transitions
+                    .retain(|region| !unmounted_ids.contains(&region.id));
+                for id in unmounted_ids {
+                    self.platform_window.clear_transition_snapshot(Some(id));
+                }
+            }
             #[cfg(feature = "profiler")]
             {
                 let viewport_size = self.viewport_size;
@@ -4138,7 +4395,7 @@ impl Window {
         let previous_focus_path = self.rendered_frame.focus_path();
         let previous_window_active = self.rendered_frame.window_active;
         mem::swap(&mut self.rendered_frame, &mut self.next_frame);
-        let animation_interval = if self.active_view_transition.is_some() {
+        let animation_interval = if self.has_active_view_transition() {
             Some(Duration::ZERO)
         } else {
             self.rendered_frame.scene.animation_frame_interval()

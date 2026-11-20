@@ -4,8 +4,8 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use crate::{
-    App, FontFeatures, Global, Hsla, Pixels, Point, SharedString, SpringConfig, Subscription,
-    ViewTransition, Window, WindowAppearance, px,
+    App, Bounds, FontFeatures, Global, Hsla, Pixels, Point, SharedString, SpringConfig,
+    Subscription, ViewTransition, Window, WindowAppearance, px,
 };
 
 use super::palette;
@@ -286,9 +286,10 @@ impl Default for Theme {
     }
 }
 
-/// Visual shader style used when transitioning between light and dark themes.
+/// Visual GPU shader preset shared by both full-window theme transitions and component-scoped
+/// transitions ([`TransitionView`](super::TransitionView)).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub enum ThemeTransitionStyle {
+pub enum TransitionStyle {
     /// Crisp expanding circular reveal from the click point.
     #[default]
     RadialReveal,
@@ -306,11 +307,14 @@ pub enum ThemeTransitionStyle {
     Glitch,
     /// Organic double-blob radial reveal with prismatic chromatic aberration between inner & outer blobs.
     PrismaticBlob,
-    /// Gentle full-window cross-fade.
+    /// Gentle cross-fade.
     CrossFade,
 }
 
-impl ThemeTransitionStyle {
+/// Backward-compatible alias for [`TransitionStyle`] used by [`ThemeSwitcher`](super::ThemeSwitcher).
+pub type ThemeTransitionStyle = TransitionStyle;
+
+impl TransitionStyle {
     /// All available transition styles in display order.
     pub const ALL: [Self; 9] = [
         Self::ChromaticWarp,
@@ -339,36 +343,54 @@ impl ThemeTransitionStyle {
         }
     }
 
-    /// Converts this style and optional click coordinate into a GPU [`ViewTransition`].
+    /// Converts this style into a full-window GPU [`ViewTransition`] for `window`.
     pub fn to_view_transition(
         self,
         origin: Option<Point<Pixels>>,
         window: &Window,
     ) -> ViewTransition {
-        let fallback_origin = || {
-            let vp = window.viewport_size();
-            crate::point(vp.width * 0.5, vp.height * 0.5)
+        let viewport_bounds = Bounds {
+            origin: crate::point(px(0.), px(0.)),
+            size: window.viewport_size(),
         };
+        self.build_transition(origin, viewport_bounds, true)
+    }
+
+    /// Converts this style into a component-scoped GPU [`ViewTransition`] bounded to `bounds`.
+    pub fn to_component_transition(
+        self,
+        origin: Option<Point<Pixels>>,
+        bounds: Bounds<Pixels>,
+    ) -> ViewTransition {
+        self.build_transition(origin, bounds, false).in_bounds(bounds)
+    }
+
+    fn build_transition(
+        self,
+        origin: Option<Point<Pixels>>,
+        target_bounds: Bounds<Pixels>,
+        crossfade_radial_without_origin: bool,
+    ) -> ViewTransition {
+        let fallback_center = || target_bounds.center();
+        let fallback_corner = || crate::point(target_bounds.right(), target_bounds.top());
         match self {
             Self::RadialReveal => match origin {
                 Some(pt) => ViewTransition::radial_reveal(pt),
-                None => ViewTransition::cross_fade(),
+                None if crossfade_radial_without_origin => ViewTransition::cross_fade(),
+                None => ViewTransition::radial_reveal(fallback_center()),
             },
-            Self::Shockwave => ViewTransition::shockwave(origin.unwrap_or_else(fallback_origin)),
-            Self::PageCurl => ViewTransition::page_curl(origin.unwrap_or_else(|| {
-                let vp = window.viewport_size();
-                crate::point(vp.width, px(0.))
-            })),
+            Self::Shockwave => ViewTransition::shockwave(origin.unwrap_or_else(fallback_center)),
+            Self::PageCurl => ViewTransition::page_curl(origin.unwrap_or_else(fallback_corner)),
             Self::LiquidDissolve => {
-                ViewTransition::liquid_dissolve(origin.unwrap_or_else(fallback_origin))
+                ViewTransition::liquid_dissolve(origin.unwrap_or_else(fallback_center))
             }
             Self::ChromaticWarp => {
-                ViewTransition::chromatic_warp(origin.unwrap_or_else(fallback_origin))
+                ViewTransition::chromatic_warp(origin.unwrap_or_else(fallback_center))
             }
             Self::BlurFade => ViewTransition::blur_fade(),
             Self::Glitch => ViewTransition::glitch(),
             Self::PrismaticBlob => {
-                ViewTransition::prismatic_blob(origin.unwrap_or_else(fallback_origin))
+                ViewTransition::prismatic_blob(origin.unwrap_or_else(fallback_center))
             }
             Self::CrossFade => ViewTransition::cross_fade(),
         }

@@ -5,6 +5,15 @@ struct ViewTransitionParams {
     progress: f32,
     kind: u32,
     viewport_px: vec2<f32>,
+    region_origin: vec2<f32>,
+    region_size: vec2<f32>,
+    clip_min: vec2<f32>,
+    clip_max: vec2<f32>,
+    corner_radii: vec4<f32>,
+    overlay_pass: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: ViewTransitionParams;
@@ -24,22 +33,69 @@ fn vs_view_transition(@builtin(vertex_index) vertex_index: u32) -> @builtin(posi
     return vec4<f32>(positions[vertex_index], 0.0, 1.0);
 }
 
-fn vt_sample_old(uv: vec2<f32>) -> vec4<f32> {
-    return textureSampleLevel(t_old, s_linear, clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)), 0.0);
+// `t_old` is cropped to the transition's old region (full viewport for window mode, or just the
+// component's captured rectangle for component-scoped mode), so region-local UV in [0, 1]^2 maps
+// directly across `t_old` with half-texel clamping to eliminate edge bleed.
+fn vt_sample_old(local_uv: vec2<f32>) -> vec4<f32> {
+    let old_dims = max(vec2<f32>(textureDimensions(t_old, 0)), vec2<f32>(1.0));
+    let half_tex = vec2<f32>(0.5) / old_dims;
+    let uv = clamp(local_uv, half_tex, vec2<f32>(1.0) - half_tex);
+    return textureSampleLevel(t_old, s_linear, uv, 0.0);
 }
 
-fn vt_sample_new(uv: vec2<f32>) -> vec4<f32> {
-    return textureSampleLevel(t_new, s_linear, clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)), 0.0);
+// `t_new` holds the full live viewport; remap region-local UV in [0, 1]^2 strictly inside
+// `[region_origin, region_origin + region_size]` with half-texel inset so blurs/warps/refraction
+// inside a component never bleed pixels from surrounding UI chrome.
+fn vt_sample_new(local_uv: vec2<f32>) -> vec4<f32> {
+    let inv_vp = vec2<f32>(1.0) / max(params.viewport_px, vec2<f32>(1.0));
+    let min_px = params.region_origin + vec2<f32>(0.5);
+    let max_px = max(params.region_origin + params.region_size - vec2<f32>(0.5), min_px);
+    let px = clamp(
+        params.region_origin + clamp(local_uv, vec2<f32>(0.0), vec2<f32>(1.0)) * params.region_size,
+        min_px,
+        max_px,
+    );
+    return textureSampleLevel(t_new, s_linear, px * inv_vp, 0.0);
 }
 
-fn vt_load_old(frag_pos: vec2<f32>, dims_i: vec2<i32>) -> vec4<f32> {
-    let coord = clamp(vec2<i32>(frag_pos), vec2<i32>(0), dims_i - vec2<i32>(1));
-    return textureLoad(t_old, coord, 0);
+fn vt_load_old(local_pos: vec2<f32>, dims_i: vec2<i32>) -> vec4<f32> {
+    let old_dims_i = vec2<i32>(textureDimensions(t_old, 0));
+    let old_dims = vec2<f32>(old_dims_i);
+    let local_dims = max(params.region_size, vec2<f32>(dims_i));
+    if (abs(old_dims.x - local_dims.x) <= 1.0 && abs(old_dims.y - local_dims.y) <= 1.0) {
+        let coord = clamp(vec2<i32>(local_pos), vec2<i32>(0), old_dims_i - vec2<i32>(1));
+        return textureLoad(t_old, coord, 0);
+    }
+    return vt_sample_old(local_pos / max(local_dims, vec2<f32>(1.0)));
 }
 
-fn vt_load_new(frag_pos: vec2<f32>, dims_i: vec2<i32>) -> vec4<f32> {
+fn vt_load_new(local_pos: vec2<f32>, _dims_i: vec2<i32>) -> vec4<f32> {
+    let new_dims_i = vec2<i32>(textureDimensions(t_new, 0));
+    let min_i = clamp(vec2<i32>(floor(params.region_origin)), vec2<i32>(0), new_dims_i - vec2<i32>(1));
+    let max_i = clamp(
+        vec2<i32>(ceil(params.region_origin + params.region_size)) - vec2<i32>(1),
+        min_i,
+        new_dims_i - vec2<i32>(1),
+    );
+    let coord = clamp(vec2<i32>(params.region_origin + local_pos), min_i, max_i);
+    return textureLoad(t_new, coord, 0);
+}
+
+fn vt_load_new_raw(frag_pos: vec2<f32>) -> vec4<f32> {
+    let dims_i = vec2<i32>(textureDimensions(t_new, 0));
     let coord = clamp(vec2<i32>(frag_pos), vec2<i32>(0), dims_i - vec2<i32>(1));
     return textureLoad(t_new, coord, 0);
+}
+
+// Signed distance to a rounded rectangle with per-corner radii (tl, tr, br, bl).
+fn vt_rounded_rect_sdf(local_pos: vec2<f32>, size: vec2<f32>, radii: vec4<f32>) -> f32 {
+    let half_size = size * 0.5;
+    let p = local_pos - half_size;
+    let r_top = select(radii.x, radii.y, p.x > 0.0);
+    let r_bot = select(radii.w, radii.z, p.x > 0.0);
+    let r = min(select(r_top, r_bot, p.y > 0.0), min(half_size.x, half_size.y));
+    let q = abs(p) - (half_size - vec2<f32>(r));
+    return length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - r;
 }
 
 fn vt_rect_sdf(p: vec2<f32>, dims: vec2<f32>) -> f32 {
@@ -90,10 +146,11 @@ fn vt_shockwave(frag_pos: vec2<f32>, dims: vec2<f32>, dims_i: vec2<i32>) -> vec4
     let dist = length(delta);
     let dir = delta / max(dist, 0.001);
 
-    let band = 82.0 * scale;
+    let band = min(82.0 * scale, max(min(dims.x, dims.y) * 0.28, 16.0 * scale));
+    let disp_scale = band / (82.0 * scale);
     let d = dist - params.radius_px;
     let wake_d = d + band * 0.88;
-    let time_env = smoothstep(0.0, 0.07, p) * smoothstep(1.0, 0.84, p);
+    let time_env = smoothstep(0.0, 0.07, p) * (1.0 - smoothstep(0.84, 1.0, p));
 
     // Fast exact path for pixels outside the active shockwave + trailing wake.
     if ((abs(d) > band * 2.4 && abs(wake_d) > band * 1.8) || time_env <= 0.0005) {
@@ -111,11 +168,11 @@ fn vt_shockwave(frag_pos: vec2<f32>, dims: vec2<f32>, dims_i: vec2<i32>) -> vec4
     let wake_env = exp(-(wake_d * wake_d) / (2.0 * sigma_wake * sigma_wake)) * time_env * 0.28;
     let wake_ripple = sin((wake_d / band) * 4.8) * wake_env;
 
-    // Gently damp displacement near viewport edges so borders never smear.
+    // Gently damp displacement near region edges so borders never smear.
     let border_dist = min(min(frag_pos.x, dims.x - frag_pos.x), min(frag_pos.y, dims.y - frag_pos.y));
-    let edge_damp = smoothstep(0.0, 22.0 * scale, border_dist);
+    let edge_damp = smoothstep(0.0, 22.0 * scale * disp_scale, border_dist);
 
-    let disp_px = (ripple + wake_ripple) * (20.0 * scale) * edge_damp;
+    let disp_px = (ripple + wake_ripple) * (20.0 * scale * disp_scale) * edge_damp;
     let uv_r = (frag_pos - dir * disp_px * 0.76) / dims;
     let uv_g = (frag_pos - dir * disp_px * 1.00) / dims;
     let uv_b = (frag_pos - dir * disp_px * 1.28) / dims;
@@ -125,7 +182,7 @@ fn vt_shockwave(frag_pos: vec2<f32>, dims: vec2<f32>, dims_i: vec2<i32>) -> vec4
     let new_g = vt_sample_new(uv_g);
     let new_col = vec4<f32>(vt_sample_new(uv_r).r, new_g.g, vt_sample_new(uv_b).b, new_g.a);
 
-    let mix_w = 18.0 * scale;
+    let mix_w = 18.0 * scale * disp_scale;
     let show_old = smoothstep(-mix_w * 0.5, mix_w * 0.5, d);
     var color = mix(new_col, old_col, show_old);
 
@@ -174,7 +231,7 @@ fn vt_page_curl(frag_pos: vec2<f32>, dims: vec2<f32>, dims_i: vec2<i32>) -> vec4
     let diag = max(length(diag_vec), 1.0);
     let curl_dir = diag_vec / diag;
 
-    let R = clamp(min(dims.x, dims.y) * 0.135, 48.0 * scale, 148.0 * scale);
+    let R = clamp(min(dims.x, dims.y) * 0.135, 16.0 * scale, 148.0 * scale);
     let start_fade = smoothstep(0.0, 0.07, p);
     let end_fade = smoothstep(1.0, 0.88, p);
     let axis_s = mix(0.0, diag + R * 2.65, p);
@@ -277,15 +334,17 @@ fn vt_liquid_dissolve(frag_pos: vec2<f32>, dims: vec2<f32>, dims_i: vec2<i32>) -
         return vt_load_new(frag_pos, dims_i);
     }
 
-    let q = frag_pos / (120.0 * scale);
+    let cell = clamp(min(dims.x, dims.y) * 0.22, 36.0 * scale, 120.0 * scale);
+    let disp_scale = cell / (120.0 * scale);
+    let q = frag_pos / cell;
     let norm_dist = clamp(length(frag_pos - params.origin_px) / max(params.radius_px, 1.0), 0.0, 1.0);
     let n = vt_warped_fbm(q);
     let field = norm_dist * 0.66 + n * 0.34;
     let threshold = mix(-0.11, 1.11, p);
     let diff = field - threshold;
-    let time_env = smoothstep(0.0, 0.07, p) * smoothstep(1.0, 0.88, p);
+    let time_env = smoothstep(0.0, 0.07, p) * (1.0 - smoothstep(0.88, 1.0, p));
 
-    // Fast exact path for ~92% of screen pixels away from the active liquid frontier.
+    // Fast exact path for ~92% of pixels away from the active liquid frontier.
     if (abs(diff) > 0.095 || time_env <= 0.0005) {
         if (diff < 0.0) {
             return vt_load_new(frag_pos, dims_i);
@@ -300,10 +359,10 @@ fn vt_liquid_dissolve(frag_pos: vec2<f32>, dims: vec2<f32>, dims_i: vec2<i32>) -
     let grad = vec2<f32>(nx, ny) / (2.0 * eps);
 
     let border_dist = min(min(frag_pos.x, dims.x - frag_pos.x), min(frag_pos.y, dims.y - frag_pos.y));
-    let edge_damp = smoothstep(0.0, 20.0 * scale, border_dist);
+    let edge_damp = smoothstep(0.0, 20.0 * scale * disp_scale, border_dist);
 
     let meniscus = exp(-(diff * diff) / (2.0 * 0.028 * 0.028)) * time_env;
-    let disp_px = grad * meniscus * (18.0 * scale) * edge_damp;
+    let disp_px = grad * meniscus * (18.0 * scale * disp_scale) * edge_damp;
 
     let uv_r = (frag_pos + disp_px * 0.80) / dims;
     let uv_g = (frag_pos + disp_px * 1.00) / dims;
@@ -546,7 +605,7 @@ fn vt_blur_fade(frag_pos: vec2<f32>, dims: vec2<f32>, dims_i: vec2<i32>) -> vec4
         return vt_load_new(frag_pos, dims_i);
     }
 
-    let max_radius = 26.0 * scale;
+    let max_radius = min(26.0 * scale, max(min(dims.x, dims.y) * 0.12, 6.0 * scale));
     let t_one_third = 1.0 / 3.0;
     let t_two_thirds = 2.0 / 3.0;
 
@@ -624,13 +683,14 @@ fn vt_glitch(frag_pos: vec2<f32>, dims: vec2<f32>, dims_i: vec2<i32>) -> vec4<f3
     }
 
     // Sharp horizontal tear displacement + micro vertical jitter on active slivers.
+    let g_scale = scale * clamp(min(dims.x, dims.y) / (320.0 * scale), 0.35, 1.0);
     let dir_sign = select(-1.0, 1.0, vt_hash21(mid_cell + vec2<f32>(step_t * 2.1, 9.4)) > 0.5);
     let slice_burst = select(0.35, 1.0, sliver_h > 0.62);
-    let shift_px = dir_sign * glitch_amt * (16.0 + 48.0 * slice_burst * block_flicker) * scale;
-    let v_jitter_px = (vt_hash21(vec2<f32>(mid_row, step_t * 4.7)) - 0.5) * 6.0 * glitch_amt * scale * select(0.0, 1.0, sliver_h > 0.78);
+    let shift_px = dir_sign * glitch_amt * (16.0 + 48.0 * slice_burst * block_flicker) * g_scale;
+    let v_jitter_px = (vt_hash21(vec2<f32>(mid_row, step_t * 4.7)) - 0.5) * 6.0 * glitch_amt * g_scale * select(0.0, 1.0, sliver_h > 0.78);
 
     // Wide horizontal RGB chromatic aberration split across the tearing chunk.
-    let ca_px = glitch_amt * (9.0 + 22.0 * slice_burst) * scale;
+    let ca_px = glitch_amt * (9.0 + 22.0 * slice_burst) * g_scale;
     let base_p = frag_pos + vec2<f32>(shift_px, v_jitter_px);
     let uv_r = (base_p - vec2<f32>(ca_px, 0.0)) / dims;
     let uv_g = base_p / dims;
@@ -683,7 +743,8 @@ fn vt_prismatic_blob(frag_pos: vec2<f32>, dims: vec2<f32>, dims_i: vec2<i32>) ->
     // Origin-derived seed so each click position spawns a fresh pair of organic blob shapes.
     let seed = fract(params.origin_px * vec2<f32>(0.0137, 0.0193) + vec2<f32>(0.37, 0.71));
 
-    let band = clamp(min(dims.x, dims.y) * 0.135, 64.0 * scale, 140.0 * scale);
+    let band = clamp(min(dims.x, dims.y) * 0.135, 22.0 * scale, 140.0 * scale);
+    let disp_scale = clamp(band / (80.0 * scale), 0.35, 1.0);
     let max_r = max(params.radius_px, 1.0);
     let r_base_out = mix(-band * 0.35, max_r + band * 2.15, p);
     let r_base_in = mix(-band * 1.45, max_r + band * 1.15, p);
@@ -744,11 +805,11 @@ fn vt_prismatic_blob(frag_pos: vec2<f32>, dims: vec2<f32>, dims_i: vec2<i32>) ->
 
     // 14-tap IGN-dithered spectral chromatic aberration refracting cleanly across the double-blob band.
     let swirl_dir = normalize(dir + perp * ((shape_out - shape_in) * 0.58));
-    let max_disp = (32.0 * scale) * (0.26 + 0.74 * ribbon) * edge_damp;
+    let max_disp = (32.0 * scale * disp_scale) * (0.26 + 0.74 * ribbon) * edge_damp;
     let blend_old = smoothstep(0.10, 0.90, u);
     let inv_dims = 1.0 / dims;
     let jitter = vt_ign(floor(frag_pos)) - 0.5;
-    let tang_wave = sin(u * VT_PI * 2.0 + (n_out + n_in) * 3.0) * 8.0 * scale * ribbon * edge_damp;
+    let tang_wave = sin(u * VT_PI * 2.0 + (n_out + n_in) * 3.0) * (8.0 * scale * disp_scale) * ribbon * edge_damp;
 
     var acc_rgb = vec3<f32>(0.0);
     var w_sum = vec3<f32>(0.0);
@@ -795,42 +856,38 @@ fn vt_prismatic_blob(frag_pos: vec2<f32>, dims: vec2<f32>, dims_i: vec2<i32>) ->
     return result;
 }
 
-@fragment
-fn fs_view_transition(@builtin(position) frag_pos: vec4<f32>) -> @location(0) vec4<f32> {
-    let dims_i = vec2<i32>(textureDimensions(t_new, 0));
-    let dims = max(params.viewport_px, vec2<f32>(dims_i));
-
+fn vt_eval_transition(local_pos: vec2<f32>, local_dims: vec2<f32>, dims_i: vec2<i32>) -> vec4<f32> {
     if (params.kind == 3u) {
-        return vt_shockwave(frag_pos.xy, dims, dims_i);
+        return vt_shockwave(local_pos, local_dims, dims_i);
     }
     if (params.kind == 4u) {
-        return vt_page_curl(frag_pos.xy, dims, dims_i);
+        return vt_page_curl(local_pos, local_dims, dims_i);
     }
     if (params.kind == 5u) {
-        return vt_liquid_dissolve(frag_pos.xy, dims, dims_i);
+        return vt_liquid_dissolve(local_pos, local_dims, dims_i);
     }
     if (params.kind == 6u) {
-        return vt_chromatic_warp(frag_pos.xy, dims, dims_i);
+        return vt_chromatic_warp(local_pos, local_dims, dims_i);
     }
     if (params.kind == 7u) {
-        return vt_blur_fade(frag_pos.xy, dims, dims_i);
+        return vt_blur_fade(local_pos, local_dims, dims_i);
     }
     if (params.kind == 8u) {
-        return vt_glitch(frag_pos.xy, dims, dims_i);
+        return vt_glitch(local_pos, local_dims, dims_i);
     }
     if (params.kind == 9u) {
-        return vt_prismatic_blob(frag_pos.xy, dims, dims_i);
+        return vt_prismatic_blob(local_pos, local_dims, dims_i);
     }
 
-    let old_color = vt_load_old(frag_pos.xy, dims_i);
-    let new_color = vt_load_new(frag_pos.xy, dims_i);
+    let old_color = vt_load_old(local_pos, dims_i);
+    let new_color = vt_load_new(local_pos, dims_i);
 
     var show_old: f32;
     if (params.kind == 2u) {
         // CrossFade
         show_old = 1.0 - clamp(params.progress, 0.0, 1.0);
     } else {
-        let dist = length(frag_pos.xy - params.origin_px);
+        let dist = length(local_pos - params.origin_px);
         let feather = max(params.feather_px, 0.5);
         if (params.kind == 0u) {
             // RadialExpand: new scene revealed inside expanding circle, old outside.
@@ -842,4 +899,49 @@ fn fs_view_transition(@builtin(position) frag_pos: vec4<f32>) -> @location(0) ve
     }
 
     return mix(new_color, old_color, show_old);
+}
+
+@fragment
+fn fs_view_transition(@builtin(position) frag_pos: vec4<f32>) -> @location(0) vec4<f32> {
+    let vp_dims = max(params.viewport_px, vec2<f32>(textureDimensions(t_new, 0)));
+    let local_dims = max(params.region_size, vec2<f32>(1.0));
+    let local_pos = frag_pos.xy - params.region_origin;
+
+    let outside_clip = frag_pos.x < params.clip_min.x
+        || frag_pos.x > params.clip_max.x
+        || frag_pos.y < params.clip_min.y
+        || frag_pos.y > params.clip_max.y;
+    let is_scoped = params.region_origin.x > 0.5
+        || params.region_origin.y > 0.5
+        || local_dims.x < vp_dims.x - 0.5
+        || local_dims.y < vp_dims.y - 0.5
+        || params.corner_radii.x > 0.0
+        || params.corner_radii.y > 0.0
+        || params.corner_radii.z > 0.0
+        || params.corner_radii.w > 0.0
+        || outside_clip;
+
+    var mask = 1.0;
+    if (is_scoped) {
+        if (outside_clip) {
+            mask = 0.0;
+        } else {
+            let sdf = vt_rounded_rect_sdf(local_pos, local_dims, params.corner_radii);
+            mask = 1.0 - smoothstep(-0.75, 0.75, sdf);
+        }
+    }
+
+    if (mask <= 0.001) {
+        if (params.overlay_pass != 0u) {
+            discard;
+        }
+        return vt_load_new_raw(frag_pos.xy);
+    }
+
+    let dims_i = max(vec2<i32>(round(local_dims)), vec2<i32>(1));
+    let effect_col = vt_eval_transition(local_pos, local_dims, dims_i);
+    if (mask >= 0.999) {
+        return effect_col;
+    }
+    return mix(vt_load_new_raw(frag_pos.xy), effect_col, mask);
 }

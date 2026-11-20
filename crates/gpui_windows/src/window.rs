@@ -1053,17 +1053,25 @@ impl PlatformWindow for WindowsWindow {
             .log_err();
     }
 
-    fn capture_transition_snapshot(&self, scene: &Scene) -> bool {
+    fn capture_transition_snapshot(
+        &self,
+        id: u64,
+        scene: &Scene,
+        region: Option<Bounds<ScaledPixels>>,
+    ) -> bool {
         self.state
             .renderer
             .borrow_mut()
-            .capture_transition_snapshot(scene, self.state.background_appearance.get())
+            .capture_transition_snapshot(id, scene, region, self.state.background_appearance.get())
             .log_err()
             .unwrap_or(false)
     }
 
-    fn clear_transition_snapshot(&self) {
-        self.state.renderer.borrow_mut().clear_transition_snapshot();
+    fn clear_transition_snapshot(&self, id: Option<u64>) {
+        self.state
+            .renderer
+            .borrow_mut()
+            .clear_transition_snapshot(id);
     }
 
     #[cfg(feature = "test-support")]

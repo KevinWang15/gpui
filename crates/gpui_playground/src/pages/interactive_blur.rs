@@ -1264,6 +1264,436 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
             ),
         );
 
+    // 0a. Component-to-Component GPU Transitions (`TransitionView`) Workbench
+    let comp_fx = app.comp_transition_style;
+    let card_a_idx = app.comp_transition_card_a % 3;
+    let card_b_idx = app.comp_transition_card_b % 3;
+    // Secondary card uses a complementary effect when firing both concurrently so the user can
+    // see two independent GPU shaders animating side-by-side in the same frame!
+    let card_b_fx = match comp_fx {
+        TransitionStyle::PrismaticBlob => TransitionStyle::Glitch,
+        TransitionStyle::Glitch => TransitionStyle::PrismaticBlob,
+        TransitionStyle::ChromaticWarp => TransitionStyle::BlurFade,
+        other => other,
+    };
+
+    let render_rich_slot_a = |idx: usize| -> gpui::AnyElement {
+        match idx {
+            0 => div()
+                .w_full()
+                .h(px(210.))
+                .p(px(18.))
+                .rounded(theme.radius_lg)
+                .border_1()
+                .border_color(Hsla::from(palette::INDIGO_500).opacity(0.35))
+                .bg(Hsla::from(palette::INDIGO_600).opacity(if theme.mode == ThemeMode::Dark { 0.24 } else { 0.10 }))
+                .flex()
+                .flex_col()
+                .justify_between()
+                .child(
+                    h_stack()
+                        .justify_between()
+                        .child(
+                            h_stack()
+                                .spacing(px(8.))
+                                .child(
+                                    div()
+                                        .w(px(34.))
+                                        .h(px(34.))
+                                        .rounded(theme.radius_md)
+                                        .bg(Hsla::from(palette::INDIGO_500))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .child(Icon::new(LucideIcon::Activity).size(IconSize::Sm).color(Hsla::from(palette::WHITE))),
+                                )
+                                .child(
+                                    v_stack()
+                                        .spacing(px(1.))
+                                        .child(div().text_size(px(14.)).font_weight(FontWeight::SEMIBOLD).text_color(theme.foreground).child("Live Cluster Metrics"))
+                                        .child(div().text_size(px(11.5)).text_color(theme.muted_foreground).child("Component A · Click anywhere inside to swap")),
+                                ),
+                        )
+                        .child(badge("99.98% SLA").color(BadgeColor::Indigo).pill(true)),
+                )
+                .child(
+                    h_stack()
+                        .spacing(px(10.))
+                        .items_end()
+                        .h(px(88.))
+                        .children([42.0_f32, 68.0, 54.0, 84.0, 62.0, 76.0, 48.0, 86.0].into_iter().enumerate().map(|(i, h)| {
+                            let c = [palette::INDIGO_500, palette::VIOLET_500, palette::CYAN_500, palette::EMERALD_500][i % 4];
+                            div().flex_1().h(px(h)).rounded(px(5.)).bg(Hsla::from(c))
+                        })),
+                )
+                .child(
+                    h_stack()
+                        .justify_between()
+                        .child(div().text_size(px(12.)).text_color(theme.muted_foreground).child("p99 latency: 11.4 ms"))
+                        .child(div().text_size(px(12.)).font_weight(FontWeight::SEMIBOLD).text_color(Hsla::from(palette::INDIGO_500)).child("48.2k req/s →")),
+                )
+                .into_any_element(),
+            1 => div()
+                .w_full()
+                .h(px(210.))
+                .p(px(18.))
+                .rounded(theme.radius_lg)
+                .border_1()
+                .border_color(Hsla::from(palette::EMERALD_500).opacity(0.40))
+                .bg(Hsla::from(palette::SLATE_900))
+                .flex()
+                .flex_col()
+                .justify_between()
+                .child(
+                    h_stack()
+                        .justify_between()
+                        .child(
+                            h_stack()
+                                .spacing(px(8.))
+                                .child(
+                                    div()
+                                        .w(px(34.))
+                                        .h(px(34.))
+                                        .rounded(theme.radius_md)
+                                        .bg(Hsla::from(palette::EMERALD_500))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .child(Icon::new(LucideIcon::Rocket).size(IconSize::Sm).color(Hsla::from(palette::WHITE))),
+                                )
+                                .child(
+                                    v_stack()
+                                        .spacing(px(1.))
+                                        .child(div().text_size(px(14.)).font_weight(FontWeight::SEMIBOLD).text_color(Hsla::from(palette::WHITE)).child("Production Release v2.8"))
+                                        .child(div().text_size(px(11.5)).text_color(Hsla::from(palette::SLATE_400)).child("Component B · Dark terminal card inside any theme")),
+                                ),
+                        )
+                        .child(badge("DEPLOYED").color(BadgeColor::Green).pill(true)),
+                )
+                .child(
+                    v_stack()
+                        .spacing(px(8.))
+                        .p(px(12.))
+                        .rounded(theme.radius_md)
+                        .bg(Hsla::from(palette::SLATE_950))
+                        .font_family("Lilex")
+                        .text_size(px(12.))
+                        .child(div().text_color(Hsla::from(palette::EMERALD_400)).child("✓ wgpu shader pipeline compiled (0.4ms)"))
+                        .child(div().text_color(Hsla::from(palette::SKY_400)).child("✓ 10 transition kernels verified across regions"))
+                        .child(div().text_color(Hsla::from(palette::AMBER_400)).child("→ edge nodes synced: us-west, eu-central, ap-east")),
+                )
+                .child(
+                    h_stack()
+                        .justify_between()
+                        .child(div().text_size(px(12.)).text_color(Hsla::from(palette::SLATE_400)).child("Build #4109 · SHA 746ac89"))
+                        .child(div().text_size(px(12.)).font_weight(FontWeight::SEMIBOLD).text_color(Hsla::from(palette::EMERALD_400)).child("Click for Component C →")),
+                )
+                .into_any_element(),
+            _ => div()
+                .w_full()
+                .h(px(210.))
+                .p(px(18.))
+                .rounded(theme.radius_lg)
+                .border_1()
+                .border_color(Hsla::from(palette::ROSE_500).opacity(0.40))
+                .bg(Hsla::from(palette::AMBER_500).opacity(if theme.mode == ThemeMode::Dark { 0.22 } else { 0.14 }))
+                .flex()
+                .flex_col()
+                .justify_between()
+                .child(
+                    h_stack()
+                        .justify_between()
+                        .child(
+                            h_stack()
+                                .spacing(px(8.))
+                                .child(
+                                    div()
+                                        .w(px(34.))
+                                        .h(px(34.))
+                                        .rounded(theme.radius_md)
+                                        .bg(Hsla::from(palette::ROSE_500))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .child(Icon::new(LucideIcon::Palette).size(IconSize::Sm).color(Hsla::from(palette::WHITE))),
+                                )
+                                .child(
+                                    v_stack()
+                                        .spacing(px(1.))
+                                        .child(div().text_size(px(14.)).font_weight(FontWeight::SEMIBOLD).text_color(theme.foreground).child("Prismatic Color Studio"))
+                                        .child(div().text_size(px(11.5)).text_color(theme.muted_foreground).child("Component C · High-contrast swatches show off dispersion")),
+                                ),
+                        )
+                        .child(badge("HDR P3").color(BadgeColor::Amber).pill(true)),
+                )
+                .child(
+                    h_stack()
+                        .spacing(px(8.))
+                        .children(
+                            [
+                                palette::ROSE_500,
+                                palette::ORANGE_500,
+                                palette::AMBER_400,
+                                palette::EMERALD_500,
+                                palette::CYAN_500,
+                                palette::INDIGO_500,
+                                palette::VIOLET_500,
+                            ]
+                            .into_iter()
+                            .map(|c| div().flex_1().h(px(72.)).rounded(theme.radius_md).bg(Hsla::from(c))),
+                        ),
+                )
+                .child(
+                    h_stack()
+                        .justify_between()
+                        .child(div().text_size(px(12.)).text_color(theme.muted_foreground).child("Zero bleed outside rounded card bounds"))
+                        .child(div().text_size(px(12.)).font_weight(FontWeight::SEMIBOLD).text_color(Hsla::from(palette::ROSE_500)).child("Back to Component A →")),
+                )
+                .into_any_element(),
+        }
+    };
+
+    let render_rich_slot_b = |idx: usize| -> gpui::AnyElement {
+        match idx {
+            0 => div()
+                .w_full()
+                .h(px(210.))
+                .p(px(18.))
+                .rounded(theme.radius_lg)
+                .border_1()
+                .border_color(Hsla::from(palette::SKY_500).opacity(0.35))
+                .bg(Hsla::from(palette::SKY_500).opacity(if theme.mode == ThemeMode::Dark { 0.22 } else { 0.12 }))
+                .flex()
+                .flex_col()
+                .justify_between()
+                .child(
+                    h_stack()
+                        .justify_between()
+                        .child(div().text_size(px(14.)).font_weight(FontWeight::SEMIBOLD).text_color(theme.foreground).child("Audio Waveform Synth"))
+                        .child(badge(format!("FX: {}", card_b_fx.label())).color(BadgeColor::Blue).pill(true)),
+                )
+                .child(
+                    h_stack()
+                        .spacing(px(6.))
+                        .items_center()
+                        .justify_center()
+                        .h(px(90.))
+                        .children([24.0_f32, 56.0, 78.0, 38.0, 86.0, 62.0, 90.0, 44.0, 72.0, 32.0, 64.0, 48.0].into_iter().map(|h| {
+                            div().w(px(12.)).h(px(h)).rounded_full().bg(Hsla::from(palette::SKY_500))
+                        })),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(theme.muted_foreground)
+                        .child("Independent TransitionView · Click to cycle or fire both at once"),
+                )
+                .into_any_element(),
+            1 => div()
+                .w_full()
+                .h(px(210.))
+                .p(px(18.))
+                .rounded(theme.radius_lg)
+                .border_1()
+                .border_color(Hsla::from(palette::VIOLET_500).opacity(0.45))
+                .bg(Hsla::from(palette::VIOLET_950))
+                .flex()
+                .flex_col()
+                .justify_between()
+                .child(
+                    h_stack()
+                        .justify_between()
+                        .child(div().text_size(px(14.)).font_weight(FontWeight::SEMIBOLD).text_color(Hsla::from(palette::WHITE)).child("GPU Shader Telemetry"))
+                        .child(badge("120 FPS").color(BadgeColor::Purple).pill(true)),
+                )
+                .child(
+                    grid(2)
+                        .child(
+                            div()
+                                .p(px(10.))
+                                .rounded(theme.radius_md)
+                                .bg(Hsla::from(palette::VIOLET_500).opacity(0.24))
+                                .child(div().text_size(px(11.)).text_color(Hsla::from(palette::VIOLET_200)).child("SNAPSHOT VRAM"))
+                                .child(div().text_size(px(18.)).font_weight(FontWeight::BOLD).text_color(Hsla::from(palette::WHITE)).child("380 KB")),
+                        )
+                        .child(
+                            div()
+                                .p(px(10.))
+                                .rounded(theme.radius_md)
+                                .bg(Hsla::from(palette::CYAN_500).opacity(0.24))
+                                .child(div().text_size(px(11.)).text_color(Hsla::from(palette::CYAN_200)).child("SCISSOR PASS"))
+                                .child(div().text_size(px(18.)).font_weight(FontWeight::BOLD).text_color(Hsla::from(palette::WHITE)).child("0.18 ms")),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(Hsla::from(palette::VIOLET_200))
+                        .child("Only this card's rounded bounds are shaded — rest of UI stays live"),
+                )
+                .into_any_element(),
+            _ => div()
+                .w_full()
+                .h(px(210.))
+                .p(px(18.))
+                .rounded(theme.radius_lg)
+                .border_1()
+                .border_color(Hsla::from(palette::EMERALD_500).opacity(0.40))
+                .bg(Hsla::from(palette::EMERALD_500).opacity(if theme.mode == ThemeMode::Dark { 0.20 } else { 0.12 }))
+                .flex()
+                .flex_col()
+                .justify_between()
+                .child(
+                    h_stack()
+                        .justify_between()
+                        .child(div().text_size(px(14.)).font_weight(FontWeight::SEMIBOLD).text_color(theme.foreground).child("Security Audit Passed"))
+                        .child(badge("VERIFIED").color(BadgeColor::Green).pill(true)),
+                )
+                .child(
+                    h_stack()
+                        .spacing(px(12.))
+                        .items_center()
+                        .child(
+                            div()
+                                .w(px(56.))
+                                .h(px(56.))
+                                .rounded_full()
+                                .bg(Hsla::from(palette::EMERALD_500))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(Icon::new(LucideIcon::ShieldCheck).size(IconSize::Xl).color(Hsla::from(palette::WHITE))),
+                        )
+                        .child(
+                            v_stack()
+                                .spacing(px(4.))
+                                .child(div().text_size(px(15.)).font_weight(FontWeight::BOLD).text_color(theme.foreground).child("All 10 Shaders Unified"))
+                                .child(div().text_size(px(12.)).text_color(theme.muted_foreground).child("Same WGSL & HLSL pipeline powers both full-window and component transitions.")),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(Hsla::from(palette::EMERALD_600))
+                        .child("Click again to loop back to Waveform Synth →"),
+                )
+                .into_any_element(),
+        }
+    };
+
+    let component_transitions_section = card()
+        .child(
+            card_header().bordered().child(
+                h_stack()
+                    .justify_between()
+                    .child(
+                        v_stack()
+                            .spacing(px(3.))
+                            .child(
+                                h_stack()
+                                    .spacing(px(8.))
+                                    .child(card_title("Component-to-Component GPU Transitions"))
+                                    .child(
+                                        badge("TransitionView")
+                                            .color(BadgeColor::Purple)
+                                            .pill(true),
+                                    ),
+                            )
+                            .child(card_description(
+                                "Reuses the exact same GPU shaders scoped to individual rounded components. Click a card (or fire both concurrently) while the rest of the window stays 100% live.",
+                            )),
+                    )
+                    .child(
+                        button("comp-fx-both")
+                            .primary()
+                            .size(ComponentSize::Sm)
+                            .leading_icon(LucideIcon::Sparkles)
+                            .label("Transition Both")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.comp_transition_card_a = (this.comp_transition_card_a + 1) % 3;
+                                this.comp_transition_card_b = (this.comp_transition_card_b + 1) % 3;
+                                this.log_event(
+                                    "TransitionView",
+                                    format!("concurrent dual swap ({})", this.comp_transition_style.label()),
+                                    cx,
+                                );
+                            })),
+                    ),
+            ),
+        )
+        .child(
+            card_content()
+                .child(
+                    h_stack()
+                        .flex_wrap()
+                        .spacing(px(6.))
+                        .children(TransitionStyle::ALL.into_iter().enumerate().map(|(i, style)| {
+                            button(("comp-fx-pick", i))
+                                .size(ComponentSize::Xs)
+                                .variant(if comp_fx == style {
+                                    ButtonVariant::Primary
+                                } else {
+                                    ButtonVariant::Secondary
+                                })
+                                .label(style.label())
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.comp_transition_style = style;
+                                    this.comp_transition_card_a = (this.comp_transition_card_a + 1) % 3;
+                                    this.log_event(
+                                        "TransitionView",
+                                        format!("card A -> {} ({})", this.comp_transition_card_a, style.label()),
+                                        cx,
+                                    );
+                                }))
+                        })),
+                )
+                .child(
+                    grid(2)
+                        .child(
+                            div()
+                                .id("comp-slot-a-hit")
+                                .cursor_pointer()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.comp_transition_card_a = (this.comp_transition_card_a + 1) % 3;
+                                    this.log_event(
+                                        "TransitionView",
+                                        format!("card A swapped ({})", this.comp_transition_style.label()),
+                                        cx,
+                                    );
+                                }))
+                                .child(
+                                    transition_view("pg-comp-transition-a", card_a_idx)
+                                        .transition_style(comp_fx)
+                                        .origin(TransitionOrigin::Pointer)
+                                        .rounded(theme.radius_lg)
+                                        .w_full()
+                                        .child(render_rich_slot_a(card_a_idx)),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("comp-slot-b-hit")
+                                .cursor_pointer()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.comp_transition_card_b = (this.comp_transition_card_b + 1) % 3;
+                                    this.log_event(
+                                        "TransitionView",
+                                        format!("card B swapped ({})", card_b_fx.label()),
+                                        cx,
+                                    );
+                                }))
+                                .child(
+                                    transition_view("pg-comp-transition-b", card_b_idx)
+                                        .transition_style(card_b_fx)
+                                        .origin(TransitionOrigin::Pointer)
+                                        .rounded(theme.radius_lg)
+                                        .w_full()
+                                        .child(render_rich_slot_b(card_b_idx)),
+                                ),
+                        ),
+                ),
+        );
+
     // 0b. Composable Optical LiquidGlass Lens, Floating Bar & Progressive Blur Lab
     let glass_refraction = app.glass_refraction_slider.read(cx).value();
     let glass_dispersion = app.glass_dispersion_slider.read(cx).value();
@@ -1677,6 +2107,7 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
                 ),
         )
         .child(liquid_glass_section)
+        .child(component_transitions_section)
         .child(shader_transitions_section)
         .child(blur_loading_section)
         .child(spinners_and_rings)

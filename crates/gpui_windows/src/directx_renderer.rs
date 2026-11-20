@@ -98,15 +98,24 @@ struct DirectXRenderPipelines {
     backdrop_blur: BackdropBlurPipeline,
 }
 
-/// The two frames a view transition blends, as copies of the render target:
-/// `old` captured before the change, `new` rendered each frame while it runs.
-struct TransitionFrames {
+/// Captured snapshot texture for a single full-window or component-scoped view transition.
+struct TransitionSnapshot {
     width: u32,
     height: u32,
     old: ID3D11Texture2D,
     old_view: Option<ID3D11ShaderResourceView>,
+}
+
+/// Shared DirectX 11 state for full-window and concurrent component-scoped transitions:
+/// `new` holds the full live frame copied from the render target, while `snapshots` holds
+/// per-transition cropped (or full-viewport) `old` textures keyed by transition ID.
+struct TransitionFrames {
+    width: u32,
+    height: u32,
     new: ID3D11Texture2D,
     new_view: Option<ID3D11ShaderResourceView>,
+    snapshots: collections::FxHashMap<u64, TransitionSnapshot>,
+    capture_generation: Option<u64>,
 }
 
 /// The pass that blends the two frames into the render target (shaders.hlsl,
@@ -118,7 +127,7 @@ struct ViewTransitionPipeline {
     clamp_sampler: Option<ID3D11SamplerState>,
 }
 
-/// `ViewTransitionParams` in shaders.hlsl.
+/// `ViewTransitionParams` in shaders.hlsl (96 bytes, 16-byte aligned).
 #[repr(C)]
 struct ViewTransitionParams {
     origin: [f32; 2],
@@ -127,6 +136,13 @@ struct ViewTransitionParams {
     progress: f32,
     kind: u32,
     viewport_size: [f32; 2],
+    region_origin: [f32; 2],
+    region_size: [f32; 2],
+    clip_min: [f32; 2],
+    clip_max: [f32; 2],
+    corner_radii: [f32; 4],
+    overlay_pass: u32,
+    _pad: [u32; 3],
 }
 
 /// Offscreen textures for backdrop blurs (`gpui::backdrop_blur`): `snapshot`
@@ -434,22 +450,24 @@ impl DirectXRenderer {
             return Ok(());
         }
         self.render(scene, background_appearance)?;
-        if let Some(transition) = scene.transition
+        if !scene.transitions.is_empty()
             && self
                 .transition
                 .as_ref()
                 .is_some_and(|t| t.width == self.width && t.height == self.height)
         {
-            self.composite_transition(&transition)?;
+            self.composite_transitions(&scene.transitions)?;
         }
         self.present()
     }
 
-    /// Renders `scene` (the frame before a change) and keeps a copy of it for
-    /// the view transition that follows. Nothing is presented.
+    /// Renders `scene` (the frame before a change) and keeps a full-frame or cropped sub-region
+    /// snapshot keyed by `id` for the view or component transition that follows. Nothing is presented.
     pub(crate) fn capture_transition_snapshot(
         &mut self,
+        id: u64,
         scene: &Scene,
+        region: Option<Bounds<ScaledPixels>>,
         background_appearance: WindowBackgroundAppearance,
     ) -> Result<bool> {
         if self.skip_draws {
@@ -468,21 +486,99 @@ impl DirectXRenderer {
         {
             self.transition = Some(TransitionFrames::new(&devices.device, &render_target)?);
         }
-        self.render(scene, background_appearance)?;
+
+        let has_mid_flight = !scene.transitions.is_empty()
+            && self
+                .transition
+                .as_ref()
+                .is_some_and(|t| !t.snapshots.is_empty());
+        let scene_gen = scene.generation();
+        let can_reuse = !has_mid_flight
+            && region.is_some()
+            && scene_gen != 0
+            && self
+                .transition
+                .as_ref()
+                .is_some_and(|t| t.capture_generation == Some(scene_gen));
+
+        if !can_reuse {
+            self.render(scene, background_appearance)?;
+            if has_mid_flight {
+                self.composite_transitions(&scene.transitions)?;
+                if let Some(frames) = self.transition.as_mut() {
+                    frames.capture_generation = None;
+                }
+            } else if let Some(frames) = self.transition.as_mut() {
+                frames.capture_generation = (scene_gen != 0).then_some(scene_gen);
+            }
+        }
+
         let devices = self.devices.as_ref().context("devices missing")?;
-        let frames = self.transition.as_ref().context("transition frames missing")?;
-        unsafe { devices.device_context.CopyResource(&frames.old, &render_target) };
+        let frames = self.transition.as_mut().context("transition frames missing")?;
+        let (crop_x, crop_y, tex_w, tex_h, is_cropped) = if let Some(rect) = region {
+            let vw = frames.width;
+            let vh = frames.height;
+            let min_x = (rect.origin.x.0.floor().max(0.0) as u32).min(vw);
+            let min_y = (rect.origin.y.0.floor().max(0.0) as u32).min(vh);
+            let max_x = ((rect.origin.x.0 + rect.size.width.0).ceil().max(0.0) as u32).min(vw);
+            let max_y = ((rect.origin.y.0 + rect.size.height.0).ceil().max(0.0) as u32).min(vh);
+            if max_x <= min_x || max_y <= min_y {
+                return Ok(false);
+            }
+            (min_x, min_y, max_x - min_x, max_y - min_y, true)
+        } else {
+            (0, 0, frames.width, frames.height, false)
+        };
+
+        let snapshot = TransitionFrames::create_snapshot(&devices.device, &render_target, tex_w, tex_h)?;
+        if is_cropped {
+            let src_box = D3D11_BOX {
+                left: crop_x,
+                top: crop_y,
+                front: 0,
+                right: crop_x + tex_w,
+                bottom: crop_y + tex_h,
+                back: 1,
+            };
+            unsafe {
+                devices.device_context.CopySubresourceRegion(
+                    &snapshot.old,
+                    0,
+                    0,
+                    0,
+                    0,
+                    &render_target,
+                    0,
+                    Some(&src_box),
+                );
+            }
+        } else {
+            unsafe { devices.device_context.CopyResource(&snapshot.old, &render_target) };
+        }
+        frames.snapshots.insert(id, snapshot);
         Ok(true)
     }
 
-    /// Releases the frames of a finished or cancelled view transition.
-    pub(crate) fn clear_transition_snapshot(&mut self) {
-        self.transition = None;
+    /// Releases snapshot resources for a single finished transition (`Some(id)`) or all active
+    /// transitions (`None`).
+    pub(crate) fn clear_transition_snapshot(&mut self, id: Option<u64>) {
+        match id {
+            Some(target_id) => {
+                if let Some(frames) = self.transition.as_mut() {
+                    frames.snapshots.remove(&target_id);
+                    if frames.snapshots.is_empty() {
+                        self.transition = None;
+                    }
+                }
+            }
+            None => {
+                self.transition = None;
+            }
+        }
     }
 
-    /// Blends the captured frame with the frame just rendered, into the
-    /// render target.
-    fn composite_transition(&mut self, transition: &SceneTransition) -> Result<()> {
+    /// Blends one or more active full-window / component-scoped transitions into the render target.
+    fn composite_transitions(&mut self, transitions: &[SceneTransition]) -> Result<()> {
         let devices = self.devices.as_ref().context("devices missing")?;
         let resources = self.resources.as_ref().context("resources missing")?;
         let render_target = resources.render_target.as_ref().context("render target missing")?;
@@ -490,21 +586,28 @@ impl DirectXRenderer {
         let pipeline = &self.pipelines.view_transition;
         let params = pipeline.params.as_ref().context("view transition params missing")?;
         let context = &devices.device_context;
-        update_buffer(
-            context,
-            params,
-            &[ViewTransitionParams {
-                origin: [transition.origin.x.0, transition.origin.y.0],
-                radius: transition.radius.0,
-                feather: transition.feather.0,
-                progress: transition.progress,
-                kind: transition.kind as u32,
-                viewport_size: [self.width.max(1) as f32, self.height.max(1) as f32],
-            }],
-        )?;
+
+        let active: Vec<(&SceneTransition, &TransitionSnapshot)> = transitions
+            .iter()
+            .filter_map(|t| {
+                let snap = frames.snapshots.get(&t.id)?;
+                if t.id == gpui::FULL_WINDOW_TRANSITION_ID
+                    && (snap.width != frames.width || snap.height != frames.height)
+                {
+                    return None;
+                }
+                Some((t, snap))
+            })
+            .collect();
+        if active.is_empty() {
+            return Ok(());
+        }
+
+        let vw = self.width.max(1) as f32;
+        let vh = self.height.max(1) as f32;
         unsafe {
             context.CopyResource(&frames.new, render_target);
-            // Every pixel is written as blended, so no blending and no depth.
+            // Every pixel is written directly (or discarded on overlay passes).
             context.OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
             context.RSSetViewports(Some(slice::from_ref(&resources.viewport)));
             context.OMSetBlendState(None, None, 0xFFFFFFFF);
@@ -515,8 +618,51 @@ impl DirectXRenderer {
             context.PSSetShader(&pipeline.fragment, None);
             context.PSSetConstantBuffers(2, Some(slice::from_ref(&pipeline.params)));
             context.PSSetSamplers(0, Some(slice::from_ref(&pipeline.clamp_sampler)));
-            context.PSSetShaderResources(0, Some(&[frames.old_view.clone(), frames.new_view.clone()]));
-            context.Draw(3, 0);
+        }
+
+        for (slot, (transition, snap)) in active.iter().enumerate() {
+            update_buffer(
+                context,
+                params,
+                &[ViewTransitionParams {
+                    origin: [transition.origin.x.0, transition.origin.y.0],
+                    radius: transition.radius.0,
+                    feather: transition.feather.0,
+                    progress: transition.progress,
+                    kind: transition.kind as u32,
+                    viewport_size: [vw, vh],
+                    region_origin: [transition.bounds.origin.x.0, transition.bounds.origin.y.0],
+                    region_size: [
+                        transition.bounds.size.width.0.max(1.0),
+                        transition.bounds.size.height.0.max(1.0),
+                    ],
+                    clip_min: [
+                        transition.clip_bounds.origin.x.0,
+                        transition.clip_bounds.origin.y.0,
+                    ],
+                    clip_max: [
+                        transition.clip_bounds.origin.x.0 + transition.clip_bounds.size.width.0,
+                        transition.clip_bounds.origin.y.0 + transition.clip_bounds.size.height.0,
+                    ],
+                    corner_radii: [
+                        transition.corner_radii.top_left.0,
+                        transition.corner_radii.top_right.0,
+                        transition.corner_radii.bottom_right.0,
+                        transition.corner_radii.bottom_left.0,
+                    ],
+                    overlay_pass: (slot > 0) as u32,
+                    _pad: [0; 3],
+                }],
+            )?;
+            unsafe {
+                context.PSSetShaderResources(
+                    0,
+                    Some(&[snap.old_view.clone(), frames.new_view.clone()]),
+                );
+                context.Draw(3, 0);
+            }
+        }
+        unsafe {
             // Unbound, so the frames can be copied into again next frame.
             context.PSSetShaderResources(0, Some(&[None, None]));
         }
@@ -1557,11 +1703,33 @@ impl ViewTransitionPipeline {
 }
 
 impl TransitionFrames {
-    /// Two shader-readable textures shaped like `render_target`.
+    /// Allocates the full-frame live `new` texture shaped like `render_target`.
     fn new(device: &ID3D11Device, render_target: &ID3D11Texture2D) -> Result<Self> {
         let mut desc = D3D11_TEXTURE2D_DESC::default();
         unsafe { render_target.GetDesc(&mut desc) };
+        let snap = Self::create_snapshot(device, render_target, desc.Width, desc.Height)?;
+        Ok(Self {
+            width: desc.Width,
+            height: desc.Height,
+            new: snap.old,
+            new_view: snap.old_view,
+            snapshots: collections::FxHashMap::default(),
+            capture_generation: None,
+        })
+    }
+
+    /// Creates a shader-readable snapshot texture matching `render_target`'s format at `(width, height)`.
+    fn create_snapshot(
+        device: &ID3D11Device,
+        render_target: &ID3D11Texture2D,
+        width: u32,
+        height: u32,
+    ) -> Result<TransitionSnapshot> {
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        unsafe { render_target.GetDesc(&mut desc) };
         let desc = D3D11_TEXTURE2D_DESC {
+            Width: width.max(1),
+            Height: height.max(1),
             MipLevels: 1,
             ArraySize: 1,
             SampleDesc: DXGI_SAMPLE_DESC {
@@ -1574,23 +1742,16 @@ impl TransitionFrames {
             MiscFlags: 0,
             ..desc
         };
-        let texture = || -> Result<(ID3D11Texture2D, Option<ID3D11ShaderResourceView>)> {
-            let mut texture = None;
-            unsafe { device.CreateTexture2D(&desc, None, Some(&mut texture))? };
-            let texture = texture.context("creating a view transition texture")?;
-            let mut view = None;
-            unsafe { device.CreateShaderResourceView(&texture, None, Some(&mut view))? };
-            Ok((texture, view))
-        };
-        let (old, old_view) = texture()?;
-        let (new, new_view) = texture()?;
-        Ok(Self {
+        let mut texture = None;
+        unsafe { device.CreateTexture2D(&desc, None, Some(&mut texture))? };
+        let texture = texture.context("creating a view transition texture")?;
+        let mut view = None;
+        unsafe { device.CreateShaderResourceView(&texture, None, Some(&mut view))? };
+        Ok(TransitionSnapshot {
             width: desc.Width,
             height: desc.Height,
-            old,
-            old_view,
-            new,
-            new_view,
+            old: texture,
+            old_view: view,
         })
     }
 }

@@ -3,8 +3,9 @@ use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
 use collections::FxHashMap;
 use gpui::{
-    AtlasTextureId, Bounds, DevicePixels, GpuSpecs, PaintedPath, PrimitiveBatch, ScaledPixels,
-    Scene, SceneTransition, Size, get_gamma_correction_ratios, quad_depth, quad_depth_scale,
+    AtlasTextureId, Bounds, DevicePixels, FULL_WINDOW_TRANSITION_ID, GpuSpecs, PaintedPath,
+    PrimitiveBatch, ScaledPixels, Scene, SceneTransition, Size, get_gamma_correction_ratios,
+    quad_depth, quad_depth_scale,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -84,6 +85,13 @@ struct TransitionTexture {
     size: Size<DevicePixels>,
 }
 
+struct TransitionSnapshot {
+    texture: TransitionTexture,
+    bind_group: Option<wgpu::BindGroup>,
+    bind_group_new_id: u64,
+    bind_group_buf_gen: u64,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct ViewTransitionParams {
@@ -93,19 +101,72 @@ struct ViewTransitionParams {
     progress: f32,
     kind: u32,
     viewport_px: [f32; 2],
+    region_origin: [f32; 2],
+    region_size: [f32; 2],
+    clip_min: [f32; 2],
+    clip_max: [f32; 2],
+    corner_radii: [f32; 4],
+    overlay_pass: u32,
+    _pad: [u32; 3],
 }
 
 impl ViewTransitionParams {
-    fn from_transition(transition: SceneTransition, size: Size<DevicePixels>) -> Self {
+    fn from_transition(
+        transition: SceneTransition,
+        size: Size<DevicePixels>,
+        overlay_pass: bool,
+    ) -> Self {
+        let vw = size.width.0.max(1) as f32;
+        let vh = size.height.0.max(1) as f32;
         Self {
             origin_px: [transition.origin.x.0, transition.origin.y.0],
             radius_px: transition.radius.0,
             feather_px: transition.feather.0,
             progress: transition.progress,
             kind: transition.kind as u32,
-            viewport_px: [size.width.0.max(1) as f32, size.height.0.max(1) as f32],
+            viewport_px: [vw, vh],
+            region_origin: [transition.bounds.origin.x.0, transition.bounds.origin.y.0],
+            region_size: [
+                transition.bounds.size.width.0.max(1.0),
+                transition.bounds.size.height.0.max(1.0),
+            ],
+            clip_min: [
+                transition.clip_bounds.origin.x.0,
+                transition.clip_bounds.origin.y.0,
+            ],
+            clip_max: [
+                transition.clip_bounds.origin.x.0 + transition.clip_bounds.size.width.0,
+                transition.clip_bounds.origin.y.0 + transition.clip_bounds.size.height.0,
+            ],
+            corner_radii: [
+                transition.corner_radii.top_left.0,
+                transition.corner_radii.top_right.0,
+                transition.corner_radii.bottom_right.0,
+                transition.corner_radii.bottom_left.0,
+            ],
+            overlay_pass: overlay_pass as u32,
+            _pad: [0; 3],
         }
     }
+}
+
+fn clamp_device_rect(
+    rect: Bounds<ScaledPixels>,
+    viewport: Size<DevicePixels>,
+) -> Option<(u32, u32, u32, u32)> {
+    let vw = viewport.width.0.max(0) as u32;
+    let vh = viewport.height.0.max(0) as u32;
+    if vw == 0 || vh == 0 {
+        return None;
+    }
+    let min_x = (rect.origin.x.0.floor().max(0.0) as u32).min(vw);
+    let min_y = (rect.origin.y.0.floor().max(0.0) as u32).min(vh);
+    let max_x = ((rect.origin.x.0 + rect.size.width.0).ceil().max(0.0) as u32).min(vw);
+    let max_y = ((rect.origin.y.0 + rect.size.height.0).ceil().max(0.0) as u32).min(vh);
+    if max_x <= min_x || max_y <= min_y {
+        return None;
+    }
+    Some((min_x, min_y, max_x - min_x, max_y - min_y))
 }
 
 /// The blur shaders' uniform (`gpui::backdrop_blur::BlurParams`).
@@ -277,6 +338,8 @@ struct WgpuResources {
     globals_buffer: wgpu::Buffer,
     globals_bind_group: wgpu::BindGroup,
     view_transition_buffer: wgpu::Buffer,
+    view_transition_slot_capacity: usize,
+    view_transition_buffer_generation: u64,
     backdrop_blur_buffer: wgpu::Buffer,
     backdrop_blur_slot_capacity: usize,
     backdrop_blur_buffer_generation: u64,
@@ -292,6 +355,7 @@ struct WgpuRendererCore {
     resources: WgpuResources,
     atlas: Arc<WgpuAtlas>,
     gamma_offset: u64,
+    view_transition_stride: u64,
     backdrop_blur_stride: u64,
     instance_data_capacity: u64,
     max_instance_data_size: u64,
@@ -309,10 +373,12 @@ struct WgpuRendererCore {
     transient_attachments: bool,
     adapter_info: wgpu::AdapterInfo,
     depth_texture: Option<DepthTexture>,
-    transition_old: Option<TransitionTexture>,
+    transition_snapshots: FxHashMap<u64, TransitionSnapshot>,
+    transition_capture: Option<TransitionTexture>,
+    transition_capture_generation: Option<u64>,
     transition_new: Option<TransitionTexture>,
+    transition_new_id: u64,
     transition_new_generation: Option<u64>,
-    transition_bind_group: Option<wgpu::BindGroup>,
     backdrop_blur_targets: Option<BackdropBlurTargets>,
     target_format: wgpu::TextureFormat,
     max_texture_size: u32,
@@ -768,7 +834,7 @@ impl WgpuRendererCore {
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
+                        has_dynamic_offset: true,
                         min_binding_size: NonZeroU64::new(
                             std::mem::size_of::<ViewTransitionParams>() as u64,
                         ),
@@ -1325,7 +1391,7 @@ impl WgpuRenderer {
         self.surface_config.height = clamped_height.max(1);
 
         if let RendererState::Ready { surface, core } = &mut self.state {
-            core.clear_transition_snapshot();
+            core.clear_transition_snapshot(None);
             surface.configure(&core.resources.device, &self.surface_config);
         }
     }
@@ -1355,7 +1421,7 @@ impl WgpuRenderer {
         core.rebuild_pipelines(format, new_alpha_mode);
 
         if let RendererState::Ready { surface, core } = &mut self.state {
-            core.clear_transition_snapshot();
+            core.clear_transition_snapshot(None);
             surface.configure(&core.resources.device, &self.surface_config);
         }
     }
@@ -1392,8 +1458,15 @@ impl WgpuRenderer {
         self.max_texture_size
     }
 
-    /// Captures `scene` into a GPU-side offscreen snapshot texture for an upcoming view transition.
-    pub fn capture_transition_snapshot(&mut self, scene: &Scene) -> bool {
+    /// Captures `scene` (or a component sub-region `region` of it, in device pixels) into a
+    /// GPU-side offscreen snapshot texture keyed by `id` for an upcoming full-window or
+    /// component-scoped view transition.
+    pub fn capture_transition_snapshot(
+        &mut self,
+        id: u64,
+        scene: &Scene,
+        region: Option<Bounds<ScaledPixels>>,
+    ) -> bool {
         let size = Size {
             width: DevicePixels(self.surface_config.width as i32),
             height: DevicePixels(self.surface_config.height as i32),
@@ -1404,20 +1477,21 @@ impl WgpuRenderer {
         let RendererState::Ready { core, .. } = &mut self.state else {
             return false;
         };
-        match core.capture_transition_snapshot(scene, size) {
+        match core.capture_transition_snapshot(id, scene, region, size) {
             Ok(()) => true,
             Err(error) => {
                 log::warn!("failed to capture view transition snapshot: {error:#}");
-                core.clear_transition_snapshot();
+                core.clear_transition_snapshot(Some(id));
                 false
             }
         }
     }
 
-    /// Releases any offscreen GPU textures allocated for an active view transition.
-    pub fn clear_transition_snapshot(&mut self) {
+    /// Releases offscreen GPU textures allocated for an active view transition (`Some(id)`) or
+    /// all active transitions (`None`).
+    pub fn clear_transition_snapshot(&mut self, id: Option<u64>) {
         if let Some(core) = self.core_mut() {
-            core.clear_transition_snapshot();
+            core.clear_transition_snapshot(id);
         }
     }
 
@@ -1494,10 +1568,10 @@ impl WgpuRenderer {
         let frame_view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        let render_result = if let Some(transition) = scene.transition
-            && core.has_transition_snapshot(size)
+        let render_result = if !scene.transitions.is_empty()
+            && core.has_any_transition_snapshot(&scene.transitions, size)
         {
-            core.render_frame_with_transition(scene, transition, &frame_view, size)
+            core.render_frame_with_transitions(scene, &scene.transitions, &frame_view, size)
         } else {
             core.render_frame(scene, &frame_view, size, wgpu::Color::TRANSPARENT)
                 .map(|_| ())
@@ -1550,9 +1624,12 @@ impl WgpuRendererCore {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let view_transition_stride = (std::mem::size_of::<ViewTransitionParams>() as u64)
+            .next_multiple_of(uniform_alignment.max(1));
+        let view_transition_slot_capacity = 8usize;
         let view_transition_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("view_transition_buffer"),
-            size: std::mem::size_of::<ViewTransitionParams>() as u64,
+            size: view_transition_stride * (view_transition_slot_capacity as u64),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -1639,6 +1716,8 @@ impl WgpuRendererCore {
                 globals_buffer,
                 globals_bind_group,
                 view_transition_buffer,
+                view_transition_slot_capacity,
+                view_transition_buffer_generation: 1,
                 backdrop_blur_buffer,
                 backdrop_blur_slot_capacity,
                 backdrop_blur_buffer_generation: 1,
@@ -1646,6 +1725,7 @@ impl WgpuRendererCore {
             },
             atlas,
             gamma_offset,
+            view_transition_stride,
             backdrop_blur_stride,
             instance_data_capacity,
             max_instance_data_size,
@@ -1663,10 +1743,12 @@ impl WgpuRendererCore {
             transient_attachments: context.supports_transient_attachments(),
             adapter_info: context.adapter.get_info(),
             depth_texture: None,
-            transition_old: None,
+            transition_snapshots: FxHashMap::default(),
+            transition_capture: None,
+            transition_capture_generation: None,
             transition_new: None,
+            transition_new_id: 0,
             transition_new_generation: None,
-            transition_bind_group: None,
             backdrop_blur_targets: None,
             target_format,
             max_texture_size,
@@ -1683,7 +1765,7 @@ impl WgpuRendererCore {
         alpha_mode: wgpu::CompositeAlphaMode,
     ) {
         self.target_format = surface_format;
-        self.clear_transition_snapshot();
+        self.clear_transition_snapshot(None);
         self.backdrop_blur_targets = None;
         self.cached_instances = None;
         self.resources.pipelines = Self::create_pipelines(
@@ -1729,73 +1811,222 @@ impl WgpuRendererCore {
         }
     }
 
-    fn has_transition_snapshot(&self, size: Size<DevicePixels>) -> bool {
-        self.transition_old
-            .as_ref()
-            .is_some_and(|tex| tex.size == size)
+    fn has_any_transition_snapshot(
+        &self,
+        transitions: &[SceneTransition],
+        size: Size<DevicePixels>,
+    ) -> bool {
+        transitions.iter().any(|t| {
+            self.transition_snapshots.get(&t.id).is_some_and(|snap| {
+                t.id != FULL_WINDOW_TRANSITION_ID || snap.texture.size == size
+            })
+        })
     }
 
-    fn clear_transition_snapshot(&mut self) {
-        self.transition_old = None;
-        self.transition_new = None;
-        self.transition_new_generation = None;
-        self.transition_bind_group = None;
+    fn clear_transition_snapshot(&mut self, id: Option<u64>) {
+        match id {
+            Some(target_id) => {
+                self.transition_snapshots.remove(&target_id);
+                if self.transition_snapshots.is_empty() {
+                    self.transition_capture = None;
+                    self.transition_capture_generation = None;
+                    self.transition_new = None;
+                    self.transition_new_generation = None;
+                }
+            }
+            None => {
+                self.transition_snapshots.clear();
+                self.transition_capture = None;
+                self.transition_capture_generation = None;
+                self.transition_new = None;
+                self.transition_new_generation = None;
+            }
+        }
+    }
+
+    fn ensure_view_transition_buffer_capacity(&mut self, required_slots: usize) {
+        if required_slots > self.resources.view_transition_slot_capacity {
+            let new_capacity = required_slots.next_power_of_two().max(8);
+            self.resources.view_transition_buffer =
+                self.resources.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("view_transition_buffer"),
+                    size: self.view_transition_stride * (new_capacity as u64),
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+            self.resources.view_transition_slot_capacity = new_capacity;
+            self.resources.view_transition_buffer_generation += 1;
+        }
     }
 
     fn capture_transition_snapshot(
         &mut self,
+        id: u64,
         scene: &Scene,
+        region: Option<Bounds<ScaledPixels>>,
         size: Size<DevicePixels>,
     ) -> Result<()> {
-        if let Some(active_transition) = scene.transition
-            && self.has_transition_snapshot(size)
-        {
-            // Mid-flight interruption: capture the currently visible composited frame so the
-            // new transition smoothly sweeps over the partially revealed previous transition.
-            let captured = self.create_transition_texture("view_transition_captured", size);
-            self.render_frame_with_transition(scene, active_transition, &captured.view, size)?;
-            self.transition_old = Some(captured);
-            self.transition_bind_group = None;
+        let has_mid_flight =
+            !scene.transitions.is_empty() && self.has_any_transition_snapshot(&scene.transitions, size);
+
+        // Full-window capture path (no crop needed).
+        if region.is_none() {
+            let old_tex = if has_mid_flight {
+                let captured = self.create_transition_texture("view_transition_captured", size);
+                let active: Vec<SceneTransition> = scene.transitions.clone();
+                self.render_frame_with_transitions(scene, &active, &captured.view, size)?;
+                captured
+            } else {
+                let tex = self.create_transition_texture("view_transition_old", size);
+                self.render_frame(scene, &tex.view, size, wgpu::Color::TRANSPARENT)?;
+                tex
+            };
+            self.transition_capture_generation = None;
             self.transition_new_generation = None;
+            self.transition_snapshots.insert(
+                id,
+                TransitionSnapshot {
+                    texture: old_tex,
+                    bind_group: None,
+                    bind_group_new_id: 0,
+                    bind_group_buf_gen: 0,
+                },
+            );
             return Ok(());
         }
 
-        let needs_alloc = self
-            .transition_old
-            .as_ref()
-            .is_none_or(|tex| tex.size != size);
-        if needs_alloc {
-            self.transition_old = Some(self.create_transition_texture("view_transition_old", size));
-            self.transition_bind_group = None;
+        // Component-scoped capture path: render `scene` once into a reusable full-frame
+        // capture texture (reused if multiple components trigger on the same frame!) and copy
+        // only the component's sub-rectangle into a compact per-component snapshot texture.
+        let crop_rect = region.expect("checked above");
+        let Some((crop_x, crop_y, crop_w, crop_h)) = clamp_device_rect(crop_rect, size) else {
+            anyhow::bail!("component transition crop rect is outside viewport");
+        };
+
+        let scene_gen = scene.generation();
+        let can_reuse_capture = !has_mid_flight
+            && scene_gen != 0
+            && self.transition_capture_generation == Some(scene_gen)
+            && self
+                .transition_capture
+                .as_ref()
+                .is_some_and(|tex| tex.size == size);
+
+        if !can_reuse_capture {
+            if has_mid_flight {
+                let captured = self.create_transition_texture("view_transition_captured", size);
+                let active: Vec<SceneTransition> = scene.transitions.clone();
+                self.render_frame_with_transitions(scene, &active, &captured.view, size)?;
+                self.transition_capture = Some(captured);
+                self.transition_capture_generation = None;
+            } else {
+                let needs_alloc = self
+                    .transition_capture
+                    .as_ref()
+                    .is_none_or(|tex| tex.size != size);
+                if needs_alloc {
+                    self.transition_capture =
+                        Some(self.create_transition_texture("view_transition_capture", size));
+                }
+                let capture_tex = self.transition_capture.take().expect("just initialized");
+                let result =
+                    self.render_frame(scene, &capture_tex.view, size, wgpu::Color::TRANSPARENT);
+                self.transition_capture = Some(capture_tex);
+                result?;
+                self.transition_capture_generation = (scene_gen != 0).then_some(scene_gen);
+            }
         }
+
+        let crop_size = Size {
+            width: DevicePixels(crop_w as i32),
+            height: DevicePixels(crop_h as i32),
+        };
+        let cropped = self.create_transition_texture("view_transition_region_old", crop_size);
+        let capture_tex = self
+            .transition_capture
+            .as_ref()
+            .expect("transition_capture initialized");
+
+        let mut encoder =
+            self.resources
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("view_transition_crop_encoder"),
+                });
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &capture_tex.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: crop_x,
+                    y: crop_y,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &cropped.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width: crop_w,
+                height: crop_h,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.resources
+            .queue
+            .submit(std::iter::once(encoder.finish()));
+
         self.transition_new_generation = None;
-        let old_tex = self.transition_old.take().expect("just initialized");
-        let result = self.render_frame(scene, &old_tex.view, size, wgpu::Color::TRANSPARENT);
-        self.transition_old = Some(old_tex);
-        result?;
+        self.transition_snapshots.insert(
+            id,
+            TransitionSnapshot {
+                texture: cropped,
+                bind_group: None,
+                bind_group_new_id: 0,
+                bind_group_buf_gen: 0,
+            },
+        );
         Ok(())
     }
 
-    fn render_frame_with_transition(
+    fn render_frame_with_transitions(
         &mut self,
         scene: &Scene,
-        transition: SceneTransition,
+        transitions: &[SceneTransition],
         target_view: &wgpu::TextureView,
         size: Size<DevicePixels>,
     ) -> Result<()> {
+        let active: Vec<SceneTransition> = transitions
+            .iter()
+            .copied()
+            .filter(|t| {
+                self.transition_snapshots.get(&t.id).is_some_and(|snap| {
+                    t.id != FULL_WINDOW_TRANSITION_ID || snap.texture.size == size
+                })
+            })
+            .collect();
+        if active.is_empty() {
+            self.render_frame(scene, target_view, size, wgpu::Color::TRANSPARENT)?;
+            return Ok(());
+        }
+
         let needs_alloc = self
             .transition_new
             .as_ref()
             .is_none_or(|tex| tex.size != size);
         if needs_alloc {
             self.transition_new = Some(self.create_transition_texture("view_transition_new", size));
+            self.transition_new_id = self.transition_new_id.wrapping_add(1).max(1);
             self.transition_new_generation = None;
-            self.transition_bind_group = None;
         }
 
         // Only re-rasterize `scene` into `transition_new` when the scene generation changed
         // (new Window::draw or animated sprites). On static transition frames this reduces
-        // GPU work to a single 3-vertex fullscreen composite pass.
+        // GPU work to tiny composite passes.
         let scene_gen = scene.generation();
         let needs_render_new =
             scene_gen == 0 || self.transition_new_generation != Some(scene_gen);
@@ -1808,58 +2039,77 @@ impl WgpuRendererCore {
             self.transition_new_generation = (scene_gen != 0).then_some(scene_gen);
         }
 
-        if self.transition_bind_group.is_none() {
-            let old_view = &self
-                .transition_old
-                .as_ref()
-                .expect("transition_old checked before composite")
-                .view;
+        self.ensure_view_transition_buffer_capacity(active.len());
+        let new_id = self.transition_new_id;
+        let buf_gen = self.resources.view_transition_buffer_generation;
+        let stride = self.view_transition_stride;
+
+        // Write per-transition uniforms into dynamic uniform slots and ensure bind groups exist.
+        {
             let new_view = &self
                 .transition_new
                 .as_ref()
                 .expect("transition_new initialized")
                 .view;
-            self.transition_bind_group = Some(
-                self.resources
-                    .device
-                    .create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("view_transition_bind_group"),
-                        layout: &self.resources.bind_group_layouts.view_transition,
-                        entries: &[
-                            wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: self.resources.view_transition_buffer.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 1,
-                                resource: wgpu::BindingResource::TextureView(old_view),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 2,
-                                resource: wgpu::BindingResource::TextureView(new_view),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 3,
-                                resource: wgpu::BindingResource::Sampler(
-                                    &self.resources.atlas_sampler,
-                                ),
-                            },
-                        ],
-                    }),
-            );
+            for (slot, transition) in active.iter().enumerate() {
+                let params = ViewTransitionParams::from_transition(*transition, size, slot > 0);
+                self.resources.queue.write_buffer(
+                    &self.resources.view_transition_buffer,
+                    (slot as u64) * stride,
+                    bytemuck::bytes_of(&params),
+                );
+                let snap = self
+                    .transition_snapshots
+                    .get_mut(&transition.id)
+                    .expect("filtered above");
+                if snap.bind_group.is_none()
+                    || snap.bind_group_new_id != new_id
+                    || snap.bind_group_buf_gen != buf_gen
+                {
+                    snap.bind_group = Some(
+                        self.resources
+                            .device
+                            .create_bind_group(&wgpu::BindGroupDescriptor {
+                                label: Some("view_transition_bind_group"),
+                                layout: &self.resources.bind_group_layouts.view_transition,
+                                entries: &[
+                                    wgpu::BindGroupEntry {
+                                        binding: 0,
+                                        resource: wgpu::BindingResource::Buffer(
+                                            wgpu::BufferBinding {
+                                                buffer: &self.resources.view_transition_buffer,
+                                                offset: 0,
+                                                size: NonZeroU64::new(
+                                                    std::mem::size_of::<ViewTransitionParams>()
+                                                        as u64,
+                                                ),
+                                            },
+                                        ),
+                                    },
+                                    wgpu::BindGroupEntry {
+                                        binding: 1,
+                                        resource: wgpu::BindingResource::TextureView(
+                                            &snap.texture.view,
+                                        ),
+                                    },
+                                    wgpu::BindGroupEntry {
+                                        binding: 2,
+                                        resource: wgpu::BindingResource::TextureView(new_view),
+                                    },
+                                    wgpu::BindGroupEntry {
+                                        binding: 3,
+                                        resource: wgpu::BindingResource::Sampler(
+                                            &self.resources.atlas_sampler,
+                                        ),
+                                    },
+                                ],
+                            }),
+                    );
+                    snap.bind_group_new_id = new_id;
+                    snap.bind_group_buf_gen = buf_gen;
+                }
+            }
         }
-
-        let params = ViewTransitionParams::from_transition(transition, size);
-        self.resources.queue.write_buffer(
-            &self.resources.view_transition_buffer,
-            0,
-            bytemuck::bytes_of(&params),
-        );
-
-        let bind_group = self
-            .transition_bind_group
-            .as_ref()
-            .expect("transition_bind_group initialized");
 
         let mut encoder =
             self.resources
@@ -1867,14 +2117,37 @@ impl WgpuRendererCore {
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("view_transition_encoder"),
                 });
-        {
+        for (slot, transition) in active.iter().enumerate() {
+            let bind_group = self
+                .transition_snapshots
+                .get(&transition.id)
+                .and_then(|snap| snap.bind_group.as_ref())
+                .expect("bind_group initialized");
+            let dyn_offset = ((slot as u64) * stride) as u32;
+
+            let scissor = if slot > 0 {
+                let effective = transition.bounds.intersect(&transition.clip_bounds);
+                match clamp_device_rect(effective, size) {
+                    Some(rect) => Some(rect),
+                    None => continue,
+                }
+            } else {
+                None
+            };
+
+            let load_op = if slot == 0 {
+                wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT)
+            } else {
+                wgpu::LoadOp::Load
+            };
+
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("view_transition_pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: target_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        load: load_op,
                         store: wgpu::StoreOp::Store,
                     },
                     depth_slice: None,
@@ -1883,7 +2156,10 @@ impl WgpuRendererCore {
                 ..Default::default()
             });
             pass.set_pipeline(&self.resources.pipelines.view_transition);
-            pass.set_bind_group(0, bind_group, &[]);
+            if let Some((sx, sy, sw, sh)) = scissor {
+                pass.set_scissor_rect(sx, sy, sw, sh);
+            }
+            pass.set_bind_group(0, bind_group, &[dyn_offset]);
             pass.draw(0..3, 0..1);
         }
         self.resources
@@ -4280,7 +4556,7 @@ mod tests {
 
         headless
             .core
-            .capture_transition_snapshot(&light_scene, size)
+            .capture_transition_snapshot(FULL_WINDOW_TRANSITION_ID, &light_scene, None, size)
             .expect("capture light snapshot");
 
         let origin = Point {
@@ -4296,16 +4572,17 @@ mod tests {
             ("liquid_dissolve", SceneTransitionKind::LiquidDissolve, diag),
         ] {
             // p = 0.0 -> pure light scene
-            let start_t = SceneTransition {
+            let start_t = SceneTransition::full_viewport(
                 kind,
                 origin,
-                radius: ScaledPixels(0.0),
-                feather: ScaledPixels(1.0),
-                progress: 0.0,
-            };
+                ScaledPixels(0.0),
+                ScaledPixels(1.0),
+                0.0,
+                size,
+            );
             headless
                 .core
-                .render_frame_with_transition(&dark_scene, start_t, &target_view, size)
+                .render_frame_with_transitions(&dark_scene, &[start_t], &target_view, size)
                 .expect("p=0 frame");
             let img_start = headless.read_image().expect("read p=0");
             let p0 = img_start.get_pixel(400, 300);
@@ -4315,16 +4592,17 @@ mod tests {
             );
 
             // p = 0.45 -> dramatic mid-transition optical effect
-            let mid_t = SceneTransition {
+            let mid_t = SceneTransition::full_viewport(
                 kind,
                 origin,
-                radius: ScaledPixels(mid_radius),
-                feather: ScaledPixels(1.0),
-                progress: 0.45,
-            };
+                ScaledPixels(mid_radius),
+                ScaledPixels(1.0),
+                0.45,
+                size,
+            );
             headless
                 .core
-                .render_frame_with_transition(&dark_scene, mid_t, &target_view, size)
+                .render_frame_with_transitions(&dark_scene, &[mid_t], &target_view, size)
                 .expect("p=0.45 frame");
             let img_mid = headless.read_image().expect("read p=0.45");
             // Top-right corner (near origin) should now be dark theme, bottom-left still light theme
@@ -4343,16 +4621,17 @@ mod tests {
             }
 
             // p = 1.0 -> pure dark scene
-            let end_t = SceneTransition {
+            let end_t = SceneTransition::full_viewport(
                 kind,
                 origin,
-                radius: ScaledPixels(diag * 1.25),
-                feather: ScaledPixels(1.0),
-                progress: 1.0,
-            };
+                ScaledPixels(diag * 1.25),
+                ScaledPixels(1.0),
+                1.0,
+                size,
+            );
             headless
                 .core
-                .render_frame_with_transition(&dark_scene, end_t, &target_view, size)
+                .render_frame_with_transitions(&dark_scene, &[end_t], &target_view, size)
                 .expect("p=1 frame");
             let img_end = headless.read_image().expect("read p=1");
             let p1 = img_end.get_pixel(24, 575);
@@ -4372,16 +4651,17 @@ mod tests {
             ("f5_settle", 0.88),
             ("end", 1.0),
         ] {
-            let t = SceneTransition {
-                kind: SceneTransitionKind::ChromaticWarp,
+            let t = SceneTransition::full_viewport(
+                SceneTransitionKind::ChromaticWarp,
                 origin,
-                radius: ScaledPixels(diag),
-                feather: ScaledPixels(1.0),
+                ScaledPixels(diag),
+                ScaledPixels(1.0),
                 progress,
-            };
+                size,
+            );
             headless
                 .core
-                .render_frame_with_transition(&dark_scene, t, &target_view, size)
+                .render_frame_with_transitions(&dark_scene, &[t], &target_view, size)
                 .expect("chromatic_warp frame");
             let img = headless.read_image().expect("read chromatic_warp");
             if tag == "start" {
@@ -4428,16 +4708,17 @@ mod tests {
             ("t240_blurin", 0.80),
             ("end", 1.0),
         ] {
-            let t = SceneTransition {
-                kind: SceneTransitionKind::BlurFade,
+            let t = SceneTransition::full_viewport(
+                SceneTransitionKind::BlurFade,
                 origin,
-                radius: ScaledPixels(0.0),
-                feather: ScaledPixels(1.0),
+                ScaledPixels(0.0),
+                ScaledPixels(1.0),
                 progress,
-            };
+                size,
+            );
             headless
                 .core
-                .render_frame_with_transition(&dark_scene, t, &target_view, size)
+                .render_frame_with_transitions(&dark_scene, &[t], &target_view, size)
                 .expect("blur_fade frame");
             let img = headless.read_image().expect("read blur_fade");
             if tag == "start" {
@@ -4475,16 +4756,17 @@ mod tests {
             ("late", 0.78),
             ("end", 1.0),
         ] {
-            let t = SceneTransition {
-                kind: SceneTransitionKind::Glitch,
+            let t = SceneTransition::full_viewport(
+                SceneTransitionKind::Glitch,
                 origin,
-                radius: ScaledPixels(0.0),
-                feather: ScaledPixels(1.0),
+                ScaledPixels(0.0),
+                ScaledPixels(1.0),
                 progress,
-            };
+                size,
+            );
             headless
                 .core
-                .render_frame_with_transition(&dark_scene, t, &target_view, size)
+                .render_frame_with_transitions(&dark_scene, &[t], &target_view, size)
                 .expect("glitch frame");
             let img = headless.read_image().expect("read glitch");
             if tag == "start" {
@@ -4532,16 +4814,17 @@ mod tests {
             ("late", 0.72),
             ("end", 1.0),
         ] {
-            let t = SceneTransition {
-                kind: SceneTransitionKind::PrismaticBlob,
-                origin: center_origin,
-                radius: ScaledPixels(center_diag),
-                feather: ScaledPixels(1.0),
+            let t = SceneTransition::full_viewport(
+                SceneTransitionKind::PrismaticBlob,
+                center_origin,
+                ScaledPixels(center_diag),
+                ScaledPixels(1.0),
                 progress,
-            };
+                size,
+            );
             headless
                 .core
-                .render_frame_with_transition(&dark_scene, t, &target_view, size)
+                .render_frame_with_transitions(&dark_scene, &[t], &target_view, size)
                 .expect("prismatic_blob frame");
             let img = headless.read_image().expect("read prismatic_blob");
             if tag == "start" {
@@ -4565,6 +4848,169 @@ mod tests {
                     std::path::Path::new(dir).join(format!("transition_prismatic_blob_{tag}.png"));
                 img.save(&path).expect("save prismatic_blob preview png");
             }
+        }
+
+        // Component-scoped concurrent transitions: TWO rounded component cards transitioning
+        // simultaneously (`PrismaticBlob` on the chart card + `Glitch` on the bottom-right card)
+        // while the surrounding light-mode dashboard stays 100% crisp and untouched!
+        headless.core.clear_transition_snapshot(None);
+        let chart_card = Bounds {
+            origin: Point {
+                x: ScaledPixels(216.0),
+                y: ScaledPixels(210.0),
+            },
+            size: Size {
+                width: ScaledPixels(464.0),
+                height: ScaledPixels(362.0),
+            },
+        };
+        let side_card = Bounds {
+            origin: Point {
+                x: ScaledPixels(700.0),
+                y: ScaledPixels(398.0),
+            },
+            size: Size {
+                width: ScaledPixels(236.0),
+                height: ScaledPixels(174.0),
+            },
+        };
+        // Build a hybrid "new" scene where ONLY the two cards switched to dark content while
+        // the surrounding chrome remains light!
+        let mut hybrid_new = build_dashboard(false);
+        let full_mask = ContentMask {
+            bounds: Bounds {
+                origin: Point {
+                    x: ScaledPixels(0.0),
+                    y: ScaledPixels(0.0),
+                },
+                size: Size {
+                    width: ScaledPixels(w as f32),
+                    height: ScaledPixels(h as f32),
+                },
+            },
+        };
+        let dark_card_bg = Hsla { h: 0.62, s: 0.34, l: 0.13, a: 1.0 };
+        let dark_card_border = Hsla { h: 0.62, s: 0.28, l: 0.24, a: 1.0 };
+        hybrid_new.insert_primitive(Quad {
+            order: 0,
+            border_style: BorderStyle::Solid,
+            bounds: chart_card,
+            content_mask: full_mask,
+            background: dark_card_bg.into(),
+            border_color: dark_card_border,
+            corner_radii: Corners::all(ScaledPixels(16.0)),
+            border_widths: Edges::all(ScaledPixels(1.0)),
+        });
+        hybrid_new.insert_primitive(Quad {
+            order: 0,
+            border_style: BorderStyle::Solid,
+            bounds: side_card,
+            content_mask: full_mask,
+            background: dark_card_bg.into(),
+            border_color: dark_card_border,
+            corner_radii: Corners::all(ScaledPixels(16.0)),
+            border_widths: Edges::all(ScaledPixels(1.0)),
+        });
+        // Bright emerald + amber accent bars inside the dark chart card so the component swap pops!
+        for i in 0..8usize {
+            let bx = 250.0 + (i as f32) * 50.0;
+            let bh = 90.0 + ((i * 37) % 160) as f32;
+            let color = Hsla {
+                h: 0.45 + (i as f32) * 0.05,
+                s: 0.85,
+                l: 0.56,
+                a: 1.0,
+            };
+            hybrid_new.insert_primitive(Quad {
+                order: 0,
+                border_style: BorderStyle::Solid,
+                bounds: Bounds {
+                    origin: Point {
+                        x: ScaledPixels(bx),
+                        y: ScaledPixels(530.0 - bh),
+                    },
+                    size: Size {
+                        width: ScaledPixels(30.0),
+                        height: ScaledPixels(bh),
+                    },
+                },
+                content_mask: full_mask,
+                background: color.into(),
+                border_color: color,
+                corner_radii: Corners::all(ScaledPixels(6.0)),
+                border_widths: Edges::default(),
+            });
+        }
+        hybrid_new.finish();
+
+        headless
+            .core
+            .capture_transition_snapshot(101, &light_scene, Some(chart_card), size)
+            .expect("capture chart component snapshot");
+        headless
+            .core
+            .capture_transition_snapshot(102, &light_scene, Some(side_card), size)
+            .expect("capture side component snapshot");
+
+        let chart_t = SceneTransition {
+            id: 101,
+            kind: SceneTransitionKind::PrismaticBlob,
+            origin: Point {
+                x: ScaledPixels(chart_card.size.width.0 * 0.5),
+                y: ScaledPixels(chart_card.size.height.0 * 0.5),
+            },
+            radius: ScaledPixels(
+                (chart_card.size.width.0 * 0.5).hypot(chart_card.size.height.0 * 0.5),
+            ),
+            feather: ScaledPixels(1.0),
+            progress: 0.48,
+            bounds: chart_card,
+            clip_bounds: full_mask.bounds,
+            corner_radii: Corners::all(ScaledPixels(16.0)),
+        };
+        let side_t = SceneTransition {
+            id: 102,
+            kind: SceneTransitionKind::Glitch,
+            origin: Point {
+                x: ScaledPixels(side_card.size.width.0 * 0.5),
+                y: ScaledPixels(side_card.size.height.0 * 0.5),
+            },
+            radius: ScaledPixels(0.0),
+            feather: ScaledPixels(1.0),
+            progress: 0.50,
+            bounds: side_card,
+            clip_bounds: full_mask.bounds,
+            corner_radii: Corners::all(ScaledPixels(16.0)),
+        };
+        headless
+            .core
+            .render_frame_with_transitions(&hybrid_new, &[chart_t, side_t], &target_view, size)
+            .expect("concurrent component transitions");
+        let comp_img = headless.read_image().expect("read component transitions");
+
+        // Outside both components (e.g. sidebar & top bar) must stay 100% untouched light chrome!
+        let outside_sidebar = comp_img.get_pixel(90, 480);
+        assert!(
+            outside_sidebar[0] > 235 && outside_sidebar[1] > 235 && outside_sidebar[2] > 235,
+            "pixels outside component transitions must remain untouched light UI, got {outside_sidebar:?}"
+        );
+        // Inside the center of the chart card (inside inner blob) must already show dark new card!
+        let inside_chart_center = comp_img.get_pixel(448, 390);
+        assert!(
+            inside_chart_center[0] < 120 || inside_chart_center[1] < 120,
+            "center of PrismaticBlob component should reveal dark new card, got {inside_chart_center:?}"
+        );
+        // Outer corner inside chart card (outside outer blob) must still show light old card!
+        let inside_chart_corner = comp_img.get_pixel(234, 226);
+        assert!(
+            inside_chart_corner[0] > 180 && inside_chart_corner[1] > 180 && inside_chart_corner[2] > 180,
+            "outer corner inside PrismaticBlob component should still show light old card, got {inside_chart_corner:?}"
+        );
+        if let Some(ref dir) = dump_dir {
+            let path = std::path::Path::new(dir).join("transition_component_dual.png");
+            comp_img
+                .save(&path)
+                .expect("save dual component transition preview png");
         }
     }
 
@@ -4704,7 +5150,7 @@ mod tests {
         let cap_t0 = Instant::now();
         headless
             .core
-            .capture_transition_snapshot(&light_scene, size)
+            .capture_transition_snapshot(FULL_WINDOW_TRANSITION_ID, &light_scene, None, size)
             .expect("capture");
         wait_gpu(&headless.core);
         let capture_ms = cap_t0.elapsed().as_secs_f64() * 1_000.0;
@@ -4714,39 +5160,41 @@ mod tests {
         let mut frame_times = Vec::with_capacity(frames);
         for i in 0..frames {
             let progress = (i as f32 + 1.0) / (frames as f32);
-            let transition = SceneTransition {
-                kind: SceneTransitionKind::RadialExpand,
-                origin: Point {
+            let transition = SceneTransition::full_viewport(
+                SceneTransitionKind::RadialExpand,
+                Point {
                     x: ScaledPixels(1200.0),
                     y: ScaledPixels(28.0),
                 },
-                radius: ScaledPixels(1500.0 * progress),
-                feather: ScaledPixels(1.5),
+                ScaledPixels(1500.0 * progress),
+                ScaledPixels(1.5),
                 progress,
-            };
+                size,
+            );
             let t0 = Instant::now();
             headless
                 .core
-                .render_frame_with_transition(&dark_scene, transition, &target_view, size)
+                .render_frame_with_transitions(&dark_scene, &[transition], &target_view, size)
                 .expect("transition frame");
             wait_gpu(&headless.core);
             frame_times.push(t0.elapsed());
         }
 
         // Verify mid-frame pixel correctness (read back last frame at radius ~750)
-        let mid_transition = SceneTransition {
-            kind: SceneTransitionKind::RadialExpand,
-            origin: Point {
+        let mid_transition = SceneTransition::full_viewport(
+            SceneTransitionKind::RadialExpand,
+            Point {
                 x: ScaledPixels(1200.0),
                 y: ScaledPixels(28.0),
             },
-            radius: ScaledPixels(400.0),
-            feather: ScaledPixels(1.5),
-            progress: 0.25,
-        };
+            ScaledPixels(400.0),
+            ScaledPixels(1.5),
+            0.25,
+            size,
+        );
         headless
             .core
-            .render_frame_with_transition(&dark_scene, mid_transition, &target_view, size)
+            .render_frame_with_transitions(&dark_scene, &[mid_transition], &target_view, size)
             .expect("mid check");
         let img = headless.read_image().expect("readback");
         let inside_px = img.get_pixel(1195, 28);
@@ -4767,7 +5215,7 @@ mod tests {
         assert_ne!(bright_red_scene.generation(), dark_scene.generation());
         headless
             .core
-            .render_frame_with_transition(&bright_red_scene, mid_transition, &target_view, size)
+            .render_frame_with_transitions(&bright_red_scene, &[mid_transition], &target_view, size)
             .expect("invalidated frame");
         let img2 = headless.read_image().expect("readback invalidated");
         let updated_inside = img2.get_pixel(1195, 28);

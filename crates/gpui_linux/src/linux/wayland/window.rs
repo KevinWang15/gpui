@@ -2095,7 +2095,12 @@ impl PlatformWindow for WaylandWindow {
         }
     }
 
-    fn capture_transition_snapshot(&self, scene: &Scene) -> bool {
+    fn capture_transition_snapshot(
+        &self,
+        id: u64,
+        scene: &Scene,
+        region: Option<Bounds<gpui::ScaledPixels>>,
+    ) -> bool {
         let mut state = self.borrow_mut();
         let Some(renderer) = &mut state.renderer else {
             return false;
@@ -2103,13 +2108,13 @@ impl PlatformWindow for WaylandWindow {
         if renderer.device_lost() {
             return false;
         }
-        renderer.capture_transition_snapshot(scene)
+        renderer.capture_transition_snapshot(id, scene, region)
     }
 
-    fn clear_transition_snapshot(&self) {
+    fn clear_transition_snapshot(&self, id: Option<u64>) {
         let mut state = self.borrow_mut();
         if let Some(renderer) = &mut state.renderer {
-            renderer.clear_transition_snapshot();
+            renderer.clear_transition_snapshot(id);
         }
     }
 

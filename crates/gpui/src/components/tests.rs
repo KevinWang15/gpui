@@ -1032,6 +1032,55 @@ fn view_transition_physical_shader_modes_evaluate_cleanly() {
                 .is_none()
         );
     }
+
+    // Component-scoped region evaluation reuses the exact same engine in region-local coordinates.
+    let card_bounds = crate::Bounds {
+        origin: crate::point(px(200.), px(150.)),
+        size: size(px(360.), px(240.)),
+    };
+    let click_in_card = crate::point(px(260.), px(190.));
+    let card_radii = crate::Corners::all(px(14.));
+    for style in TransitionStyle::ALL {
+        let transition = style
+            .to_component_transition(Some(click_in_card), card_bounds)
+            .with_corner_radii(card_radii);
+        let region = crate::ActiveRegionTransition {
+            id: crate::next_region_transition_id(),
+            started_at: now,
+            transition,
+            bounds: card_bounds,
+            clip_bounds: crate::Bounds {
+                origin: crate::point(px(0.), px(0.)),
+                size: vp,
+            },
+            corner_radii: card_radii,
+            scale_factor: 2.0,
+            auto_track_element: true,
+            seen_in_draw: true,
+        };
+        let evaluated = region
+            .evaluate(now + transition.duration / 2, vp, 2.0)
+            .expect("region transition active at midpoint");
+        assert_eq!(evaluated.bounds.origin.x.0, 400.0);
+        assert_eq!(evaluated.bounds.origin.y.0, 300.0);
+        assert_eq!(evaluated.bounds.size.width.0, 720.0);
+        assert_eq!(evaluated.bounds.size.height.0, 480.0);
+        assert_eq!(evaluated.corner_radii.top_left.0, 28.0);
+        // For origin-based modes, origin must be translated into region-local device pixels:
+        // (260 - 200) * 2 = 120, (190 - 150) * 2 = 80.
+        if !matches!(
+            style,
+            TransitionStyle::CrossFade | TransitionStyle::BlurFade | TransitionStyle::Glitch
+        ) {
+            assert!((evaluated.origin.x.0 - 120.0).abs() < 1e-3);
+            assert!((evaluated.origin.y.0 - 80.0).abs() < 1e-3);
+        }
+        assert!(
+            region
+                .evaluate(now + transition.duration, vp, 2.0)
+                .is_none()
+        );
+    }
 }
 
 struct AdvancedAnalyticsTestView {

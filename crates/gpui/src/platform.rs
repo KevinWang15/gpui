@@ -1368,17 +1368,28 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>);
     fn on_button_layout_changed(&self, _callback: Box<dyn FnMut()>) {}
     fn draw(&self, scene: &Scene);
-    /// Captures the currently displayed `scene` into a GPU-side offscreen snapshot texture for an
-    /// upcoming full-window [`ViewTransition`](crate::ViewTransition).
+    /// Captures the currently displayed `scene` (or a sub-region `region` of it, in device pixels)
+    /// into a GPU-side offscreen snapshot texture keyed by `id` for an upcoming full-window or
+    /// component-scoped [`ViewTransition`](crate::ViewTransition).
+    ///
+    /// `id == FULL_WINDOW_TRANSITION_ID` (`0`) is used for full-window transitions; non-zero `id`s
+    /// allow multiple independent component transitions to run concurrently.
     ///
     /// Returns `true` if the renderer supports GPU view transitions and captured the snapshot.
-    /// Backends that do not override this return `false`, causing `Window::start_view_transition`
-    /// to commit state changes immediately without error.
-    fn capture_transition_snapshot(&self, _scene: &Scene) -> bool {
+    /// Backends that do not override this return `false`, causing transitions to commit state
+    /// changes immediately without error.
+    fn capture_transition_snapshot(
+        &self,
+        _id: u64,
+        _scene: &Scene,
+        _region: Option<Bounds<crate::ScaledPixels>>,
+    ) -> bool {
         false
     }
-    /// Releases any GPU-side offscreen textures held for an active [`ViewTransition`](crate::ViewTransition).
-    fn clear_transition_snapshot(&self) {}
+    /// Releases GPU-side offscreen snapshot textures held for an active
+    /// [`ViewTransition`](crate::ViewTransition). Pass `Some(id)` to release a single transition
+    /// snapshot, or `None` to release all active transition snapshots.
+    fn clear_transition_snapshot(&self, _id: Option<u64>) {}
     fn schedule_frame(&self) {}
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
     fn is_subpixel_rendering_supported(&self) -> bool;
