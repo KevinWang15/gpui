@@ -23,6 +23,7 @@ pub mod context_menu;
 pub mod date_time_picker;
 pub mod descriptions;
 pub mod dialog;
+pub mod drag_drop;
 pub mod drawer;
 pub mod extras;
 pub mod feedback;
@@ -103,6 +104,10 @@ pub use descriptions::{DescriptionItem, Descriptions, descriptions};
 pub use dialog::{
     Dialog, DialogSize, DialogWindow, DialogWindowAction, DialogWindowView, OverlayPresentation,
     dialog, dialog_window,
+};
+pub use drag_drop::{
+    DragDropContainer, DragDropLayout, DragDropState, DraggedItem, DropEvent, DropPreview,
+    drag_drop_container,
 };
 pub use drawer::{Drawer, DrawerSide, DrawerSize, drawer};
 pub use extras::{

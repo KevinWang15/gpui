@@ -7,6 +7,143 @@ use gpui::{Context, FontWeight, IntoElement, div, prelude::*, px};
 
 use crate::state::PlaygroundApp;
 
+/// A dashboard widget tile for the drag-and-drop editor: an icon, a name, a
+/// value and a few bars, so the dragged copies show text, icons and quads.
+fn widget_tile(key: &str, theme: &Theme) -> impl IntoElement {
+    let (icon, title, value, accent, bars): (LucideIcon, &str, &str, gpui::Hsla, [f32; 7]) =
+        match key {
+            "revenue" => (LucideIcon::DollarSign, "Revenue", "$48.2k", palette::EMERALD_500.into(), [0.4, 0.55, 0.5, 0.7, 0.65, 0.85, 0.9]),
+            "latency" => (LucideIcon::Timer, "P95 latency", "182 ms", palette::AMBER_500.into(), [0.7, 0.6, 0.65, 0.5, 0.55, 0.45, 0.4]),
+            "users" => (LucideIcon::Users, "Active users", "12,940", palette::INDIGO_500.into(), [0.3, 0.45, 0.5, 0.6, 0.62, 0.75, 0.8]),
+            "errors" => (LucideIcon::Bug, "Errors", "0.08%", palette::ROSE_500.into(), [0.2, 0.25, 0.6, 0.3, 0.2, 0.15, 0.1]),
+            "cache" => (LucideIcon::Database, "Cache hits", "94.1%", palette::SKY_500.into(), [0.8, 0.82, 0.85, 0.83, 0.9, 0.92, 0.94]),
+            "deploys" => (LucideIcon::Rocket, "Deploys", "27", palette::VIOLET_500.into(), [0.2, 0.4, 0.3, 0.6, 0.5, 0.7, 0.4]),
+            "traffic" => (LucideIcon::Activity, "Traffic", "3.1M req", palette::INDIGO_500.into(), [0.5, 0.6, 0.55, 0.8, 0.7, 0.9, 0.85]),
+            "uptime" => (LucideIcon::ShieldCheck, "Uptime", "99.98%", palette::EMERALD_500.into(), [0.95, 0.96, 0.94, 0.97, 0.98, 0.97, 0.99]),
+            _ => (LucideIcon::Bell, "Alerts", "3 open", palette::ROSE_500.into(), [0.1, 0.3, 0.2, 0.5, 0.4, 0.3, 0.6]),
+        };
+    v_stack()
+        .spacing(px(6.))
+        .w(px(176.))
+        .h(px(104.))
+        .p(px(12.))
+        .rounded(theme.radius_lg)
+        .bg(theme.surface)
+        .border_1()
+        .border_color(theme.border)
+        .shadow_xs()
+        .child(
+            h_stack()
+                .spacing(px(6.))
+                .child(gpui::icons::Icon::new(icon).size(gpui::icons::IconSize::Sm).color(accent))
+                .child(div().text_size(px(12.)).text_color(theme.muted_foreground).child(title)),
+        )
+        .child(div().text_size(px(18.)).font_weight(FontWeight::SEMIBOLD).child(value))
+        .child(
+            h_stack().spacing(px(3.)).items_end().h(px(22.)).children(bars.into_iter().map(
+                move |v| div().w(px(14.)).h(px(22. * v)).rounded_sm().bg(accent.opacity(0.75)),
+            )),
+        )
+}
+
+/// The drag-and-drop dashboard editor: a widget palette, a dashboard and a
+/// side column, sharing one `DragDropState`.
+fn dnd_editor(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl IntoElement {
+    let theme = cx.theme();
+    let preview = match app.dnd_preview {
+        0 => DropPreview::Ghost(0.5),
+        1 => DropPreview::Outline,
+        _ => DropPreview::Space,
+    };
+    let container = |id: &str, layout: DragDropLayout, cx: &mut Context<PlaygroundApp>| {
+        let items = app
+            .dnd_lists
+            .iter()
+            .find(|(list, _)| list.as_ref() == id)
+            .map(|(_, items)| items.clone())
+            .unwrap_or_default();
+        let theme = theme.clone();
+        drag_drop_container(id.to_string(), &app.dnd)
+            .layout(layout)
+            .gap(px(12.))
+            .preview(preview)
+            .p(px(12.))
+            .min_h(px(128.))
+            .rounded(theme.radius_lg)
+            .border_1()
+            .border_dashed()
+            .border_color(theme.border)
+            .bg(theme.surface_muted.opacity(0.5))
+            .items(items.iter().map(|key| (key.clone(), widget_tile(key, &theme))))
+            .empty(
+                div()
+                    .text_size(px(12.5))
+                    .text_color(theme.muted_foreground)
+                    .child("Drop widgets here"),
+            )
+            .on_drop(cx.listener(|this, event: &DropEvent, _, cx| this.apply_drop(event, cx)))
+    };
+    card()
+        .child(
+            card_header().bordered().child(
+                h_stack()
+                    .justify_between()
+                    .child(
+                        v_stack()
+                            .spacing(px(2.))
+                            .child(card_title("Drag & Drop Containers (Dashboard Editor)"))
+                            .child(card_description(
+                                "Drag widgets from the palette into the dashboard or the side column, or reorder them. Where one would land, a half-transparent copy of its own pixels shows.",
+                            )),
+                    )
+                    .child(
+                        segmented_control(
+                            "dnd-preview",
+                            ["ghost", "outline", "space"][app.dnd_preview.min(2)],
+                        )
+                        .item(SegmentedItem::new("ghost", "Ghost"))
+                        .item(SegmentedItem::new("outline", "Outline"))
+                        .item(SegmentedItem::new("space", "Space"))
+                        .on_change(cx.listener(|this, value: &gpui::SharedString, _, cx| {
+                            this.dnd_preview = match value.as_ref() {
+                                "ghost" => 0,
+                                "outline" => 1,
+                                _ => 2,
+                            };
+                            cx.notify();
+                        })),
+                    ),
+            ),
+        )
+        .child(
+            card_content().child(
+                v_stack()
+                    .spacing(px(14.))
+                    .child(label("Widget palette"))
+                    .child(container("palette", DragDropLayout::Wrap, cx))
+                    .child(
+                        h_stack()
+                            .spacing(px(14.))
+                            .items_start()
+                            .child(
+                                v_stack()
+                                    .flex_1()
+                                    .spacing(px(8.))
+                                    .child(label("Dashboard"))
+                                    .child(container("main", DragDropLayout::Wrap, cx).min_h(px(248.))),
+                            )
+                            .child(
+                                v_stack()
+                                    .w(px(202.))
+                                    .spacing(px(8.))
+                                    .child(label("Side column"))
+                                    .child(container("side", DragDropLayout::Vertical, cx).min_h(px(248.))),
+                            ),
+                    ),
+            ),
+        )
+}
+
 pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl IntoElement {
     let theme = cx.theme();
 
@@ -59,7 +196,7 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
         _ => "Settings panel: Configure light/dark mode, focus rings, and brand accents globally via Theme.",
     };
 
-    v_stack()
+    let page = v_stack()
         .spacing(px(20.))
         .child(
             page_header("Layout, Tabs, Accordion & Navigation")
@@ -386,5 +523,6 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
                                 ),
                         ),
                 ),
-        )
+        );
+    page.child(dnd_editor(app, cx))
 }

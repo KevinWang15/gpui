@@ -297,9 +297,35 @@ pub struct PlaygroundApp {
     pub demo_result_status: ResultStatus,
     pub demo_qr_input: Entity<InputState>,
     pub popconfirm_count: usize,
+
+    // Drag-and-drop dashboard editor
+    pub dnd: Entity<DragDropState>,
+    /// (container, widget keys), in order.
+    pub dnd_lists: Vec<(SharedString, Vec<SharedString>)>,
+    pub dnd_preview: usize,
 }
 
 impl PlaygroundApp {
+    /// Applies a finished drag in the dashboard editor.
+    pub fn apply_drop(&mut self, event: &DropEvent, cx: &mut Context<Self>) {
+        let Some(from) = self.dnd_lists.iter_mut().find(|(id, _)| *id == event.from) else {
+            return;
+        };
+        if event.from_index >= from.1.len() || from.1[event.from_index] != event.item {
+            return;
+        }
+        let item = from.1.remove(event.from_index);
+        if let Some(to) = self.dnd_lists.iter_mut().find(|(id, _)| *id == event.to) {
+            let index = event.to_index.min(to.1.len());
+            to.1.insert(index, item);
+        }
+        self.log_event(
+            "DragDrop",
+            format!("{} {}#{} -> {}#{}", event.item, event.from, event.from_index, event.to, event.to_index),
+            cx,
+        );
+    }
+
     pub fn new(cx: &mut Context<Self>) -> Self {
         let nav_search = cx.new(|cx| {
             InputState::new(cx)
@@ -1605,6 +1631,19 @@ impl PlaygroundApp {
             demo_result_status: ResultStatus::Success,
             demo_qr_input,
             popconfirm_count: 0,
+            dnd: cx.new(|_| DragDropState::new()),
+            dnd_lists: vec![
+                (
+                    "palette".into(),
+                    ["revenue", "latency", "users", "errors", "cache", "deploys"]
+                        .into_iter()
+                        .map(SharedString::from)
+                        .collect(),
+                ),
+                ("main".into(), vec!["traffic".into(), "uptime".into()]),
+                ("side".into(), vec!["alerts".into()]),
+            ],
+            dnd_preview: 0,
         };
 
         app.log_event(

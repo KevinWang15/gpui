@@ -5551,6 +5551,26 @@ impl Window {
         }
     }
 
+    /// Paints `snapshot` (see [`crate::SnapshotSource`]) with its top left at
+    /// `origin`, its alpha times `opacity` and the element opacity, clipped
+    /// to the content mask. Nothing is painted when it was copied at another
+    /// scale factor (the window changed displays since).
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_snapshot(&mut self, snapshot: &crate::PaintSnapshot, origin: Point<Pixels>, opacity: f32) {
+        self.invalidator.debug_assert_paint();
+        let scale_factor = self.scale_factor();
+        if (snapshot.scale_factor() - scale_factor).abs() > f32::EPSILON {
+            return;
+        }
+        let offset = (origin - snapshot.bounds.origin).scale(scale_factor);
+        let clip = self.content_mask().scale(scale_factor);
+        let opacity = opacity * self.element_opacity();
+        self.next_frame
+            .scene
+            .insert_snapshot(snapshot, offset, opacity, clip);
+    }
+
     /// Paint the given `Path` into the scene for the next frame at the current z-index.
     ///
     /// This method should only be called as part of the paint phase of element drawing.

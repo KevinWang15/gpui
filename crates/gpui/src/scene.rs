@@ -93,11 +93,15 @@ pub struct Scene {
     animated_monochrome_sprite_range: Option<Range<usize>>,
     /// Optional active full-window GPU view transition evaluated for the current frame.
     pub transition: Option<SceneTransition>,
+    /// See [`Scene::paint_id`].
+    paint_id: u64,
 }
 
 #[expect(missing_docs)]
 impl Scene {
     pub fn clear(&mut self) {
+        static NEXT_PAINT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        self.paint_id = NEXT_PAINT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.paint_operations.clear();
         self.primitive_bounds.clear();
         self.layer_stack.clear();
@@ -1810,6 +1814,9 @@ pub struct PaintedPath {
     bounds: Bounds<ScaledPixels>,
     tiles: Arc<PathTiles>,
     paint: PathPaint,
+    /// The path and scale it was binned from, to paint it again elsewhere
+    /// ([`PaintSnapshot`]).
+    source: (Path, f32),
 }
 
 #[expect(missing_docs)]
@@ -1842,6 +1849,7 @@ impl PaintedPath {
             bounds: tiles.painted_bounds(),
             tiles,
             paint,
+            source: (path, scale_factor),
         }
     }
 
@@ -1870,6 +1878,196 @@ impl PaintedPath {
 impl From<PaintedPath> for Primitive {
     fn from(path: PaintedPath) -> Self {
         Primitive::Path(path)
+    }
+}
+
+/// What an element painted in one frame, copied out of the scene so it can
+/// be painted again elsewhere and faded: the same primitives, so the same
+/// pixels at any scale, on every renderer. See [`crate::SnapshotSource`].
+///
+/// Backdrop blurs and platform surfaces aren't copied. Fading multiplies
+/// each primitive's alpha, like an element's `opacity`.
+#[derive(Clone)]
+pub struct PaintSnapshot {
+    primitives: Arc<[SnapshotOperation]>,
+    /// Where the element was, in logical pixels.
+    pub bounds: Bounds<Pixels>,
+    scale_factor: f32,
+}
+
+#[derive(Clone)]
+enum SnapshotOperation {
+    Primitive(Primitive),
+    StartLayer,
+    EndLayer,
+}
+
+impl PaintSnapshot {
+    /// The element's size when it was copied.
+    pub fn size(&self) -> Size<Pixels> {
+        self.bounds.size
+    }
+
+    pub(crate) fn scale_factor(&self) -> f32 {
+        self.scale_factor
+    }
+
+    /// Whether nothing visible was copied.
+    pub fn is_empty(&self) -> bool {
+        !self
+            .primitives
+            .iter()
+            .any(|op| matches!(op, SnapshotOperation::Primitive(_)))
+    }
+}
+
+impl Scene {
+    /// A number that changes every time the scene is cleared, so a recorded
+    /// operation range can tell whether it still belongs to this scene.
+    pub(crate) fn paint_id(&self) -> u64 {
+        self.paint_id
+    }
+
+    /// Copies the operations painted in `range` (an element painting
+    /// `bounds`, at `scale_factor`).
+    pub(crate) fn snapshot(
+        &self,
+        range: Range<usize>,
+        bounds: Bounds<Pixels>,
+        scale_factor: f32,
+    ) -> Option<PaintSnapshot> {
+        let ops = self.paint_operations.get(range)?;
+        let primitives = ops
+            .iter()
+            .filter_map(|op| match op {
+                PaintOperation::Primitive(Primitive::BackdropBlur(_))
+                | PaintOperation::Primitive(Primitive::Surface(_)) => None,
+                PaintOperation::Primitive(primitive) => {
+                    Some(SnapshotOperation::Primitive(primitive.clone()))
+                }
+                PaintOperation::AnimatedQuad(quad, _) => {
+                    Some(SnapshotOperation::Primitive(Primitive::Quad(*quad)))
+                }
+                PaintOperation::StartLayer => Some(SnapshotOperation::StartLayer),
+                PaintOperation::EndLayer => Some(SnapshotOperation::EndLayer),
+            })
+            .collect();
+        Some(PaintSnapshot {
+            primitives,
+            bounds,
+            scale_factor,
+        })
+    }
+
+    /// Paints `snapshot` moved by `offset` (device pixels), its alpha times
+    /// `opacity`, clipped to `clip`.
+    pub(crate) fn insert_snapshot(
+        &mut self,
+        snapshot: &PaintSnapshot,
+        offset: Point<ScaledPixels>,
+        opacity: f32,
+        clip: ContentMask<ScaledPixels>,
+    ) {
+        let shift = |b: Bounds<ScaledPixels>| Bounds {
+            origin: b.origin + offset,
+            size: b.size,
+        };
+        let mask = |m: ContentMask<ScaledPixels>| ContentMask {
+            bounds: shift(m.bounds).intersect(&clip.bounds),
+        };
+        for op in snapshot.primitives.iter() {
+            let primitive = match op {
+                SnapshotOperation::StartLayer => {
+                    self.push_layer();
+                    continue;
+                }
+                SnapshotOperation::EndLayer => {
+                    self.pop_layer();
+                    continue;
+                }
+                SnapshotOperation::Primitive(primitive) => primitive,
+            };
+            match primitive {
+                Primitive::Quad(quad) => self.insert_primitive(Quad {
+                    bounds: shift(quad.bounds),
+                    content_mask: mask(quad.content_mask),
+                    background: quad.background.opacity(opacity),
+                    border_color: quad.border_color.opacity(opacity),
+                    ..*quad
+                }),
+                Primitive::Shadow(shadow) => self.insert_primitive(Shadow {
+                    bounds: shift(shadow.bounds),
+                    shape_bounds: shift(shadow.shape_bounds),
+                    content_mask: mask(shadow.content_mask),
+                    color: shadow.color.opacity(opacity),
+                    ..*shadow
+                }),
+                Primitive::Underline(underline) => self.insert_primitive(Underline {
+                    bounds: shift(underline.bounds),
+                    content_mask: mask(underline.content_mask),
+                    color: underline.color.opacity(opacity),
+                    ..*underline
+                }),
+                Primitive::MonochromeSprite(sprite) => self.insert_primitive(MonochromeSprite {
+                    animation: SpriteAnimationId::NONE,
+                    bounds: shift(sprite.bounds),
+                    content_mask: mask(sprite.content_mask),
+                    color: sprite.color.opacity(opacity),
+                    transformation: sprite.transformation.moved(offset),
+                    ..*sprite
+                }),
+                Primitive::SubpixelSprite(sprite) => self.insert_primitive(SubpixelSprite {
+                    bounds: shift(sprite.bounds),
+                    content_mask: mask(sprite.content_mask),
+                    color: sprite.color.opacity(opacity),
+                    transformation: sprite.transformation.moved(offset),
+                    ..*sprite
+                }),
+                Primitive::PolychromeSprite(sprite) => self.insert_primitive(PolychromeSprite {
+                    bounds: shift(sprite.bounds),
+                    content_mask: mask(sprite.content_mask),
+                    opacity: sprite.opacity * opacity,
+                    ..*sprite
+                }),
+                Primitive::Path(path) => {
+                    // Paths are binned into device-pixel tiles, so a moved
+                    // path is binned again from its curves.
+                    let (source, scale_factor) = &path.source;
+                    let logical = |v: ScaledPixels| Pixels(v.0 / scale_factor);
+                    let moved = source.translated(crate::point(logical(offset.x), logical(offset.y)));
+                    let clip = mask(path.paint.content_mask).bounds;
+                    let content_mask = ContentMask {
+                        bounds: Bounds {
+                            origin: crate::point(logical(clip.origin.x), logical(clip.origin.y)),
+                            size: crate::size(logical(clip.size.width), logical(clip.size.height)),
+                        },
+                    };
+                    self.insert_primitive(PaintedPath::new(
+                        moved,
+                        *scale_factor,
+                        content_mask,
+                        path.paint.color.opacity(opacity),
+                    ));
+                }
+                Primitive::BackdropBlur(_) | Primitive::Surface(_) => {}
+            }
+        }
+    }
+}
+
+impl TransformationMatrix {
+    /// This transformation for content moved by `offset`: `x -> M(x - d) + d`,
+    /// since a sprite's matrix works in window coordinates.
+    fn moved(self, offset: Point<ScaledPixels>) -> Self {
+        let [[a, b], [c, d]] = self.rotation_scale;
+        let (dx, dy) = (offset.x.0, offset.y.0);
+        TransformationMatrix {
+            rotation_scale: self.rotation_scale,
+            translation: [
+                self.translation[0] + dx - (a * dx + b * dy),
+                self.translation[1] + dy - (c * dx + d * dy),
+            ],
+        }
     }
 }
 

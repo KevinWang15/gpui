@@ -394,6 +394,26 @@ pub struct Path {
 }
 
 impl Path {
+    /// This path moved by `offset`. Only a curve's end points are positions
+    /// (`a` and `b` are differences), so only they move.
+    pub(crate) fn translated(&self, offset: Point<Pixels>) -> Self {
+        let (dx, dy) = (offset.x.0, offset.y.0);
+        let curves: Vec<PathCurve> = self
+            .curves
+            .iter()
+            .map(|curve| PathCurve {
+                p0: point(curve.p0.x + dx, curve.p0.y + dy),
+                p1: point(curve.p1.x + dx, curve.p1.y + dy),
+                ..*curve
+            })
+            .collect();
+        Self {
+            curves: curves.into(),
+            even_odd: self.even_odd,
+            binned_tiles: Arc::new(parking_lot::Mutex::new(None)),
+        }
+    }
+
     pub(crate) fn from_curves(curves: Vec<PathCurve>, fill_rule: FillRule) -> Self {
         Self {
             curves: curves.into(),
