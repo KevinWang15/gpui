@@ -125,17 +125,22 @@ where
     ///
     /// The ordering is one greater than the maximum ordering of any existing
     /// bounds that intersect with the new bounds. The new bounds share that
-    /// maximum ordering instead if every intersecting bounds there has a kind
-    /// of at most `max_shared_kind`, since those are drawn first.
+    /// maximum ordering instead if `max_shared_kind` is `Some(shared)` and every
+    /// intersecting bounds there has a kind of at most `shared`, since those are
+    /// drawn first. Pass `None` for framebuffer-reading primitives (such as
+    /// `BackdropBlur`) that must never share an ordering with any overlapping
+    /// primitive.
     pub fn insert(
         &mut self,
         new_bounds: Bounds<U>,
         kind: PrimitiveKind,
-        max_shared_kind: PrimitiveKind,
+        max_shared_kind: Option<PrimitiveKind>,
     ) -> u32 {
         let ordering = match self.find_max_key(&new_bounds) {
             None => 1,
-            Some(max_key) if max_key.kind <= max_shared_kind => max_key.ordering,
+            Some(max_key) if max_shared_kind.is_some_and(|shared| max_key.kind <= shared) => {
+                max_key.ordering
+            }
             Some(max_key) => max_key.ordering + 1,
         };
         let key = Key { ordering, kind };
@@ -421,9 +426,9 @@ mod tests {
         };
 
         // Insert the bounds into the tree and verify the order is correct
-        assert_eq!(tree.insert(bounds1, quad, shadow), 1);
-        assert_eq!(tree.insert(bounds2, quad, shadow), 2);
-        assert_eq!(tree.insert(bounds3, quad, shadow), 3);
+        assert_eq!(tree.insert(bounds1, quad, Some(shadow)), 1);
+        assert_eq!(tree.insert(bounds2, quad, Some(shadow)), 2);
+        assert_eq!(tree.insert(bounds3, quad, Some(shadow)), 3);
 
         // Insert non-overlapping bounds and verify they can reuse orders
         let bounds4 = Bounds {
@@ -447,9 +452,12 @@ mod tests {
                 height: 10.0,
             },
         };
-        assert_eq!(tree.insert(bounds4, quad, shadow), 1); // bounds4 does not overlap with bounds1, bounds2, or bounds3
-        assert_eq!(tree.insert(bounds5, quad, shadow), 1); // bounds5 does not overlap with any other bounds
-        assert_eq!(tree.insert(bounds6, quad, shadow), 2); // bounds6 overlaps with bounds4, so it should have a different order
+        assert_eq!(tree.insert(bounds4, quad, Some(shadow)), 1); // bounds4 does not overlap with bounds1, bounds2, or bounds3
+        assert_eq!(tree.insert(bounds5, quad, Some(shadow)), 1); // bounds5 does not overlap with any other bounds
+        assert_eq!(tree.insert(bounds6, quad, Some(shadow)), 2); // bounds6 overlaps with bounds4, so it should have a different order
+        // Overlapping BackdropBlur (max_shared_kind = None) must never share an order
+        assert_eq!(tree.insert(bounds6, PrimitiveKind::BackdropBlur, None), 3);
+        assert_eq!(tree.insert(bounds6, PrimitiveKind::BackdropBlur, None), 4);
     }
 
     #[test]
@@ -460,6 +468,7 @@ mod tests {
             let mut rng = rand::rngs::StdRng::seed_from_u64(seed as u64);
             let mut expected_quads: Vec<(Bounds<f32>, u32, PrimitiveKind)> = Vec::new();
             let kinds = [
+                PrimitiveKind::BackdropBlur,
                 PrimitiveKind::Shadow,
                 PrimitiveKind::Quad,
                 PrimitiveKind::Path,
@@ -478,7 +487,11 @@ mod tests {
                     size: Size { width, height },
                 };
                 let kind = kinds[rng.random_range(0..kinds.len())];
-                let max_shared_kind = kinds[rng.random_range(0..kinds.len())];
+                let max_shared_kind = if kind == PrimitiveKind::BackdropBlur {
+                    None
+                } else {
+                    Some(kinds[rng.random_range(0..kinds.len())])
+                };
 
                 let max_intersecting = expected_quads
                     .iter()
@@ -487,7 +500,11 @@ mod tests {
                     .max();
                 let expected_ordering = match max_intersecting {
                     None => 1,
-                    Some((ordering, max_kind)) if max_kind <= max_shared_kind => ordering,
+                    Some((ordering, max_kind))
+                        if max_shared_kind.is_some_and(|shared| max_kind <= shared) =>
+                    {
+                        ordering
+                    }
                     Some((ordering, _)) => ordering + 1,
                 };
                 expected_quads.push((bounds, expected_ordering, kind));

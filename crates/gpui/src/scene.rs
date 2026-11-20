@@ -58,7 +58,7 @@ struct Layer {
     primitives: SmallVec<[Range<usize>; 1]>,
     bounds: Bounds<ScaledPixels>,
     max_kind: PrimitiveKind,
-    max_shared_kind: PrimitiveKind,
+    max_shared_kind: Option<PrimitiveKind>,
 }
 
 #[derive(Default)]
@@ -279,7 +279,7 @@ impl Scene {
             primitives: SmallVec::new(),
             bounds: Bounds::default(),
             max_kind: PrimitiveKind::BackdropBlur,
-            max_shared_kind: PrimitiveKind::Surface,
+            max_shared_kind: Some(PrimitiveKind::Surface),
         });
         self.paint_operations.push(PaintOperation::StartLayer);
     }
@@ -629,12 +629,15 @@ impl PrimitiveKind {
     /// paint order. So, a primitive can only share the draw order of the
     /// topmost primitive it overlaps if that primitive's kind is at most the
     /// one returned here. Otherwise, it needs a new draw order.
-    fn max_shared_kind(self) -> Self {
+    fn max_shared_kind(self) -> Option<Self> {
         match self {
-            Self::MonochromeSprite => Self::Underline,
-            Self::SubpixelSprite => Self::MonochromeSprite,
-            Self::PolychromeSprite => Self::SubpixelSprite,
-            kind => kind,
+            // A BackdropBlur reads the rendered framebuffer behind it, so it must never share a
+            // draw order with any overlapping earlier primitive (including another BackdropBlur).
+            Self::BackdropBlur => None,
+            Self::MonochromeSprite => Some(Self::Underline),
+            Self::SubpixelSprite => Some(Self::MonochromeSprite),
+            Self::PolychromeSprite => Some(Self::SubpixelSprite),
+            kind => Some(kind),
         }
     }
 }
@@ -699,9 +702,28 @@ impl Primitive {
     }
 
     fn clipped_bounds(&self) -> Bounds<ScaledPixels> {
-        self.transformation()
-            .transform_bounds(*self.bounds())
-            .intersect(&self.content_mask().bounds)
+        let raw_bounds = match self {
+            Primitive::BackdropBlur(blur) if blur.shadow_opacity > 0.0005 => {
+                // Match the exterior drop-shadow vertex expansion in shaders_backdrop_blur / shaders.hlsl
+                // so overlapping floating glass panels and their shadows always sort strictly in paint order.
+                let scale = blur.scale_factor.max(1.0);
+                let pad_x = ScaledPixels(40.0 * scale);
+                let pad_top = ScaledPixels(32.0 * scale);
+                let pad_bottom = ScaledPixels(52.0 * scale);
+                Bounds {
+                    origin: crate::Point {
+                        x: blur.bounds.origin.x - pad_x,
+                        y: blur.bounds.origin.y - pad_top,
+                    },
+                    size: crate::Size {
+                        width: blur.bounds.size.width + pad_x * 2.0,
+                        height: blur.bounds.size.height + pad_top + pad_bottom,
+                    },
+                }
+            }
+            _ => self.transformation().transform_bounds(*self.bounds()),
+        };
+        raw_bounds.intersect(&self.content_mask().bounds)
     }
 
     pub fn content_mask(&self) -> &ContentMask<ScaledPixels> {

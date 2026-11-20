@@ -1902,7 +1902,7 @@ float4 backdrop_blur_fragment(BlurFullscreenInput input): SV_Target {
         || blur_shadow_opacity > 0.0005;
 
     if (!is_glass) {
-        float strength = saturate(blur_radius / 3.0);
+        float strength = saturate(blur_radius / (3.0 * scale));
         float alpha = edge_alpha * strength;
         if (alpha <= 0.001) {
             discard;
@@ -1961,7 +1961,7 @@ float4 backdrop_blur_fragment(BlurFullscreenInput input): SV_Target {
     } else if (blur_progressive_mode == 5u) {
         prog = smoothstep(0.10, 1.0, pow(one_minus_u, 0.85));
     }
-    float blur_mix = saturate(blur_radius / 5.0) * prog;
+    float blur_mix = saturate(blur_radius / (5.0 * scale)) * prog;
 
     float4 glass_sample = sample_glass_layer(uv_r, uv_g, uv_b, blur_mix);
     float3 rgb = glass_sample.rgb;

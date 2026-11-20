@@ -225,7 +225,7 @@ fn fs_backdrop_blur(input: FullscreenVarying) -> @location(0) vec4<f32> {
 
     // Classic fast path for standard `div().backdrop_blur(...)` elements.
     if (!is_glass) {
-        let strength = clamp(params.blur_radius / 3.0, 0.0, 1.0);
+        let strength = clamp(params.blur_radius / (3.0 * scale), 0.0, 1.0);
         let alpha = edge_alpha * strength;
         if (alpha <= 0.001) {
             discard;
@@ -298,7 +298,7 @@ fn fs_backdrop_blur(input: FullscreenVarying) -> @location(0) vec4<f32> {
     } else if (params.progressive_mode == 5u) {
         prog = smoothstep(0.10, 1.0, pow(one_minus_u, 0.85));
     }
-    let blur_mix = clamp(params.blur_radius / 5.0, 0.0, 1.0) * prog;
+    let blur_mix = clamp(params.blur_radius / (5.0 * scale), 0.0, 1.0) * prog;
 
     let glass_sample = sample_glass_layer(uv_r, uv_g, uv_b, blur_mix);
     var rgb = glass_sample.rgb;

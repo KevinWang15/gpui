@@ -760,11 +760,6 @@ impl DirectXRenderer {
             .context("backdrop blur params missing")?;
         let context = &devices.device_context;
 
-        let max_radius = blurs
-            .iter()
-            .map(|b| b.blur_radius.0)
-            .fold(0.0f32, f32::max);
-        let kawase_offset = (max_radius / 5.0).clamp(0.75, 4.0);
         let vw = targets.width as f32;
         let vh = targets.height as f32;
         let hw = targets.half_width as f32;
@@ -789,87 +784,112 @@ impl DirectXRenderer {
             MaxDepth: 1.0,
         };
 
+        let kawase_offset_for = |b: &BackdropBlur| -> f32 {
+            if b.blur_radius.0 > 0.05 {
+                let s = b.scale_factor.max(1.0);
+                (b.blur_radius.0 / 5.0).clamp(0.75 * s, 4.0 * s)
+            } else {
+                0.0
+            }
+        };
+
         unsafe {
             // Snapshot everything drawn into the render target before this blur batch.
             context.CopyResource(&targets.scene, render_target);
 
-            // Common state for Kawase downsample/upsample passes (no blend, no depth).
-            context.OMSetBlendState(None, None, 0xFFFFFFFF);
+            // Common state shared across Kawase and composite passes.
             context.OMSetDepthStencilState(None, 0);
             context.IASetInputLayout(None);
-            context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             context.VSSetConstantBuffers(2, Some(slice::from_ref(&pipeline.params)));
             context.PSSetConstantBuffers(2, Some(slice::from_ref(&pipeline.params)));
             context.PSSetSamplers(0, Some(slice::from_ref(&pipeline.clamp_sampler)));
-            context.PSSetShaderResources(0, Some(&[None]));
 
-            if max_radius > 0.05 {
-                // Pass 1: Downsample full -> half
-                update_buffer(
-                    context,
-                    params_buf,
-                    &[BackdropBlurParams {
-                        texel_size: [1.0 / vw, 1.0 / vh],
-                        kawase_offset,
-                        ..Default::default()
-                    }],
-                )?;
-                context.OMSetRenderTargets(Some(slice::from_ref(&targets.half_rtv)), None);
-                context.RSSetViewports(Some(slice::from_ref(&half_viewport)));
-                context.VSSetShader(&pipeline.downsample_vs, None);
-                context.PSSetShader(&pipeline.downsample_ps, None);
-                context.PSSetShaderResources(0, Some(slice::from_ref(&targets.scene_srv)));
-                context.Draw(3, 0);
-                context.PSSetShaderResources(0, Some(&[None]));
-
-                // Pass 2: Downsample half -> quarter
-                update_buffer(
-                    context,
-                    params_buf,
-                    &[BackdropBlurParams {
-                        texel_size: [1.0 / hw, 1.0 / hh],
-                        kawase_offset,
-                        ..Default::default()
-                    }],
-                )?;
-                context.OMSetRenderTargets(Some(slice::from_ref(&targets.quarter_rtv)), None);
-                context.RSSetViewports(Some(slice::from_ref(&quarter_viewport)));
-                context.PSSetShaderResources(0, Some(slice::from_ref(&targets.half_srv)));
-                context.Draw(3, 0);
-                context.PSSetShaderResources(0, Some(&[None]));
-
-                // Pass 3: Upsample quarter -> half
-                update_buffer(
-                    context,
-                    params_buf,
-                    &[BackdropBlurParams {
-                        texel_size: [1.0 / qw, 1.0 / qh],
-                        kawase_offset,
-                        ..Default::default()
-                    }],
-                )?;
-                context.OMSetRenderTargets(Some(slice::from_ref(&targets.half_rtv)), None);
-                context.RSSetViewports(Some(slice::from_ref(&half_viewport)));
-                context.VSSetShader(&pipeline.upsample_vs, None);
-                context.PSSetShader(&pipeline.upsample_ps, None);
-                context.PSSetShaderResources(0, Some(slice::from_ref(&targets.quarter_srv)));
-                context.Draw(3, 0);
-                context.PSSetShaderResources(0, Some(&[None]));
-            }
-
-            // Pass 4: Composite each rounded BackdropBlur / LiquidGlass region back onto render_target.
-            context.OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
-            context.RSSetViewports(Some(slice::from_ref(&resources.viewport)));
-            context.OMSetBlendState(&pipeline.blend_state, None, 0xFFFFFFFF);
-            context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-            context.VSSetShader(&pipeline.composite_vs, None);
-            context.PSSetShader(&pipeline.composite_ps, None);
-            context.PSSetShaderResources(
-                0,
-                Some(&[targets.half_srv.clone(), targets.scene_srv.clone()]),
-            );
+            let mut cached_kawase_offset: Option<f32> = None;
+            let mut in_composite_state = false;
 
             for blur in blurs {
+                let blur_kawase = kawase_offset_for(blur);
+                if blur_kawase > 0.0
+                    && cached_kawase_offset.is_none_or(|c| (c - blur_kawase).abs() > 0.02)
+                {
+                    // Unbind composite SRVs before writing into `targets.half_rtv`.
+                    context.PSSetShaderResources(0, Some(&[None, None]));
+                    context.OMSetBlendState(None, None, 0xFFFFFFFF);
+                    context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+                    // Pass 1: Downsample full -> half
+                    update_buffer(
+                        context,
+                        params_buf,
+                        &[BackdropBlurParams {
+                            texel_size: [1.0 / vw, 1.0 / vh],
+                            kawase_offset: blur_kawase,
+                            ..Default::default()
+                        }],
+                    )?;
+                    context.OMSetRenderTargets(Some(slice::from_ref(&targets.half_rtv)), None);
+                    context.RSSetViewports(Some(slice::from_ref(&half_viewport)));
+                    context.VSSetShader(&pipeline.downsample_vs, None);
+                    context.PSSetShader(&pipeline.downsample_ps, None);
+                    context.PSSetShaderResources(0, Some(slice::from_ref(&targets.scene_srv)));
+                    context.Draw(3, 0);
+                    context.PSSetShaderResources(0, Some(&[None]));
+
+                    // Pass 2: Downsample half -> quarter
+                    update_buffer(
+                        context,
+                        params_buf,
+                        &[BackdropBlurParams {
+                            texel_size: [1.0 / hw, 1.0 / hh],
+                            kawase_offset: blur_kawase,
+                            ..Default::default()
+                        }],
+                    )?;
+                    context.OMSetRenderTargets(Some(slice::from_ref(&targets.quarter_rtv)), None);
+                    context.RSSetViewports(Some(slice::from_ref(&quarter_viewport)));
+                    context.PSSetShaderResources(0, Some(slice::from_ref(&targets.half_srv)));
+                    context.Draw(3, 0);
+                    context.PSSetShaderResources(0, Some(&[None]));
+
+                    // Pass 3: Upsample quarter -> half
+                    update_buffer(
+                        context,
+                        params_buf,
+                        &[BackdropBlurParams {
+                            texel_size: [1.0 / qw, 1.0 / qh],
+                            kawase_offset: blur_kawase,
+                            ..Default::default()
+                        }],
+                    )?;
+                    context.OMSetRenderTargets(Some(slice::from_ref(&targets.half_rtv)), None);
+                    context.RSSetViewports(Some(slice::from_ref(&half_viewport)));
+                    context.VSSetShader(&pipeline.upsample_vs, None);
+                    context.PSSetShader(&pipeline.upsample_ps, None);
+                    context.PSSetShaderResources(0, Some(slice::from_ref(&targets.quarter_srv)));
+                    context.Draw(3, 0);
+                    context.PSSetShaderResources(0, Some(&[None]));
+
+                    cached_kawase_offset = Some(blur_kawase);
+                    in_composite_state = false;
+                }
+
+                if !in_composite_state {
+                    context.OMSetRenderTargets(
+                        Some(slice::from_ref(&resources.render_target_view)),
+                        None,
+                    );
+                    context.RSSetViewports(Some(slice::from_ref(&resources.viewport)));
+                    context.OMSetBlendState(&pipeline.blend_state, None, 0xFFFFFFFF);
+                    context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+                    context.VSSetShader(&pipeline.composite_vs, None);
+                    context.PSSetShader(&pipeline.composite_ps, None);
+                    context.PSSetShaderResources(
+                        0,
+                        Some(&[targets.half_srv.clone(), targets.scene_srv.clone()]),
+                    );
+                    in_composite_state = true;
+                }
+
                 let tint = gpui::Rgba::from(blur.tint);
                 update_buffer(
                     context,
@@ -878,7 +898,7 @@ impl DirectXRenderer {
                         viewport_size: [vw, vh],
                         texel_size: [1.0 / hw, 1.0 / hh],
                         blur_radius: blur.blur_radius.0,
-                        kawase_offset,
+                        kawase_offset: cached_kawase_offset.unwrap_or(0.0),
                         premultiplied_alpha: 0,
                         progressive_mode: blur.progressive_mode as u32,
                         bounds_origin: [blur.bounds.origin.x.0, blur.bounds.origin.y.0],

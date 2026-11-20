@@ -141,6 +141,7 @@ struct BackdropBlurTargets {
     quarter: TransitionTexture,
     depth: DepthTexture,
     scene_bind_group: wgpu::BindGroup,
+    scene_copy_bind_group: wgpu::BindGroup,
     half_bind_group: wgpu::BindGroup,
     quarter_bind_group: wgpu::BindGroup,
 }
@@ -2228,6 +2229,7 @@ impl WgpuRendererCore {
         };
 
         let scene_bind_group = make_bg("backdrop_blur_scene_bg", &scene_tex.view);
+        let scene_copy_bind_group = make_bg("backdrop_blur_scene_copy_bg", &scene_copy_tex.view);
         let half_bind_group = make_bg("backdrop_blur_half_bg", &half_tex.view);
         let quarter_bind_group = make_bg("backdrop_blur_quarter_bg", &quarter_tex.view);
 
@@ -2243,6 +2245,7 @@ impl WgpuRendererCore {
                 view: depth_view,
             },
             scene_bind_group,
+            scene_copy_bind_group,
             half_bind_group,
             quarter_bind_group,
         });
@@ -2258,16 +2261,14 @@ impl WgpuRendererCore {
         depth_scale: f32,
     ) -> Result<wgpu::SubmissionIndex> {
         let batches: Vec<PrimitiveBatch> = scene.batches().collect();
-        let mut blur_batch_count = 0usize;
         let mut total_blurs = 0usize;
         for batch in &batches {
             if let PrimitiveBatch::BackdropBlurs(range) = batch {
-                blur_batch_count += 1;
                 total_blurs += range.len();
             }
         }
-        // Slot 0 = final blit; each blur batch uses 3 Kawase slots + `range.len()` composite slots.
-        let required_slots = 1 + blur_batch_count * 3 + total_blurs;
+        // Slot 0 = final blit; worst case each distinct blur uses 3 Kawase slots + 1 composite slot.
+        let required_slots = 1 + total_blurs * 4;
         self.ensure_backdrop_blur_targets(size, required_slots);
 
         let viewport_width = size.width.0 as f32;
@@ -2424,188 +2425,231 @@ impl WgpuRendererCore {
                 let blur_range = blur_range.clone();
                 batch_idx += 1;
 
-                let max_radius = scene.backdrop_blurs[blur_range.clone()]
-                    .iter()
-                    .map(|b| b.blur_radius.0)
-                    .fold(0.0f32, f32::max);
-                let needs_sharp = scene.backdrop_blurs[blur_range.clone()]
-                    .iter()
-                    .any(|b| b.is_liquid_glass());
-                let kawase_offset = (max_radius / 5.0).clamp(0.75, 4.0);
-
-                if needs_sharp {
-                    encoder.copy_texture_to_texture(
-                        targets.scene.texture.as_image_copy(),
-                        targets.scene_copy.texture.as_image_copy(),
-                        wgpu::Extent3d {
-                            width: size.width.0 as u32,
-                            height: size.height.0 as u32,
-                            depth_or_array_layers: 1,
-                        },
-                    );
+                let batch_blurs = &scene.backdrop_blurs[blur_range];
+                if batch_blurs.is_empty() {
+                    continue;
                 }
 
-                if max_radius > 0.05 {
-                    // Downsample 1: full -> half
-                    let d1_slot = next_slot;
-                    next_slot += 1;
-                    let d1_params = BackdropBlurParams {
-                        texel_size: [1.0 / viewport_width, 1.0 / viewport_height],
-                        kawase_offset,
-                        ..zero_params
-                    };
-                    self.resources.queue.write_buffer(
-                        &self.resources.backdrop_blur_buffer,
-                        u64::from(d1_slot) * stride,
-                        bytemuck::bytes_of(&d1_params),
-                    );
-                    {
-                        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                            label: Some("kawase_downsample_half"),
-                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                view: &targets.half.view,
-                                resolve_target: None,
-                                ops: wgpu::Operations {
-                                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                                    store: wgpu::StoreOp::Store,
-                                },
-                                depth_slice: None,
-                            })],
-                            depth_stencil_attachment: None,
-                            ..Default::default()
-                        });
-                        pass.set_pipeline(&self.resources.pipelines.kawase_downsample);
-                        pass.set_bind_group(0, &targets.scene_bind_group, &[slot_offset(d1_slot)]);
-                        pass.draw(0..3, 0..1);
-                    }
+                // Snapshot the clean pre-batch scene once so both sharp refraction (`t_sharp`) and
+                // every per-radius Dual-Kawase mip pass read the exact immutable pre-batch pixels.
+                encoder.copy_texture_to_texture(
+                    targets.scene.texture.as_image_copy(),
+                    targets.scene_copy.texture.as_image_copy(),
+                    wgpu::Extent3d {
+                        width: size.width.0 as u32,
+                        height: size.height.0 as u32,
+                        depth_or_array_layers: 1,
+                    },
+                );
 
-                    // Downsample 2: half -> quarter
-                    let d2_slot = next_slot;
-                    next_slot += 1;
-                    let d2_params = BackdropBlurParams {
-                        texel_size: [1.0 / half_w, 1.0 / half_h],
-                        kawase_offset,
-                        ..zero_params
-                    };
-                    self.resources.queue.write_buffer(
-                        &self.resources.backdrop_blur_buffer,
-                        u64::from(d2_slot) * stride,
-                        bytemuck::bytes_of(&d2_params),
-                    );
-                    {
-                        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                            label: Some("kawase_downsample_quarter"),
-                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                view: &targets.quarter.view,
-                                resolve_target: None,
-                                ops: wgpu::Operations {
-                                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                                    store: wgpu::StoreOp::Store,
-                                },
-                                depth_slice: None,
-                            })],
-                            depth_stencil_attachment: None,
-                            ..Default::default()
-                        });
-                        pass.set_pipeline(&self.resources.pipelines.kawase_downsample);
-                        pass.set_bind_group(0, &targets.half_bind_group, &[slot_offset(d2_slot)]);
-                        pass.draw(0..3, 0..1);
+                let kawase_offset_for = |b: &gpui::BackdropBlur| -> f32 {
+                    if b.blur_radius.0 > 0.05 {
+                        let s = b.scale_factor.max(1.0);
+                        (b.blur_radius.0 / 5.0).clamp(0.75 * s, 4.0 * s)
+                    } else {
+                        0.0
                     }
+                };
 
-                    // Upsample: quarter -> half
-                    let u1_slot = next_slot;
-                    next_slot += 1;
-                    let u1_params = BackdropBlurParams {
-                        texel_size: [1.0 / quarter_w, 1.0 / quarter_h],
-                        kawase_offset,
-                        ..zero_params
-                    };
-                    self.resources.queue.write_buffer(
-                        &self.resources.backdrop_blur_buffer,
-                        u64::from(u1_slot) * stride,
-                        bytemuck::bytes_of(&u1_params),
-                    );
+                let mut cached_kawase_offset: Option<f32> = None;
+                let mut idx = 0usize;
+                while idx < batch_blurs.len() {
+                    let blur_kawase = kawase_offset_for(&batch_blurs[idx]);
+                    if blur_kawase > 0.0
+                        && cached_kawase_offset.is_none_or(|c| (c - blur_kawase).abs() > 0.02)
                     {
-                        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                            label: Some("kawase_upsample_half"),
-                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                view: &targets.half.view,
-                                resolve_target: None,
-                                ops: wgpu::Operations {
-                                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                                    store: wgpu::StoreOp::Store,
-                                },
-                                depth_slice: None,
-                            })],
-                            depth_stencil_attachment: None,
-                            ..Default::default()
-                        });
-                        pass.set_pipeline(&self.resources.pipelines.kawase_upsample);
-                        pass.set_bind_group(0, &targets.quarter_bind_group, &[slot_offset(u1_slot)]);
-                        pass.draw(0..3, 0..1);
-                    }
-                }
-
-                // Composite each rounded BackdropBlur / LiquidGlass region onto targets.scene
-                {
-                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("backdrop_blur_composite_pass"),
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: &targets.scene.view,
-                            resolve_target: None,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Load,
-                                store: wgpu::StoreOp::Store,
-                            },
-                            depth_slice: None,
-                        })],
-                        depth_stencil_attachment: None,
-                        ..Default::default()
-                    });
-                    pass.set_pipeline(&self.resources.pipelines.backdrop_blur_composite);
-                    for blur in &scene.backdrop_blurs[blur_range] {
-                        let c_slot = next_slot;
+                        // Downsample 1: full (scene_copy) -> half
+                        let d1_slot = next_slot;
                         next_slot += 1;
-                        let tint = gpui::Rgba::from(blur.tint);
-                        let comp_params = BackdropBlurParams {
-                            viewport_size: [viewport_width, viewport_height],
-                            texel_size: [1.0 / half_w, 1.0 / half_h],
-                            blur_radius: blur.blur_radius.0,
-                            kawase_offset,
-                            premultiplied_alpha,
-                            progressive_mode: blur.progressive_mode as u32,
-                            bounds_origin: [blur.bounds.origin.x.0, blur.bounds.origin.y.0],
-                            bounds_size: [blur.bounds.size.width.0, blur.bounds.size.height.0],
-                            corner_radii: [
-                                blur.corner_radii.top_left.0,
-                                blur.corner_radii.top_right.0,
-                                blur.corner_radii.bottom_right.0,
-                                blur.corner_radii.bottom_left.0,
-                            ],
-                            mask_origin: [
-                                blur.content_mask.bounds.origin.x.0,
-                                blur.content_mask.bounds.origin.y.0,
-                            ],
-                            mask_size: [
-                                blur.content_mask.bounds.size.width.0,
-                                blur.content_mask.bounds.size.height.0,
-                            ],
-                            refraction: blur.refraction,
-                            dispersion: blur.dispersion,
-                            bevel_width: blur.bevel_width.0,
-                            specular: blur.specular,
-                            pointer_pos: [blur.pointer_pos.x.0, blur.pointer_pos.y.0],
-                            scale_factor: blur.scale_factor.max(1.0),
-                            shadow_opacity: blur.shadow_opacity,
-                            tint_rgba: [tint.r, tint.g, tint.b, tint.a],
+                        let d1_params = BackdropBlurParams {
+                            texel_size: [1.0 / viewport_width, 1.0 / viewport_height],
+                            kawase_offset: blur_kawase,
+                            ..zero_params
                         };
                         self.resources.queue.write_buffer(
                             &self.resources.backdrop_blur_buffer,
-                            u64::from(c_slot) * stride,
-                            bytemuck::bytes_of(&comp_params),
+                            u64::from(d1_slot) * stride,
+                            bytemuck::bytes_of(&d1_params),
                         );
-                        pass.set_bind_group(0, &targets.half_bind_group, &[slot_offset(c_slot)]);
-                        pass.draw(0..4, 0..1);
+                        {
+                            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                label: Some("kawase_downsample_half"),
+                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                    view: &targets.half.view,
+                                    resolve_target: None,
+                                    ops: wgpu::Operations {
+                                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                        store: wgpu::StoreOp::Store,
+                                    },
+                                    depth_slice: None,
+                                })],
+                                depth_stencil_attachment: None,
+                                ..Default::default()
+                            });
+                            pass.set_pipeline(&self.resources.pipelines.kawase_downsample);
+                            pass.set_bind_group(
+                                0,
+                                &targets.scene_copy_bind_group,
+                                &[slot_offset(d1_slot)],
+                            );
+                            pass.draw(0..3, 0..1);
+                        }
+
+                        // Downsample 2: half -> quarter
+                        let d2_slot = next_slot;
+                        next_slot += 1;
+                        let d2_params = BackdropBlurParams {
+                            texel_size: [1.0 / half_w, 1.0 / half_h],
+                            kawase_offset: blur_kawase,
+                            ..zero_params
+                        };
+                        self.resources.queue.write_buffer(
+                            &self.resources.backdrop_blur_buffer,
+                            u64::from(d2_slot) * stride,
+                            bytemuck::bytes_of(&d2_params),
+                        );
+                        {
+                            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                label: Some("kawase_downsample_quarter"),
+                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                    view: &targets.quarter.view,
+                                    resolve_target: None,
+                                    ops: wgpu::Operations {
+                                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                        store: wgpu::StoreOp::Store,
+                                    },
+                                    depth_slice: None,
+                                })],
+                                depth_stencil_attachment: None,
+                                ..Default::default()
+                            });
+                            pass.set_pipeline(&self.resources.pipelines.kawase_downsample);
+                            pass.set_bind_group(
+                                0,
+                                &targets.half_bind_group,
+                                &[slot_offset(d2_slot)],
+                            );
+                            pass.draw(0..3, 0..1);
+                        }
+
+                        // Upsample: quarter -> half
+                        let u1_slot = next_slot;
+                        next_slot += 1;
+                        let u1_params = BackdropBlurParams {
+                            texel_size: [1.0 / quarter_w, 1.0 / quarter_h],
+                            kawase_offset: blur_kawase,
+                            ..zero_params
+                        };
+                        self.resources.queue.write_buffer(
+                            &self.resources.backdrop_blur_buffer,
+                            u64::from(u1_slot) * stride,
+                            bytemuck::bytes_of(&u1_params),
+                        );
+                        {
+                            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                label: Some("kawase_upsample_half"),
+                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                    view: &targets.half.view,
+                                    resolve_target: None,
+                                    ops: wgpu::Operations {
+                                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                        store: wgpu::StoreOp::Store,
+                                    },
+                                    depth_slice: None,
+                                })],
+                                depth_stencil_attachment: None,
+                                ..Default::default()
+                            });
+                            pass.set_pipeline(&self.resources.pipelines.kawase_upsample);
+                            pass.set_bind_group(
+                                0,
+                                &targets.quarter_bind_group,
+                                &[slot_offset(u1_slot)],
+                            );
+                            pass.draw(0..3, 0..1);
+                        }
+
+                        cached_kawase_offset = Some(blur_kawase);
+                    }
+
+                    // Batch all consecutive blurs that can reuse the current Kawase mip (or need none).
+                    let run_start = idx;
+                    idx += 1;
+                    while idx < batch_blurs.len() {
+                        let next_kawase = kawase_offset_for(&batch_blurs[idx]);
+                        if next_kawase > 0.0
+                            && cached_kawase_offset.is_none_or(|c| (c - next_kawase).abs() > 0.02)
+                        {
+                            break;
+                        }
+                        idx += 1;
+                    }
+
+                    // Composite this run onto targets.scene in a single render pass.
+                    {
+                        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("backdrop_blur_composite_pass"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: &targets.scene.view,
+                                resolve_target: None,
+                                ops: wgpu::Operations {
+                                    load: wgpu::LoadOp::Load,
+                                    store: wgpu::StoreOp::Store,
+                                },
+                                depth_slice: None,
+                            })],
+                            depth_stencil_attachment: None,
+                            ..Default::default()
+                        });
+                        pass.set_pipeline(&self.resources.pipelines.backdrop_blur_composite);
+                        for blur in &batch_blurs[run_start..idx] {
+                            let c_slot = next_slot;
+                            next_slot += 1;
+                            let tint = gpui::Rgba::from(blur.tint);
+                            let comp_params = BackdropBlurParams {
+                                viewport_size: [viewport_width, viewport_height],
+                                texel_size: [1.0 / half_w, 1.0 / half_h],
+                                blur_radius: blur.blur_radius.0,
+                                kawase_offset: cached_kawase_offset.unwrap_or(0.0),
+                                premultiplied_alpha,
+                                progressive_mode: blur.progressive_mode as u32,
+                                bounds_origin: [blur.bounds.origin.x.0, blur.bounds.origin.y.0],
+                                bounds_size: [blur.bounds.size.width.0, blur.bounds.size.height.0],
+                                corner_radii: [
+                                    blur.corner_radii.top_left.0,
+                                    blur.corner_radii.top_right.0,
+                                    blur.corner_radii.bottom_right.0,
+                                    blur.corner_radii.bottom_left.0,
+                                ],
+                                mask_origin: [
+                                    blur.content_mask.bounds.origin.x.0,
+                                    blur.content_mask.bounds.origin.y.0,
+                                ],
+                                mask_size: [
+                                    blur.content_mask.bounds.size.width.0,
+                                    blur.content_mask.bounds.size.height.0,
+                                ],
+                                refraction: blur.refraction,
+                                dispersion: blur.dispersion,
+                                bevel_width: blur.bevel_width.0,
+                                specular: blur.specular,
+                                pointer_pos: [blur.pointer_pos.x.0, blur.pointer_pos.y.0],
+                                scale_factor: blur.scale_factor.max(1.0),
+                                shadow_opacity: blur.shadow_opacity,
+                                tint_rgba: [tint.r, tint.g, tint.b, tint.a],
+                            };
+                            self.resources.queue.write_buffer(
+                                &self.resources.backdrop_blur_buffer,
+                                u64::from(c_slot) * stride,
+                                bytemuck::bytes_of(&comp_params),
+                            );
+                            pass.set_bind_group(
+                                0,
+                                &targets.half_bind_group,
+                                &[slot_offset(c_slot)],
+                            );
+                            pass.draw(0..4, 0..1);
+                        }
                     }
                 }
             }
@@ -4985,6 +5029,211 @@ mod tests {
                 img.save(&path).expect("save liquid glass preview png");
             }
         }
+    }
+
+    #[test]
+    fn liquid_glass_blur_radius_is_invariant_to_batch_grouping_and_overlap() {
+        use gpui::{
+            BackdropBlur, BorderStyle, Bounds, ContentMask, Corners, Edges, Hsla, Point,
+            ProgressiveBlur, Quad, ScaledPixels, Size,
+        };
+
+        let mut headless = WgpuHeadlessRenderer::new().expect("headless wgpu renderer");
+        let w = 480u32;
+        let h = 320u32;
+        let size = Size {
+            width: DevicePixels(w as i32),
+            height: DevicePixels(h as i32),
+        };
+        let full_mask = ContentMask {
+            bounds: Bounds {
+                origin: Point {
+                    x: ScaledPixels(0.0),
+                    y: ScaledPixels(0.0),
+                },
+                size: Size {
+                    width: ScaledPixels(w as f32),
+                    height: ScaledPixels(h as f32),
+                },
+            },
+        };
+        let bg = Hsla { h: 222.0 / 360.0, s: 0.45, l: 0.10, a: 1.0 };
+        let stripe_a = Hsla { h: 350.0 / 360.0, s: 0.90, l: 0.56, a: 1.0 };
+        let stripe_b = Hsla { h: 155.0 / 360.0, s: 0.85, l: 0.48, a: 1.0 };
+        let tint = Hsla { h: 220.0 / 360.0, s: 0.25, l: 0.16, a: 0.18 };
+
+        let build_scene = |force_separate_batch: bool, overlapping_lens: bool| {
+            let mut scene = Scene::default();
+            scene.insert_primitive(Quad {
+                order: 0,
+                border_style: BorderStyle::Solid,
+                bounds: full_mask.bounds,
+                content_mask: full_mask,
+                background: bg.into(),
+                border_color: bg,
+                corner_radii: Corners::default(),
+                border_widths: Edges::default(),
+            });
+            // High-contrast vertical stripes under the floating glass bar
+            for i in 0..8 {
+                let col = if i % 2 == 0 { stripe_a } else { stripe_b };
+                scene.insert_primitive(Quad {
+                    order: 0,
+                    border_style: BorderStyle::Solid,
+                    bounds: Bounds {
+                        origin: Point {
+                            x: ScaledPixels(40.0 + i as f32 * 44.0),
+                            y: ScaledPixels(60.0),
+                        },
+                        size: Size {
+                            width: ScaledPixels(22.0),
+                            height: ScaledPixels(220.0),
+                        },
+                    },
+                    content_mask: full_mask,
+                    background: col.into(),
+                    border_color: col,
+                    corner_radii: Corners::default(),
+                    border_widths: Edges::default(),
+                });
+            }
+            // Heavy 18px progressive header at top (non-overlapping with bar)
+            scene.insert_primitive(BackdropBlur {
+                order: 0,
+                blur_radius: ScaledPixels(18.0),
+                bounds: Bounds {
+                    origin: Point { x: ScaledPixels(0.0), y: ScaledPixels(0.0) },
+                    size: Size { width: ScaledPixels(w as f32), height: ScaledPixels(44.0) },
+                },
+                corner_radii: Corners::default(),
+                content_mask: full_mask,
+                refraction: 0.35,
+                dispersion: 0.20,
+                bevel_width: ScaledPixels(10.0),
+                specular: 0.40,
+                progressive_mode: ProgressiveBlur::BottomToTop,
+                scale_factor: 1.0,
+                pointer_pos: Point { x: ScaledPixels(-10_000.0), y: ScaledPixels(-10_000.0) },
+                tint,
+                shadow_opacity: 0.0,
+            });
+            if overlapping_lens {
+                // Crystal optical lens underneath the floating bar
+                scene.insert_primitive(BackdropBlur {
+                    order: 0,
+                    blur_radius: ScaledPixels(0.0),
+                    bounds: Bounds {
+                        origin: Point { x: ScaledPixels(220.0), y: ScaledPixels(140.0) },
+                        size: Size { width: ScaledPixels(180.0), height: ScaledPixels(120.0) },
+                    },
+                    corner_radii: Corners::all(ScaledPixels(60.0)),
+                    content_mask: full_mask,
+                    refraction: 1.2,
+                    dispersion: 0.8,
+                    bevel_width: ScaledPixels(22.0),
+                    specular: 1.0,
+                    progressive_mode: ProgressiveBlur::None,
+                    scale_factor: 1.0,
+                    pointer_pos: Point { x: ScaledPixels(-10_000.0), y: ScaledPixels(-10_000.0) },
+                    tint: Hsla::transparent_black(),
+                    shadow_opacity: 0.45,
+                });
+            }
+            if force_separate_batch {
+                // Force a higher DrawOrder (order = 2) on the far-right tip of the floating bar
+                // (e.g. a text underline + overlay badge), splitting the bar into its own batch.
+                let tip_bounds = Bounds {
+                    origin: Point { x: ScaledPixels(360.0), y: ScaledPixels(170.0) },
+                    size: Size { width: ScaledPixels(16.0), height: ScaledPixels(16.0) },
+                };
+                scene.insert_primitive(gpui::Underline {
+                    order: 0,
+                    pad: 0,
+                    bounds: tip_bounds,
+                    content_mask: full_mask,
+                    color: bg,
+                    thickness: ScaledPixels(1.0),
+                    wavy: false.into(),
+                });
+                scene.insert_primitive(Quad {
+                    order: 0,
+                    border_style: BorderStyle::Solid,
+                    bounds: tip_bounds,
+                    content_mask: full_mask,
+                    background: bg.into(),
+                    border_color: bg,
+                    corner_radii: Corners::default(),
+                    border_widths: Edges::default(),
+                });
+            }
+            // Floating 6px glass bar
+            scene.insert_primitive(BackdropBlur {
+                order: 0,
+                blur_radius: ScaledPixels(6.0),
+                bounds: Bounds {
+                    origin: Point { x: ScaledPixels(60.0), y: ScaledPixels(150.0) },
+                    size: Size { width: ScaledPixels(320.0), height: ScaledPixels(64.0) },
+                },
+                corner_radii: Corners::all(ScaledPixels(32.0)),
+                content_mask: full_mask,
+                refraction: 0.95,
+                dispersion: 0.60,
+                bevel_width: ScaledPixels(16.0),
+                specular: 0.90,
+                progressive_mode: ProgressiveBlur::None,
+                scale_factor: 1.0,
+                pointer_pos: Point { x: ScaledPixels(-10_000.0), y: ScaledPixels(-10_000.0) },
+                tint,
+                shadow_opacity: 0.45,
+            });
+            scene.finish();
+            scene
+        };
+
+        // 1. Floating 6px bar must render BIT-FOR-BIT identically whether it shares a batch
+        //    with the 18px progressive header OR splits into its own BackdropBlurs batch!
+        let scene_shared = build_scene(false, false);
+        let scene_split = build_scene(true, false);
+        assert_eq!(
+            scene_shared.backdrop_blurs[0].order,
+            scene_shared.backdrop_blurs[1].order,
+            "sanity: non-overlapping header and bar should share a batch"
+        );
+        assert!(
+            scene_split.backdrop_blurs[1].order > scene_split.backdrop_blurs[0].order,
+            "sanity: bar overlapping higher-order quad should split into its own batch"
+        );
+        let img_shared = headless
+            .render_scene_to_image(&scene_shared, size)
+            .expect("render shared batch");
+        let img_split = headless
+            .render_scene_to_image(&scene_split, size)
+            .expect("render split batch");
+
+        let mut max_diff = 0u8;
+        for y in 156..208 {
+            for x in 80..240 {
+                let a = img_shared.get_pixel(x, y);
+                let b = img_split.get_pixel(x, y);
+                for c in 0..4 {
+                    max_diff = max_diff.max(a[c].abs_diff(b[c]));
+                }
+            }
+        }
+        assert_eq!(
+            max_diff, 0,
+            "LiquidGlass 6px bar flashed/changed blur radius when grouped with 18px header vs separate batch (max channel diff={max_diff})"
+        );
+
+        // 2. Overlapping BackdropBlur primitives (Floating Bar over Crystal Lens) must NEVER
+        //    share a DrawOrder even with zero intermediate quads between them.
+        let scene_overlap = build_scene(false, true);
+        let lens_order = scene_overlap.backdrop_blurs[1].order;
+        let bar_order = scene_overlap.backdrop_blurs[2].order;
+        assert!(
+            bar_order > lens_order,
+            "overlapping LiquidGlass bar (order={bar_order}) must strictly sort after underlying lens (order={lens_order})"
+        );
     }
 
     #[test]
