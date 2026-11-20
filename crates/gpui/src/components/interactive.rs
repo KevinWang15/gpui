@@ -15,6 +15,7 @@ use crate::{
 };
 
 use super::button::ButtonVariant;
+use super::cursor_blink::{CursorBlink, is_mounted_and_focused};
 use super::layout::focus_ring_shadow;
 use super::palette;
 use super::theme::{ActiveTheme, ComponentSize, ThemeMode, tabular_numerals};
@@ -606,6 +607,7 @@ pub struct PinInputState {
     invalid: bool,
     disabled: bool,
     size: ComponentSize,
+    blink: CursorBlink,
     frame_style: StyleRefinement,
 }
 
@@ -631,8 +633,26 @@ impl PinInputState {
             invalid: false,
             disabled: false,
             size: ComponentSize::Lg,
+            blink: CursorBlink::new(),
             frame_style: StyleRefinement::default(),
         }
+    }
+
+    fn should_blink_cursor(&self, window: &Window) -> bool {
+        !self.disabled
+            && self.focus_handle.is_focused(window)
+            && window.is_window_active()
+            && self
+                .chars
+                .get(self.active_index)
+                .copied()
+                .flatten()
+                .is_none()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn blink(&self) -> &CursorBlink {
+        &self.blink
     }
 
     /// Allows ASCII letters as well as digits (default `false`, digits only).
@@ -663,6 +683,9 @@ impl PinInputState {
     pub fn set_disabled(&mut self, disabled: bool, cx: &mut Context<Self>) {
         if self.disabled != disabled {
             self.disabled = disabled;
+            if disabled {
+                self.blink.stop();
+            }
             cx.notify();
         }
     }
@@ -697,6 +720,7 @@ impl PinInputState {
             }
         }
         self.active_index = idx.min(self.length - 1);
+        self.blink.reset(cx);
         self.emit_after_mutation(cx);
     }
 
@@ -705,6 +729,7 @@ impl PinInputState {
         let had_any = self.chars.iter().any(Option::is_some);
         self.chars.fill(None);
         self.active_index = 0;
+        self.blink.reset(cx);
         if had_any {
             self.emit_after_mutation(cx);
         } else {
@@ -768,6 +793,7 @@ impl PinInputState {
             cursor += 1;
         }
         self.active_index = cursor.min(self.length - 1);
+        self.blink.reset(cx);
         self.emit_after_mutation(cx);
     }
 
@@ -794,41 +820,53 @@ impl PinInputState {
         match key {
             "backspace" => {
                 let mut mutated = false;
+                let mut moved = false;
                 if self.chars[self.active_index].take().is_some() {
                     mutated = true;
                 } else if self.active_index > 0 {
                     self.active_index -= 1;
+                    moved = true;
                     mutated = self.chars[self.active_index].take().is_some();
-                    cx.notify();
                 }
+                let woke = self.blink.reset(cx);
                 if mutated {
                     self.emit_after_mutation(cx);
+                } else if moved || woke {
+                    cx.notify();
                 }
                 cx.stop_propagation();
             }
             "delete" => {
-                if self.chars[self.active_index].take().is_some() {
+                let mutated = self.chars[self.active_index].take().is_some();
+                let woke = self.blink.reset(cx);
+                if mutated {
                     self.emit_after_mutation(cx);
+                } else if woke {
+                    cx.notify();
                 }
                 cx.stop_propagation();
             }
             "left" => {
                 self.active_index = self.active_index.saturating_sub(1);
+                self.blink.reset(cx);
                 cx.notify();
                 cx.stop_propagation();
             }
             "right" => {
                 self.active_index = (self.active_index + 1).min(self.length - 1);
+                self.blink.reset(cx);
                 cx.notify();
                 cx.stop_propagation();
             }
             "home" => {
                 self.active_index = 0;
+                self.blink.reset(cx);
                 cx.notify();
                 cx.stop_propagation();
             }
             "end" => {
                 self.active_index = self.length - 1;
+                self.blink.reset(cx);
                 cx.notify();
                 cx.stop_propagation();
             }
@@ -844,6 +882,7 @@ impl PinInputState {
                     if self.active_index + 1 < self.length {
                         self.active_index += 1;
                     }
+                    self.blink.reset(cx);
                     self.emit_after_mutation(cx);
                     cx.stop_propagation();
                 }
@@ -856,6 +895,18 @@ impl Render for PinInputState {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let focused = self.focus_handle.is_focused(window);
+        let should_blink = self.should_blink_cursor(window) && !cx.reduce_motion();
+        self.blink.sync(
+            should_blink,
+            window,
+            cx,
+            |this| &mut this.blink,
+            |this, window, _cx| {
+                is_mounted_and_focused(&this.focus_handle, window)
+                    && this.should_blink_cursor(window)
+            },
+        );
+        let show_caret = window.is_window_active() && self.blink.is_visible();
         let (box_w, box_h, font_px) = match self.size {
             ComponentSize::Xs => (px(30.), px(34.), px(14.)),
             ComponentSize::Sm => (px(36.), px(40.), px(16.)),
@@ -926,6 +977,7 @@ impl Render for PinInputState {
                         MouseButton::Left,
                         cx.listener(move |this, _, window, cx| {
                             this.active_index = idx;
+                            this.blink.reset(cx);
                             window.focus(&this.focus_handle, cx);
                             cx.notify();
                         }),
@@ -939,7 +991,7 @@ impl Render for PinInputState {
                         .w(px(2.))
                         .h(font_px)
                         .rounded_full()
-                        .bg(theme.primary)
+                        .when(show_caret, |el| el.bg(theme.primary))
                         .into_any_element()
                 } else {
                     div()

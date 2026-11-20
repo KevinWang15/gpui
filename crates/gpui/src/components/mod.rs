@@ -20,6 +20,7 @@ pub mod color_picker;
 pub mod combobox;
 pub mod command_palette;
 pub mod context_menu;
+pub(crate) mod cursor_blink;
 pub mod date_time_picker;
 pub mod descriptions;
 pub mod dialog;

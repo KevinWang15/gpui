@@ -16,6 +16,7 @@ use crate::{
     relative, size,
 };
 
+use super::cursor_blink::{CursorBlink, is_mounted_and_focused};
 use super::input::{clamp_char_boundary, is_word_char};
 use super::layout::focus_ring_shadow;
 use super::theme::ActiveTheme;
@@ -154,6 +155,7 @@ pub struct TextBoxState {
     undo_stack: Vec<UndoEntry>,
     redo_stack: Vec<UndoEntry>,
     was_focused: bool,
+    blink: CursorBlink,
     frame_style: StyleRefinement,
 }
 
@@ -192,8 +194,21 @@ impl TextBoxState {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             was_focused: false,
+            blink: CursorBlink::new(),
             frame_style: StyleRefinement::default(),
         }
+    }
+
+    fn should_blink_cursor(&self, window: &Window) -> bool {
+        !self.disabled
+            && self.focus_handle.is_focused(window)
+            && window.is_window_active()
+            && self.selected_range.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn blink(&self) -> &CursorBlink {
+        &self.blink
     }
 
     /// Sets initial text content.
@@ -268,6 +283,7 @@ impl TextBoxState {
         self.selection_reversed = false;
         self.marked_range = None;
         self.preferred_x = None;
+        self.blink.reset(cx);
         cx.emit(TextBoxEvent::Change(SharedString::from(
             self.content.clone(),
         )));
@@ -325,6 +341,7 @@ impl TextBoxState {
         if reset_x {
             self.preferred_x = None;
         }
+        self.blink.reset(cx);
         window.notify_text_selection_changed(&self.focus_handle);
         cx.notify();
     }
@@ -343,6 +360,7 @@ impl TextBoxState {
         if reset_x {
             self.preferred_x = None;
         }
+        self.blink.reset(cx);
         window.notify_text_selection_changed(&self.focus_handle);
         cx.notify();
     }
@@ -557,6 +575,9 @@ impl TextBoxState {
         if self.selected_range.is_empty() {
             let prev = self.previous_boundary(self.cursor_offset());
             if prev == self.cursor_offset() {
+                if self.blink.reset(cx) {
+                    cx.notify();
+                }
                 return;
             }
             self.select_to(prev, true, window, cx);
@@ -571,6 +592,9 @@ impl TextBoxState {
         if self.selected_range.is_empty() {
             let next = self.next_boundary(self.cursor_offset());
             if next == self.cursor_offset() {
+                if self.blink.reset(cx) {
+                    cx.notify();
+                }
                 return;
             }
             self.select_to(next, true, window, cx);
@@ -638,6 +662,7 @@ impl TextBoxState {
             self.selected_range = entry.selected_range;
             self.selection_reversed = entry.selection_reversed;
             self.marked_range = None;
+            self.blink.reset(cx);
             window.notify_text_input_changed(&self.focus_handle);
             cx.emit(TextBoxEvent::Change(SharedString::from(
                 self.content.clone(),
@@ -660,6 +685,7 @@ impl TextBoxState {
             self.selected_range = entry.selected_range;
             self.selection_reversed = entry.selection_reversed;
             self.marked_range = None;
+            self.blink.reset(cx);
             window.notify_text_input_changed(&self.focus_handle);
             cx.emit(TextBoxEvent::Change(SharedString::from(
                 self.content.clone(),
@@ -686,6 +712,7 @@ impl TextBoxState {
             let range = self.line_ranges()[line_idx].clone();
             self.selected_range = range;
             self.selection_reversed = false;
+            self.blink.reset(cx);
             window.notify_text_selection_changed(&self.focus_handle);
             cx.notify();
         } else if event.modifiers.shift {
@@ -763,6 +790,7 @@ impl EntityInputHandler for TextBoxState {
         self.selected_range = self.range_from_utf16(&range_utf16);
         self.selection_reversed = false;
         self.preferred_x = None;
+        self.blink.reset(cx);
         window.notify_text_selection_changed(&self.focus_handle);
         cx.notify();
     }
@@ -787,6 +815,7 @@ impl EntityInputHandler for TextBoxState {
 
     fn unmark_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.marked_range = None;
+        self.blink.reset(cx);
         window.notify_text_input_changed(&self.focus_handle);
         cx.notify();
     }
@@ -826,6 +855,7 @@ impl EntityInputHandler for TextBoxState {
         self.selection_reversed = false;
         self.marked_range = None;
         self.preferred_x = None;
+        self.blink.reset(cx);
         window.notify_text_input_changed(&self.focus_handle);
         cx.emit(TextBoxEvent::Change(SharedString::from(
             self.content.clone(),
@@ -868,6 +898,7 @@ impl EntityInputHandler for TextBoxState {
             .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
         self.selection_reversed = false;
         self.preferred_x = None;
+        self.blink.reset(cx);
         window.notify_text_input_changed(&self.focus_handle);
         cx.emit(TextBoxEvent::Change(SharedString::from(
             self.content.clone(),
@@ -1161,9 +1192,13 @@ impl Element for MultiLineTextElement {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let (focus_handle, disabled) = {
+        let (focus_handle, disabled, cursor_visible) = {
             let state = self.state.read(cx);
-            (state.focus_handle.clone(), state.disabled)
+            (
+                state.focus_handle.clone(),
+                state.disabled,
+                state.blink.is_visible(),
+            )
         };
         let focused = !disabled && focus_handle.is_focused(window);
         if focused {
@@ -1204,8 +1239,9 @@ impl Element for MultiLineTextElement {
             }
         }
 
-        if focus_handle.is_focused(window)
-            && !disabled
+        if focused
+            && window.is_window_active()
+            && cursor_visible
             && let Some(cursor) = prepaint.cursor.take()
         {
             window.paint_quad(cursor);
@@ -1245,6 +1281,17 @@ impl Render for TextBoxState {
                 TextBoxEvent::Blur
             });
         }
+        let should_blink = self.should_blink_cursor(window) && !cx.reduce_motion();
+        self.blink.sync(
+            should_blink,
+            window,
+            cx,
+            |this| &mut this.blink,
+            |this, window, _cx| {
+                is_mounted_and_focused(&this.focus_handle, window)
+                    && this.should_blink_cursor(window)
+            },
+        );
 
         let border_color = if self.invalid {
             theme.destructive
