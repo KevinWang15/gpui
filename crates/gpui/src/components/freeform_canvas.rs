@@ -1472,6 +1472,7 @@ pub fn freeform_canvas(
         canvas_radius: px(10.),
         canvas_bg: None,
         canvas_border: None,
+        canvas_backdrop_blur: px(0.),
         items: Vec::new(),
         empty: None,
         style: StyleRefinement::default(),
@@ -1489,6 +1490,7 @@ pub struct FreeformCanvas {
     canvas_radius: Pixels,
     canvas_bg: Option<Hsla>,
     canvas_border: Option<Hsla>,
+    canvas_backdrop_blur: Pixels,
     items: Vec<CanvasItemSpec>,
     empty: Option<AnyElement>,
     style: StyleRefinement,
@@ -1523,6 +1525,13 @@ impl FreeformCanvas {
     /// Overrides the canvas border color (defaults to `theme.border`).
     pub fn canvas_border(mut self, color: Hsla) -> Self {
         self.canvas_border = Some(color);
+        self
+    }
+
+    /// Applies a GPU backdrop blur behind the canvas frame (useful for previewing
+    /// translucent surfaces over a backdrop).
+    pub fn canvas_backdrop_blur(mut self, radius: impl Into<Pixels>) -> Self {
+        self.canvas_backdrop_blur = radius.into();
         self
     }
 
@@ -1884,6 +1893,9 @@ impl RenderOnce for FreeformCanvas {
             .w(px(cw))
             .h(px(ch))
             .rounded(self.canvas_radius)
+            .when(self.canvas_backdrop_blur > px(0.), |el| {
+                el.backdrop_blur(self.canvas_backdrop_blur)
+            })
             .bg(canvas_bg)
             .border_1()
             .border_color(if active_canvas_resize.is_some() {
