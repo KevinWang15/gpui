@@ -706,6 +706,19 @@ fn calendar_date_and_time_range_arithmetic() {
     assert_eq!(zoomed.span_days(), 60);
     assert_eq!(zoomed.end, nov19);
     assert_eq!(zoomed.zoom_out(nov19, 92).span_days(), 92);
+
+    // Year-to-date and sub-day hourly presets
+    let ytd = TimeRangePreset::YearToDate.resolve(nov19, 366);
+    assert_eq!(ytd.start, CalendarDate::new(2026, 1, 1));
+    assert_eq!(ytd.end, nov19);
+    assert_eq!(TimeRangePreset::LastHour.duration_hours(), Some(1));
+    assert_eq!(TimeRangePreset::Last6Hours.duration_hours(), Some(6));
+    assert_eq!(TimeRangePreset::Last24Hours.duration_hours(), Some(24));
+    assert_eq!(
+        TimeRangePreset::QuickRelative(12, TimeRangeUnit::Hours).duration_hours(),
+        Some(12)
+    );
+    assert_eq!(TimeRangePreset::Last7Days.duration_hours(), None);
 }
 
 #[test]
