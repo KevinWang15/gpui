@@ -10,7 +10,7 @@ use crate::{
     TextAlign, TextRun, Window, div, fill, point, prelude::*, px, quad, size,
 };
 
-use crate::components::palette as tw;
+use crate::components::palette;
 use crate::components::theme::{ActiveTheme, Theme, ThemeMode, tabular_numerals};
 
 /// Categorical series color palette automatically tuned for Light and Dark themes.
@@ -38,8 +38,8 @@ impl ChartPalette {
             theme.chart_colors.clone()
         };
         let crosshair = match theme.mode {
-            ThemeMode::Light => Hsla::from(tw::SLATE_900).opacity(0.08),
-            ThemeMode::Dark => Hsla::from(tw::WHITE).opacity(0.07),
+            ThemeMode::Light => Hsla::from(palette::SLATE_900).opacity(0.08),
+            ThemeMode::Dark => Hsla::from(palette::WHITE).opacity(0.07),
         };
         Self {
             colors,

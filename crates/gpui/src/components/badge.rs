@@ -7,7 +7,7 @@ use crate::{
     StyleRefinement, Styled, Window, div, prelude::*, px,
 };
 
-use super::palette as tw;
+use super::palette;
 use super::theme::{ActiveTheme, Theme, ThemeMode};
 
 /// Color themes for [`Badge`].
@@ -127,136 +127,136 @@ impl Badge {
             BadgeColor::Gray => {
                 if dark {
                     (
-                        Hsla::from(tw::SLATE_400).opacity(0.15),
-                        tw::SLATE_300.into(),
-                        tw::SLATE_600.into(),
-                        tw::SLATE_400.into(),
+                        Hsla::from(palette::SLATE_400).opacity(0.15),
+                        palette::SLATE_300.into(),
+                        palette::SLATE_600.into(),
+                        palette::SLATE_400.into(),
                     )
                 } else {
                     (
-                        tw::SLATE_100.into(),
-                        tw::SLATE_700.into(),
-                        tw::SLATE_700.into(),
-                        tw::SLATE_500.into(),
+                        palette::SLATE_100.into(),
+                        palette::SLATE_700.into(),
+                        palette::SLATE_700.into(),
+                        palette::SLATE_500.into(),
                     )
                 }
             }
             BadgeColor::Indigo => {
                 if dark {
                     (
-                        Hsla::from(tw::INDIGO_400).opacity(0.16),
-                        tw::INDIGO_300.into(),
-                        tw::INDIGO_600.into(),
-                        tw::INDIGO_400.into(),
+                        Hsla::from(palette::INDIGO_400).opacity(0.16),
+                        palette::INDIGO_300.into(),
+                        palette::INDIGO_600.into(),
+                        palette::INDIGO_400.into(),
                     )
                 } else {
                     (
-                        tw::INDIGO_50.into(),
-                        tw::INDIGO_700.into(),
-                        tw::INDIGO_600.into(),
-                        tw::INDIGO_500.into(),
+                        palette::INDIGO_50.into(),
+                        palette::INDIGO_700.into(),
+                        palette::INDIGO_600.into(),
+                        palette::INDIGO_500.into(),
                     )
                 }
             }
             BadgeColor::Blue => {
                 if dark {
                     (
-                        Hsla::from(tw::BLUE_400).opacity(0.16),
-                        tw::BLUE_300.into(),
-                        tw::BLUE_600.into(),
-                        tw::BLUE_400.into(),
+                        Hsla::from(palette::BLUE_400).opacity(0.16),
+                        palette::BLUE_300.into(),
+                        palette::BLUE_600.into(),
+                        palette::BLUE_400.into(),
                     )
                 } else {
                     (
-                        tw::BLUE_50.into(),
-                        tw::BLUE_700.into(),
-                        tw::BLUE_600.into(),
-                        tw::BLUE_500.into(),
+                        palette::BLUE_50.into(),
+                        palette::BLUE_700.into(),
+                        palette::BLUE_600.into(),
+                        palette::BLUE_500.into(),
                     )
                 }
             }
             BadgeColor::Green => {
                 if dark {
                     (
-                        Hsla::from(tw::EMERALD_400).opacity(0.16),
-                        tw::EMERALD_300.into(),
-                        tw::EMERALD_600.into(),
-                        tw::EMERALD_400.into(),
+                        Hsla::from(palette::EMERALD_400).opacity(0.16),
+                        palette::EMERALD_300.into(),
+                        palette::EMERALD_600.into(),
+                        palette::EMERALD_400.into(),
                     )
                 } else {
                     (
-                        tw::EMERALD_50.into(),
-                        tw::EMERALD_700.into(),
-                        tw::EMERALD_600.into(),
-                        tw::EMERALD_500.into(),
+                        palette::EMERALD_50.into(),
+                        palette::EMERALD_700.into(),
+                        palette::EMERALD_600.into(),
+                        palette::EMERALD_500.into(),
                     )
                 }
             }
             BadgeColor::Amber => {
                 if dark {
                     (
-                        Hsla::from(tw::AMBER_400).opacity(0.16),
-                        tw::AMBER_300.into(),
-                        tw::AMBER_600.into(),
-                        tw::AMBER_400.into(),
+                        Hsla::from(palette::AMBER_400).opacity(0.16),
+                        palette::AMBER_300.into(),
+                        palette::AMBER_600.into(),
+                        palette::AMBER_400.into(),
                     )
                 } else {
                     (
-                        tw::AMBER_50.into(),
-                        tw::AMBER_800.into(),
-                        tw::AMBER_500.into(),
-                        tw::AMBER_500.into(),
+                        palette::AMBER_50.into(),
+                        palette::AMBER_800.into(),
+                        palette::AMBER_500.into(),
+                        palette::AMBER_500.into(),
                     )
                 }
             }
             BadgeColor::Red => {
                 if dark {
                     (
-                        Hsla::from(tw::RED_400).opacity(0.16),
-                        tw::RED_300.into(),
-                        tw::RED_600.into(),
-                        tw::RED_400.into(),
+                        Hsla::from(palette::RED_400).opacity(0.16),
+                        palette::RED_300.into(),
+                        palette::RED_600.into(),
+                        palette::RED_400.into(),
                     )
                 } else {
                     (
-                        tw::RED_50.into(),
-                        tw::RED_700.into(),
-                        tw::RED_600.into(),
-                        tw::RED_500.into(),
+                        palette::RED_50.into(),
+                        palette::RED_700.into(),
+                        palette::RED_600.into(),
+                        palette::RED_500.into(),
                     )
                 }
             }
             BadgeColor::Purple => {
                 if dark {
                     (
-                        Hsla::from(tw::PURPLE_400).opacity(0.16),
-                        tw::PURPLE_300.into(),
-                        tw::PURPLE_600.into(),
-                        tw::PURPLE_400.into(),
+                        Hsla::from(palette::PURPLE_400).opacity(0.16),
+                        palette::PURPLE_300.into(),
+                        palette::PURPLE_600.into(),
+                        palette::PURPLE_400.into(),
                     )
                 } else {
                     (
-                        tw::PURPLE_50.into(),
-                        tw::PURPLE_700.into(),
-                        tw::PURPLE_600.into(),
-                        tw::PURPLE_500.into(),
+                        palette::PURPLE_50.into(),
+                        palette::PURPLE_700.into(),
+                        palette::PURPLE_600.into(),
+                        palette::PURPLE_500.into(),
                     )
                 }
             }
             BadgeColor::Pink => {
                 if dark {
                     (
-                        Hsla::from(tw::PINK_400).opacity(0.16),
-                        tw::PINK_300.into(),
-                        tw::PINK_600.into(),
-                        tw::PINK_400.into(),
+                        Hsla::from(palette::PINK_400).opacity(0.16),
+                        palette::PINK_300.into(),
+                        palette::PINK_600.into(),
+                        palette::PINK_400.into(),
                     )
                 } else {
                     (
-                        tw::PINK_50.into(),
-                        tw::PINK_700.into(),
-                        tw::PINK_600.into(),
-                        tw::PINK_500.into(),
+                        palette::PINK_50.into(),
+                        palette::PINK_700.into(),
+                        palette::PINK_600.into(),
+                        palette::PINK_500.into(),
                     )
                 }
             }
@@ -264,7 +264,12 @@ impl Badge {
 
         match self.variant {
             BadgeVariant::Soft => (soft_bg, soft_fg, dot_color.opacity(0.25), dot_color),
-            BadgeVariant::Solid => (solid_bg, tw::WHITE.into(), solid_bg, tw::WHITE.into()),
+            BadgeVariant::Solid => (
+                solid_bg,
+                palette::WHITE.into(),
+                solid_bg,
+                palette::WHITE.into(),
+            ),
             BadgeVariant::Outline => (
                 crate::transparent_black(),
                 soft_fg,

@@ -13,7 +13,7 @@ use crate::{
     Window, div, ease_out_quint, prelude::*, px,
 };
 
-use super::palette as tw;
+use super::palette;
 use super::theme::{ANIM_NORMAL, ActiveTheme, focus_ring_shadow};
 
 const MIN_AUTOPLAY_INTERVAL: Duration = Duration::from_millis(100);
@@ -295,8 +295,8 @@ impl RenderOnce for Carousel {
                 .into_any_element()
         };
 
-        let arrow_bg = crate::Hsla::from(tw::SLATE_900).opacity(0.62);
-        let arrow_hover = crate::Hsla::from(tw::SLATE_900).opacity(0.84);
+        let arrow_bg = crate::Hsla::from(palette::SLATE_900).opacity(0.62);
+        let arrow_hover = crate::Hsla::from(palette::SLATE_900).opacity(0.84);
 
         let mut root = div()
             .id(self.id)
@@ -361,7 +361,7 @@ impl RenderOnce for Carousel {
                         .h(px(32.))
                         .rounded_full()
                         .bg(arrow_bg)
-                        .text_color(tw::WHITE)
+                        .text_color(palette::WHITE)
                         .when(can_prev, |el| {
                             el.cursor_pointer()
                                 .hover(move |s| s.bg(arrow_hover))
@@ -386,7 +386,7 @@ impl RenderOnce for Carousel {
                         .h(px(32.))
                         .rounded_full()
                         .bg(arrow_bg)
-                        .text_color(tw::WHITE)
+                        .text_color(palette::WHITE)
                         .when(can_next, |el| {
                             el.cursor_pointer()
                                 .hover(move |s| s.bg(arrow_hover))
@@ -417,7 +417,7 @@ impl RenderOnce for Carousel {
                                 .px(px(6.))
                                 .py(px(2.))
                                 .rounded_full()
-                                .bg(crate::Hsla::from(tw::SLATE_950).opacity(0.38))
+                                .bg(crate::Hsla::from(palette::SLATE_950).opacity(0.38))
                                 .children((0..slide_count).map(move |i| {
                                     let is_active = i == active_idx;
                                     let st_i = st_dots.clone();
@@ -438,9 +438,9 @@ impl RenderOnce for Carousel {
                                                 .w(if is_active { px(20.) } else { px(6.) })
                                                 .rounded_full()
                                                 .bg(if is_active {
-                                                    crate::Hsla::from(tw::WHITE)
+                                                    crate::Hsla::from(palette::WHITE)
                                                 } else {
-                                                    crate::Hsla::from(tw::WHITE).opacity(0.45)
+                                                    crate::Hsla::from(palette::WHITE).opacity(0.45)
                                                 }),
                                         )
                                 })),

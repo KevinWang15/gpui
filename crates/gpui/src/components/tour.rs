@@ -15,7 +15,7 @@ use crate::{
 };
 
 use super::button::button;
-use super::palette as tw;
+use super::palette;
 use super::theme::{ANIM_FAST, ActiveTheme, ComponentSize, tabular_numerals};
 
 /// Descriptor for a single step in an interactive [`Tour`].
@@ -354,7 +354,7 @@ impl Render for TourState {
         let is_first = idx == 0;
         let is_last = idx + 1 == total;
         let vp = window.viewport_size();
-        let scrim = crate::Hsla::from(tw::SLATE_950).opacity(0.58);
+        let scrim = crate::Hsla::from(palette::SLATE_950).opacity(0.58);
         let pad = self.spotlight_padding.0;
 
         // Only honor targets actually mounted in the current/previous frame and intersecting the viewport.

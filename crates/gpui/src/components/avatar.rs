@@ -9,7 +9,7 @@ use crate::{
     SharedString, StyleRefinement, Styled, Window, div, prelude::*, px,
 };
 
-use super::palette as tw;
+use super::palette;
 use super::theme::{ActiveTheme, ComponentSize};
 
 /// Presence status dot displayed at the bottom-right corner of an [`Avatar`].
@@ -28,10 +28,10 @@ pub enum AvatarStatus {
 impl AvatarStatus {
     fn color(self) -> Hsla {
         match self {
-            Self::Online => tw::EMERALD_500.into(),
-            Self::Away => tw::AMBER_400.into(),
-            Self::Busy => tw::RED_500.into(),
-            Self::Offline => tw::SLATE_400.into(),
+            Self::Online => palette::EMERALD_500.into(),
+            Self::Away => palette::AMBER_400.into(),
+            Self::Busy => palette::RED_500.into(),
+            Self::Offline => palette::SLATE_400.into(),
         }
     }
 }
@@ -134,7 +134,7 @@ impl RenderOnce for Avatar {
         let (dim, font_size, dot_size) = self.dimensions();
         let bg = self.bg_color.unwrap_or(theme.primary_soft);
         let fg = if self.bg_color.is_some() {
-            tw::WHITE.into()
+            palette::WHITE.into()
         } else {
             theme.primary_soft_foreground
         };

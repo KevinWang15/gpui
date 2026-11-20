@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use gpui::components::palette as tw;
+use gpui::components::palette;
 use gpui::components::*;
 use gpui::icons::{Icon, IconSize, LucideIcon};
 use gpui::{Context, FontWeight, Hsla, div, prelude::*, px};
@@ -190,8 +190,8 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
                                     .items_center()
                                     .justify_center()
                                     .gap(px(8.))
-                                    .bg(Hsla::from(tw::INDIGO_600))
-                                    .text_color(tw::WHITE)
+                                    .bg(Hsla::from(palette::INDIGO_600))
+                                    .text_color(palette::WHITE)
                                     .child(Icon::new(LucideIcon::Sparkles).size(IconSize::TwoXl))
                                     .child(
                                         div()
@@ -202,7 +202,7 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
                                     .child(
                                         div()
                                             .text_size(px(13.))
-                                            .text_color(tw::INDIGO_100)
+                                            .text_color(palette::INDIGO_100)
                                             .child("Native frosted glass on both Linux WGPU and Windows DirectX 11."),
                                     ),
                             )
@@ -214,8 +214,8 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
                                     .items_center()
                                     .justify_center()
                                     .gap(px(8.))
-                                    .bg(Hsla::from(tw::EMERALD_600))
-                                    .text_color(tw::WHITE)
+                                    .bg(Hsla::from(palette::EMERALD_600))
+                                    .text_color(palette::WHITE)
                                     .child(Icon::new(LucideIcon::Zap).size(IconSize::TwoXl))
                                     .child(
                                         div()
@@ -226,7 +226,7 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
                                     .child(
                                         div()
                                             .text_size(px(13.))
-                                            .text_color(tw::EMERALD_100)
+                                            .text_color(palette::EMERALD_100)
                                             .child("Scene-level QuadAnimations & uniform_list virtualization."),
                                     ),
                             )
@@ -238,8 +238,8 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
                                     .items_center()
                                     .justify_center()
                                     .gap(px(8.))
-                                    .bg(Hsla::from(tw::ROSE_600))
-                                    .text_color(tw::WHITE)
+                                    .bg(Hsla::from(palette::ROSE_600))
+                                    .text_color(palette::WHITE)
                                     .child(Icon::new(LucideIcon::Layers).size(IconSize::TwoXl))
                                     .child(
                                         div()
@@ -250,7 +250,7 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
                                     .child(
                                         div()
                                             .text_size(px(13.))
-                                            .text_color(tw::ROSE_100)
+                                            .text_color(palette::ROSE_100)
                                             .child("Full Ant Design functional parity + native OS dialogs & toasts."),
                                     ),
                             ),

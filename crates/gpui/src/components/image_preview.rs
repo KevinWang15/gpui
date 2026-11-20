@@ -12,7 +12,7 @@ use crate::{
     prelude::*, px,
 };
 
-use super::palette as tw;
+use super::palette;
 use super::theme::{ANIM_FAST, ActiveTheme, tabular_numerals};
 
 /// Visual source rendered inside an [`ImagePreviewItem`].
@@ -339,9 +339,9 @@ impl Render for ImagePreviewState {
                                 .flex()
                                 .items_center()
                                 .justify_center()
-                                .bg(crate::Hsla::from(tw::SLATE_950).opacity(0.0))
+                                .bg(crate::Hsla::from(palette::SLATE_950).opacity(0.0))
                                 .group_hover("img-prev-card", |s| {
-                                    s.bg(crate::Hsla::from(tw::SLATE_950).opacity(0.42))
+                                    s.bg(crate::Hsla::from(palette::SLATE_950).opacity(0.42))
                                 })
                                 .child(
                                     div()
@@ -353,9 +353,9 @@ impl Render for ImagePreviewState {
                                         .px(px(8.))
                                         .py(px(4.))
                                         .rounded_full()
-                                        .bg(crate::Hsla::from(tw::SLATE_900).opacity(0.85))
+                                        .bg(crate::Hsla::from(palette::SLATE_900).opacity(0.85))
                                         .text_size(px(11.5))
-                                        .text_color(tw::WHITE)
+                                        .text_color(palette::WHITE)
                                         .child(Icon::new(LucideIcon::ZoomIn).size(IconSize::Xs))
                                         .child("Preview"),
                                 ),
@@ -400,16 +400,16 @@ impl Render for ImagePreviewState {
                     .w(px(32.))
                     .h(px(32.))
                     .rounded_full()
-                    .text_color(tw::SLATE_100)
+                    .text_color(palette::SLATE_100)
                     .when(!disabled, |el| {
                         el.cursor_pointer()
-                            .hover(|s| s.bg(crate::Hsla::from(tw::WHITE).opacity(0.16)))
+                            .hover(|s| s.bg(crate::Hsla::from(palette::WHITE).opacity(0.16)))
                     })
                     .when(disabled, |el| el.opacity(0.35).cursor_not_allowed())
                     .child(Icon::new(icon).size(IconSize::Sm))
             };
 
-            let scrim = crate::Hsla::from(tw::SLATE_950).opacity(0.72);
+            let scrim = crate::Hsla::from(palette::SLATE_950).opacity(0.72);
             let overlay =
                 div()
                     .id(("img-lightbox-backdrop", entity_id))
@@ -439,9 +439,9 @@ impl Render for ImagePreviewState {
                             .px(px(14.))
                             .py(px(10.))
                             .rounded(theme.radius_xl)
-                            .bg(crate::Hsla::from(tw::SLATE_900).opacity(0.78))
+                            .bg(crate::Hsla::from(palette::SLATE_900).opacity(0.78))
                             .border_1()
-                            .border_color(crate::Hsla::from(tw::WHITE).opacity(0.12))
+                            .border_color(crate::Hsla::from(palette::WHITE).opacity(0.12))
                             .on_any_mouse_down(cx.listener(|this, _, window, cx| {
                                 window.focus(&this.focus_handle, cx);
                                 cx.stop_propagation();
@@ -460,10 +460,10 @@ impl Render for ImagePreviewState {
                                             .px(px(8.))
                                             .py(px(2.))
                                             .rounded_full()
-                                            .bg(crate::Hsla::from(tw::WHITE).opacity(0.14))
+                                            .bg(crate::Hsla::from(palette::WHITE).opacity(0.14))
                                             .text_size(px(12.))
                                             .font_features(tabular_numerals())
-                                            .text_color(tw::SLATE_100)
+                                            .text_color(palette::SLATE_100)
                                             .child(format!("{} / {total}", idx + 1)),
                                     )
                                     .child(
@@ -472,7 +472,7 @@ impl Render for ImagePreviewState {
                                             .truncate()
                                             .text_size(px(14.))
                                             .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(tw::WHITE)
+                                            .text_color(palette::WHITE)
                                             .child(title),
                                     )
                                     .when_some(subtitle, |el, sub| {
@@ -481,7 +481,7 @@ impl Render for ImagePreviewState {
                                                 .min_w_0()
                                                 .truncate()
                                                 .text_size(px(12.5))
-                                                .text_color(tw::SLATE_300)
+                                                .text_color(palette::SLATE_300)
                                                 .child(sub),
                                         )
                                     }),
@@ -506,7 +506,7 @@ impl Render for ImagePreviewState {
                                         toolbar_btn("lb-prev", LucideIcon::ChevronLeft, false)
                                             .w(px(40.))
                                             .h(px(40.))
-                                            .bg(crate::Hsla::from(tw::SLATE_900).opacity(0.75))
+                                            .bg(crate::Hsla::from(palette::SLATE_900).opacity(0.75))
                                             .on_click(cx.listener(|this, _, _, cx| this.prev(cx))),
                                     )
                             }))
@@ -518,7 +518,7 @@ impl Render for ImagePreviewState {
                                     .overflow_scroll()
                                     .rounded(theme.radius_xl)
                                     .border_1()
-                                    .border_color(crate::Hsla::from(tw::WHITE).opacity(0.18))
+                                    .border_color(crate::Hsla::from(palette::WHITE).opacity(0.18))
                                     .shadow_2xl()
                                     .on_any_mouse_down(cx.listener(|this, _, window, cx| {
                                         window.focus(&this.focus_handle, cx);
@@ -534,7 +534,7 @@ impl Render for ImagePreviewState {
                                         toolbar_btn("lb-next", LucideIcon::ChevronRight, false)
                                             .w(px(40.))
                                             .h(px(40.))
-                                            .bg(crate::Hsla::from(tw::SLATE_900).opacity(0.75))
+                                            .bg(crate::Hsla::from(palette::SLATE_900).opacity(0.75))
                                             .on_click(cx.listener(|this, _, _, cx| this.next(cx))),
                                     )
                             })),
@@ -550,9 +550,9 @@ impl Render for ImagePreviewState {
                                 .px(px(12.))
                                 .py(px(6.))
                                 .rounded_full()
-                                .bg(crate::Hsla::from(tw::SLATE_900).opacity(0.84))
+                                .bg(crate::Hsla::from(palette::SLATE_900).opacity(0.84))
                                 .border_1()
-                                .border_color(crate::Hsla::from(tw::WHITE).opacity(0.14))
+                                .border_color(crate::Hsla::from(palette::WHITE).opacity(0.14))
                                 .on_any_mouse_down(cx.listener(|this, _, window, cx| {
                                     window.focus(&this.focus_handle, cx);
                                     cx.stop_propagation();
@@ -571,7 +571,7 @@ impl Render for ImagePreviewState {
                                         .text_center()
                                         .text_size(px(12.))
                                         .font_features(tabular_numerals())
-                                        .text_color(tw::SLATE_100)
+                                        .text_color(palette::SLATE_100)
                                         .child(format!("{zoom_pct}%")),
                                 )
                                 .child(
@@ -587,7 +587,7 @@ impl Render for ImagePreviewState {
                                         .w(px(1.))
                                         .h(px(18.))
                                         .mx(px(4.))
-                                        .bg(crate::Hsla::from(tw::WHITE).opacity(0.18)),
+                                        .bg(crate::Hsla::from(palette::WHITE).opacity(0.18)),
                                 )
                                 .child(
                                     toolbar_btn("lb-rot-l", LucideIcon::RotateCcw, false).on_click(
@@ -603,7 +603,7 @@ impl Render for ImagePreviewState {
                                     div()
                                         .text_size(px(11.5))
                                         .font_features(tabular_numerals())
-                                        .text_color(tw::SLATE_300)
+                                        .text_color(palette::SLATE_300)
                                         .px(px(4.))
                                         .child(format!("{}°", self.rotation_deg)),
                                 )

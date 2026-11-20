@@ -1,6 +1,6 @@
 //! Brand accent color presets for live playground theme switching.
 
-use gpui::components::{Theme, ThemeMode, palette as tw};
+use gpui::components::{Theme, ThemeMode, palette};
 use gpui::{Hsla, Rgba};
 
 /// Brand accent swatches selectable in the playground navbar.
@@ -41,13 +41,13 @@ impl AccentPreset {
 
     pub const fn swatch(self) -> Rgba {
         match self {
-            Self::Indigo => tw::INDIGO_600,
-            Self::Blue => tw::BLUE_600,
-            Self::Emerald => tw::EMERALD_600,
-            Self::Violet => tw::VIOLET_600,
-            Self::Rose => tw::ROSE_600,
-            Self::Amber => tw::AMBER_500,
-            Self::Slate => tw::SLATE_800,
+            Self::Indigo => palette::INDIGO_600,
+            Self::Blue => palette::BLUE_600,
+            Self::Emerald => palette::EMERALD_600,
+            Self::Violet => palette::VIOLET_600,
+            Self::Rose => palette::ROSE_600,
+            Self::Amber => palette::AMBER_500,
+            Self::Slate => palette::SLATE_800,
         }
     }
 
@@ -61,67 +61,67 @@ impl AccentPreset {
         let (p_light, p_light_h, p_soft_l, p_soft_fg_l, p_dark, p_dark_h, p_soft_fg_d) = match self
         {
             Self::Indigo => (
-                tw::INDIGO_600,
-                tw::INDIGO_700,
-                tw::INDIGO_50,
-                tw::INDIGO_700,
-                tw::INDIGO_500,
-                tw::INDIGO_400,
-                tw::INDIGO_300,
+                palette::INDIGO_600,
+                palette::INDIGO_700,
+                palette::INDIGO_50,
+                palette::INDIGO_700,
+                palette::INDIGO_500,
+                palette::INDIGO_400,
+                palette::INDIGO_300,
             ),
             Self::Blue => (
-                tw::BLUE_600,
-                tw::BLUE_700,
-                tw::BLUE_50,
-                tw::BLUE_700,
-                tw::BLUE_500,
-                tw::BLUE_400,
-                tw::BLUE_300,
+                palette::BLUE_600,
+                palette::BLUE_700,
+                palette::BLUE_50,
+                palette::BLUE_700,
+                palette::BLUE_500,
+                palette::BLUE_400,
+                palette::BLUE_300,
             ),
             Self::Emerald => (
-                tw::EMERALD_600,
-                tw::EMERALD_700,
-                tw::EMERALD_50,
-                tw::EMERALD_700,
-                tw::EMERALD_500,
-                tw::EMERALD_400,
-                tw::EMERALD_300,
+                palette::EMERALD_600,
+                palette::EMERALD_700,
+                palette::EMERALD_50,
+                palette::EMERALD_700,
+                palette::EMERALD_500,
+                palette::EMERALD_400,
+                palette::EMERALD_300,
             ),
             Self::Violet => (
-                tw::VIOLET_600,
-                tw::VIOLET_700,
-                tw::VIOLET_50,
-                tw::VIOLET_700,
-                tw::VIOLET_500,
-                tw::VIOLET_400,
-                tw::VIOLET_300,
+                palette::VIOLET_600,
+                palette::VIOLET_700,
+                palette::VIOLET_50,
+                palette::VIOLET_700,
+                palette::VIOLET_500,
+                palette::VIOLET_400,
+                palette::VIOLET_300,
             ),
             Self::Rose => (
-                tw::ROSE_600,
-                tw::ROSE_700,
-                tw::ROSE_50,
-                tw::ROSE_700,
-                tw::ROSE_500,
-                tw::ROSE_400,
-                tw::ROSE_300,
+                palette::ROSE_600,
+                palette::ROSE_700,
+                palette::ROSE_50,
+                palette::ROSE_700,
+                palette::ROSE_500,
+                palette::ROSE_400,
+                palette::ROSE_300,
             ),
             Self::Amber => (
-                tw::AMBER_600,
-                tw::AMBER_700,
-                tw::AMBER_50,
-                tw::AMBER_800,
-                tw::AMBER_500,
-                tw::AMBER_400,
-                tw::AMBER_300,
+                palette::AMBER_600,
+                palette::AMBER_700,
+                palette::AMBER_50,
+                palette::AMBER_800,
+                palette::AMBER_500,
+                palette::AMBER_400,
+                palette::AMBER_300,
             ),
             Self::Slate => (
-                tw::SLATE_900,
-                tw::SLATE_800,
-                tw::SLATE_100,
-                tw::SLATE_800,
-                tw::SLATE_200,
-                tw::SLATE_300,
-                tw::SLATE_200,
+                palette::SLATE_900,
+                palette::SLATE_800,
+                palette::SLATE_100,
+                palette::SLATE_800,
+                palette::SLATE_200,
+                palette::SLATE_300,
+                palette::SLATE_200,
             ),
         };
 
@@ -146,7 +146,7 @@ impl AccentPreset {
                 theme.primary = p_dark.into();
                 theme.primary_hover = p_dark_h.into();
                 if self == Self::Slate {
-                    theme.primary_foreground = tw::SLATE_950.into();
+                    theme.primary_foreground = palette::SLATE_950.into();
                 }
                 theme.primary_soft = Hsla::from(p_dark).opacity(0.18);
                 theme.primary_soft_foreground = p_soft_fg_d.into();

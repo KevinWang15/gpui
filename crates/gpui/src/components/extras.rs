@@ -22,7 +22,7 @@ use crate::{
     div, ease_out_quint, point, prelude::*, px, quad, transparent_black,
 };
 
-use super::palette as tw;
+use super::palette;
 use super::theme::{ANIM_FAST, ActiveTheme, focus_ring_shadow};
 use super::tooltip::Tooltip;
 
@@ -1414,8 +1414,10 @@ impl RenderOnce for QRCode {
             }
         });
         let matrix = cached_qr_matrix(&self.value, ecc);
-        let fg = self.fg_color.unwrap_or_else(|| Hsla::from(tw::SLATE_950));
-        let bg = self.bg_color.unwrap_or_else(|| Hsla::from(tw::WHITE));
+        let fg = self
+            .fg_color
+            .unwrap_or_else(|| Hsla::from(palette::SLATE_950));
+        let bg = self.bg_color.unwrap_or_else(|| Hsla::from(palette::WHITE));
 
         // Only draw center emblem when QR is large enough and sized <= 18% of symbol width.
         let show_icon = self.icon.filter(|_| self.size.0 >= 96.0);

@@ -3,7 +3,7 @@
 //! `CommandPalette`, `Drawer`, `ContextMenu`, drag-resizable `SplitPane`,
 //! `NumberInput`, `Stepper`, `Rating`, `CopyButton`, and segmented `PinInput`.
 
-use gpui::components::palette as tw;
+use gpui::components::palette;
 use gpui::components::*;
 use gpui::icons::{Icon, IconSize, LucideIcon};
 use gpui::{Context, FontWeight, Hsla, div, prelude::*, px};
@@ -382,7 +382,7 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
                                     spinner()
                                         .variant(SpinnerVariant::Loader)
                                         .size(IconSize::Xl)
-                                        .color(Hsla::from(tw::EMERALD_500))
+                                        .color(Hsla::from(palette::EMERALD_500))
                                         .vertical()
                                         .label("Loader"),
                                 ),
@@ -397,7 +397,7 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
                                     spinner()
                                         .variant(SpinnerVariant::Dots)
                                         .size(IconSize::TwoXl)
-                                        .color(Hsla::from(tw::VIOLET_500))
+                                        .color(Hsla::from(palette::VIOLET_500))
                                         .vertical()
                                         .label("Dots"),
                                 ),
@@ -412,7 +412,7 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
                                     spinner()
                                         .variant(SpinnerVariant::Bars)
                                         .size(IconSize::Xl)
-                                        .color(Hsla::from(tw::SKY_500))
+                                        .color(Hsla::from(palette::SKY_500))
                                         .vertical()
                                         .label("Bars"),
                                 ),
@@ -427,7 +427,7 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
                                     spinner()
                                         .variant(SpinnerVariant::Pulse)
                                         .size(IconSize::Xl)
-                                        .color(Hsla::from(tw::ROSE_500))
+                                        .color(Hsla::from(palette::ROSE_500))
                                         .vertical()
                                         .label("Pulse"),
                                 ),
@@ -485,7 +485,7 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
                                 .child(
                                     progress_ring(ring_pct)
                                         .size(ComponentSize::Sm)
-                                        .color(Hsla::from(tw::ROSE_500))
+                                        .color(Hsla::from(palette::ROSE_500))
                                         .show_percentage(false),
                                 ),
                         )
@@ -1039,7 +1039,7 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
                                         .child(
                                             rating("demo-rating-hearts", app.rating_hearts)
                                                 .icon(LucideIcon::Heart)
-                                                .color(Hsla::from(tw::ROSE_500))
+                                                .color(Hsla::from(palette::ROSE_500))
                                                 .size(IconSize::Md)
                                                 .show_value(true)
                                                 .on_change(cx.listener(|this, val, _, cx| {
@@ -1255,12 +1255,12 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
     ];
 
     let bar_colors = [
-        tw::INDIGO_500,
-        tw::EMERALD_500,
-        tw::AMBER_500,
-        tw::ROSE_500,
-        tw::SKY_500,
-        tw::VIOLET_500,
+        palette::INDIGO_500,
+        palette::EMERALD_500,
+        palette::AMBER_500,
+        palette::ROSE_500,
+        palette::SKY_500,
+        palette::VIOLET_500,
     ];
 
     let liquid_glass_section = card()

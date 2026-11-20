@@ -16,7 +16,7 @@ use crate::{
 
 use super::button::ButtonVariant;
 use super::layout::focus_ring_shadow;
-use super::palette as tw;
+use super::palette;
 use super::theme::{ActiveTheme, ComponentSize, ThemeMode, tabular_numerals};
 
 // ============================================================================
@@ -140,9 +140,9 @@ impl RenderOnce for Rating {
         let display_val = hovered.unwrap_or(self.value).min(self.max);
         let active_color = self.color.unwrap_or_else(|| {
             if theme.mode == ThemeMode::Dark {
-                Hsla::from(tw::AMBER_400)
+                Hsla::from(palette::AMBER_400)
             } else {
-                Hsla::from(tw::AMBER_500)
+                Hsla::from(palette::AMBER_500)
             }
         });
         let inactive_color = if theme.mode == ThemeMode::Dark {

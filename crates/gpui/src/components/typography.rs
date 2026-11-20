@@ -16,7 +16,7 @@ use crate::{
 use super::button::{ButtonVariant, button};
 use super::input::{Input, InputEvent, InputState};
 use super::interactive::copy_button;
-use super::palette as tw;
+use super::palette;
 use super::theme::{ActiveTheme, ComponentSize, ThemeMode, focus_ring_shadow, tabular_numerals};
 
 // ============================================================================
@@ -776,11 +776,11 @@ impl RenderOnce for CodeBlock {
         let theme = cx.theme();
         let is_dark = theme.mode == ThemeMode::Dark;
         let bg = if is_dark {
-            tw::SLATE_950
+            palette::SLATE_950
         } else {
-            tw::SLATE_900
+            palette::SLATE_900
         };
-        let header_bg = tw::SLATE_800;
+        let header_bg = palette::SLATE_800;
         let code_copy = self.code.clone();
         let ranges = Rc::new(line_byte_ranges(self.code.as_ref()));
         let line_count = ranges.len();
@@ -817,7 +817,7 @@ impl RenderOnce for CodeBlock {
                                 .px(px(12.))
                                 .text_size(px(12.5))
                                 .line_height(px(CODE_LINE_HEIGHT))
-                                .text_color(tw::SLATE_100)
+                                .text_color(palette::SLATE_100)
                                 .when_some(mono_font.clone(), |el, f| el.font_family(f))
                                 .when(show_nums, |el| {
                                     el.child(
@@ -826,7 +826,7 @@ impl RenderOnce for CodeBlock {
                                             .flex_shrink_0()
                                             .text_right()
                                             .font_features(tabular_numerals())
-                                            .text_color(tw::SLATE_500)
+                                            .text_color(palette::SLATE_500)
                                             .child(format!("{}", idx + 1)),
                                     )
                                 })
@@ -860,7 +860,7 @@ impl RenderOnce for CodeBlock {
                 .overflow_x_scroll()
                 .text_size(px(12.5))
                 .line_height(px(CODE_LINE_HEIGHT))
-                .text_color(tw::SLATE_100)
+                .text_color(palette::SLATE_100)
                 .when_some(mono_font, |el, f| el.font_family(f))
                 .children(ranges.iter().enumerate().map(|(idx, span)| {
                     let slice = &src[span.clone()];
@@ -881,7 +881,7 @@ impl RenderOnce for CodeBlock {
                                     .flex_shrink_0()
                                     .text_right()
                                     .font_features(tabular_numerals())
-                                    .text_color(tw::SLATE_500)
+                                    .text_color(palette::SLATE_500)
                                     .child(format!("{}", idx + 1)),
                             )
                         })
@@ -900,7 +900,7 @@ impl RenderOnce for CodeBlock {
             .border_color(if is_dark {
                 theme.border
             } else {
-                tw::SLATE_800.into()
+                palette::SLATE_800.into()
             })
             .overflow_hidden()
             .child(
@@ -921,13 +921,13 @@ impl RenderOnce for CodeBlock {
                             .child(
                                 Icon::new(LucideIcon::CodeXml)
                                     .size(IconSize::Sm)
-                                    .color(tw::INDIGO_400),
+                                    .color(palette::INDIGO_400),
                             )
                             .child(
                                 div()
                                     .text_size(px(12.))
                                     .font_weight(FontWeight::MEDIUM)
-                                    .text_color(tw::SLATE_200)
+                                    .text_color(palette::SLATE_200)
                                     .child(self.language.unwrap_or_else(|| "code".into())),
                             ),
                     )
@@ -935,8 +935,8 @@ impl RenderOnce for CodeBlock {
                         copy_button((self.id, "cb-copy"), code_copy)
                             .size(ComponentSize::Xs)
                             .variant(ButtonVariant::Ghost)
-                            .text_color(tw::SLATE_100)
-                            .hover_bg(tw::SLATE_700),
+                            .text_color(palette::SLATE_100)
+                            .hover_bg(palette::SLATE_700),
                     ),
             )
             .child(body_el);
