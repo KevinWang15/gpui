@@ -144,6 +144,293 @@ fn dnd_editor(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
         )
 }
 
+/// Renders one live widget inside the [`FreeformCanvas`] showcase.
+fn freeform_widget_view(kind: &str, theme: &Theme) -> impl IntoElement {
+    let (icon, accent, body): (LucideIcon, gpui::Hsla, gpui::AnyElement) = match kind {
+        "metric" => (
+            LucideIcon::DollarSign,
+            palette::INDIGO_500.into(),
+            v_stack()
+                .spacing(px(2.))
+                .child(div().text_size(px(10.5)).text_color(theme.muted_foreground).child("Today's spend"))
+                .child(
+                    div()
+                        .text_size(px(20.))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(theme.foreground)
+                        .child("$14.80"),
+                )
+                .into_any_element(),
+        ),
+        "badge" => (
+            LucideIcon::TrendingDown,
+            palette::EMERALD_500.into(),
+            badge("−18.4% vs avg")
+                .color(BadgeColor::Green)
+                .pill(true)
+                .into_any_element(),
+        ),
+        "chart" => {
+            let bars = [0.28_f32, 0.42, 0.36, 0.58, 0.62, 0.78, 0.92, 0.84];
+            let accent: gpui::Hsla = palette::INDIGO_500.into();
+            (
+                LucideIcon::ChartArea,
+                accent,
+                v_stack()
+                    .size_full()
+                    .justify_between()
+                    .child(div().text_size(px(10.5)).text_color(theme.muted_foreground).child("Hourly trend"))
+                    .child(
+                        h_stack()
+                            .flex_1()
+                            .items_end()
+                            .spacing(px(4.))
+                            .children(bars.into_iter().map(move |v| {
+                                div()
+                                    .flex_1()
+                                    .h(px((44.0 * v).max(6.0)))
+                                    .rounded_sm()
+                                    .bg(accent.opacity(0.75))
+                            })),
+                    )
+                    .into_any_element(),
+            )
+        }
+        "status" => (
+            LucideIcon::CircleDot,
+            palette::EMERALD_500.into(),
+            h_stack()
+                .spacing(px(6.))
+                .items_center()
+                .child(div().size(px(7.)).rounded_full().bg(palette::EMERALD_500))
+                .child(div().text_size(px(11.5)).text_color(theme.muted_foreground).child("Connected · live"))
+                .into_any_element(),
+        ),
+        _ => (
+            LucideIcon::Type,
+            palette::AMBER_500.into(),
+            div()
+                .text_size(px(12.))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(theme.foreground)
+                .truncate()
+                .child("Updated 14:42")
+                .into_any_element(),
+        ),
+    };
+    let _ = (icon, accent);
+    div()
+        .size_full()
+        .px(px(8.))
+        .py(px(4.))
+        .rounded(theme.radius_md)
+        .bg(theme.surface_muted.opacity(0.45))
+        .border_1()
+        .border_color(theme.border.opacity(0.7))
+        .flex()
+        .items_center()
+        .overflow_hidden()
+        .child(body)
+}
+
+/// Interactive showcase of [`FreeformCanvas`] + [`CanvasPaletteItem`]: drag new widgets from the
+/// palette onto a 2D canvas, move or resize them with magnetic auto-alignment guides, resize the
+/// canvas frame itself, and align selected widgets in one click.
+fn freeform_canvas_demo(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl IntoElement {
+    let theme = cx.theme().clone();
+    let snap_cfg = app.freeform_canvas.read(cx).current_snap();
+    let show_grid = app.freeform_canvas.read(cx).is_grid_visible();
+    let snap_on = snap_cfg.snap_to_guides || snap_cfg.snap_to_grid;
+    let selected = app.freeform_canvas.read(cx).selected().cloned();
+
+    let palette_specs: [(&str, &str, LucideIcon, (f32, f32)); 5] = [
+        ("metric", "KPI metric", LucideIcon::DollarSign, (148.0, 56.0)),
+        ("badge", "Trend pill", LucideIcon::TrendingDown, (112.0, 28.0)),
+        ("chart", "Mini chart", LucideIcon::ChartArea, (164.0, 84.0)),
+        ("status", "Live status", LucideIcon::CircleDot, (132.0, 24.0)),
+        ("note", "Caption", LucideIcon::Type, (124.0, 24.0)),
+    ];
+
+    let mut palette_col = v_stack().w(px(164.)).flex_none().spacing(px(8.)).child(label("Palette (drag)"));
+    for (kind, name, icon, default_size) in palette_specs {
+        let hover_bg = theme.surface_hover;
+        let chip = div()
+            .w_full()
+            .px(px(10.))
+            .py(px(8.))
+            .rounded(theme.radius_md)
+            .bg(theme.surface_muted.opacity(0.65))
+            .border_1()
+            .border_color(theme.border)
+            .hover(move |s| s.bg(hover_bg))
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .child(gpui::icons::Icon::new(icon).size(gpui::icons::IconSize::Xs).color(theme.primary))
+            .child(div().text_size(px(12.5)).font_weight(FontWeight::MEDIUM).child(name));
+
+        palette_col = palette_col.child(
+            canvas_palette_item(
+                format!("pg-fc-pal-{kind}"),
+                &app.freeform_canvas,
+                kind,
+                default_size,
+                chip,
+            )
+            .w_full(),
+        );
+    }
+
+    let mut fc = freeform_canvas("pg-freeform-canvas", &app.freeform_canvas)
+        .w_full()
+        .min_h(px(270.))
+        .canvas_size(app.freeform_size.width, app.freeform_size.height)
+        .canvas_limits(CanvasSize::new(160.0, 72.0), CanvasSize::new(520.0, 260.0))
+        .canvas_radius(theme.radius_lg)
+        .empty(
+            div()
+                .text_size(px(12.))
+                .text_color(theme.muted_foreground)
+                .child("Drag widgets from the left palette"),
+        );
+
+    for item in &app.freeform_items {
+        fc = fc.item(
+            CanvasItemSpec::new(
+                item.id.clone(),
+                item.rect,
+                freeform_widget_view(item.kind.as_ref(), &theme),
+            )
+            .min_size(64.0, 22.0),
+        );
+    }
+
+    let align_btn = |id: &'static str, icon: LucideIcon, tip: &'static str, action: AlignAction| {
+        button::Button::icon(id, icon)
+            .ghost()
+            .size(ComponentSize::Xs)
+            .disabled(selected.is_none())
+            .tooltip_text(tip)
+            .on_click(cx.listener(move |this, _, _, cx| this.align_freeform_selected(action, cx)))
+    };
+
+    card()
+        .child(
+            card_header().bordered().child(
+                h_stack()
+                    .justify_between()
+                    .flex_wrap()
+                    .gap(px(10.))
+                    .child(
+                        v_stack()
+                            .spacing(px(2.))
+                            .child(card_title("Freeform 2D Canvas (Drag, Resize & Auto-Align)"))
+                            .child(card_description(
+                                "Drag components from the palette, resize items (8 handles) or the canvas frame itself, and snap to sibling edges, centers, and uniform gaps. Hold Alt to move freely.",
+                            )),
+                    )
+                    .child(
+                        h_stack()
+                            .spacing(px(6.))
+                            .child(
+                                button("pg-fc-snap")
+                                    .size(ComponentSize::Xs)
+                                    .leading_icon(LucideIcon::Magnet)
+                                    .label(if snap_on { "Snap on" } else { "Snap off" })
+                                    .map(|b| if snap_on { b.soft() } else { b.outline() })
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        let mut cfg = this.freeform_canvas.read(cx).current_snap();
+                                        let next = !(cfg.snap_to_guides || cfg.snap_to_grid);
+                                        cfg.snap_to_guides = next;
+                                        cfg.snap_to_grid = next;
+                                        this.freeform_canvas.update(cx, |s, cx| s.set_snap(cfg, cx));
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                button("pg-fc-grid")
+                                    .size(ComponentSize::Xs)
+                                    .leading_icon(LucideIcon::Grid3x3)
+                                    .label("Grid")
+                                    .map(|b| if show_grid { b.soft() } else { b.outline() })
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        let next = !this.freeform_canvas.read(cx).is_grid_visible();
+                                        this.freeform_canvas
+                                            .update(cx, |s, cx| s.set_grid_visible(next, cx));
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                button("pg-fc-reset")
+                                    .outline()
+                                    .size(ComponentSize::Xs)
+                                    .leading_icon(LucideIcon::RotateCcw)
+                                    .label("Reset")
+                                    .on_click(cx.listener(|this, _, _, cx| this.reset_freeform_demo(cx))),
+                            ),
+                    ),
+            ),
+        )
+        .child(
+            card_content().child(
+                h_stack()
+                    .spacing(px(14.))
+                    .items_start()
+                    .child(palette_col)
+                    .child(
+                        v_stack()
+                            .flex_1()
+                            .min_w_0()
+                            .spacing(px(8.))
+                            .child(
+                                h_stack()
+                                    .justify_between()
+                                    .px(px(10.))
+                                    .py(px(6.))
+                                    .rounded(theme.radius_md)
+                                    .bg(theme.surface_muted.opacity(0.5))
+                                    .border_1()
+                                    .border_color(theme.border)
+                                    .child(
+                                        h_stack()
+                                            .spacing(px(4.))
+                                            .child(align_btn("pg-fc-al-l", LucideIcon::AlignStartVertical, "Align left", AlignAction::Left))
+                                            .child(align_btn("pg-fc-al-ch", LucideIcon::AlignCenterVertical, "Center horizontally", AlignAction::CenterHorizontal))
+                                            .child(align_btn("pg-fc-al-r", LucideIcon::AlignEndVertical, "Align right", AlignAction::Right))
+                                            .child(align_btn("pg-fc-al-t", LucideIcon::AlignStartHorizontal, "Align top", AlignAction::Top))
+                                            .child(align_btn("pg-fc-al-cv", LucideIcon::AlignCenterHorizontal, "Center vertically", AlignAction::CenterVertical))
+                                            .child(align_btn("pg-fc-al-b", LucideIcon::AlignEndHorizontal, "Align bottom", AlignAction::Bottom))
+                                            .child(align_btn("pg-fc-al-w", LucideIcon::MoveHorizontal, "Fill width", AlignAction::FillWidth))
+                                            .child(align_btn("pg-fc-al-g", LucideIcon::Grid3x3, "Snap to grid", AlignAction::SnapToGrid)),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(11.5))
+                                            .text_color(theme.muted_foreground)
+                                            .font_features(tabular_numerals())
+                                            .child(format!(
+                                                "Canvas {}×{} px · {} items",
+                                                app.freeform_size.width as i32,
+                                                app.freeform_size.height as i32,
+                                                app.freeform_items.len(),
+                                            )),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .w_full()
+                                    .rounded(theme.radius_lg)
+                                    .border_1()
+                                    .border_color(theme.border)
+                                    .bg(theme.background.opacity(0.6))
+                                    .overflow_hidden()
+                                    .child(fc),
+                            ),
+                    ),
+            ),
+        )
+}
+
 pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl IntoElement {
     let theme = cx.theme();
 
@@ -719,4 +1006,5 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
                 ),
         );
     page.child(dnd_editor(app, cx))
+        .child(freeform_canvas_demo(app, cx))
 }

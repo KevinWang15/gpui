@@ -70,7 +70,7 @@ impl Page {
             Self::Controls => "toggle switch checkbox indeterminate radio cards slider range",
             Self::Selection => "select listbox dropdown combobox autocomplete tags multiselect",
             Self::LayoutNavigation => {
-                "layout container grid stack scroll area scrollarea overflow scrollbar card divider tabs accordion disclosure breadcrumb pagination"
+                "layout container grid stack scroll area scrollarea overflow scrollbar card divider tabs accordion disclosure breadcrumb pagination drag drop freeform canvas snap align resize palette studio"
             }
             Self::OverlaysData => {
                 "dialog modal native os window popup popover dropdown menu toast notification tooltip table sort badge avatar alert progress spinner skeleton empty"
@@ -87,6 +87,14 @@ pub struct EventLogEntry {
     pub seq: usize,
     pub source: SharedString,
     pub detail: SharedString,
+}
+
+/// One placed widget inside the playground's [`FreeformCanvas`] showcase.
+#[derive(Clone, Debug)]
+pub struct FreeformDemoItem {
+    pub id: SharedString,
+    pub kind: SharedString,
+    pub rect: CanvasRect,
 }
 
 /// Sort column for the interactive Data Table page.
@@ -310,9 +318,133 @@ pub struct PlaygroundApp {
     /// (container, widget keys), in order.
     pub dnd_lists: Vec<(SharedString, Vec<SharedString>)>,
     pub dnd_preview: usize,
+
+    // Freeform 2D drag/resize/auto-align canvas showcase
+    pub freeform_canvas: Entity<FreeformCanvasState>,
+    pub freeform_items: Vec<FreeformDemoItem>,
+    pub freeform_size: CanvasSize,
+    pub freeform_next_seq: usize,
 }
 
 impl PlaygroundApp {
+    pub fn default_freeform_items() -> Vec<FreeformDemoItem> {
+        vec![
+            FreeformDemoItem {
+                id: "metric-1".into(),
+                kind: "metric".into(),
+                rect: CanvasRect::new(12.0, 12.0, 148.0, 56.0),
+            },
+            FreeformDemoItem {
+                id: "badge-1".into(),
+                kind: "badge".into(),
+                rect: CanvasRect::new(12.0, 76.0, 108.0, 28.0),
+            },
+            FreeformDemoItem {
+                id: "chart-1".into(),
+                kind: "chart".into(),
+                rect: CanvasRect::new(168.0, 12.0, 180.0, 92.0),
+            },
+            FreeformDemoItem {
+                id: "status-1".into(),
+                kind: "status".into(),
+                rect: CanvasRect::new(12.0, 114.0, 148.0, 24.0),
+            },
+            FreeformDemoItem {
+                id: "note-1".into(),
+                kind: "note".into(),
+                rect: CanvasRect::new(168.0, 114.0, 180.0, 24.0),
+            },
+        ]
+    }
+
+    pub fn apply_freeform_event(&mut self, ev: &FreeformCanvasEvent, cx: &mut Context<Self>) {
+        match ev {
+            FreeformCanvasEvent::Select(id) => {
+                if let Some(id) = id {
+                    self.log_event("FreeformCanvas", format!("Select({id})"), cx);
+                }
+            }
+            FreeformCanvasEvent::Move { id, rect } => {
+                if let Some(it) = self.freeform_items.iter_mut().find(|it| it.id == *id) {
+                    it.rect = *rect;
+                }
+                self.log_event(
+                    "FreeformCanvas",
+                    format!("Move {id} -> ({}, {})", rect.x as i32, rect.y as i32),
+                    cx,
+                );
+            }
+            FreeformCanvasEvent::Resize { id, rect, committed } => {
+                if let Some(it) = self.freeform_items.iter_mut().find(|it| it.id == *id) {
+                    it.rect = *rect;
+                }
+                if *committed {
+                    self.log_event(
+                        "FreeformCanvas",
+                        format!("Resize {id} -> {}×{}", rect.width as i32, rect.height as i32),
+                        cx,
+                    );
+                }
+            }
+            FreeformCanvasEvent::DropNew { kind, rect } => {
+                let seq = self.freeform_next_seq;
+                self.freeform_next_seq += 1;
+                let id: SharedString = format!("{kind}-{seq}").into();
+                self.freeform_items.push(FreeformDemoItem {
+                    id: id.clone(),
+                    kind: kind.clone(),
+                    rect: *rect,
+                });
+                let sel = id.clone();
+                self.freeform_canvas.update(cx, |s, cx| s.select(Some(sel), cx));
+                self.log_event(
+                    "FreeformCanvas",
+                    format!("DropNew {id} at ({}, {})", rect.x as i32, rect.y as i32),
+                    cx,
+                );
+            }
+            FreeformCanvasEvent::Remove(id) => {
+                self.freeform_items.retain(|it| it.id != *id);
+                self.log_event("FreeformCanvas", format!("Remove({id})"), cx);
+            }
+            FreeformCanvasEvent::ResizeCanvas { size, committed } => {
+                self.freeform_size = *size;
+                for it in &mut self.freeform_items {
+                    it.rect = it.rect.clamped_in(*size);
+                }
+                if *committed {
+                    self.log_event(
+                        "FreeformCanvas",
+                        format!("ResizeCanvas -> {}×{}", size.width as i32, size.height as i32),
+                        cx,
+                    );
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    pub fn align_freeform_selected(&mut self, action: AlignAction, cx: &mut Context<Self>) {
+        let Some(id) = self.freeform_canvas.read(cx).selected().cloned() else {
+            return;
+        };
+        let snap = self.freeform_canvas.read(cx).current_snap();
+        let canvas = self.freeform_size;
+        if let Some(it) = self.freeform_items.iter_mut().find(|it| it.id == id) {
+            it.rect = align_item(it.rect, canvas, snap.canvas_padding, snap.grid, action);
+            self.log_event("FreeformCanvas", format!("Align {id} -> {action:?}"), cx);
+        }
+        cx.notify();
+    }
+
+    pub fn reset_freeform_demo(&mut self, cx: &mut Context<Self>) {
+        self.freeform_size = CanvasSize::new(360.0, 152.0);
+        self.freeform_items = Self::default_freeform_items();
+        self.freeform_canvas.update(cx, |s, cx| s.select(None, cx));
+        self.log_event("FreeformCanvas", "Reset canvas layout", cx);
+        cx.notify();
+    }
+
     /// Applies a finished drag in the dashboard editor.
     pub fn apply_drop(&mut self, event: &DropEvent, cx: &mut Context<Self>) {
         let Some(from) = self.dnd_lists.iter_mut().find(|(id, _)| *id == event.from) else {
@@ -1628,6 +1760,18 @@ impl PlaygroundApp {
         })
         .detach();
 
+        let freeform_canvas = cx.new(|cx| {
+            FreeformCanvasState::new(cx)
+                .snap_config(SnapConfig::default())
+                .show_grid(true)
+                .drag_out_to_remove(true)
+        });
+        cx.subscribe(
+            &freeform_canvas,
+            |this, _, ev: &FreeformCanvasEvent, cx| this.apply_freeform_event(ev, cx),
+        )
+        .detach();
+
         let mut app = Self {
             page: Page::InteractiveBlur,
             accent: AccentPreset::Indigo,
@@ -1835,6 +1979,10 @@ impl PlaygroundApp {
                 ("side".into(), vec!["alerts".into()]),
             ],
             dnd_preview: 0,
+            freeform_canvas,
+            freeform_items: Self::default_freeform_items(),
+            freeform_size: CanvasSize::new(360.0, 152.0),
+            freeform_next_seq: 2,
         };
 
         app.log_event(
