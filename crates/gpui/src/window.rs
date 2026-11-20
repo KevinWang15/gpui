@@ -624,6 +624,14 @@ impl FocusHandle {
         self.id.is_focused(window)
     }
 
+    /// Whether this element is focused and should show it, as CSS's
+    /// `:focus-visible` decides for a button: focus got here by keyboard
+    /// (Tab, or a key that moved it), not by a click or a touch. It stays
+    /// visible until focus moves.
+    pub fn is_focus_visible(&self, window: &Window) -> bool {
+        self.is_focused(window) && window.focus_visible
+    }
+
     /// Obtains whether the element associated with this handle contains the focused
     /// element or is itself focused.
     pub fn contains_focused(&self, window: &Window, cx: &App) -> bool {
@@ -869,6 +877,9 @@ pub struct Hitbox {
     /// The nearest scroll container this hitbox was inserted inside (see
     /// [`Window::with_scroll_container`]): where a wheel over it bubbles.
     pub scroll_parent: Option<HitboxId>,
+    /// The focusable element this hitbox is inside, itself included: what a
+    /// mouse down on it focuses (see [`Window::dispatch_event`]).
+    pub focus_owner: Option<FocusId>,
 }
 
 impl Hitbox {
@@ -1364,6 +1375,9 @@ pub struct Window {
     pub(crate) refreshing: bool,
     pub(crate) activation_observers: SingleSubscriberSet<AnyObserver>,
     pub(crate) focus: Option<FocusId>,
+    /// Whether the focus got where it is by keyboard (see
+    /// [`FocusHandle::is_focus_visible`]).
+    focus_visible: bool,
     focus_enabled: bool,
     /// Incremented every time focus moves. Used to invalidate a
     /// pending keyboard activation state when focus changes.
@@ -2528,6 +2542,7 @@ impl Window {
             refreshing: false,
             activation_observers: SingleSubscriberSet::new(),
             focus: None,
+            focus_visible: false,
             focus_enabled: true,
             focus_generation: 0,
             pending_input: None,
@@ -2797,6 +2812,7 @@ impl Window {
         }
 
         self.focus = Some(handle.id);
+        self.focus_visible = self.last_input_modality == InputModality::Keyboard;
         self.focus_generation = self.focus_generation.wrapping_add(1);
         self.clear_pending_keystrokes(cx);
 
@@ -2824,24 +2840,50 @@ impl Window {
         self.focus_enabled = false;
     }
 
-    /// Move focus to next tab stop.
-    pub fn focus_next(&mut self, cx: &mut App) {
-        if !self.focus_enabled {
-            return;
-        }
-
-        if let Some(handle) = self.rendered_frame.tab_stops.next(self.focus.as_ref()) {
-            self.focus(&handle, cx)
+    /// Focuses the focusable element under the mouse (the frontmost hitbox's
+    /// [`Hitbox::focus_owner`]), or blurs when there's none.
+    fn focus_pressed_element(&mut self, cx: &mut App) {
+        let owner = self.mouse_hit_test.ids.first().and_then(|id| {
+            self.rendered_frame
+                .hitboxes
+                .iter()
+                .find(|hitbox| hitbox.id == *id)
+                .and_then(|hitbox| hitbox.focus_owner)
+        });
+        match owner.and_then(|id| FocusHandle::for_id(id, &cx.focus_handles)) {
+            Some(handle) => self.focus(&handle, cx),
+            None => self.blur(cx),
         }
     }
 
-    /// Move focus to previous tab stop.
+    /// Move focus to the next tab stop: what Tab does when nothing handles
+    /// it. While focus is inside a focus trap (`.focus_trap()`), only the
+    /// trap's tab stops take part, and the order wraps around inside it.
+    pub fn focus_next(&mut self, cx: &mut App) {
+        self.move_focus(true, cx);
+    }
+
+    /// Move focus to the previous tab stop (Shift+Tab); see [`Self::focus_next`].
     pub fn focus_prev(&mut self, cx: &mut App) {
+        self.move_focus(false, cx);
+    }
+
+    fn move_focus(&mut self, forward: bool, cx: &mut App) {
         if !self.focus_enabled {
             return;
         }
-
-        if let Some(handle) = self.rendered_frame.tab_stops.prev(self.focus.as_ref()) {
+        let frame = &mut self.rendered_frame;
+        let trap = self
+            .focus
+            .and_then(|focused| frame.dispatch_tree.focus_trap_around(focused));
+        let tree = &frame.dispatch_tree;
+        let inside = |id: FocusId| trap.is_none_or(|trap| id == trap || tree.focus_contains(trap, id));
+        let next = if forward {
+            frame.tab_stops.next_where(self.focus.as_ref(), inside)
+        } else {
+            frame.tab_stops.prev_where(self.focus.as_ref(), inside)
+        };
+        if let Some(handle) = next {
             self.focus(&handle, cx)
         }
     }
@@ -6085,6 +6127,11 @@ impl Window {
             content_mask,
             behavior,
             scroll_parent: self.scroll_parents.last().copied(),
+            focus_owner: self
+                .next_frame
+                .dispatch_tree
+                .active_node_id()
+                .and_then(|node| self.next_frame.dispatch_tree.focus_owner(node)),
         };
         self.next_frame.hitboxes.push(hitbox.clone());
         hitbox
@@ -6849,6 +6896,7 @@ impl Window {
             return;
         }
 
+        let focus_generation = self.focus_generation;
         let mut mouse_listeners = mem::take(&mut self.rendered_frame.mouse_listeners);
 
         // Capture phase, events bubble from back to front. Handlers for this phase are used for
@@ -6873,6 +6921,17 @@ impl Window {
         }
 
         self.rendered_frame.mouse_listeners = mouse_listeners;
+
+        // A mouse down's default, as in a browser: unless a handler moved focus
+        // or prevented the default, focus goes to the focusable element the
+        // press is inside, and when there's none, the window blurs (so
+        // clicking outside a text field leaves it).
+        if event.is::<crate::MouseDownEvent>()
+            && !self.default_prevented
+            && self.focus_generation == focus_generation
+        {
+            self.focus_pressed_element(cx);
+        }
 
         if cx.has_active_drag() {
             if event.is::<MouseMoveEvent>() {
@@ -7146,6 +7205,25 @@ impl Window {
         self.dispatch_key_down_up_event(event, &dispatch_path, cx);
         if !cx.propagate_event {
             return;
+        }
+
+        // Tab's default, as in a browser: a Tab or Shift+Tab that nothing
+        // handled (no binding took it, no listener stopped it or prevented
+        // the default) moves focus through the tab stops.
+        if let Some(key_down) = event.downcast_ref::<KeyDownEvent>()
+            && key_down.keystroke.key == "tab"
+            && !self.default_prevented
+        {
+            let modifiers = key_down.keystroke.modifiers;
+            if !modifiers.modified() || modifiers == Modifiers::shift() {
+                if modifiers.shift {
+                    self.focus_prev(cx);
+                } else {
+                    self.focus_next(cx);
+                }
+                cx.propagate_event = false;
+                return;
+            }
         }
 
         self.dispatch_modifiers_changed_event(event, &dispatch_path, cx);

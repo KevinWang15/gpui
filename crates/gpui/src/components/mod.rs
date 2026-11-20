@@ -27,6 +27,13 @@ pub mod drawer;
 pub mod extras;
 pub mod feedback;
 pub mod field;
+pub(crate) mod focus;
+#[cfg(test)]
+mod keyboard_tests;
+#[cfg(test)]
+mod keyboard_tests_controls;
+#[cfg(test)]
+mod keyboard_tests_fields;
 pub mod file_dropzone;
 pub mod filter_bar;
 pub mod form;

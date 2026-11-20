@@ -101,29 +101,55 @@ impl TabStopMap {
         self.sorted = false;
     }
 
+    #[cfg(test)]
     pub fn next(&mut self, focused_id: Option<&FocusId>) -> Option<FocusHandle> {
+        self.next_where(focused_id, |_| true)
+    }
+
+    #[cfg(test)]
+    pub fn prev(&mut self, focused_id: Option<&FocusId>) -> Option<FocusHandle> {
+        self.prev_where(focused_id, |_| true)
+    }
+
+    /// The next tab stop for which `include` is true, wrapping around.
+    pub fn next_where(
+        &mut self,
+        focused_id: Option<&FocusId>,
+        include: impl Fn(FocusId) -> bool,
+    ) -> Option<FocusHandle> {
         self.ensure_sorted();
         let start = focused_id
             .and_then(|id| self.by_id.get(id))
             .map_or(0, |position| position + 1);
-        let node = self.nodes[start..]
+        self.nodes[start..]
             .iter()
             .chain(&self.nodes[..start])
-            .find(|node| node.tab_stop)?;
-        self.focus_handle_for_order(node)
+            .filter(|node| node.tab_stop)
+            .find_map(|node| {
+            self.focus_handle_for_order(node)
+                .filter(|handle| include(handle.id))
+        })
     }
 
-    pub fn prev(&mut self, focused_id: Option<&FocusId>) -> Option<FocusHandle> {
+    /// The previous tab stop for which `include` is true, wrapping around.
+    pub fn prev_where(
+        &mut self,
+        focused_id: Option<&FocusId>,
+        include: impl Fn(FocusId) -> bool,
+    ) -> Option<FocusHandle> {
         self.ensure_sorted();
         let end = focused_id
             .and_then(|id| self.by_id.get(id).copied())
             .unwrap_or(self.nodes.len());
-        let node = self.nodes[..end]
+        self.nodes[..end]
             .iter()
             .rev()
             .chain(self.nodes[end..].iter().rev())
-            .find(|node| node.tab_stop)?;
-        self.focus_handle_for_order(node)
+            .filter(|node| node.tab_stop)
+            .find_map(|node| {
+            self.focus_handle_for_order(node)
+                .filter(|handle| include(handle.id))
+        })
     }
 
     fn ensure_sorted(&mut self) {

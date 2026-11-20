@@ -366,6 +366,8 @@ impl RenderOnce for Button {
             el = el.child(Icon::new(icon).size(icon_size).color(fg));
         }
 
+        el = super::focus::tab_stop(el, interactive, &theme);
+
         if interactive
             && let Some(on_click) = self.on_click
         {

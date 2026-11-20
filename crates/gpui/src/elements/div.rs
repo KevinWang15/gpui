@@ -874,6 +874,16 @@ pub trait InteractiveElement: Sized {
         self
     }
 
+    /// Keep Tab and Shift+Tab inside this element while focus is in it: the
+    /// tab order wraps around within it (a modal dialog's behavior). The
+    /// element becomes focusable, so a modal can focus it when it opens and
+    /// let Tab go to its first tab stop.
+    fn focus_trap(mut self) -> Self {
+        self.interactivity().focusable = true;
+        self.interactivity().focus_trap = true;
+        self
+    }
+
     /// Set the keymap context for this element. This will be used to determine
     /// which action to dispatch from the keymap.
     fn key_context<C, E>(mut self, key_context: C) -> Self
@@ -2322,6 +2332,7 @@ pub struct Interactivity {
     pub(crate) hitbox_behavior: HitboxBehavior,
     pub(crate) tab_index: Option<isize>,
     pub(crate) tab_group: bool,
+    pub(crate) focus_trap: bool,
     pub(crate) tab_stop: bool,
 
     pub(crate) a11y_action_listeners:
@@ -2401,6 +2412,18 @@ impl Interactivity {
                     }
 
                     self.tracked_focus_handle = Some(handle);
+                } else if let Some(handle) = self.tracked_focus_handle.take() {
+                    // A tracked handle keeps its own tab settings unless the
+                    // element asks for a tab stop or a tab index.
+                    let mut handle = if self.tab_stop {
+                        handle.tab_stop(true)
+                    } else {
+                        handle
+                    };
+                    if let Some(index) = self.tab_index {
+                        handle = handle.tab_index(index);
+                    }
+                    self.tracked_focus_handle = Some(handle);
                 }
 
                 if let Some(scroll_handle) = self.tracked_scroll_handle.as_ref() {
@@ -2459,6 +2482,9 @@ impl Interactivity {
 
         if let Some(focus_handle) = self.tracked_focus_handle.as_ref() {
             window.set_focus_handle(focus_handle, cx);
+            if self.focus_trap {
+                window.next_frame.dispatch_tree.set_focus_trap();
+            }
 
             if window.a11y.is_active() {
                 if let Some(global_id) = global_id {
@@ -3576,8 +3602,7 @@ impl Interactivity {
             }
 
             if let Some(focus_visible_style) = self.focus_visible_style.as_ref()
-                && focus_handle.is_focused(window)
-                && window.last_input_was_keyboard()
+                && focus_handle.is_focus_visible(window)
             {
                 style.refine(focus_visible_style);
             }

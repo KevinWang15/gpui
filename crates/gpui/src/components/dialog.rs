@@ -307,7 +307,10 @@ impl Styled for Dialog {
 }
 
 impl RenderOnce for Dialog {
-    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        // Takes focus when it opens, keeps Tab inside, gives focus back when
+        // it closes (`focus::modal_focus`).
+        let focus = super::focus::modal_focus((self.id.clone(), "focus"), self.open, window, cx);
         if !self.open {
             return div().into_any_element();
         }
@@ -318,6 +321,8 @@ impl RenderOnce for Dialog {
 
         let mut panel = div()
             .id((self.id.clone(), "panel"))
+            .track_focus(&focus)
+            .focus_trap()
             .flex()
             .flex_col()
             .w(self.size.width())

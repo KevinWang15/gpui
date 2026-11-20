@@ -37,6 +37,8 @@ mod assets;
 pub mod backdrop_blur;
 #[cfg(test)]
 mod scroll_routing_tests;
+#[cfg(test)]
+mod focus_navigation_tests;
 mod bounds_tree;
 mod color;
 mod element;

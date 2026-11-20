@@ -86,6 +86,8 @@ pub(crate) struct DispatchNode {
     pub modifiers_changed_listeners: Vec<ModifiersChangedListener>,
     pub context: Option<KeyContext>,
     pub focus_id: Option<FocusId>,
+    /// Tab and Shift+Tab stay inside this node while focus is in it.
+    pub focus_trap: bool,
     view_id: Option<EntityId>,
     parent: Option<DispatchNodeId>,
 }
@@ -223,6 +225,11 @@ impl DispatchTree {
         self.focusable_node_ids.insert(focus_id, node_id);
     }
 
+    /// Makes the active node a focus trap (see [`DispatchNode::focus_trap`]).
+    pub fn set_focus_trap(&mut self) {
+        self.active_node().focus_trap = true;
+    }
+
     pub fn set_view_id(&mut self, view_id: EntityId) {
         if self.view_stack.last().copied() != Some(view_id) {
             let node_id = *self.node_stack.last().unwrap();
@@ -256,6 +263,7 @@ impl DispatchTree {
         }
 
         let target = self.active_node();
+        target.focus_trap = source.focus_trap;
         target.key_listeners = mem::take(&mut source.key_listeners);
         target.action_listeners = mem::take(&mut source.action_listeners);
         target.modifiers_changed_listeners = mem::take(&mut source.modifiers_changed_listeners);
@@ -602,6 +610,32 @@ impl DispatchTree {
     fn active_node(&mut self) -> &mut DispatchNode {
         let active_node_id = self.active_node_id().unwrap();
         &mut self.nodes[active_node_id.0]
+    }
+
+    /// The innermost focus trap that `focused` is inside, itself included.
+    pub fn focus_trap_around(&self, focused: FocusId) -> Option<FocusId> {
+        let mut current = self.focusable_node_ids.get(&focused).copied();
+        while let Some(node_id) = current {
+            let node = self.node(node_id);
+            if node.focus_trap && node.focus_id.is_some() {
+                return node.focus_id;
+            }
+            current = node.parent;
+        }
+        None
+    }
+
+    /// The focus id of `node`, or of its nearest ancestor that has one.
+    pub fn focus_owner(&self, node: DispatchNodeId) -> Option<FocusId> {
+        let mut current = Some(node);
+        while let Some(node_id) = current {
+            let node = self.nodes.get(node_id.0)?;
+            if node.focus_id.is_some() {
+                return node.focus_id;
+            }
+            current = node.parent;
+        }
+        None
     }
 
     pub fn focusable_node_id(&self, target: FocusId) -> Option<DispatchNodeId> {

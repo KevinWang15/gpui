@@ -8,7 +8,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use crate::{
-    App, BorderStyle, Bounds, ClickEvent, Corners, Edges, ElementId, FontWeight, IntoElement,
+    App, BorderStyle, Bounds, ClickEvent, Corners, Edges, ElementId, FontWeight, IntoElement, KeyDownEvent,
     ParentElement, Pixels, Point, QuadAnimationCurve, QuadAnimationMode, RenderOnce, SharedString,
     Size, StyleRefinement, Styled, Window, canvas, div, prelude::*, px, quad,
 };
@@ -308,6 +308,43 @@ impl RenderOnce for SegmentedControl {
 
         let has_measured_pill = measured_pill.is_some();
 
+        // One tab stop, the selected segment; the arrow keys move the choice
+        // (`focus` module docs).
+        let enabled: Vec<bool> = self.items.iter().map(|item| !item.disabled).collect();
+        let handles = super::focus::choice_focus(
+            (self.id.clone(), "segmented-focus"),
+            item_count,
+            window,
+            cx,
+        );
+        let tab_item = super::focus::choice_tab_item(selected_idx, &enabled);
+        if let Some(on_change) = self.on_change.clone() {
+            let values: Vec<SharedString> = self.items.iter().map(|item| item.value.clone()).collect();
+            let handles = handles.clone();
+            let key_cache = layout_cache.clone();
+            track = track.on_key_down(move |event: &KeyDownEvent, window, cx| {
+                let Some(from) = handles.iter().position(|h| h.is_focused(window)) else {
+                    return;
+                };
+                if event.keystroke.modifiers.modified() {
+                    return;
+                }
+                let Some(to) = super::focus::choice_step(&event.keystroke.key, from, &enabled) else {
+                    return;
+                };
+                cx.stop_propagation();
+                let origin = key_cache
+                    .borrow()
+                    .items
+                    .get(to)
+                    .copied()
+                    .flatten()
+                    .map_or_else(Point::default, |bounds| bounds.center());
+                on_change(&values[to], origin, window, cx);
+                window.focus(&handles[to], cx);
+            });
+        }
+
         for (index, item) in self.items.into_iter().enumerate() {
             let active = item.value == self.selected;
             let disabled = item.disabled;
@@ -324,8 +361,11 @@ impl RenderOnce for SegmentedControl {
                 theme.muted_foreground
             };
 
+            let ring = super::focus::focus_visible_ring(&handles[index], window, &theme);
             let mut seg = div()
                 .id(("seg", index))
+                .track_focus(&super::focus::choice_item_handle(&handles, index, tab_item))
+                .when_some(ring, |el, ring| el.shadow(ring))
                 .relative()
                 .flex()
                 .items_center()
