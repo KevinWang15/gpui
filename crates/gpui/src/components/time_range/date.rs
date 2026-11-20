@@ -78,6 +78,11 @@ impl CalendarDate {
         (self.to_days_since_epoch() + 3).rem_euclid(7) as u8
     }
 
+    /// First day of this date's year (`YYYY-01-01`).
+    pub fn first_of_year(self) -> Self {
+        Self::new(self.year, 1, 1)
+    }
+
     /// First day of this date's month.
     pub fn first_of_month(self) -> Self {
         Self::new(self.year, self.month, 1)
@@ -256,9 +261,11 @@ impl DateRange {
     }
 }
 
-/// Duration unit used in the Quick Select row (`Last [N] [days|weeks|months]`).
+/// Duration unit used in the Quick Select row (`Last [N] [hours|days|weeks|months]`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum TimeRangeUnit {
+    /// Rolling 60-minute hours ending now.
+    Hours,
     /// Whole calendar days.
     #[default]
     Days,
@@ -272,24 +279,27 @@ impl TimeRangeUnit {
     /// Display label in the unit dropdown.
     pub fn label(self) -> &'static str {
         match self {
+            Self::Hours => "hours",
             Self::Days => "days",
             Self::Weeks => "weeks",
             Self::Months => "months",
         }
     }
 
-    /// Cycles to the next unit (`days -> weeks -> months -> days`).
+    /// Cycles to the next unit (`hours -> days -> weeks -> months -> hours`).
     pub fn next(self) -> Self {
         match self {
+            Self::Hours => Self::Days,
             Self::Days => Self::Weeks,
             Self::Weeks => Self::Months,
-            Self::Months => Self::Days,
+            Self::Months => Self::Hours,
         }
     }
 
     /// Converts `amount` of this unit to days, clamped to `1..=max_span_days`.
     pub fn to_days(self, amount: u32, max_span_days: u32) -> u32 {
         let raw = match self {
+            Self::Hours => amount.div_ceil(24),
             Self::Days => amount,
             Self::Weeks => amount.saturating_mul(7),
             Self::Months => amount.saturating_mul(30),
@@ -301,6 +311,12 @@ impl TimeRangeUnit {
 /// Named relative time-range preset displayed under **COMMONLY USED**.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TimeRangePreset {
+    /// Rolling last 1 hour ending now.
+    LastHour,
+    /// Rolling last 6 hours ending now.
+    Last6Hours,
+    /// Rolling last 24 hours ending now.
+    Last24Hours,
     /// Last 7 whole days ending on `anchor`.
     Last7Days,
     /// Last 30 whole days ending on `anchor`.
@@ -311,6 +327,8 @@ pub enum TimeRangePreset {
     MonthToDate,
     /// Full calendar month preceding `anchor`'s month.
     LastMonth,
+    /// First day of `anchor`'s year (Jan 1) through `anchor`.
+    YearToDate,
     /// Custom relative "Last N units".
     QuickRelative(u32, TimeRangeUnit),
     /// Explicit user-selected start & end calendar range.
@@ -327,17 +345,36 @@ impl TimeRangePreset {
         Self::LastMonth,
     ];
 
+    /// Rolling duration in hours if this preset is an hourly/sub-day window (`1h`, `6h`, `24h`,
+    /// or `QuickRelative(n, TimeRangeUnit::Hours)`), or `None` for calendar-day ranges.
+    pub const fn duration_hours(self) -> Option<u32> {
+        match self {
+            Self::LastHour => Some(1),
+            Self::Last6Hours => Some(6),
+            Self::Last24Hours => Some(24),
+            Self::QuickRelative(n, TimeRangeUnit::Hours) => {
+                if n == 0 { Some(1) } else { Some(n) }
+            }
+            _ => None,
+        }
+    }
+
     /// Human-readable label shown in the picker trigger and preset menu.
     pub fn label(self) -> SharedString {
         match self {
+            Self::LastHour => "Last hour".into(),
+            Self::Last6Hours => "Last 6 hours".into(),
+            Self::Last24Hours => "Last 24 hours".into(),
             Self::Last7Days => "Last 7 days".into(),
             Self::Last30Days => "Last 30 days".into(),
             Self::Last90Days => "Last 90 days".into(),
             Self::MonthToDate => "Month to date".into(),
             Self::LastMonth => "Last month".into(),
+            Self::YearToDate => "This year".into(),
             Self::QuickRelative(n, unit) => {
                 if n == 1 {
                     let singular = match unit {
+                        TimeRangeUnit::Hours => "hour",
                         TimeRangeUnit::Days => "day",
                         TimeRangeUnit::Weeks => "week",
                         TimeRangeUnit::Months => "month",
@@ -366,6 +403,8 @@ impl TimeRangePreset {
     pub fn resolve(self, today: CalendarDate, max_span_days: u32) -> DateRange {
         let max_span = max_span_days.max(1);
         match self {
+            Self::LastHour | Self::Last6Hours => DateRange::new(today, today),
+            Self::Last24Hours => DateRange::last_days(today, 2.min(max_span)),
             Self::Last7Days => DateRange::last_days(today, 7.min(max_span)),
             Self::Last30Days => DateRange::last_days(today, 30.min(max_span)),
             Self::Last90Days => DateRange::last_days(today, 90.min(max_span)),
@@ -382,6 +421,15 @@ impl TimeRangePreset {
                 let prev_first = today.prev_month();
                 let prev_last = prev_first.last_of_month();
                 DateRange::new(prev_first, prev_last)
+            }
+            Self::YearToDate => {
+                let start = today.first_of_year();
+                let range = DateRange::new(start, today);
+                if range.span_days() > max_span {
+                    DateRange::last_days(today, max_span)
+                } else {
+                    range
+                }
             }
             Self::QuickRelative(n, unit) => {
                 let days = unit.to_days(n, max_span);

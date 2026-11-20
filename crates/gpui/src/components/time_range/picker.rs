@@ -54,6 +54,7 @@ pub struct TimeRangePickerState {
     draft_end: CalendarDate,
     calendar_target: Option<CalendarTarget>,
     calendar_month: CalendarDate,
+    presets: Option<Vec<(TimeRangePreset, SharedString)>>,
     helper_note: Option<SharedString>,
     focus_handle: FocusHandle,
 }
@@ -86,9 +87,19 @@ impl TimeRangePickerState {
             draft_end: range.end,
             calendar_target: None,
             calendar_month: range.end.first_of_month(),
+            presets: None,
             helper_note: None,
             focus_handle: cx.focus_handle(),
         }
+    }
+
+    /// Replaces the **COMMONLY USED** presets and their display labels.
+    pub fn presets<L: Into<SharedString>>(
+        mut self,
+        presets: impl IntoIterator<Item = (TimeRangePreset, L)>,
+    ) -> Self {
+        self.presets = Some(presets.into_iter().map(|(p, l)| (p, l.into())).collect());
+        self
     }
 
     /// Sets the maximum allowed span in whole days (default `92`).
@@ -135,14 +146,19 @@ impl TimeRangePickerState {
         self.max_span_days
     }
 
-    /// Whether the forward `>` stepper is enabled (`range.end < today`).
+    /// Whether the backward `<` stepper is enabled (disabled for live rolling sub-day windows).
+    pub fn can_step_backward(&self) -> bool {
+        self.preset.duration_hours().is_none()
+    }
+
+    /// Whether the forward `>` stepper is enabled (`range.end < today` and not a live rolling window).
     pub fn can_step_forward(&self) -> bool {
-        self.range.end < self.today
+        self.preset.duration_hours().is_none() && self.range.end < self.today
     }
 
     /// Whether zoom-out `🔍-` can expand the range further.
     pub fn can_zoom_out(&self) -> bool {
-        self.range.span_days() < self.max_span_days
+        self.preset.duration_hours().is_some() || self.range.span_days() < self.max_span_days
     }
 
     fn emit_change(&mut self, cx: &mut Context<Self>) {
@@ -167,15 +183,29 @@ impl TimeRangePickerState {
 
     /// Applies the current Quick Select (`Last N unit`) draft.
     pub fn apply_quick_select(&mut self, cx: &mut Context<Self>) {
+        let max_for_unit = match self.quick_unit {
+            TimeRangeUnit::Hours => (self.max_span_days.saturating_mul(24)).min(720).max(1),
+            TimeRangeUnit::Days => self.max_span_days.max(1),
+            TimeRangeUnit::Weeks => (self.max_span_days / 7).max(1),
+            TimeRangeUnit::Months => (self.max_span_days / 30).max(1),
+        };
         let parsed = self
             .quick_amount_text
             .trim()
             .parse::<u32>()
             .unwrap_or(self.quick_amount)
-            .clamp(1, self.max_span_days);
+            .clamp(1, max_for_unit);
         self.quick_amount = parsed;
         self.quick_amount_text = parsed.to_string();
-        let preset = TimeRangePreset::QuickRelative(parsed, self.quick_unit);
+        let preset = match (self.quick_unit, parsed) {
+            (TimeRangeUnit::Hours, 1) => TimeRangePreset::LastHour,
+            (TimeRangeUnit::Hours, 6) => TimeRangePreset::Last6Hours,
+            (TimeRangeUnit::Hours, 24) => TimeRangePreset::Last24Hours,
+            (TimeRangeUnit::Days, 7) => TimeRangePreset::Last7Days,
+            (TimeRangeUnit::Days, 30) => TimeRangePreset::Last30Days,
+            (TimeRangeUnit::Days, 90) => TimeRangePreset::Last90Days,
+            _ => TimeRangePreset::QuickRelative(parsed, self.quick_unit),
+        };
         self.apply_preset(preset, cx);
     }
 
@@ -199,6 +229,9 @@ impl TimeRangePickerState {
 
     /// Shifts the active window backward by its current span.
     pub fn step_backward(&mut self, cx: &mut Context<Self>) {
+        if !self.can_step_backward() {
+            return;
+        }
         self.range = self.range.shift_backward();
         self.preset = TimeRangePreset::Custom;
         self.emit_change(cx);
@@ -223,9 +256,20 @@ impl TimeRangePickerState {
         self.emit_change(cx);
     }
 
-    /// Zooms out by doubling the range span, clamped to `max_span_days`.
+    /// Zooms out by stepping up hourly ranges (`1h -> 6h -> 24h -> 7d`) or doubling day spans.
     pub fn zoom_out(&mut self, cx: &mut Context<Self>) {
         if !self.can_zoom_out() {
+            return;
+        }
+        if let Some(hours) = self.preset.duration_hours() {
+            let next = if hours < 6 {
+                TimeRangePreset::Last6Hours
+            } else if hours < 24 {
+                TimeRangePreset::Last24Hours
+            } else {
+                TimeRangePreset::Last7Days
+            };
+            self.apply_preset(next, cx);
             return;
         }
         self.range = self.range.zoom_out(self.today, self.max_span_days);
@@ -295,6 +339,7 @@ impl TimeRangePickerState {
             .parse::<i32>()
             .unwrap_or(self.quick_amount as i32);
         let max_for_unit = match self.quick_unit {
+            TimeRangeUnit::Hours => (self.max_span_days.saturating_mul(24)).min(720).max(1) as i32,
             TimeRangeUnit::Days => self.max_span_days as i32,
             TimeRangeUnit::Weeks => (self.max_span_days / 7).max(1) as i32,
             TimeRangeUnit::Months => (self.max_span_days / 30).max(1) as i32,
@@ -382,21 +427,39 @@ impl TimeRangePickerState {
         cx.notify();
     }
 
+    fn common_presets(&self) -> Vec<(TimeRangePreset, SharedString)> {
+        if let Some(custom) = &self.presets {
+            custom.clone()
+        } else {
+            TimeRangePreset::COMMON
+                .into_iter()
+                .map(|p| (p, p.label()))
+                .collect()
+        }
+    }
+
+    fn preset_display_label(&self, preset: TimeRangePreset) -> SharedString {
+        if let Some(custom) = &self.presets
+            && let Some((_, label)) = custom.iter().find(|(p, _)| *p == preset)
+        {
+            return label.clone();
+        }
+        preset.label()
+    }
+
     fn footer_text(&self) -> SharedString {
         if let Some(custom) = &self.helper_note {
             custom.clone()
         } else {
-            format!(
-                "Whole days in your local time, at most {}.",
-                self.max_span_days
-            )
-            .into()
+            format!("Local timezone · up to {} days", self.max_span_days).into()
         }
     }
 }
 
 struct TimeRangeSnapshot {
     preset: TimeRangePreset,
+    preset_label: SharedString,
+    presets: Vec<(TimeRangePreset, SharedString)>,
     range: DateRange,
     today: CalendarDate,
     active_popover: ActivePopover,
@@ -417,6 +480,8 @@ impl TimeRangeSnapshot {
     fn from_state(state: &TimeRangePickerState) -> Self {
         Self {
             preset: state.preset,
+            preset_label: state.preset_display_label(state.preset),
+            presets: state.common_presets(),
             range: state.range,
             today: state.today,
             active_popover: state.active_popover,
@@ -539,6 +604,7 @@ impl TimeRangePicker {
                 }
             });
 
+        let is_sub_day = snap.preset.duration_hours().is_some();
         let range_label_btn = div()
             .id("range-trigger")
             .flex()
@@ -550,7 +616,7 @@ impl TimeRangePicker {
             .cursor_pointer()
             .when(custom_open, |el| el.bg(theme.primary_soft))
             .when(!custom_open, |el| el.hover(move |s| s.bg(hover_bg)))
-            .when(snap.preset != TimeRangePreset::Custom, |el| {
+            .when(snap.preset != TimeRangePreset::Custom && !is_sub_day, |el| {
                 el.child(
                     div()
                         .text_size(px(12.5))
@@ -560,7 +626,7 @@ impl TimeRangePicker {
                         } else {
                             theme.muted_foreground
                         })
-                        .child(snap.preset.label()),
+                        .child(snap.preset_label.clone()),
                 )
             })
             .child(
@@ -572,7 +638,11 @@ impl TimeRangePicker {
                     } else {
                         theme.foreground
                     })
-                    .child(snap.range.format_compact()),
+                    .child(if is_sub_day {
+                        snap.preset_label.clone()
+                    } else {
+                        snap.range.format_compact().into()
+                    }),
             )
             .on_click({
                 let state = self.state.clone();
@@ -584,7 +654,7 @@ impl TimeRangePicker {
         let prev_btn = Self::render_stepper_button(
             "step-prev",
             LucideIcon::ChevronLeft,
-            true,
+            !is_sub_day,
             theme,
             |s, cx| s.step_backward(cx),
             self.state.clone(),
@@ -758,9 +828,14 @@ impl TimeRangePicker {
                 .flex()
                 .flex_col()
                 .gap(px(2.));
-            for (u_idx, unit) in [TimeRangeUnit::Days, TimeRangeUnit::Weeks, TimeRangeUnit::Months]
-                .into_iter()
-                .enumerate()
+            for (u_idx, unit) in [
+                TimeRangeUnit::Hours,
+                TimeRangeUnit::Days,
+                TimeRangeUnit::Weeks,
+                TimeRangeUnit::Months,
+            ]
+            .into_iter()
+            .enumerate()
             {
                 let active = unit == snap.quick_unit;
                 let state = self.state.clone();
@@ -789,7 +864,7 @@ impl TimeRangePicker {
         }
 
         let mut preset_list = div().flex().flex_col().gap(px(2.));
-        for (idx, item) in TimeRangePreset::COMMON.into_iter().enumerate() {
+        for (idx, (item, label)) in snap.presets.iter().cloned().enumerate() {
             let active = item == snap.preset;
             let state = self.state.clone();
             preset_list = preset_list.child(
@@ -815,7 +890,7 @@ impl TimeRangePicker {
                     .on_click(move |_: &ClickEvent, _, cx| {
                         state.update(cx, |s, cx| s.apply_preset(item, cx));
                     })
-                    .child(item.label()),
+                    .child(label),
             );
         }
 
@@ -886,15 +961,16 @@ impl TimeRangePicker {
                     )
                     .child(preset_list),
             )
-            .child(div().w_full().h(px(1.)).bg(theme.border))
-            .child(
-                div()
-                    .px(px(14.))
-                    .py(px(10.))
-                    .text_size(px(12.))
-                    .text_color(theme.muted_foreground)
-                    .child(snap.footer_text.clone()),
-            )
+            .when(!snap.footer_text.is_empty(), |el| {
+                el.child(div().w_full().h(px(1.)).bg(theme.border)).child(
+                    div()
+                        .px(px(14.))
+                        .py(px(10.))
+                        .text_size(px(12.))
+                        .text_color(theme.muted_foreground)
+                        .child(snap.footer_text.clone()),
+                )
+            })
             .with_animation(
                 (self.id.clone(), "quick-enter"),
                 Animation::new(ANIM_FAST).with_easing(ease_out_quint()),
