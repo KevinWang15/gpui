@@ -305,11 +305,11 @@ pub struct Style {
     pub backdrop_blur: Option<Pixels>,
 
     /// The grid columns of this element
-    /// Roughly equivalent to the Tailwind `grid-cols-<number>`
+    /// Roughly equivalent to a `grid-cols-<number>` utility class
     pub grid_cols: Option<GridTemplate>,
 
     /// The row span of this element
-    /// Equivalent to the Tailwind `grid-rows-<number>`
+    /// Equivalent to a `grid-rows-<number>` utility class
     pub grid_rows: Option<GridTemplate>,
 
     /// The grid location of this element

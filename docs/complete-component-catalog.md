@@ -30,7 +30,7 @@ popconfirm("del-snap", "Delete snapshot?", button("del").destructive().label("De
 ```
 
 ### `ColorPicker` (`components/color_picker.rs`)
-Interactive HSVA color picker with a draggable 2D saturation/value spectrum canvas, rainbow Hue slider, checkerboard Alpha slider, live `#RRGGBB`/`#RRGGBBAA` hex input, and Tailwind preset swatches. Use `.inline(true)` or `.inline(false)` (anchored swatch trigger).
+Interactive HSVA color picker with a draggable 2D saturation/value spectrum canvas, rainbow Hue slider, checkerboard Alpha slider, live `#RRGGBB`/`#RRGGBBAA` hex input, and preset swatches. Use `.inline(true)` or `.inline(false)` (anchored swatch trigger).
 
 ### `FileDropzone` (`components/file_dropzone.rs`)
 Native desktop file dropzone (`ExternalPaths` drag-over highlight + drop) and native OS file picker (`cx.prompt_for_paths`), supporting extension allowlists (`.accept(&["png", "json"])`), max file cap, human-readable file sizes, per-file `ProgressBar`, status badges, and remove controls.

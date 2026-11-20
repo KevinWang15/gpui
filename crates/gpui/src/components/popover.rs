@@ -1,4 +1,4 @@
-//! Tailwind-inspired [`Popover`] and [`DropdownMenu`] anchored floating panels.
+//! [`Popover`] and [`DropdownMenu`] anchored floating panels.
 
 use std::rc::Rc;
 
@@ -257,7 +257,7 @@ impl MenuEntry {
     }
 }
 
-/// Tailwind UI Dropdown Menu anchored to a trigger element.
+/// Dropdown Menu anchored to a trigger element.
 #[derive(IntoElement)]
 pub struct DropdownMenu {
     id: ElementId,

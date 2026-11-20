@@ -122,7 +122,7 @@ fn toast_accent(variant: ToastVariant, theme: &Theme) -> (Hsla, LucideIcon) {
     }
 }
 
-/// Single elevated Tailwind notification card.
+/// Single elevated notification card.
 #[derive(IntoElement)]
 pub struct Toast {
     id: ElementId,

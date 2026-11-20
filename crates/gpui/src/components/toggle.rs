@@ -1,4 +1,4 @@
-//! Tailwind-inspired [`Toggle`] / [`Switch`], [`ToggleButton`], and [`ToggleGroup`] components.
+//! [`Toggle`] / [`Switch`], [`ToggleButton`], and [`ToggleGroup`] components.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -27,7 +27,7 @@ const TOGGLE_ANIM_MAX_MS: u64 = 520;
 /// Alias for [`Toggle`].
 pub type Switch = Toggle;
 
-/// Tailwind UI Toggle / Headless UI Switch with pill track, sliding thumb, optional
+/// Toggle / Headless UI Switch with pill track, sliding thumb, optional
 /// on/off icons inside the thumb, and optional label & description.
 #[derive(IntoElement)]
 pub struct Toggle {

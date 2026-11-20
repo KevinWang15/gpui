@@ -3,7 +3,7 @@
 GPUI is a hybrid immediate and retained mode, GPU accelerated, UI framework
 for Rust, designed to support a wide variety of applications.
 
-> **Fork additions:** This fork includes a Tailwind-inspired component library
+> **Fork additions:** This fork includes a component library
 > (`gpui::components`), all 2,092 bundled Lucide SVG icons (`gpui::icons`), and an
 > interactive developer playground (`cargo run -p gpui_playground`). See the
 > repository root `README.md` for full documentation and examples.
@@ -82,7 +82,7 @@ GPUI offers three different [registers](<https://en.wikipedia.org/wiki/Register_
 
 - State management and communication with `Entity`'s. Whenever you need to store application state that communicates between different parts of your application, you'll want to use GPUI's entities. Entities are owned by GPUI and are only accessible through an owned smart pointer similar to an `Rc`. See the `app::context` module for more information.
 
-- High level, declarative UI with views. All UI in GPUI starts with a view. A view is simply an `Entity` that can be rendered, by implementing the `Render` trait. At the start of each frame, GPUI will call this render method on the root view of a given window. Views build a tree of `elements`, lay them out and style them with a tailwind-style API, and then give them to GPUI to turn into pixels. See the `div` element for an all purpose swiss-army knife of rendering.
+- High level, declarative UI with views. All UI in GPUI starts with a view. A view is simply an `Entity` that can be rendered, by implementing the `Render` trait. At the start of each frame, GPUI will call this render method on the root view of a given window. Views build a tree of `elements`, lay them out and style them with a utility-style API, and then give them to GPUI to turn into pixels. See the `div` element for an all purpose swiss-army knife of rendering.
 
 - Low level, imperative UI with Elements. Elements are the building blocks of UI in GPUI, and they provide a nice wrapper around an imperative API that provides as much flexibility and control as you need. Elements have total control over how they and their child elements are rendered and can be used for making efficient views into large lists, implement custom layouting for a code editor, and anything else you can think of. See the `element` module for more information.
 

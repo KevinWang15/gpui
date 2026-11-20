@@ -14,7 +14,7 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
         .child(
             page_header("Toggles, Checkboxes, Radio Groups & Sliders")
                 .description(
-                    "Boolean switches with thumb icons, tri-state indeterminate checkboxes, Tailwind Radio Cards, and range sliders.",
+                    "Boolean switches with thumb icons, tri-state indeterminate checkboxes, Radio Cards, and range sliders.",
                 ),
         )
         .child(
@@ -201,7 +201,7 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
                         ),
                 ),
         )
-        // RadioGroup List vs Tailwind Cards
+        // RadioGroup List vs Cards
         .child(
             card()
                 .child(
@@ -213,7 +213,7 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
                                 .child(
                                     v_stack()
                                         .spacing(px(2.))
-                                        .child(card_title("RadioGroup (List & Tailwind Cards)"))
+                                        .child(card_title("RadioGroup (List & Cards)"))
                                         .child(card_description(format!(
                                             "Selected plan: \"{}\"",
                                             app.selected_plan

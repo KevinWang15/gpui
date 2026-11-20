@@ -1,4 +1,4 @@
-//! Tailwind-inspired [`Alert`] callout banner with semantic variants (`Info`, `Success`,
+//! [`Alert`] callout banner with semantic variants (`Info`, `Success`,
 //! `Warning`, `Destructive`), matching Lucide icons, action slot, and optional dismiss button.
 
 use smallvec::SmallVec;
@@ -25,7 +25,7 @@ pub enum AlertVariant {
     Destructive,
 }
 
-/// Tailwind UI Alert banner with icon, title, description, optional actions, and dismiss button.
+/// Alert banner with icon, title, description, optional actions, and dismiss button.
 #[derive(IntoElement)]
 pub struct Alert {
     variant: AlertVariant,

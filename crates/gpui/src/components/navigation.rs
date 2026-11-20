@@ -1,4 +1,4 @@
-//! Tailwind UI navigation components: [`Breadcrumb`] and [`Pagination`].
+//! Navigation components: [`Breadcrumb`] and [`Pagination`].
 
 use std::rc::Rc;
 
@@ -147,7 +147,7 @@ impl RenderOnce for Breadcrumb {
     }
 }
 
-/// Tailwind UI numeric [`Pagination`] bar with Previous/Next controls and smart ellipsis collapsing.
+/// Numeric [`Pagination`] bar with Previous/Next controls and smart ellipsis collapsing.
 #[derive(IntoElement)]
 pub struct Pagination {
     id: ElementId,

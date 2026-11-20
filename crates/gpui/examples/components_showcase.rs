@@ -87,13 +87,13 @@ impl ShowcaseApp {
         });
         let domain_input = cx.new(|cx| {
             InputState::new(cx)
-                .default_value("gpui-tailwind")
+                .default_value("gpui-components")
                 .prefix("https://")
                 .suffix(".rs")
         });
         let bio_textbox = cx.new(|cx| {
             TextBoxState::new(cx)
-                .default_value("Building GPU-accelerated desktop apps with GPUI.\nTailwind-inspired components + 2,092 Lucide icons!")
+                .default_value("Building GPU-accelerated desktop apps with GPUI.\nReady-made components + 2,092 Lucide icons!")
                 .placeholder("Write a few sentences...")
                 .rows(5)
                 .max_length(400)
@@ -133,7 +133,7 @@ impl ShowcaseApp {
                         .description("Zed's GPU-accelerated Rust UI framework")
                         .icon(LucideIcon::Zap)
                         .keywords(["rust", "zed", "gpu"]),
-                    ComboBoxOption::new("tailwind", "Tailwind CSS")
+                    ComboBoxOption::new("taffy", "Taffy")
                         .description("Utility-first design system")
                         .icon(LucideIcon::Wind)
                         .keywords(["css", "design"]),
@@ -281,7 +281,7 @@ impl ShowcaseApp {
                                 card_header()
                                     .bordered()
                                     .child(card_title("Text Inputs"))
-                                    .child(card_description("Single-line inputs with icons, password toggle & Tailwind addons.")),
+                                    .child(card_description("Single-line inputs with icons, password toggle & addons.")),
                             )
                             .child(
                                 card_content()
@@ -479,7 +479,7 @@ impl ShowcaseApp {
             .spacing(px(20.))
             .child(
                 page_header("Buttons, Button Groups & Menus")
-                    .description("All Tailwind button variants, sizes, icon buttons, spinners, toggle groups, popovers, and dropdown menus."),
+                    .description("All button variants, sizes, icon buttons, spinners, toggle groups, popovers, and dropdown menus."),
             )
             .child(
                 card()
@@ -661,7 +661,7 @@ impl ShowcaseApp {
             .spacing(px(20.))
             .child(
                 page_header("Layouts, Tabs, Accordion & Data Table")
-                    .description("Tailwind Cards, Grids, Tabs, Disclosures, Tables, Avatars, Badges, and Pagination."),
+                    .description("Cards, Grids, Tabs, Disclosures, Tables, Avatars, Badges, and Pagination."),
             )
             .child(
                 breadcrumb(
@@ -771,7 +771,7 @@ impl ShowcaseApp {
                                 this.faq_open[1] = *o;
                                 cx.notify();
                             }))
-                            .child("Yes! Click the Sun/Moon toggle in the top navbar to switch between Tailwind light and dark tokens instantly."),
+                            .child("Yes! Click the Sun/Moon toggle in the top navbar to switch between light and dark tokens instantly."),
                     )
                     .child(
                         disclosure("acc-2", "Is every component keyboard accessible?", self.faq_open[2])
@@ -822,7 +822,7 @@ impl ShowcaseApp {
                     .child(
                         alert("New update available")
                             .info()
-                            .description("GPUI Tailwind components & 2,092 Lucide SVGs are ready."),
+                            .description("GPUI components & 2,092 Lucide SVGs are ready."),
                     )
                     .child(
                         alert("Build succeeded")
@@ -1001,7 +1001,7 @@ impl Render for ShowcaseApp {
                             .child(
                                 v_stack()
                                     .spacing(px(1.))
-                                    .child(div().font_weight(FontWeight::BOLD).text_size(px(14.)).child("GPUI Tailwind"))
+                                    .child(div().font_weight(FontWeight::BOLD).text_size(px(14.)).child("GPUI Components"))
                                     .child(div().text_size(px(11.)).text_color(theme.muted_foreground).child("Components + Lucide")),
                             ),
                     )
@@ -1084,7 +1084,7 @@ impl Render for ShowcaseApp {
             .child(
                 dialog("showcase-dialog", self.dialog_open)
                     .title("Deploy to production?")
-                    .description("This will roll out the latest GPUI Tailwind UI bundle to all active desktop clients.")
+                    .description("This will roll out the latest GPUI UI bundle to all active desktop clients.")
                     .icon(LucideIcon::Rocket)
                     .on_close(cx.listener(|this, _, _, cx| {
                         this.dialog_open = false;

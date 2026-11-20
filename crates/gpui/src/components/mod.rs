@@ -1,6 +1,6 @@
-//! Tailwind-inspired UI component library built directly into GPUI.
+//! UI component library built directly into GPUI.
 //!
-//! Includes a full Tailwind CSS color [`palette`], light/dark [`Theme`] system, and
+//! Includes a full color [`palette`], light/dark [`Theme`] system, and
 //! production-ready interactive components covering forms, navigation, layouts, overlays,
 //! data display, and feedback — powered by bundled [`crate::icons::LucideIcon`] SVGs.
 //!

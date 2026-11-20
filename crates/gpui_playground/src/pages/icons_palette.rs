@@ -1,4 +1,4 @@
-//! Full 2,092-icon Lucide SVG Explorer and 242-swatch Tailwind CSS Palette Explorer.
+//! Full 2,092-icon Lucide SVG Explorer and 242-swatch Color Palette Explorer.
 
 use gpui::components::*;
 use gpui::icons::{Icon, IconSize, LucideIcon};
@@ -619,9 +619,9 @@ pub fn render_palette(_app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> 
     v_stack()
         .spacing(px(20.))
         .child(
-            page_header("Tailwind CSS Color Palette")
+            page_header("Color Palette")
                 .description(
-                    "All 22 Tailwind CSS hues × 11 shades (50–950) are defined as zero-cost `Rgba` constants in `gpui::components::palette`. Click any swatch to copy its constant.",
+                    "All 22 hues × 11 shades (50–950) are defined as zero-cost `Rgba` constants in `gpui::components::palette`. Click any swatch to copy its constant.",
                 ),
         )
         .child(card().padded().child(rows))

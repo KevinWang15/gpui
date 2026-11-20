@@ -1,4 +1,4 @@
-//! Tailwind-inspired [`RadioGroup`] supporting classic radio lists and bordered Tailwind Radio Cards.
+//! [`RadioGroup`] supporting classic radio lists and bordered Radio Cards.
 
 use std::rc::Rc;
 
@@ -16,7 +16,7 @@ pub enum RadioVariant {
     /// Traditional circular radio button list.
     #[default]
     List,
-    /// Tailwind UI bordered clickable cards with accent ring and check indicator.
+    /// Bordered clickable cards with accent ring and check indicator.
     Cards,
 }
 
@@ -66,7 +66,7 @@ impl<T> RadioOption<T> {
     }
 }
 
-/// Tailwind-style radio group (`List` or `Cards`) parameterized by option value type `T`.
+/// Radio group (`List` or `Cards`) parameterized by option value type `T`.
 #[derive(IntoElement)]
 pub struct RadioGroup<T: Clone + PartialEq + 'static> {
     id: ElementId,

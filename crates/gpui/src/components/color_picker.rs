@@ -1,6 +1,6 @@
 //! Interactive HSVA [`ColorPicker`] / [`ColorPickerState`] with a GPU-gradient 2D Saturation/Value
 //! spectrum canvas, Hue rainbow slider, Alpha opacity slider with checkerboard preview, live
-//! Hex input (`#RRGGBB` / `#RRGGBBAA`), preset Tailwind swatches, keyboard navigation, and inline
+//! Hex input (`#RRGGBB` / `#RRGGBBAA`), preset palette swatches, keyboard navigation, and inline
 //! or popover modes.
 
 use std::cell::Cell;
@@ -242,7 +242,7 @@ impl Focusable for ColorPickerState {
 }
 
 impl ColorPickerState {
-    /// Creates a new [`ColorPickerState`] defaulting to Tailwind Indigo 600 (`#4F46E5`).
+    /// Creates a new [`ColorPickerState`] defaulting to Indigo 600 (`#4F46E5`).
     pub fn new(cx: &mut Context<Self>) -> Self {
         let initial: Hsla = tw::INDIGO_600.into();
         let initial_rgba: Rgba = initial.into();

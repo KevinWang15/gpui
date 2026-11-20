@@ -1,7 +1,7 @@
 //! Modal dialogs supporting both **In-Window Overlay** ([`Dialog`]) and **Native OS Window**
 //! ([`DialogWindow`], backed by [`WindowKind::Dialog`]) presentation modes.
 //!
-//! Both modes share the same Tailwind visual design (header icon badge, title, muted description,
+//! Both modes share the same visual design (header icon badge, title, muted description,
 //! body slot, and footer actions) and read the active global [`Theme`], making it
 //! easy to switch or compare in-window modal sheets against true OS-level modal dialog windows.
 
@@ -70,7 +70,7 @@ impl DialogSize {
     }
 }
 
-/// Renders the shared Tailwind dialog header (icon badge, title, muted description, close button).
+/// Renders the shared dialog header (icon badge, title, muted description, close button).
 #[allow(clippy::too_many_arguments)]
 fn render_dialog_header(
     close_id: ElementId,
@@ -247,7 +247,7 @@ impl Dialog {
         self
     }
 
-    /// Styles the header icon badge in destructive red tones (Tailwind Alert Dialog).
+    /// Styles the header icon badge in destructive red tones (an alert dialog).
     pub fn destructive(mut self, destructive: bool) -> Self {
         self.destructive = destructive;
         self

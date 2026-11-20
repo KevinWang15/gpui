@@ -5,7 +5,7 @@ Because GPUI is a native multi-window desktop UI framework, dialogs and toast no
 1. **In-Window Overlay** (`OverlayPresentation::InWindow`) — `Dialog` / `dialog(...)` and `ToastHost` / `toast_host(...)`, rendered inside the parent window via GPUI's `deferred(...)` layer.
 2. **Native OS Window** (`OverlayPresentation::NativeWindow`) — `DialogWindow` / `dialog_window()` (`WindowKind::Dialog`) and `NativeToastManager` (`WindowKind::PopUp`), rendered in dedicated OS-level windows.
 
-Both modes share the same Tailwind design tokens, Lucide icons, and live global `Theme` synchronization (`cx.refresh_windows()`).
+Both modes share the same design tokens, Lucide icons, and live global `Theme` synchronization (`cx.refresh_windows()`).
 
 ---
 

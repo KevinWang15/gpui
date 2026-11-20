@@ -1,4 +1,4 @@
-//! Shared interactive state for the GPUI Tailwind Playground application.
+//! Shared interactive state for the GPUI Playground application.
 
 use std::time::Duration;
 
@@ -43,7 +43,7 @@ impl Page {
             Self::LayoutNavigation => "Layout, Tabs & Nav",
             Self::OverlaysData => "Overlays, Table & Feedback",
             Self::LucideIcons => "Lucide Icons",
-            Self::Palette => "Tailwind Palette",
+            Self::Palette => "Color Palette",
         }
     }
 
@@ -76,7 +76,7 @@ impl Page {
                 "dialog modal native os window popup popover dropdown menu toast notification tooltip table sort badge avatar alert progress spinner skeleton empty"
             }
             Self::LucideIcons => "lucide icons svg gallery stroke search 2092",
-            Self::Palette => "tailwind color palette swatch theme slate indigo emerald rose",
+            Self::Palette => "color palette swatch theme slate indigo emerald rose",
         }
     }
 }
@@ -312,7 +312,7 @@ impl PlaygroundApp {
             .detach();
 
         let sandbox_input = Self::build_sandbox_input(
-            "gpui-tailwind".to_owned(),
+            "gpui-components".to_owned(),
             ComponentSize::Md,
             false,
             true,
@@ -357,7 +357,7 @@ impl PlaygroundApp {
         });
 
         let sandbox_textbox = Self::build_sandbox_textbox(
-            "GPUI renders Tailwind-style UI at 120 FPS on the GPU.\nTry selecting across lines, pressing Up/Down,\nUndo (Ctrl/Cmd+Z), or Submit (Ctrl/Cmd+Enter)!".to_owned(),
+            "GPUI renders UI at 120 FPS on the GPU.\nTry selecting across lines, pressing Up/Down,\nUndo (Ctrl/Cmd+Z), or Submit (Ctrl/Cmd+Enter)!".to_owned(),
             4,
             true,
             false,
@@ -480,7 +480,7 @@ impl PlaygroundApp {
             ComboBoxState::new(
                 vec![
                     ComboBoxOption::new("rust".to_string(), "Rust").icon(LucideIcon::Flame),
-                    ComboBoxOption::new("tailwind".to_string(), "Tailwind")
+                    ComboBoxOption::new("taffy".to_string(), "Taffy")
                         .icon(LucideIcon::Wind),
                     ComboBoxOption::new("lucide".to_string(), "Lucide").icon(LucideIcon::Shapes),
                     ComboBoxOption::new("gpu".to_string(), "GPU Rendering")
@@ -495,7 +495,7 @@ impl PlaygroundApp {
             .multiple(true)
             .allow_custom(true)
             .placeholder("Add or create tags...")
-            .default_values(vec!["rust".to_string(), "tailwind".to_string()])
+            .default_values(vec!["rust".to_string(), "taffy".to_string()])
         });
         cx.subscribe(&multi_combo, |this, combo, ev: &ComboBoxEvent<String>, cx| {
             match ev {
@@ -1457,7 +1457,7 @@ impl PlaygroundApp {
             badge_variant: BadgeVariant::Soft,
             badge_pill: true,
             badge_dot: true,
-            active_tags: vec!["Rust", "GPUI", "Tailwind", "Lucide", "wgpu"],
+            active_tags: vec!["Rust", "GPUI", "Taffy", "Lucide", "wgpu"],
             alert_dismissed: false,
 
             icon_search,
@@ -1730,7 +1730,7 @@ impl PlaygroundApp {
                 let description = if destructive {
                     "This permanently removes the cluster and all active sessions. This cannot be undone."
                 } else {
-                    "All 25 Tailwind-inspired component modules and 2,092 Lucide icons are verified and ready."
+                    "All 25 component modules and 2,092 Lucide icons are verified and ready."
                 };
                 let confirm_label = if destructive {
                     "Delete Cluster"

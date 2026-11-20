@@ -1,4 +1,4 @@
-//! Tailwind-inspired [`Tabs`] navigation component in three classic styles:
+//! [`Tabs`] navigation component in three classic styles:
 //! [`TabsVariant::Underline`], [`TabsVariant::Pills`], and [`TabsVariant::Segmented`].
 
 use std::rc::Rc;
@@ -19,7 +19,7 @@ pub enum TabsVariant {
     Underline,
     /// Soft rounded pill buttons.
     Pills,
-    /// iOS/Tailwind segmented control container with elevated active tab.
+    /// iOS-style segmented control container with elevated active tab.
     Segmented,
 }
 
@@ -66,7 +66,7 @@ impl TabItem {
     }
 }
 
-/// Tailwind-style horizontal tab bar (`Underline`, `Pills`, or `Segmented`).
+/// Horizontal tab bar (`Underline`, `Pills`, or `Segmented`).
 #[derive(IntoElement)]
 pub struct Tabs {
     id: ElementId,

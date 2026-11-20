@@ -85,7 +85,7 @@ impl Rating {
         self
     }
 
-    /// Overrides the filled icon color (defaults to theme-mode-aware Tailwind Amber).
+    /// Overrides the filled icon color (defaults to theme-mode-aware Amber).
     pub fn color(mut self, color: impl Into<Hsla>) -> Self {
         self.color = Some(color.into());
         self

@@ -43,7 +43,7 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
         .child(
             h_stack()
                 .justify_between()
-                .child(div().font_weight(FontWeight::MEDIUM).child("Row 2 · Tailwind Components"))
+                .child(div().font_weight(FontWeight::MEDIUM).child("Row 2 · Components"))
                 .child(badge("25 modules").color(BadgeColor::Green)),
         )
         .child(

@@ -1,4 +1,4 @@
-//! Interactive Developer Playground for GPUI Tailwind-inspired Components & Lucide Icons.
+//! Interactive Developer Playground for GPUI Components & Lucide Icons.
 //!
 //! Run with: `cargo run -p gpui_playground`
 
@@ -309,7 +309,7 @@ impl Render for PlaygroundApp {
                                                     div()
                                                         .text_size(px(11.))
                                                         .text_color(theme.muted_foreground)
-                                                        .child("Tailwind UI + Lucide"),
+                                                        .child("Components + Lucide"),
                                                 ),
                                         ),
                                 )
@@ -445,7 +445,7 @@ impl Render for PlaygroundApp {
                     .description(if self.dialog_destructive {
                         "This permanently removes the cluster and all active sessions. This cannot be undone."
                     } else {
-                        "All 25 Tailwind-inspired component modules and 2,092 Lucide icons are verified and ready."
+                        "All 25 component modules and 2,092 Lucide icons are verified and ready."
                     })
                     .on_close(cx.listener(|this, _, _, cx| {
                         this.dialog_open = false;

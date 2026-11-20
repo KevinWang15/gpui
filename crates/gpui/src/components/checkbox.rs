@@ -1,4 +1,4 @@
-//! Tailwind-inspired [`Checkbox`] (supporting checked, unchecked, and indeterminate states)
+//! [`Checkbox`] (supporting checked, unchecked, and indeterminate states)
 //! and [`CheckboxGroup`].
 
 use smallvec::SmallVec;
@@ -45,7 +45,7 @@ impl From<bool> for CheckState {
     }
 }
 
-/// Tailwind-style checkbox with optional label, description, indeterminate indicator,
+/// Checkbox with optional label, description, indeterminate indicator,
 /// disabled state, and error styling.
 #[derive(IntoElement)]
 pub struct Checkbox {

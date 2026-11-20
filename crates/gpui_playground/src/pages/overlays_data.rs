@@ -1114,7 +1114,7 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
                                                     .label("Reset tags")
                                                     .on_click(cx.listener(|this, _, _, cx| {
                                                         this.active_tags = vec![
-                                                            "Rust", "GPUI", "Tailwind", "Lucide",
+                                                            "Rust", "GPUI", "Taffy", "Lucide",
                                                             "wgpu",
                                                         ];
                                                         cx.notify();
@@ -1233,7 +1233,7 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
                         )
                         .child(
                             empty_state(LucideIcon::Inbox, "All caught up")
-                                .description("Classic Tailwind dashed EmptyState container.")
+                                .description("Classic dashed EmptyState container.")
                                 .action(
                                     button("es-cta")
                                         .primary()

@@ -1,4 +1,4 @@
-//! Tailwind-inspired [`Button`] and [`ButtonGroup`] components with variants, sizes,
+//! [`Button`] and [`ButtonGroup`] components with variants, sizes,
 //! Lucide icons, loading spinners, and disabled states.
 
 use smallvec::SmallVec;
@@ -14,12 +14,12 @@ use super::theme::{ActiveTheme, ComponentSize, Theme};
 /// Visual style variants for [`Button`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ButtonVariant {
-    /// Solid primary brand button (Tailwind `bg-indigo-600 text-white shadow-xs`).
+    /// Solid primary brand button (`bg-indigo-600 text-white shadow-xs`).
     #[default]
     Primary,
-    /// Elevated white/surface secondary button with border (Tailwind `bg-white ring-1 ring-slate-300`).
+    /// Elevated white/surface secondary button with border (`bg-white ring-1 ring-slate-300`).
     Secondary,
-    /// Soft tinted accent button (Tailwind `bg-indigo-50 text-indigo-700`).
+    /// Soft tinted accent button (`bg-indigo-50 text-indigo-700`).
     Soft,
     /// Soft tinted accent button with a crisp accent border (ideal for active/recording states).
     SoftOutline,
@@ -27,13 +27,13 @@ pub enum ButtonVariant {
     Outline,
     /// Borderless subtle button with hover surface highlight.
     Ghost,
-    /// Solid danger/destructive action button (Tailwind `bg-red-600 text-white`).
+    /// Solid danger/destructive action button (`bg-red-600 text-white`).
     Destructive,
     /// Inline text link style.
     Link,
 }
 
-/// Tailwind-style clickable button supporting labels, leading/trailing [`LucideIcon`]s,
+/// Clickable button supporting labels, leading/trailing [`LucideIcon`]s,
 /// loading spinners, pill radius, full-width mode, and keyboard accessibility.
 #[derive(IntoElement)]
 pub struct Button {
@@ -381,7 +381,7 @@ impl RenderOnce for Button {
     }
 }
 
-/// Connected Tailwind button group joining child buttons inside a shared bordered pill/frame.
+/// Connected button group joining child buttons inside a shared bordered pill/frame.
 #[derive(IntoElement)]
 pub struct ButtonGroup {
     style: StyleRefinement,

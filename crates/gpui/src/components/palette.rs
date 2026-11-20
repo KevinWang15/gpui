@@ -1,4 +1,4 @@
-//! Tailwind CSS color palette constants (`50`..=`950` across all 22 Tailwind hues).
+//! Color palette constants (`50`..=`950` across all 22 hues).
 //!
 //! Every constant is a [`crate::Rgba`] value that can be passed directly to GPUI styling
 //! methods such as `.bg(palette::INDIGO_600)`, `.text_color(palette::SLATE_900)`,
@@ -44,27 +44,27 @@ macro_rules! define_palette {
         ),* $(,)?
     ) => {
         $(
-            #[doc = concat!("Tailwind `", stringify!($scale), "-50`.")]
+            #[doc = concat!("`", stringify!($scale), "-50`.")]
             pub const $c50: Rgba = hex($h50);
-            #[doc = concat!("Tailwind `", stringify!($scale), "-100`.")]
+            #[doc = concat!("`", stringify!($scale), "-100`.")]
             pub const $c100: Rgba = hex($h100);
-            #[doc = concat!("Tailwind `", stringify!($scale), "-200`.")]
+            #[doc = concat!("`", stringify!($scale), "-200`.")]
             pub const $c200: Rgba = hex($h200);
-            #[doc = concat!("Tailwind `", stringify!($scale), "-300`.")]
+            #[doc = concat!("`", stringify!($scale), "-300`.")]
             pub const $c300: Rgba = hex($h300);
-            #[doc = concat!("Tailwind `", stringify!($scale), "-400`.")]
+            #[doc = concat!("`", stringify!($scale), "-400`.")]
             pub const $c400: Rgba = hex($h400);
-            #[doc = concat!("Tailwind `", stringify!($scale), "-500`.")]
+            #[doc = concat!("`", stringify!($scale), "-500`.")]
             pub const $c500: Rgba = hex($h500);
-            #[doc = concat!("Tailwind `", stringify!($scale), "-600`.")]
+            #[doc = concat!("`", stringify!($scale), "-600`.")]
             pub const $c600: Rgba = hex($h600);
-            #[doc = concat!("Tailwind `", stringify!($scale), "-700`.")]
+            #[doc = concat!("`", stringify!($scale), "-700`.")]
             pub const $c700: Rgba = hex($h700);
-            #[doc = concat!("Tailwind `", stringify!($scale), "-800`.")]
+            #[doc = concat!("`", stringify!($scale), "-800`.")]
             pub const $c800: Rgba = hex($h800);
-            #[doc = concat!("Tailwind `", stringify!($scale), "-900`.")]
+            #[doc = concat!("`", stringify!($scale), "-900`.")]
             pub const $c900: Rgba = hex($h900);
-            #[doc = concat!("Tailwind `", stringify!($scale), "-950`.")]
+            #[doc = concat!("`", stringify!($scale), "-950`.")]
             pub const $c950: Rgba = hex($h950);
         )*
     };

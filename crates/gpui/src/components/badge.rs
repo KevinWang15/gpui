@@ -1,4 +1,4 @@
-//! Tailwind-inspired [`Badge`] / pill tag component with semantic colors, variants,
+//! [`Badge`] / pill tag component with semantic colors, variants,
 //! status dot, leading icon, and optional remove button.
 
 use crate::{
@@ -10,7 +10,7 @@ use crate::icons::{Icon, IconSize, LucideIcon};
 use super::palette as tw;
 use super::theme::{ActiveTheme, Theme, ThemeMode};
 
-/// Tailwind color themes for [`Badge`].
+/// Color themes for [`Badge`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BadgeColor {
     /// Neutral slate/gray badge.
@@ -35,7 +35,7 @@ pub enum BadgeColor {
 /// Visual treatment for [`Badge`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BadgeVariant {
-    /// Soft tinted background with matching ring border (Tailwind UI default badge).
+    /// Soft tinted background with matching ring border (the default badge).
     #[default]
     Soft,
     /// Solid saturated background with white ink.
@@ -44,7 +44,7 @@ pub enum BadgeVariant {
     Outline,
 }
 
-/// Tailwind-style badge / pill tag with optional dot, icon, and removable `X` button.
+/// Badge / pill tag with optional dot, icon, and removable `X` button.
 #[derive(IntoElement)]
 pub struct Badge {
     label: SharedString,

@@ -1,4 +1,4 @@
-//! Tailwind UI / Headless UI collapsible [`Disclosure`] and [`Accordion`] components.
+//! Collapsible [`Disclosure`] and [`Accordion`] components.
 
 use smallvec::SmallVec;
 
@@ -194,7 +194,7 @@ impl RenderOnce for Disclosure {
     }
 }
 
-/// Framed vertical stack of divided [`Disclosure`] sections (Tailwind FAQ / Accordion).
+/// Framed vertical stack of divided [`Disclosure`] sections (FAQ / accordion).
 #[derive(IntoElement)]
 pub struct Accordion {
     style: StyleRefinement,

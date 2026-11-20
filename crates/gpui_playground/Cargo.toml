@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 publish = false
 license = "Apache-2.0"
-description = "Interactive developer playground for GPUI Tailwind-inspired components and Lucide icons"
+description = "Interactive developer playground for GPUI components and Lucide icons"
 
 [lints]
 workspace = true

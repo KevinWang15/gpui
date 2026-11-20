@@ -1,6 +1,6 @@
 # Theming & Component Stylability
 
-`gpui::components` is designed so applications can adopt anything from the default Tailwind Light/Dark themes to deeply customized flat dark or light desktop aesthetics—without forking component internals.
+`gpui::components` is designed so applications can adopt anything from the default Light/Dark themes to deeply customized flat dark or light desktop aesthetics—without forking component internals.
 
 Stylability works at **two complementary layers**:
 

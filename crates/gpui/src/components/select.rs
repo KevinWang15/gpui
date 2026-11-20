@@ -1,4 +1,4 @@
-//! Tailwind-inspired [`Select`] / [`SelectState`] dropdown listbox with keyboard navigation,
+//! [`Select`] / [`SelectState`] dropdown listbox with keyboard navigation,
 //! option groups, icons, descriptions, disabled options, clearable button, and anchored popover.
 
 use std::cell::Cell;
@@ -81,7 +81,7 @@ pub enum SelectEvent<T> {
     Close,
 }
 
-/// Entity state backing a Tailwind-style [`Select`] listbox.
+/// Entity state backing a [`Select`] listbox.
 pub struct SelectState<T: Clone + PartialEq + 'static> {
     focus_handle: FocusHandle,
     options: Vec<SelectOption<T>>,
@@ -691,7 +691,7 @@ impl<T: Clone + PartialEq + 'static> Render for SelectState<T> {
     }
 }
 
-/// Renderable Tailwind-style select element wrapping an [`Entity<SelectState<T>>`].
+/// Renderable select element wrapping an [`Entity<SelectState<T>>`].
 #[derive(IntoElement)]
 pub struct Select<T: Clone + PartialEq + 'static> {
     state: Entity<SelectState<T>>,

@@ -1,4 +1,4 @@
-//! Interactive Tailwind-style range [`Slider`] / [`SliderState`] and dual-thumb
+//! Interactive range [`Slider`] / [`SliderState`] and dual-thumb
 //! [`RangeSlider`] / [`RangeSliderState`] supporting mouse click, window-tracked pointer drag,
 //! optional clickable [`SliderMark`] tick labels, and full keyboard navigation.
 
@@ -482,7 +482,7 @@ impl Render for SliderState {
     }
 }
 
-/// Renderable Tailwind-style slider element wrapping an [`Entity<SliderState>`].
+/// Renderable slider element wrapping an [`Entity<SliderState>`].
 #[derive(IntoElement)]
 pub struct Slider {
     state: Entity<SliderState>,

@@ -1,4 +1,4 @@
-//! Tailwind-inspired layout primitives: [`Container`], [`Stack`], [`VStack`], [`HStack`],
+//! Layout primitives: [`Container`], [`Stack`], [`VStack`], [`HStack`],
 //! [`Grid`], [`Card`], [`Divider`], [`PageHeader`], [`AppShell`], [`Sidebar`], [`Navbar`],
 //! and [`ScrollArea`].
 
@@ -12,7 +12,7 @@ use crate::icons::{Icon, IconSize, LucideIcon};
 
 use super::theme::{ActiveTheme, Theme};
 
-/// Tailwind max-width container breakpoints (`max-w-sm` .. `max-w-7xl`).
+/// Max-width container breakpoints (`max-w-sm` .. `max-w-7xl`).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum MaxWidth {
     /// `384px` (`max-w-sm`).
@@ -62,7 +62,7 @@ impl MaxWidth {
     }
 }
 
-/// Centered, max-width constrained Tailwind container (`mx-auto w-full px-6`).
+/// Centered, max-width constrained container (`mx-auto w-full px-6`).
 #[derive(IntoElement)]
 pub struct Container {
     max_width: MaxWidth,
@@ -205,7 +205,7 @@ impl Stack {
         self
     }
 
-    /// Inserts themed 1px dividers between consecutive children (Tailwind `divide-y` / `divide-x`).
+    /// Inserts themed 1px dividers between consecutive children (`divide-y` / `divide-x`).
     pub fn divided(mut self) -> Self {
         self.divided = true;
         self
@@ -254,7 +254,7 @@ impl RenderOnce for Stack {
     }
 }
 
-/// Tailwind CSS Grid container (`grid grid-cols-{n} gap-{gap}`).
+/// Grid container (`grid grid-cols-{n} gap-{gap}`).
 #[derive(IntoElement)]
 pub struct Grid {
     cols: u16,
@@ -312,7 +312,7 @@ impl RenderOnce for Grid {
     }
 }
 
-/// Elevated Tailwind surface card (`rounded-xl border bg-white shadow-sm`).
+/// Elevated surface card (`rounded-xl border bg-white shadow-sm`).
 #[derive(IntoElement)]
 pub struct Card {
     padded: bool,
@@ -692,7 +692,7 @@ impl RenderOnce for Divider {
     }
 }
 
-/// Tailwind UI page heading with title, optional description, and right-aligned action buttons.
+/// Page heading with title, optional description, and right-aligned action buttons.
 #[derive(IntoElement)]
 pub struct PageHeader {
     title: SharedString,
@@ -1265,7 +1265,7 @@ impl RenderOnce for Sidebar {
     }
 }
 
-/// Tailwind UI Application Shell combining an optional [`Sidebar`], optional [`Navbar`],
+/// Application Shell combining an optional [`Sidebar`], optional [`Navbar`],
 /// and a scrollable main content canvas.
 #[derive(IntoElement)]
 pub struct AppShell {
@@ -1598,7 +1598,7 @@ impl RenderOnce for SettingRow {
     }
 }
 
-/// Helper for focus ring shadow around Tailwind controls.
+/// Helper for focus ring shadow around controls.
 ///
 /// Respects [`Theme::focus_ring_width`]: when `<= 0px`, returns an empty shadow list so
 /// focused controls render with a crisp border-only highlight.

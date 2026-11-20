@@ -36,7 +36,7 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
             Page::Controls,
             LucideIcon::ToggleRight,
             "Toggles, Checks & Radios",
-            "Switches with thumb icons, indeterminate checkbox tree, Tailwind Radio Cards & Slider.",
+            "Switches with thumb icons, indeterminate checkbox tree, Radio Cards & Slider.",
         ),
         (
             Page::Selection,
@@ -65,8 +65,8 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
         (
             Page::Palette,
             LucideIcon::Palette,
-            "Tailwind Palette (242)",
-            "Inspect all 22 Tailwind CSS hues × 11 shades (50–950) and click to copy constants.",
+            "Color Palette (242)",
+            "Inspect all 22 hues × 11 shades (50–950) and click to copy constants.",
         ),
     ];
 
@@ -143,9 +143,9 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
     v_stack()
         .spacing(px(22.))
         .child(
-            page_header("GPUI Tailwind Component Playground")
+            page_header("GPUI Component Playground")
                 .description(
-                    "Interactive workbench for every Tailwind-inspired GPUI component and all 2,092 bundled Lucide SVG icons.",
+                    "Interactive workbench for every GPUI component and all 2,092 bundled Lucide SVG icons.",
                 )
                 .action(
                     button("ov-open-icons")
@@ -178,7 +178,7 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
                 .child(stat_card(
                     "Components",
                     "35+",
-                    "Tailwind-styled primitives",
+                    "Primitives",
                     LucideIcon::Component,
                     cx,
                 ))

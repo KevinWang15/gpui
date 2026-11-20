@@ -1,4 +1,4 @@
-//! Tailwind-inspired single-line text [`Input`] and [`InputState`] with full IME support,
+//! Single-line text [`Input`] and [`InputState`] with full IME support,
 //! selection, clipboard, undo/redo, word navigation, horizontal scrolling, password masking,
 //! clear button, and prefix/suffix icons & addons.
 
@@ -138,7 +138,7 @@ struct InputPaintCache {
     shaped_key: Option<ShapedLineCacheKey>,
 }
 
-/// Entity state backing a Tailwind-style single-line [`Input`].
+/// Entity state backing a single-line [`Input`].
 pub struct InputState {
     focus_handle: FocusHandle,
     content: String,
@@ -273,13 +273,13 @@ impl InputState {
         self
     }
 
-    /// Sets a Tailwind input-group leading addon label (e.g. `"https://"`).
+    /// Sets an input-group leading addon label (e.g. `"https://"`).
     pub fn prefix(mut self, prefix: impl Into<SharedString>) -> Self {
         self.prefix_text = Some(prefix.into());
         self
     }
 
-    /// Sets a Tailwind input-group trailing addon label (e.g. `"USD"`).
+    /// Sets an input-group trailing addon label (e.g. `"USD"`).
     pub fn suffix(mut self, suffix: impl Into<SharedString>) -> Self {
         self.suffix_text = Some(suffix.into());
         self
@@ -1518,7 +1518,7 @@ impl Render for InputState {
     }
 }
 
-/// Renderable Tailwind-style single-line input element wrapping an [`Entity<InputState>`].
+/// Renderable single-line input element wrapping an [`Entity<InputState>`].
 ///
 /// Implements [`Styled`] with direct passthrough to the underlying input frame, so `.bg(...)`,
 /// `.border_color(...)`, `.rounded(...)`, `.h(...)`, `.w(...)`, and typography overrides apply

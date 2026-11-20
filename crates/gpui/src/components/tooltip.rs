@@ -1,4 +1,4 @@
-//! Styled Tailwind [`Tooltip`] view for use with GPUI's `.tooltip(...)` API.
+//! Styled [`Tooltip`] view for use with GPUI's `.tooltip(...)` API.
 
 use crate::{
     AnyView, App, Context, IntoElement, Render, SharedString, Window, div, prelude::*, px,
@@ -6,7 +6,7 @@ use crate::{
 
 use super::theme::ActiveTheme;
 
-/// Styled dark/themed Tailwind tooltip optionally displaying a keyboard shortcut hint.
+/// Styled dark/themed tooltip optionally displaying a keyboard shortcut hint.
 pub struct Tooltip {
     text: SharedString,
     shortcut: Option<SharedString>,

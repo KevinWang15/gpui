@@ -12,7 +12,7 @@
 //! building blocks to make the process of building your own elements easier.
 //! For this we have the [`Interactivity`] and the [`StyleRefinement`] structs, as well
 //! as several associated traits. Together, these provide the full suite of Dom-like events
-//! and Tailwind-like styling that you can use to build your own custom elements. Div is
+//! and utility-style styling that you can use to build your own custom elements. Div is
 //! constructed by combining these two systems into an all-in-one element.
 
 use crate::{

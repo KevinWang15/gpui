@@ -1,4 +1,4 @@
-//! Tailwind UI Data [`Table`] & [`VirtualTable`] with column definitions, sortable headers,
+//! Data [`Table`] & [`VirtualTable`] with column definitions, sortable headers,
 //! alignment, checkbox multi-selection with tri-state select-all header, expandable detail rows,
 //! sticky-header scrollable viewport, and `uniform_list`-virtualized large-dataset rendering.
 
@@ -154,7 +154,7 @@ impl TableRow {
     }
 }
 
-/// Tailwind UI Data Table with header row, striped/hoverable rows, column sort triggers,
+/// Data Table with header row, striped/hoverable rows, column sort triggers,
 /// checkbox multi-selection with tri-state select-all header, expandable detail rows, and
 /// optional sticky-header scrolling via [`Table::max_height`].
 #[derive(IntoElement)]

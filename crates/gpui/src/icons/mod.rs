@@ -16,21 +16,21 @@ use crate::{
     StyleRefinement, Styled, TimedTransformation, Transformation, Window, px, svg,
 };
 
-/// Standard Tailwind-aligned icon sizes.
+/// Standard icon sizes.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum IconSize {
-    /// Extra small (`12px`, Tailwind `size-3`).
+    /// Extra small (`12px`, `size-3`).
     Xs,
-    /// Small (`14px`, Tailwind `size-3.5`).
+    /// Small (`14px`, `size-3.5`).
     Sm,
-    /// Medium (`16px`, Tailwind `size-4`).
+    /// Medium (`16px`, `size-4`).
     #[default]
     Md,
-    /// Large (`20px`, Tailwind `size-5`).
+    /// Large (`20px`, `size-5`).
     Lg,
-    /// Extra large (`24px`, Tailwind `size-6`).
+    /// Extra large (`24px`, `size-6`).
     Xl,
-    /// 2x large (`32px`, Tailwind `size-8`).
+    /// 2x large (`32px`, `size-8`).
     TwoXl,
     /// Explicit pixel size.
     Custom(Pixels),
@@ -127,7 +127,7 @@ impl Icon {
         self
     }
 
-    /// Continuously spins the icon clockwise (1 revolution per second, Tailwind `animate-spin`).
+    /// Continuously spins the icon clockwise (1 revolution per second, `animate-spin`).
     pub fn spin(mut self) -> Self {
         self.spin = Some(Duration::from_millis(900));
         self

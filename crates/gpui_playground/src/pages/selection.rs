@@ -36,7 +36,7 @@ select(&role)"#
     ComboBoxState::new(
         vec![
             ComboBoxOption::new("rust".to_string(), "Rust").icon(LucideIcon::Flame),
-            ComboBoxOption::new("tailwind".to_string(), "Tailwind").icon(LucideIcon::Wind),
+            ComboBoxOption::new("taffy".to_string(), "Taffy").icon(LucideIcon::Wind),
         ],
         cx,
     )

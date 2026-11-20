@@ -20,7 +20,7 @@ fn theme_and_palette_switching(cx: &mut TestAppContext) {
         Theme::set_mode(ThemeMode::Light, cx);
         assert_eq!(cx.theme().mode, ThemeMode::Light);
 
-        // Verify Tailwind palette constants exist and are opaque
+        // Verify palette constants exist and are opaque
         assert_eq!(palette::INDIGO_600.a, 1.0);
         assert_eq!(palette::SLATE_900.a, 1.0);
         assert_eq!(palette::EMERALD_500.a, 1.0);
@@ -318,7 +318,7 @@ impl Render for FullComponentShowcaseView {
                     .left(
                         h_stack()
                             .child(Icon::new(LucideIcon::Sparkles).size(IconSize::Lg))
-                            .child("GPUI Tailwind"),
+                            .child("GPUI Components"),
                     )
                     .right(
                         button("theme-btn")
@@ -364,7 +364,7 @@ impl Render for FullComponentShowcaseView {
                         )
                         .child(
                             page_header("Component Library")
-                                .description("Tailwind-inspired GPUI components + Lucide icons")
+                                .description("GPUI components + Lucide icons")
                                 .action(button("cta").primary().label("Create").leading_icon(LucideIcon::Plus)),
                         )
                         .child(

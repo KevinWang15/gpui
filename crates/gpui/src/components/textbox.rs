@@ -1,4 +1,4 @@
-//! Tailwind-inspired multi-line [`TextBox`] / [`TextArea`] and [`TextBoxState`] with full
+//! Multi-line [`TextBox`] / [`TextArea`] and [`TextBoxState`] with full
 //! multi-line editing, IME support, line & document navigation, multi-line mouse selection,
 //! clipboard, undo/redo, vertical scrolling, and character/line counter footer.
 
@@ -127,7 +127,7 @@ struct LineLayout {
 /// Alias for [`TextBoxState`].
 pub type TextAreaState = TextBoxState;
 
-/// Entity state backing a multi-line Tailwind-style [`TextBox`] / [`TextArea`].
+/// Entity state backing a multi-line [`TextBox`] / [`TextArea`].
 pub struct TextBoxState {
     focus_handle: FocusHandle,
     content: String,
@@ -1380,8 +1380,8 @@ impl Render for TextBoxState {
 /// Alias for [`TextBox`].
 pub type TextArea = TextBox;
 
-/// Renderable Tailwind-style multi-line text box element wrapping an [`Entity<TextBoxState>`],
-/// with optional footer action toolbar (Tailwind UI "Textarea with actions").
+/// Renderable multi-line text box element wrapping an [`Entity<TextBoxState>`],
+/// with optional footer action toolbar (a "textarea with actions").
 #[derive(IntoElement)]
 pub struct TextBox {
     state: Entity<TextBoxState>,

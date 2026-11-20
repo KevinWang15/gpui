@@ -1,4 +1,4 @@
-//! Tailwind-inspired feedback & loading components: [`ProgressBar`], [`ProgressRing`],
+//! Feedback & loading components: [`ProgressBar`], [`ProgressRing`],
 //! [`Spinner`], [`Skeleton`], and [`EmptyState`].
 
 use std::cell::RefCell;
@@ -1047,7 +1047,7 @@ impl RenderOnce for Skeleton {
     }
 }
 
-/// Tailwind UI Empty State panel with dashed border, centered Lucide icon, title, description,
+/// Empty State panel with dashed border, centered Lucide icon, title, description,
 /// and primary call-to-action slot.
 #[derive(IntoElement)]
 pub struct EmptyState {

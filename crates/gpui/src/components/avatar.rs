@@ -1,4 +1,4 @@
-//! Tailwind-inspired [`Avatar`] (with initials, Lucide icon fallback, presence status dot,
+//! [`Avatar`] (with initials, Lucide icon fallback, presence status dot,
 //! and circular/rounded shapes) and stacked [`AvatarGroup`].
 
 use smallvec::SmallVec;
@@ -36,7 +36,7 @@ impl AvatarStatus {
     }
 }
 
-/// Circular or rounded Tailwind avatar displaying initials or a [`LucideIcon`], with optional presence dot.
+/// Circular or rounded avatar displaying initials or a [`LucideIcon`], with optional presence dot.
 #[derive(IntoElement)]
 pub struct Avatar {
     initials: Option<SharedString>,

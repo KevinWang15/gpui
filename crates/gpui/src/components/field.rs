@@ -1,4 +1,4 @@
-//! Tailwind form field wrappers ([`Field`], [`Label`]) and keyboard shortcut badge ([`Kbd`]).
+//! Form field wrappers ([`Field`], [`Label`]) and keyboard shortcut badge ([`Kbd`]).
 
 use smallvec::SmallVec;
 
@@ -65,7 +65,7 @@ impl RenderOnce for Label {
     }
 }
 
-/// Tailwind Catalyst-style `<Field>` wrapper combining a [`Label`], optional description,
+/// `<Field>` wrapper combining a [`Label`], optional description,
 /// one or more form controls, and an optional validation error message.
 #[derive(IntoElement)]
 pub struct Field {

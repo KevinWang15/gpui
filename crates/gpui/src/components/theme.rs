@@ -1,4 +1,4 @@
-//! Semantic design tokens, light/dark Tailwind themes, sizing tokens, and component initialization.
+//! Semantic design tokens, light/dark themes, sizing tokens, and component initialization.
 
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -61,10 +61,10 @@ impl ThemePreference {
 /// Whether the active UI theme is light or dark.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum ThemeMode {
-    /// Crisp light Tailwind aesthetic (white surfaces, slate-900 ink, indigo-600 primary).
+    /// Crisp light aesthetic (white surfaces, slate-900 ink, indigo-600 primary).
     #[default]
     Light,
-    /// Deep dark Tailwind aesthetic (slate-950 canvas, slate-900 surfaces, indigo-500 primary).
+    /// Deep dark aesthetic (slate-950 canvas, slate-900 surfaces, indigo-500 primary).
     Dark,
 }
 
@@ -77,7 +77,7 @@ impl From<WindowAppearance> for ThemeMode {
     }
 }
 
-/// Shared size scale across Tailwind-style interactive components.
+/// Shared size scale across interactive components.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ComponentSize {
     /// Extra small (`24px` control height).
@@ -139,7 +139,7 @@ impl ComponentSize {
     }
 }
 
-/// Semantic Tailwind-inspired color & radius tokens used by all `gpui::components`.
+/// Semantic color & radius tokens used by all `gpui::components`.
 #[derive(Clone, Debug)]
 pub struct Theme {
     /// Active light or dark mode.
@@ -174,7 +174,7 @@ pub struct Theme {
     pub muted_foreground: Hsla,
     /// Placeholder text color.
     pub placeholder: Hsla,
-    /// Primary brand accent (Tailwind Indigo 600 / 500).
+    /// Primary brand accent (Indigo 600 / 500).
     pub primary: Hsla,
     /// Primary hover fill.
     pub primary_hover: Hsla,
@@ -190,7 +190,7 @@ pub struct Theme {
     pub secondary_hover: Hsla,
     /// Text on secondary fill.
     pub secondary_foreground: Hsla,
-    /// Destructive / danger solid fill (Tailwind Red 600).
+    /// Destructive / danger solid fill (Red 600).
     pub destructive: Hsla,
     /// Destructive hover fill.
     pub destructive_hover: Hsla,
@@ -272,11 +272,11 @@ pub struct Theme {
     pub elevation_shadows: bool,
     /// Small border radius (`4px`).
     pub radius_sm: Pixels,
-    /// Medium border radius (`6px`, Tailwind `rounded-md`).
+    /// Medium border radius (`6px`, `rounded-md`).
     pub radius_md: Pixels,
-    /// Large border radius (`8px`, Tailwind `rounded-lg`).
+    /// Large border radius (`8px`, `rounded-lg`).
     pub radius_lg: Pixels,
-    /// Extra large border radius (`12px`, Tailwind `rounded-xl`).
+    /// Extra large border radius (`12px`, `rounded-xl`).
     pub radius_xl: Pixels,
 }
 
@@ -348,7 +348,7 @@ impl ThemeTransitionStyle {
 }
 
 impl Theme {
-    /// Tailwind-inspired light theme.
+    /// Light theme.
     pub fn light() -> Self {
         Self {
             mode: ThemeMode::Light,
@@ -429,7 +429,7 @@ impl Theme {
         }
     }
 
-    /// Tailwind-inspired dark theme.
+    /// Dark theme.
     pub fn dark() -> Self {
         Self {
             mode: ThemeMode::Dark,

@@ -1,4 +1,4 @@
-//! Tailwind-inspired searchable [`ComboBox`] / [`ComboBoxState`] supporting both single-select
+//! Searchable [`ComboBox`] / [`ComboBoxState`] supporting both single-select
 //! and multi-select (with removable tag chips), live filtering, keyboard navigation, and optional
 //! custom-entry creation.
 
@@ -107,7 +107,7 @@ pub enum ComboBoxEvent<T> {
     Create(SharedString),
 }
 
-/// Entity state backing a Tailwind-style searchable [`ComboBox`] (single or multi-select).
+/// Entity state backing a searchable [`ComboBox`] (single or multi-select).
 pub struct ComboBoxState<T: Clone + PartialEq + 'static> {
     focus_handle: FocusHandle,
     search_input: Entity<InputState>,
@@ -949,7 +949,7 @@ impl<T: Clone + PartialEq + 'static> Render for ComboBoxState<T> {
     }
 }
 
-/// Renderable Tailwind-style searchable combobox wrapping an [`Entity<ComboBoxState<T>>`].
+/// Renderable searchable combobox wrapping an [`Entity<ComboBoxState<T>>`].
 #[derive(IntoElement)]
 pub struct ComboBox<T: Clone + PartialEq + 'static> {
     state: Entity<ComboBoxState<T>>,
