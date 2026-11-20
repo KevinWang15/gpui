@@ -42,6 +42,7 @@ mod keyboard_tests_arrows;
 pub mod file_dropzone;
 pub mod filter_bar;
 pub mod form;
+pub mod freeform_canvas;
 pub mod hierarchical_select;
 pub mod image_preview;
 pub mod input;
@@ -136,6 +137,12 @@ pub use filter_bar::{
     FilterFieldDef, FilterOperator, filter_bar,
 };
 pub use form::{FormRule, FormState};
+pub use freeform_canvas::{
+    AlignAction, CanvasItemSpec, CanvasPaletteItem, CanvasRect, CanvasSize, FreeformCanvas,
+    FreeformCanvasEvent, FreeformCanvasState, GuideAxis, GuideKind, ResizeHandle, SnapConfig,
+    SnapGuide, align_item, canvas_palette_item, freeform_canvas, snap_canvas_resize, snap_move,
+    snap_resize,
+};
 pub use hierarchical_select::{
     Cascader, CascaderEvent, CascaderOption, CascaderState, TreeSelect, TreeSelectEvent,
     TreeSelectState, cascader, tree_select,
