@@ -7,7 +7,7 @@ use smallvec::SmallVec;
 use crate::icons::{Icon, IconSize, LucideIcon};
 use crate::{
     AnyElement, App, ClickEvent, ElementId, FontWeight, IntoElement, ParentElement, Pixels,
-    RenderOnce, SharedString, StyleRefinement, Styled, Window, div, prelude::*, px,
+    RenderOnce, ScrollHandle, SharedString, StyleRefinement, Styled, Window, div, prelude::*, px,
 };
 
 use super::theme::{ActiveTheme, Theme};
@@ -1361,14 +1361,33 @@ impl RenderOnce for AppShell {
     }
 }
 
-/// Scrollable region supporting vertical, horizontal, or two-axis scrolling.
+/// Scrollable region supporting vertical, horizontal, or two-axis scrolling with automatic
+/// slim overlay scrollbars.
+///
+/// Constrain the viewport with [`Self::max_height`], [`Self::height`], [`Self::max_width`],
+/// [`Self::width`], or standard [`Styled`] methods (such as `.flex_1().min_h_0()`). Children are
+/// placed inside an auto-sized inner wrapper so flex children keep their natural size and scroll
+/// cleanly instead of getting squished.
 #[derive(IntoElement)]
 pub struct ScrollArea {
     id: ElementId,
     horizontal: bool,
     vertical: bool,
+    max_height: Option<Pixels>,
+    height: Option<Pixels>,
+    max_width: Option<Pixels>,
+    width: Option<Pixels>,
+    bordered: bool,
+    padding: Option<Pixels>,
+    gap: Option<Pixels>,
+    scroll_handle: Option<ScrollHandle>,
     style: StyleRefinement,
     children: SmallVec<[AnyElement; 4]>,
+}
+
+/// Convenience constructor creating a vertically scrollable [`ScrollArea`].
+pub fn scroll_area(id: impl Into<ElementId>) -> ScrollArea {
+    ScrollArea::vertical(id)
 }
 
 impl ScrollArea {
@@ -1378,6 +1397,14 @@ impl ScrollArea {
             id: id.into(),
             horizontal: false,
             vertical: true,
+            max_height: None,
+            height: None,
+            max_width: None,
+            width: None,
+            bordered: false,
+            padding: None,
+            gap: None,
+            scroll_handle: None,
             style: StyleRefinement::default(),
             children: SmallVec::new(),
         }
@@ -1389,6 +1416,14 @@ impl ScrollArea {
             id: id.into(),
             horizontal: true,
             vertical: false,
+            max_height: None,
+            height: None,
+            max_width: None,
+            width: None,
+            bordered: false,
+            padding: None,
+            gap: None,
+            scroll_handle: None,
             style: StyleRefinement::default(),
             children: SmallVec::new(),
         }
@@ -1400,9 +1435,66 @@ impl ScrollArea {
             id: id.into(),
             horizontal: true,
             vertical: true,
+            max_height: None,
+            height: None,
+            max_width: None,
+            width: None,
+            bordered: false,
+            padding: None,
+            gap: None,
+            scroll_handle: None,
             style: StyleRefinement::default(),
             children: SmallVec::new(),
         }
+    }
+
+    /// Caps the scrollable viewport height; content grows naturally up to `height` then scrolls.
+    pub fn max_height(mut self, height: Pixels) -> Self {
+        self.max_height = height.0.is_finite().then(|| height.max(px(0.)));
+        self
+    }
+
+    /// Sets an explicit fixed height for the scrollable viewport.
+    pub fn height(mut self, height: Pixels) -> Self {
+        self.height = height.0.is_finite().then(|| height.max(px(0.)));
+        self
+    }
+
+    /// Caps the scrollable viewport width; useful for horizontal or two-axis scroll areas.
+    pub fn max_width(mut self, width: Pixels) -> Self {
+        self.max_width = width.0.is_finite().then(|| width.max(px(0.)));
+        self
+    }
+
+    /// Sets an explicit fixed width for the scrollable viewport.
+    pub fn width(mut self, width: Pixels) -> Self {
+        self.width = width.0.is_finite().then(|| width.max(px(0.)));
+        self
+    }
+
+    /// Applies a themed rounded surface frame (`surface` background + `1px` border).
+    pub fn bordered(mut self, bordered: bool) -> Self {
+        self.bordered = bordered;
+        self
+    }
+
+    /// Adds inner padding around the scrollable content (scrolls with the content, keeping
+    /// the overlay scrollbar flush with the outer viewport edge).
+    pub fn padding(mut self, padding: Pixels) -> Self {
+        self.padding = padding.0.is_finite().then(|| padding.max(px(0.)));
+        self
+    }
+
+    /// Sets spacing between children inside the scrollable content wrapper.
+    pub fn spacing(mut self, gap: Pixels) -> Self {
+        self.gap = gap.0.is_finite().then(|| gap.max(px(0.)));
+        self
+    }
+
+    /// Binds an external [`ScrollHandle`] for programmatic scrolling or offset inspection.
+    pub fn track_scroll(mut self, handle: &ScrollHandle) -> Self {
+        self.scroll_handle = Some(handle.clone());
+        self
     }
 }
 
@@ -1419,9 +1511,40 @@ impl Styled for ScrollArea {
 }
 
 impl RenderOnce for ScrollArea {
-    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let theme = cx.theme();
+
+        let inner = match (self.vertical, self.horizontal) {
+            (true, false) => div()
+                .flex()
+                .flex_col()
+                .w_full()
+                .min_w_0()
+                .when_some(self.gap, |el, g| el.gap(g))
+                .when_some(self.padding, |el, p| el.p(p))
+                .children(self.children),
+            (false, true) => div()
+                .flex()
+                .flex_row()
+                .flex_shrink_0()
+                .min_w_full()
+                .when_some(self.gap, |el, g| el.gap(g))
+                .when_some(self.padding, |el, p| el.p(p))
+                .children(self.children),
+            _ => div()
+                .flex()
+                .flex_col()
+                .flex_shrink_0()
+                .min_w_full()
+                .when_some(self.gap, |el, g| el.gap(g))
+                .when_some(self.padding, |el, p| el.p(p))
+                .children(self.children),
+        };
+
         let mut el = div()
             .id(self.id)
+            .w_full()
+            .when(self.horizontal, |el| el.flex().flex_row().items_start())
             .when(self.vertical && self.horizontal, |el| el.overflow_scroll())
             .when(self.vertical && !self.horizontal, |el| {
                 el.overflow_y_scroll()
@@ -1429,7 +1552,18 @@ impl RenderOnce for ScrollArea {
             .when(!self.vertical && self.horizontal, |el| {
                 el.overflow_x_scroll()
             })
-            .children(self.children);
+            .when_some(self.max_height, |el, h| el.max_h(h))
+            .when_some(self.height, |el, h| el.h(h))
+            .when_some(self.max_width, |el, w| el.max_w(w))
+            .when_some(self.width, |el, w| el.w(w))
+            .when(self.bordered, |el| {
+                el.rounded(theme.radius_lg)
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.surface)
+            })
+            .when_some(self.scroll_handle, |el, handle| el.track_scroll(&handle))
+            .child(inner);
         crate::Refineable::refine(el.style(), &self.style);
         el
     }

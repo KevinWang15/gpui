@@ -70,7 +70,7 @@ impl Page {
             Self::Controls => "toggle switch checkbox indeterminate radio cards slider range",
             Self::Selection => "select listbox dropdown combobox autocomplete tags multiselect",
             Self::LayoutNavigation => {
-                "layout container grid stack card divider tabs accordion disclosure breadcrumb pagination"
+                "layout container grid stack scroll area scrollarea overflow scrollbar card divider tabs accordion disclosure breadcrumb pagination"
             }
             Self::OverlaysData => {
                 "dialog modal native os window popup popover dropdown menu toast notification tooltip table sort badge avatar alert progress spinner skeleton empty"
@@ -176,6 +176,8 @@ pub struct PlaygroundApp {
     pub grid_cols: u16,
     pub stack_divided: bool,
     pub stack_gap_px: f32,
+    pub scroll_area_max_h: f32,
+    pub scroll_area_handle: gpui::ScrollHandle,
     pub tabs_underline_idx: usize,
     pub tabs_pills_idx: usize,
     pub tabs_seg_idx: usize,
@@ -1699,6 +1701,8 @@ impl PlaygroundApp {
             grid_cols: 3,
             stack_divided: true,
             stack_gap_px: 12.0,
+            scroll_area_max_h: 200.0,
+            scroll_area_handle: gpui::ScrollHandle::new(),
             tabs_underline_idx: 0,
             tabs_pills_idx: 0,
             tabs_seg_idx: 0,

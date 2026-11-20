@@ -152,7 +152,7 @@ pub use layout::{
     Divider, Grid, HStack, MaxWidth, Navbar, PageHeader, ScrollArea, Section, SettingRow, Sidebar,
     SidebarGroup, SidebarItem, Stack, StackDirection, VStack, card, card_content, card_description,
     card_footer, card_header, card_title, container, divider, grid, h_stack, navbar, page_header,
-    section, setting_row, v_stack,
+    scroll_area, section, setting_row, v_stack,
 };
 pub use liquid_glass::{
     LiquidGlass, LiquidGlassDragEvent, LiquidGlassDragState, LiquidGlassStage, liquid_glass,

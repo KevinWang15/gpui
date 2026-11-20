@@ -717,6 +717,97 @@ fn app_shell_scroll_container_never_squishes_tall_cards(cx: &mut TestAppContext)
     );
 }
 
+#[gpui::test]
+fn scroll_area_constrains_viewport_without_squishing_and_tracks_scroll(cx: &mut TestAppContext) {
+    cx.update(init_components);
+    let v_handle = crate::ScrollHandle::new();
+    let h_handle = crate::ScrollHandle::new();
+    let b_handle = crate::ScrollHandle::new();
+    let measured_child_h = Rc::new(Cell::new(0.0f32));
+
+    struct ScrollAreaTestView {
+        v_handle: crate::ScrollHandle,
+        h_handle: crate::ScrollHandle,
+        b_handle: crate::ScrollHandle,
+        measured_child_h: Rc<Cell<f32>>,
+    }
+
+    impl Render for ScrollAreaTestView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let measured = self.measured_child_h.clone();
+            crate::div()
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .w(px(300.))
+                .h(px(600.))
+                .child(
+                    scroll_area("sa-vert")
+                        .max_height(px(120.))
+                        .bordered(true)
+                        .padding(px(8.))
+                        .spacing(px(8.))
+                        .track_scroll(&self.v_handle)
+                        .child(
+                            crate::canvas(
+                                move |bounds, _, _| measured.set(bounds.size.height.0),
+                                |_, _, _, _| {},
+                            )
+                            .w_full()
+                            .h(px(90.)),
+                        )
+                        .children((0..5).map(|_| crate::div().w_full().h(px(60.)))),
+                )
+                .child(
+                    ScrollArea::horizontal("sa-horiz")
+                        .width(px(200.))
+                        .padding(px(8.))
+                        .spacing(px(8.))
+                        .track_scroll(&self.h_handle)
+                        .children((0..6).map(|_| crate::div().flex_shrink_0().w(px(100.)).h(px(40.)))),
+                )
+                .child(
+                    ScrollArea::both("sa-both")
+                        .width(px(200.))
+                        .height(px(100.))
+                        .padding(px(8.))
+                        .spacing(px(6.))
+                        .track_scroll(&self.b_handle)
+                        .children((0..6).map(|_| crate::div().flex_shrink_0().w(px(480.)).h(px(40.)))),
+                )
+        }
+    }
+
+    let _window = cx.open_window(size(px(360.), px(640.)), |_, _| ScrollAreaTestView {
+        v_handle: v_handle.clone(),
+        h_handle: h_handle.clone(),
+        b_handle: b_handle.clone(),
+        measured_child_h: measured_child_h.clone(),
+    });
+    cx.run_until_parked();
+
+    assert!(
+        measured_child_h.get() >= 89.5,
+        "vertical ScrollArea must not squish children (got {}px, expected 90px)",
+        measured_child_h.get()
+    );
+    assert!(
+        v_handle.max_offset().y > px(250.),
+        "vertical ScrollArea should overflow vertically, got {:?}",
+        v_handle.max_offset()
+    );
+    assert!(
+        h_handle.max_offset().x > px(350.),
+        "horizontal ScrollArea should overflow horizontally, got {:?}",
+        h_handle.max_offset()
+    );
+    assert!(
+        b_handle.max_offset().x > px(200.) && b_handle.max_offset().y > px(150.),
+        "two-axis ScrollArea::both should overflow on both axes, got {:?}",
+        b_handle.max_offset()
+    );
+}
+
 #[test]
 fn calendar_date_and_time_range_arithmetic() {
     let nov19 = CalendarDate::new(2026, 11, 19);

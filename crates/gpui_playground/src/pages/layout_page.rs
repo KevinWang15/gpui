@@ -201,7 +201,7 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
         .child(
             page_header("Layout, Tabs, Accordion & Navigation")
                 .description(
-                    "Interactive demos of Container, Grid, Stack, Card, Divider, Tabs (3 variants), Disclosure/Accordion, Breadcrumb, and Pagination.",
+                    "Interactive demos of Container, Grid, Stack, ScrollArea, Card, Divider, Tabs (3 variants), Disclosure/Accordion, Breadcrumb, and Pagination.",
                 )
                 .action(
                     h_stack().spacing(px(4.)).children(
@@ -298,6 +298,200 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
                                         ),
                                 ),
                         ),
+                ),
+        )
+        // ScrollArea (Vertical, Horizontal & Dual-Axis)
+        .child(
+            card()
+                .child(
+                    card_header().bordered().child(
+                        h_stack()
+                            .justify_between()
+                            .child(
+                                v_stack()
+                                    .spacing(px(2.))
+                                    .child(card_title("ScrollArea — Height-Limited, Horizontal & Dual-Axis"))
+                                    .child(card_description(
+                                        "Constrain viewport size with `.max_height(...)` or `.height(...)`; move cursor near edges to reveal slim auto-hiding scrollbars.",
+                                    )),
+                            )
+                            .child(
+                                h_stack()
+                                    .spacing(px(6.))
+                                    .children([140.0f32, 200.0, 280.0].into_iter().map(|h| {
+                                        button(("sa-maxh", h as usize))
+                                            .size(ComponentSize::Xs)
+                                            .outline()
+                                            .selected((app.scroll_area_max_h - h).abs() < 1.0)
+                                            .label(format!("max_h {}px", h as usize))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.scroll_area_max_h = h;
+                                                cx.notify();
+                                            }))
+                                    }))
+                                    .child(
+                                        button("sa-top")
+                                            .size(ComponentSize::Xs)
+                                            .ghost()
+                                            .label("Top")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.scroll_area_handle.set_offset(gpui::point(px(0.), px(0.)));
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .child(
+                                        button("sa-bottom")
+                                            .size(ComponentSize::Xs)
+                                            .ghost()
+                                            .label("Bottom")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.scroll_area_handle.scroll_to_bottom();
+                                                cx.notify();
+                                            })),
+                                    ),
+                            ),
+                    ),
+                )
+                .child(
+                    card_content().child(
+                        grid(2)
+                            .spacing(px(16.))
+                            .child(
+                                v_stack()
+                                    .spacing(px(8.))
+                                    .child(label(format!(
+                                        "Vertical `scroll_area` (.max_height({}px) + ScrollHandle)",
+                                        app.scroll_area_max_h as usize
+                                    )))
+                                    .child(
+                                        scroll_area("pg-scroll-v")
+                                            .max_height(px(app.scroll_area_max_h))
+                                            .bordered(true)
+                                            .padding(px(10.))
+                                            .spacing(px(6.))
+                                            .track_scroll(&app.scroll_area_handle)
+                                            .children((1..=16).map(|i| {
+                                                let tone = match i % 4 {
+                                                    0 => BadgeColor::Green,
+                                                    1 => BadgeColor::Indigo,
+                                                    2 => BadgeColor::Amber,
+                                                    _ => BadgeColor::Purple,
+                                                };
+                                                let status = match i % 4 {
+                                                    0 => "Deployed",
+                                                    1 => "Verified",
+                                                    2 => "Canary",
+                                                    _ => "Queued",
+                                                };
+                                                h_stack()
+                                                    .justify_between()
+                                                    .px(px(10.))
+                                                    .py(px(8.))
+                                                    .rounded(theme.radius_md)
+                                                    .bg(theme.surface_muted.opacity(0.45))
+                                                    .border_1()
+                                                    .border_color(theme.border.opacity(0.7))
+                                                    .child(
+                                                        h_stack()
+                                                            .spacing(px(8.))
+                                                            .min_w_0()
+                                                            .flex_1()
+                                                            .child(
+                                                                div()
+                                                                    .font_features(tabular_numerals())
+                                                                    .text_size(px(12.))
+                                                                    .text_color(theme.muted_foreground)
+                                                                    .child(format!("#{i:02}")),
+                                                            )
+                                                            .child(
+                                                                div()
+                                                                    .text_size(px(13.))
+                                                                    .font_weight(FontWeight::MEDIUM)
+                                                                    .truncate()
+                                                                    .child(format!("Release build v2.4.{i} — shader pipeline")),
+                                                            ),
+                                                    )
+                                                    .child(badge(status).color(tone))
+                                            })),
+                                    ),
+                            )
+                            .child(
+                                v_stack()
+                                    .spacing(px(12.))
+                                    .child(
+                                        v_stack()
+                                            .spacing(px(6.))
+                                            .child(label("Horizontal `ScrollArea::horizontal`"))
+                                            .child(
+                                                ScrollArea::horizontal("pg-scroll-h")
+                                                    .bordered(true)
+                                                    .padding(px(10.))
+                                                    .spacing(px(10.))
+                                                    .children((1..=8).map(|i| {
+                                                        v_stack()
+                                                            .flex_shrink_0()
+                                                            .w(px(132.))
+                                                            .p(px(10.))
+                                                            .spacing(px(4.))
+                                                            .rounded(theme.radius_md)
+                                                            .bg(theme.surface_muted.opacity(0.5))
+                                                            .border_1()
+                                                            .border_color(theme.border)
+                                                            .child(
+                                                                div()
+                                                                    .text_size(px(11.5))
+                                                                    .text_color(theme.muted_foreground)
+                                                                    .child(format!("Cluster us-east-{i}")),
+                                                            )
+                                                            .child(
+                                                                div()
+                                                                    .text_size(px(15.))
+                                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                                    .font_features(tabular_numerals())
+                                                                    .child(format!("{}.{} ms", 10 + i * 3, (i * 7) % 10)),
+                                                            )
+                                                    })),
+                                            ),
+                                    )
+                                    .child(
+                                        v_stack()
+                                            .spacing(px(6.))
+                                            .child(label("Two-axis `ScrollArea::both` (.height(136px))"))
+                                            .child(
+                                                ScrollArea::both("pg-scroll-both")
+                                                    .height(px(136.))
+                                                    .bordered(true)
+                                                    .padding(px(10.))
+                                                    .spacing(px(6.))
+                                                    .children((1..=10).map(|row| {
+                                                        let cell_theme = theme.clone();
+                                                        h_stack()
+                                                            .flex_shrink_0()
+                                                            .spacing(px(6.))
+                                                            .children((1..=8).map(move |col| {
+                                                                div()
+                                                                    .flex_shrink_0()
+                                                                    .w(px(88.))
+                                                                    .px(px(8.))
+                                                                    .py(px(5.))
+                                                                    .rounded(cell_theme.radius_sm)
+                                                                    .bg(if (row + col) % 2 == 0 {
+                                                                        cell_theme.surface_muted.opacity(0.6)
+                                                                    } else {
+                                                                        cell_theme.background
+                                                                    })
+                                                                    .border_1()
+                                                                    .border_color(cell_theme.border.opacity(0.6))
+                                                                    .text_size(px(11.5))
+                                                                    .font_features(tabular_numerals())
+                                                                    .text_color(cell_theme.muted_foreground)
+                                                                    .child(format!("R{row:02} · C{col:02}"))
+                                                            }))
+                                                    })),
+                                            ),
+                                    ),
+                            ),
+                    ),
                 ),
         )
         // Tabs (Underline, Pills, Segmented)
