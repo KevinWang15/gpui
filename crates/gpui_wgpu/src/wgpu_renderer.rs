@@ -4419,6 +4419,153 @@ mod tests {
                 img.save(&path).expect("save chromatic_warp preview png");
             }
         }
+
+        // BlurFade (0-0.2s blur out, 0.1-0.2s cross-fade, 0.1-0.3s blur in).
+        for (tag, progress) in [
+            ("start", 0.0_f32),
+            ("t080_blurout", 0.27),
+            ("t150_crossfade", 0.50),
+            ("t240_blurin", 0.80),
+            ("end", 1.0),
+        ] {
+            let t = SceneTransition {
+                kind: SceneTransitionKind::BlurFade,
+                origin,
+                radius: ScaledPixels(0.0),
+                feather: ScaledPixels(1.0),
+                progress,
+            };
+            headless
+                .core
+                .render_frame_with_transition(&dark_scene, t, &target_view, size)
+                .expect("blur_fade frame");
+            let img = headless.read_image().expect("read blur_fade");
+            if tag == "start" {
+                let px0 = img.get_pixel(400, 300);
+                assert!(px0[0] > 200 && px0[1] > 200 && px0[2] > 200);
+            } else if tag == "t080_blurout" {
+                // Before 0.1s (p < 1/3): still 100% light scene (blurred).
+                let p_mid = img.get_pixel(400, 300);
+                assert!(
+                    p_mid[0] > 180 && p_mid[1] > 180 && p_mid[2] > 180,
+                    "blur_fade before 0.1s should remain light scene, got {p_mid:?}"
+                );
+            } else if tag == "t240_blurin" {
+                // After 0.2s (p > 2/3): 100% dark scene (blurring into focus).
+                let p_mid = img.get_pixel(400, 300);
+                assert!(
+                    p_mid[0] < 90 && p_mid[1] < 90 && p_mid[2] < 110,
+                    "blur_fade after 0.2s should be dark scene blurring in, got {p_mid:?}"
+                );
+            } else if tag == "end" {
+                let px1 = img.get_pixel(24, 575);
+                assert!(px1[0] < 60 && px1[1] < 60 && px1[2] < 80);
+            }
+            if let Some(ref dir) = dump_dir {
+                let path = std::path::Path::new(dir).join(format!("transition_blur_fade_{tag}.png"));
+                img.save(&path).expect("save blur_fade preview png");
+            }
+        }
+
+        // Glitch (0.3s asynchronous blocks & RGB-split tears).
+        for (tag, progress) in [
+            ("start", 0.0_f32),
+            ("early", 0.25),
+            ("mid", 0.50),
+            ("late", 0.78),
+            ("end", 1.0),
+        ] {
+            let t = SceneTransition {
+                kind: SceneTransitionKind::Glitch,
+                origin,
+                radius: ScaledPixels(0.0),
+                feather: ScaledPixels(1.0),
+                progress,
+            };
+            headless
+                .core
+                .render_frame_with_transition(&dark_scene, t, &target_view, size)
+                .expect("glitch frame");
+            let img = headless.read_image().expect("read glitch");
+            if tag == "start" {
+                let px0 = img.get_pixel(400, 300);
+                assert!(px0[0] > 200 && px0[1] > 200 && px0[2] > 200);
+            } else if tag == "mid" {
+                // At midpoint, some regions must already be dark and others still light!
+                let mut dark_samples = 0usize;
+                let mut light_samples = 0usize;
+                for y in (40..h - 40).step_by(32) {
+                    for x in (40..w - 40).step_by(32) {
+                        let px = img.get_pixel(x, y);
+                        let lum = (px[0] as u32 + px[1] as u32 + px[2] as u32) / 3;
+                        if lum < 75 {
+                            dark_samples += 1;
+                        } else if lum > 180 {
+                            light_samples += 1;
+                        }
+                    }
+                }
+                assert!(
+                    dark_samples > 10 && light_samples > 10,
+                    "glitch at mid should show mixed old/new regions (dark={dark_samples}, light={light_samples})"
+                );
+            } else if tag == "end" {
+                let px1 = img.get_pixel(24, 575);
+                assert!(px1[0] < 60 && px1[1] < 60 && px1[2] < 80);
+            }
+            if let Some(ref dir) = dump_dir {
+                let path = std::path::Path::new(dir).join(format!("transition_glitch_{tag}.png"));
+                img.save(&path).expect("save glitch preview png");
+            }
+        }
+
+        // PrismaticBlob (double organic blob reveal with prismatic chromatic ribbon).
+        let center_origin = Point {
+            x: ScaledPixels(w as f32 * 0.5),
+            y: ScaledPixels(h as f32 * 0.5),
+        };
+        let center_diag = (w as f32 * 0.5).hypot(h as f32 * 0.5);
+        for (tag, progress) in [
+            ("start", 0.0_f32),
+            ("early", 0.28),
+            ("mid", 0.48),
+            ("late", 0.72),
+            ("end", 1.0),
+        ] {
+            let t = SceneTransition {
+                kind: SceneTransitionKind::PrismaticBlob,
+                origin: center_origin,
+                radius: ScaledPixels(center_diag),
+                feather: ScaledPixels(1.0),
+                progress,
+            };
+            headless
+                .core
+                .render_frame_with_transition(&dark_scene, t, &target_view, size)
+                .expect("prismatic_blob frame");
+            let img = headless.read_image().expect("read prismatic_blob");
+            if tag == "start" {
+                let px0 = img.get_pixel(400, 300);
+                assert!(px0[0] > 200 && px0[1] > 200 && px0[2] > 200);
+            } else if tag == "mid" {
+                let inside = img.get_pixel(w / 2, h / 2);
+                let outside = img.get_pixel(24, 24);
+                let luma_in = inside[0] as u32 + inside[1] as u32 + inside[2] as u32;
+                let luma_out = outside[0] as u32 + outside[1] as u32 + outside[2] as u32;
+                assert!(
+                    luma_in < luma_out,
+                    "prismatic_blob mid: center ({inside:?}) must be dark, corner ({outside:?}) must be light"
+                );
+            } else if tag == "end" {
+                let px1 = img.get_pixel(24, 575);
+                assert!(px1[0] < 60 && px1[1] < 60 && px1[2] < 80);
+            }
+            if let Some(ref dir) = dump_dir {
+                let path =
+                    std::path::Path::new(dir).join(format!("transition_prismatic_blob_{tag}.png"));
+                img.save(&path).expect("save prismatic_blob preview png");
+            }
+        }
     }
 
     #[test]

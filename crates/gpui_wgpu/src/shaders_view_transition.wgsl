@@ -482,6 +482,308 @@ fn vt_chromatic_warp(frag_pos: vec2<f32>, dims: vec2<f32>, dims_i: vec2<i32>) ->
     return vec4<f32>(final_rgb, color.a);
 }
 
+// Single-pass Golden-Angle Vogel disk Gaussian blur with IGN rotation (zero box/star artifacts).
+fn vt_disk_blur(
+    use_new: bool,
+    frag_pos: vec2<f32>,
+    dims: vec2<f32>,
+    dims_i: vec2<i32>,
+    radius_px: f32,
+) -> vec4<f32> {
+    if (radius_px <= 0.35) {
+        if (use_new) {
+            return vt_load_new(frag_pos, dims_i);
+        }
+        return vt_load_old(frag_pos, dims_i);
+    }
+
+    let inv_dims = 1.0 / dims;
+    let base_angle = vt_ign(floor(frag_pos)) * (VT_PI * 2.0);
+    let golden_angle = 2.39996323;
+
+    var acc = vec4<f32>(0.0);
+    var w_sum = 0.0;
+    for (var i = 0; i < 24; i += 1) {
+        let frac_r = sqrt((f32(i) + 0.5) / 24.0);
+        let theta = base_angle + f32(i) * golden_angle;
+        let offset_px = vec2<f32>(cos(theta), sin(theta)) * (frac_r * radius_px);
+        let uv = (frag_pos + offset_px) * inv_dims;
+        let w = exp(-2.35 * frac_r * frac_r);
+        var tex: vec4<f32>;
+        if (use_new) {
+            tex = vt_sample_new(uv);
+        } else {
+            tex = vt_sample_old(uv);
+        }
+        acc += tex * w;
+        w_sum += w;
+    }
+    return acc / max(w_sum, 0.0001);
+}
+
+// 0.3s BlurFade:
+//   - 0.0s..0.2s (p in 0.0..2/3): old view blurs out smoothly to peak radius.
+//   - 0.1s..0.2s (p in 1/3..2/3): opacity cross-fade between blurred old and blurred new.
+//   - 0.1s..0.3s (p in 1/3..1.0): new view blurs in smoothly from peak radius to crisp focus.
+fn vt_blur_fade(frag_pos: vec2<f32>, dims: vec2<f32>, dims_i: vec2<i32>) -> vec4<f32> {
+    let scale = max(params.feather_px, 1.0);
+    let p = clamp(params.progress, 0.0, 1.0);
+    if (p <= 0.0005) {
+        return vt_load_old(frag_pos, dims_i);
+    }
+    if (p >= 0.9995) {
+        return vt_load_new(frag_pos, dims_i);
+    }
+
+    let max_radius = 26.0 * scale;
+    let t_one_third = 1.0 / 3.0;
+    let t_two_thirds = 2.0 / 3.0;
+
+    let old_u = smoothstep(0.0, t_two_thirds, p);
+    let new_u = 1.0 - smoothstep(t_one_third, 1.0, p);
+    let r_old = max_radius * old_u;
+    let r_new = max_radius * new_u;
+
+    let mix_new = smoothstep(t_one_third, t_two_thirds, p);
+    if (mix_new <= 0.0005) {
+        return vt_disk_blur(false, frag_pos, dims, dims_i, r_old);
+    }
+    if (mix_new >= 0.9995) {
+        return vt_disk_blur(true, frag_pos, dims, dims_i, r_new);
+    }
+    let old_col = vt_disk_blur(false, frag_pos, dims, dims_i, r_old);
+    let new_col = vt_disk_blur(true, frag_pos, dims, dims_i, r_new);
+    return mix(old_col, new_col, mix_new);
+}
+
+// 0.3s asynchronous Glitch transition: staggered multi-scale blocks and horizontal tear strips
+// glitch at different times with crisp RGB channel separation and snap into the next view.
+fn vt_glitch(frag_pos: vec2<f32>, dims: vec2<f32>, dims_i: vec2<i32>) -> vec4<f32> {
+    let scale = max(params.feather_px, 1.0);
+    let p = clamp(params.progress, 0.0, 1.0);
+    if (p <= 0.0005) {
+        return vt_load_old(frag_pos, dims_i);
+    }
+    if (p >= 0.9995) {
+        return vt_load_new(frag_pos, dims_i);
+    }
+
+    let uv = frag_pos / dims;
+    // Quantize digital glitch steps (~18 discrete frames across 0.3s) for crisp electronic snaps.
+    let step_t = floor(p * 18.0);
+    let endpoint_env = smoothstep(0.0, 0.04, p) * (1.0 - smoothstep(0.94, 1.0, p));
+
+    // Multi-scale irregular regions so different parts of the view flip at different times.
+    let macro_cell = floor(uv * vec2<f32>(6.0, 5.0));
+    let macro_h = vt_hash21(macro_cell + vec2<f32>(3.1, 7.7));
+
+    // Horizontal mid-blocks with jittered column breaks.
+    let mid_row = floor(uv.y * 16.0);
+    let row_jitter = vt_hash21(vec2<f32>(mid_row, 11.3));
+    let mid_cols = 2.0 + floor(row_jitter * 4.0);
+    let mid_cell = vec2<f32>(floor((uv.x + row_jitter * 0.37) * mid_cols), mid_row);
+    let mid_h = vt_hash21(mid_cell + vec2<f32>(19.4, 2.9));
+
+    // Fine scanline tear slivers that fire during each region's active glitch window.
+    let sliver_row = floor(uv.y * 54.0);
+    let sliver_h = vt_hash21(vec2<f32>(sliver_row, step_t * 1.37 + 5.1));
+    let block_flicker = vt_hash21(mid_cell + vec2<f32>(step_t * 3.13, step_t * 7.41));
+
+    // Per-region switch time in [0.10, 0.86], combining macro chunks and jagged horizontal bars.
+    let cell_t = 0.10 + (macro_h * 0.56 + mid_h * 0.44) * 0.76;
+    let delta_t = p - cell_t;
+    let local_win = 0.16;
+    let glitch_amt = clamp(1.0 - abs(delta_t) / local_win, 0.0, 1.0) * endpoint_env;
+
+    // Fast exact path for regions not currently glitching.
+    if (glitch_amt <= 0.001) {
+        if (delta_t >= 0.0) {
+            return vt_load_new(frag_pos, dims_i);
+        }
+        return vt_load_old(frag_pos, dims_i);
+    }
+
+    // Decide whether this glitching chunk/sliver shows the new or old view (brief digital stutter).
+    var show_new = delta_t >= 0.0;
+    if (abs(delta_t) < 0.065 && block_flicker > 0.56) {
+        show_new = !show_new;
+    }
+    if (sliver_h > 0.84 && glitch_amt > 0.25) {
+        show_new = !show_new;
+    }
+
+    // Sharp horizontal tear displacement + micro vertical jitter on active slivers.
+    let dir_sign = select(-1.0, 1.0, vt_hash21(mid_cell + vec2<f32>(step_t * 2.1, 9.4)) > 0.5);
+    let slice_burst = select(0.35, 1.0, sliver_h > 0.62);
+    let shift_px = dir_sign * glitch_amt * (16.0 + 48.0 * slice_burst * block_flicker) * scale;
+    let v_jitter_px = (vt_hash21(vec2<f32>(mid_row, step_t * 4.7)) - 0.5) * 6.0 * glitch_amt * scale * select(0.0, 1.0, sliver_h > 0.78);
+
+    // Wide horizontal RGB chromatic aberration split across the tearing chunk.
+    let ca_px = glitch_amt * (9.0 + 22.0 * slice_burst) * scale;
+    let base_p = frag_pos + vec2<f32>(shift_px, v_jitter_px);
+    let uv_r = (base_p - vec2<f32>(ca_px, 0.0)) / dims;
+    let uv_g = base_p / dims;
+    let uv_b = (base_p + vec2<f32>(ca_px * 1.15, 0.0)) / dims;
+
+    var col: vec4<f32>;
+    if (show_new) {
+        let g = vt_sample_new(uv_g);
+        col = vec4<f32>(vt_sample_new(uv_r).r, g.g, vt_sample_new(uv_b).b, g.a);
+    } else {
+        let g = vt_sample_old(uv_g);
+        col = vec4<f32>(vt_sample_old(uv_r).r, g.g, vt_sample_old(uv_b).b, g.a);
+    }
+
+    // Subtle CRT scanline modulation + rare thin neon cyan/magenta bitstream flash inside active bars.
+    let scanline = 1.0 - 0.10 * glitch_amt * (0.5 + 0.5 * sin(frag_pos.y * (VT_PI / scale)));
+    var rgb = col.rgb * scanline;
+    if (sliver_h > 0.91 && glitch_amt > 0.35) {
+        let tint = select(vec3<f32>(0.08, 0.95, 1.0), vec3<f32>(1.0, 0.14, 0.68), block_flicker > 0.5);
+        rgb = mix(rgb, tint * col.a, 0.32 * glitch_amt);
+    }
+    return vec4<f32>(clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0)), col.a);
+}
+
+// Smooth 2-octave value noise (silky organic curves without high-frequency crinkles).
+fn vt_smooth_noise2(p: vec2<f32>) -> f32 {
+    let a = vt_noise2d(p);
+    let b = vt_noise2d(vec2<f32>(p.x * 1.72 - p.y * 1.18, p.x * 1.18 + p.y * 1.72) + vec2<f32>(7.4, 13.1));
+    return a * 0.68 + b * 0.32;
+}
+
+// Organic double-blob radial reveal: two independent smooth random blobs (outer & inner)
+// expanding from origin, with silky spectral chromatic aberration and prismatic glass color
+// filling the varying-width ribbon between the two blob contours.
+fn vt_prismatic_blob(frag_pos: vec2<f32>, dims: vec2<f32>, dims_i: vec2<i32>) -> vec4<f32> {
+    let scale = max(params.feather_px, 1.0);
+    let p = clamp(params.progress, 0.0, 1.0);
+    if (p <= 0.0005) {
+        return vt_load_old(frag_pos, dims_i);
+    }
+    if (p >= 0.9995) {
+        return vt_load_new(frag_pos, dims_i);
+    }
+
+    let delta = frag_pos - params.origin_px;
+    let dist = length(delta);
+    let dir = delta / max(dist, 0.001);
+    let theta = atan2(delta.y, delta.x);
+
+    // Origin-derived seed so each click position spawns a fresh pair of organic blob shapes.
+    let seed = fract(params.origin_px * vec2<f32>(0.0137, 0.0193) + vec2<f32>(0.37, 0.71));
+
+    let band = clamp(min(dims.x, dims.y) * 0.135, 64.0 * scale, 140.0 * scale);
+    let max_r = max(params.radius_px, 1.0);
+    let r_base_out = mix(-band * 0.35, max_r + band * 2.15, p);
+    let r_base_in = mix(-band * 1.45, max_r + band * 1.15, p);
+
+    // Fast coarse radial reject for pixels far outside the double-blob envelope.
+    let max_amp = band * 0.96;
+    if (dist > r_base_out + max_amp + 12.0 * scale) {
+        return vt_load_old(frag_pos, dims_i);
+    }
+    if (dist < r_base_in - max_amp - 12.0 * scale) {
+        return vt_load_new(frag_pos, dims_i);
+    }
+
+    // Smooth organic OUTER blob silhouette (seamless around 2*PI via unit `dir`, zero crinkles).
+    let n_out = vt_smooth_noise2(
+        dir * 1.15 + vec2<f32>(seed.x * 7.3 + 1.4, seed.y * 5.9 + 2.8) + vec2<f32>(p * 0.55, -p * 0.38),
+    );
+    let lobes_out = 0.42 * sin(theta * 2.0 + seed.x * 6.28318 + 0.5 + p * 0.65)
+        + 0.33 * sin(theta * 3.0 - seed.y * 6.28318 + 2.1 - p * 0.45)
+        + 0.16 * sin(theta * 4.0 + seed.x * 4.12 - 0.9 + p * 0.35)
+        + 0.09 * sin(theta * 5.0 - seed.y * 3.74 + 1.3);
+    let shape_out = clamp((n_out - 0.5) * 1.05 + lobes_out * 0.78, -1.0, 1.0);
+
+    // Independent smooth organic INNER blob silhouette (different noise domain & lobe harmonics).
+    let n_in = vt_smooth_noise2(
+        dir * 1.25 + vec2<f32>(seed.y * 9.1 + 11.7, seed.x * 6.4 + 8.3) + vec2<f32>(-p * 0.42, p * 0.60),
+    );
+    let lobes_in = 0.40 * cos(theta * 2.0 - seed.y * 6.28318 + 1.9 - p * 0.55)
+        + 0.34 * sin(theta * 3.0 + seed.x * 6.28318 + 0.4 + p * 0.50)
+        + 0.18 * cos(theta * 4.0 + seed.y * 5.14 - 1.4 - p * 0.30)
+        + 0.08 * cos(theta * 5.0 + seed.x * 2.91 + 0.8);
+    let shape_in = clamp((n_in - 0.5) * 1.05 + lobes_in * 0.78, -1.0, 1.0);
+
+    // Cap lobe amplitude proportionally to base radius near origin so neither blob ever pinches/folds.
+    let amp_out = min(max_amp, max(r_base_out, 0.0) * 0.44);
+    let amp_in = min(max_amp, max(r_base_in, 0.0) * 0.44);
+
+    let r_outer = r_base_out + amp_out * shape_out;
+    let r_inner = min(r_base_in + amp_in * shape_in, r_outer - band * 0.24);
+
+    let aa = max(2.2 * scale, 1.5);
+    if (dist > r_outer + aa * 1.5) {
+        return vt_load_old(frag_pos, dims_i);
+    }
+    if (dist < r_inner - aa * 1.5) {
+        return vt_load_new(frag_pos, dims_i);
+    }
+
+    // Inside the prismatic chromatic-aberration zone between the inner blob and the outer blob!
+    let band_w = max(r_outer - r_inner, 1.0);
+    let u = clamp((dist - r_inner) / band_w, 0.0, 1.0);
+    let ribbon = sin(u * VT_PI);
+    let perp = vec2<f32>(-dir.y, dir.x);
+
+    // Gently damp displacement near viewport edges so screen borders never smear.
+    let border_dist = min(min(frag_pos.x, dims.x - frag_pos.x), min(frag_pos.y, dims.y - frag_pos.y));
+    let edge_damp = smoothstep(0.0, 24.0 * scale, border_dist);
+
+    // 14-tap IGN-dithered spectral chromatic aberration refracting cleanly across the double-blob band.
+    let swirl_dir = normalize(dir + perp * ((shape_out - shape_in) * 0.58));
+    let max_disp = (32.0 * scale) * (0.26 + 0.74 * ribbon) * edge_damp;
+    let blend_old = smoothstep(0.10, 0.90, u);
+    let inv_dims = 1.0 / dims;
+    let jitter = vt_ign(floor(frag_pos)) - 0.5;
+    let tang_wave = sin(u * VT_PI * 2.0 + (n_out + n_in) * 3.0) * 8.0 * scale * ribbon * edge_damp;
+
+    var acc_rgb = vec3<f32>(0.0);
+    var w_sum = vec3<f32>(0.0);
+    var acc_a = 0.0;
+    var a_sum = 0.0;
+    for (var i = 0; i < 14; i += 1) {
+        let s = clamp(((f32(i) + 0.5 + jitter) / 14.0) - 0.5, -0.5, 0.5);
+        let offset_px = swirl_dir * (s * 2.0 * max_disp) + perp * tang_wave;
+        let sample_uv = (frag_pos + offset_px) * inv_dims;
+        let tex = mix(vt_sample_new(sample_uv), vt_sample_old(sample_uv), blend_old);
+        let spec_w = vt_spectrum_weight(s, 1.0);
+        let bell = exp(-(s * s) / (2.0 * 0.34 * 0.34));
+        acc_rgb += tex.rgb * spec_w;
+        w_sum += spec_w;
+        acc_a += tex.a * bell;
+        a_sum += bell;
+    }
+    let refracted_rgb = acc_rgb / max(w_sum, vec3<f32>(0.0001));
+    let refracted_a = acc_a / max(a_sum, 0.0001);
+
+    // Flowing prismatic / iridescent rainbow sheen filling the zone between outer and inner blobs.
+    // Using `theta / (2*PI)` wraps by exactly 1.0 full cycle across [-PI, +PI] (zero seam).
+    let prism_phase = u * 1.18 + (n_out * 0.55 + n_in * 0.45) * 0.85 + theta / (VT_PI * 2.0) + p * 0.55;
+    let prism_rgb = 0.52 + 0.48 * cos((VT_PI * 2.0) * (prism_phase + vec3<f32>(0.0, 0.33, 0.67)));
+
+    // Crisp luminous glass rim highlights tracing BOTH the outer blob and inner blob contours.
+    let rim_sigma = 4.2 * scale;
+    let outer_rim = exp(-((dist - r_outer) * (dist - r_outer)) / (2.0 * rim_sigma * rim_sigma));
+    let inner_rim = exp(-((dist - r_inner) * (dist - r_inner)) / (2.0 * rim_sigma * rim_sigma));
+    let rim_glow = clamp(outer_rim + inner_rim, 0.0, 1.0);
+
+    // Boost chromatic saturation inside the band and infuse translucent prismatic iridescent glass.
+    let luma = dot(refracted_rgb, vec3<f32>(0.299, 0.587, 0.114));
+    let vivid_rgb = clamp(mix(vec3<f32>(luma), refracted_rgb, 1.44), vec3<f32>(0.0), vec3<f32>(1.0));
+    let band_rgb = mix(vivid_rgb, prism_rgb * refracted_a, 0.36 * ribbon + 0.28 * rim_glow)
+        + prism_rgb * (0.20 * rim_glow * refracted_a);
+    let band_col = vec4<f32>(clamp(band_rgb, vec3<f32>(0.0), vec3<f32>(1.0)), refracted_a);
+
+    // Smoothly AA into crisp `t_new` inside the inner blob and crisp `t_old` outside the outer blob.
+    let enter_band = smoothstep(r_inner - aa, r_inner + aa, dist);
+    let exit_band = smoothstep(r_outer - aa, r_outer + aa, dist);
+    var result = mix(vt_load_new(frag_pos, dims_i), band_col, enter_band);
+    result = mix(result, vt_load_old(frag_pos, dims_i), exit_band);
+    return result;
+}
+
 @fragment
 fn fs_view_transition(@builtin(position) frag_pos: vec4<f32>) -> @location(0) vec4<f32> {
     let dims_i = vec2<i32>(textureDimensions(t_new, 0));
@@ -498,6 +800,15 @@ fn fs_view_transition(@builtin(position) frag_pos: vec4<f32>) -> @location(0) ve
     }
     if (params.kind == 6u) {
         return vt_chromatic_warp(frag_pos.xy, dims, dims_i);
+    }
+    if (params.kind == 7u) {
+        return vt_blur_fade(frag_pos.xy, dims, dims_i);
+    }
+    if (params.kind == 8u) {
+        return vt_glitch(frag_pos.xy, dims, dims_i);
+    }
+    if (params.kind == 9u) {
+        return vt_prismatic_blob(frag_pos.xy, dims, dims_i);
     }
 
     let old_color = vt_load_old(frag_pos.xy, dims_i);

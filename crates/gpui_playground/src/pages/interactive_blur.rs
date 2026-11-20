@@ -1087,6 +1087,24 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
             "Hyper-zoom & whip-spin tunnel + mirror tiling + prismatic RGB aberration",
         ),
         (
+            ThemeTransitionStyle::PrismaticBlob,
+            LucideIcon::Rainbow,
+            "Prismatic Blob",
+            "Organic double-blob radial reveal with chromatic aberration & prismatic rainbow gap",
+        ),
+        (
+            ThemeTransitionStyle::Glitch,
+            LucideIcon::Zap,
+            "Glitch (0.3s)",
+            "Asynchronous staggered digital blocks & horizontal RGB-split tears snapping into view",
+        ),
+        (
+            ThemeTransitionStyle::BlurFade,
+            LucideIcon::CloudFog,
+            "Blur Fade (0.3s)",
+            "0–0.2s optical blur-out, 0.1–0.2s opacity cross-fade, 0.1–0.3s blur-in",
+        ),
+        (
             ThemeTransitionStyle::Shockwave,
             LucideIcon::WavesHorizontal,
             "Shockwave",

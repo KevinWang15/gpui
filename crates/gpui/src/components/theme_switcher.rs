@@ -51,8 +51,9 @@ impl ThemeSwitcher {
         self
     }
 
-    /// Sets the GPU shader [`ThemeTransitionStyle`] (`ChromaticWarp`, `Shockwave`, `PageCurl`,
-    /// `LiquidDissolve`, `RadialReveal`, or `CrossFade`) used when switching themes without a custom `on_change`.
+    /// Sets the GPU shader [`ThemeTransitionStyle`] (`ChromaticWarp`, `PrismaticBlob`, `Glitch`,
+    /// `BlurFade`, `Shockwave`, `PageCurl`, `LiquidDissolve`, `RadialReveal`, or `CrossFade`) used
+    /// when switching themes without a custom `on_change`.
     pub fn transition_style(mut self, style: ThemeTransitionStyle) -> Self {
         self.transition_style = style;
         self

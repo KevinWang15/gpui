@@ -353,26 +353,12 @@ impl Render for PlaygroundApp {
                                         )
                                         .child({
                                             let active_style = self.theme_transition_style;
-                                            let next_style = match active_style {
-                                                ThemeTransitionStyle::ChromaticWarp => {
-                                                    ThemeTransitionStyle::Shockwave
-                                                }
-                                                ThemeTransitionStyle::Shockwave => {
-                                                    ThemeTransitionStyle::PageCurl
-                                                }
-                                                ThemeTransitionStyle::PageCurl => {
-                                                    ThemeTransitionStyle::LiquidDissolve
-                                                }
-                                                ThemeTransitionStyle::LiquidDissolve => {
-                                                    ThemeTransitionStyle::RadialReveal
-                                                }
-                                                ThemeTransitionStyle::RadialReveal => {
-                                                    ThemeTransitionStyle::CrossFade
-                                                }
-                                                ThemeTransitionStyle::CrossFade => {
-                                                    ThemeTransitionStyle::ChromaticWarp
-                                                }
-                                            };
+                                            let all = ThemeTransitionStyle::ALL;
+                                            let next_style = all
+                                                .iter()
+                                                .position(|&s| s == active_style)
+                                                .map(|i| all[(i + 1) % all.len()])
+                                                .unwrap_or(ThemeTransitionStyle::ChromaticWarp);
                                             button("nav-transition-fx-btn")
                                                 .soft()
                                                 .size(ComponentSize::Sm)

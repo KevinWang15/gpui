@@ -968,6 +968,10 @@ fn view_transition_physical_shader_modes_evaluate_cleanly() {
             crate::ViewTransition::chromatic_warp(origin),
             crate::SceneTransitionKind::ChromaticWarp,
         ),
+        (
+            crate::ViewTransition::prismatic_blob(origin),
+            crate::SceneTransitionKind::PrismaticBlob,
+        ),
     ] {
         let active = crate::ActiveViewTransition {
             started_at: now,
@@ -990,6 +994,41 @@ fn view_transition_physical_shader_modes_evaluate_cleanly() {
         assert!(
             active
                 .evaluate(now + transition.duration, vp, 2.0)
+                .is_none()
+        );
+    }
+
+    // 300ms full-screen timed shader modes (BlurFade & Glitch).
+    for (transition, expected_kind) in [
+        (
+            crate::ViewTransition::blur_fade(),
+            crate::SceneTransitionKind::BlurFade,
+        ),
+        (
+            crate::ViewTransition::glitch(),
+            crate::SceneTransitionKind::Glitch,
+        ),
+    ] {
+        assert_eq!(transition.duration, std::time::Duration::from_millis(300));
+        let active = crate::ActiveViewTransition {
+            started_at: now,
+            transition,
+            viewport_size: vp,
+            scale_factor: 2.0,
+        };
+        let t0 = active.evaluate(now, vp, 2.0).expect("active at t=0");
+        assert_eq!(t0.kind, expected_kind);
+        assert_eq!(t0.progress, 0.0);
+
+        let t_mid = active
+            .evaluate(now + std::time::Duration::from_millis(150), vp, 2.0)
+            .expect("active at 150ms");
+        assert_eq!(t_mid.kind, expected_kind);
+        assert!((t_mid.progress - 0.5).abs() < 0.02);
+
+        assert!(
+            active
+                .evaluate(now + std::time::Duration::from_millis(300), vp, 2.0)
                 .is_none()
         );
     }

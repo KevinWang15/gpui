@@ -70,6 +70,17 @@ pub enum ViewTransitionKind {
         /// Logical pixel coordinate gently biasing the optical warp pivot.
         origin: Point<Pixels>,
     },
+    /// Smooth photographic blur-out (0–0.2s), opacity cross-fade (0.1–0.2s), and blur-in (0.1–0.3s).
+    BlurFade,
+    /// Asynchronous digital glitch transition where staggered regions tear, RGB-split, and snap
+    /// into the next view over 0.3s.
+    Glitch,
+    /// Organic random double-blob radial reveal with independent outer and inner blob contours
+    /// filled between them with chromatic aberration and prismatic spectral color.
+    PrismaticBlob {
+        /// Logical pixel coordinate inside the window where the organic blob expands from.
+        origin: Point<Pixels>,
+    },
 }
 
 /// Configuration for a GPU-composited full-window view transition started via
@@ -171,6 +182,40 @@ impl ViewTransition {
         }
     }
 
+    /// Creates a 300ms blur-out (`0–0.2s`), cross-fade (`0.1–0.2s`), blur-in (`0.1–0.3s`) transition.
+    pub fn blur_fade() -> Self {
+        Self {
+            kind: ViewTransitionKind::BlurFade,
+            duration: Duration::from_millis(300),
+            easing: view_transition_linear,
+            feather: px(1.5),
+            reduce_motion_crossfade: false,
+        }
+    }
+
+    /// Creates a 300ms asynchronous digital glitch transition with staggered RGB-split tears.
+    pub fn glitch() -> Self {
+        Self {
+            kind: ViewTransitionKind::Glitch,
+            duration: Duration::from_millis(300),
+            easing: view_transition_linear,
+            feather: px(1.5),
+            reduce_motion_crossfade: false,
+        }
+    }
+
+    /// Creates an organic double-blob reveal expanding from `origin` with a prismatic chromatic
+    /// aberration ribbon between the independent outer and inner blob boundaries.
+    pub fn prismatic_blob(origin: Point<Pixels>) -> Self {
+        Self {
+            kind: ViewTransitionKind::PrismaticBlob { origin },
+            duration: Duration::from_millis(640),
+            easing: view_transition_ease_out,
+            feather: px(2.0),
+            reduce_motion_crossfade: false,
+        }
+    }
+
     /// Overrides the transition duration.
     pub fn duration(mut self, duration: Duration) -> Self {
         self.duration = duration;
@@ -214,6 +259,12 @@ pub enum SceneTransitionKind {
     LiquidDissolve = 5,
     /// Cinema hyper-zoom & whip-spin warp with mirror-tiled streaks and prismatic chromatic aberration.
     ChromaticWarp = 6,
+    /// Staged blur-out (0–0.2s), opacity cross-fade (0.1–0.2s), and blur-in (0.1–0.3s).
+    BlurFade = 7,
+    /// Asynchronous digital block/scanline glitch transition over 0.3s.
+    Glitch = 8,
+    /// Expanding organic double-blob reveal with prismatic chromatic aberration between inner and outer blobs.
+    PrismaticBlob = 9,
 }
 
 /// GPU-ready per-frame transition parameters attached to a [`Scene`](crate::Scene).
@@ -358,6 +409,40 @@ impl ActiveViewTransition {
                 let max_radius = max_corner_distance(origin_px, viewport_w, viewport_h).max(1.0);
                 Some(SceneTransition {
                     kind: SceneTransitionKind::ChromaticWarp,
+                    origin: origin_px,
+                    radius: ScaledPixels(max_radius),
+                    feather: ScaledPixels(scale_factor.max(0.5)),
+                    progress: eased,
+                })
+            }
+            ViewTransitionKind::BlurFade => Some(SceneTransition {
+                kind: SceneTransitionKind::BlurFade,
+                origin: point(
+                    ScaledPixels(viewport_w * 0.5),
+                    ScaledPixels(viewport_h * 0.5),
+                ),
+                radius: ScaledPixels(0.0),
+                feather: ScaledPixels(scale_factor.max(0.5)),
+                progress: eased,
+            }),
+            ViewTransitionKind::Glitch => Some(SceneTransition {
+                kind: SceneTransitionKind::Glitch,
+                origin: point(
+                    ScaledPixels(viewport_w * 0.5),
+                    ScaledPixels(viewport_h * 0.5),
+                ),
+                radius: ScaledPixels(0.0),
+                feather: ScaledPixels(scale_factor.max(0.5)),
+                progress: eased,
+            }),
+            ViewTransitionKind::PrismaticBlob { origin } => {
+                let origin_px = point(
+                    ScaledPixels(origin.x.0 * scale_factor),
+                    ScaledPixels(origin.y.0 * scale_factor),
+                );
+                let max_radius = max_corner_distance(origin_px, viewport_w, viewport_h).max(1.0);
+                Some(SceneTransition {
+                    kind: SceneTransitionKind::PrismaticBlob,
                     origin: origin_px,
                     radius: ScaledPixels(max_radius),
                     feather: ScaledPixels(scale_factor.max(0.5)),

@@ -300,14 +300,23 @@ pub enum ThemeTransitionStyle {
     LiquidDissolve,
     /// Cinema hyper-zoom & whip-spin warp with mirror-tiled radial streaks and heavy chromatic aberration.
     ChromaticWarp,
+    /// Staged blur-out (0–0.2s), opacity cross-fade (0.1–0.2s), and blur-in (0.1–0.3s).
+    BlurFade,
+    /// Asynchronous digital glitch blocks & RGB tear strips flipping over 0.3s.
+    Glitch,
+    /// Organic double-blob radial reveal with prismatic chromatic aberration between inner & outer blobs.
+    PrismaticBlob,
     /// Gentle full-window cross-fade.
     CrossFade,
 }
 
 impl ThemeTransitionStyle {
     /// All available transition styles in display order.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 9] = [
         Self::ChromaticWarp,
+        Self::PrismaticBlob,
+        Self::Glitch,
+        Self::BlurFade,
         Self::Shockwave,
         Self::PageCurl,
         Self::LiquidDissolve,
@@ -323,6 +332,9 @@ impl ThemeTransitionStyle {
             Self::PageCurl => "Page Curl",
             Self::LiquidDissolve => "Liquid",
             Self::ChromaticWarp => "Chromatic Warp",
+            Self::BlurFade => "Blur Fade",
+            Self::Glitch => "Glitch",
+            Self::PrismaticBlob => "Prismatic Blob",
             Self::CrossFade => "Cross-Fade",
         }
     }
@@ -352,6 +364,11 @@ impl ThemeTransitionStyle {
             }
             Self::ChromaticWarp => {
                 ViewTransition::chromatic_warp(origin.unwrap_or_else(fallback_origin))
+            }
+            Self::BlurFade => ViewTransition::blur_fade(),
+            Self::Glitch => ViewTransition::glitch(),
+            Self::PrismaticBlob => {
+                ViewTransition::prismatic_blob(origin.unwrap_or_else(fallback_origin))
             }
             Self::CrossFade => ViewTransition::cross_fade(),
         }

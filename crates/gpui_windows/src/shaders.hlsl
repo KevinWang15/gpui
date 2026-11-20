@@ -1384,7 +1384,10 @@ float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Targe
 //   3: Shockwave (optical refraction + RGB dispersion + caustic ridge),
 //   4: PageCurl (3D cylindrical curl + specular ridge + cast shadow),
 //   5: LiquidDissolve (domain-warped FBM liquid melt + meniscus refraction),
-//   6: ChromaticWarp (hyper-zoom & whip-spin + mirror tunnel + prismatic chromatic aberration).
+//   6: ChromaticWarp (hyper-zoom & whip-spin + mirror tunnel + prismatic chromatic aberration),
+//   7: BlurFade (0-0.2s blur out, 0.1-0.2s cross-fade, 0.1-0.3s blur in),
+//   8: Glitch (asynchronous staggered blocks & horizontal RGB-split tears over 0.3s),
+//   9: PrismaticBlob (organic double-blob radial reveal with chromatic prismatic ribbon).
 cbuffer ViewTransitionParams: register(b2) {
     float2 vt_origin;
     float vt_radius;
@@ -1824,6 +1827,259 @@ float4 vt_chromatic_warp(float2 frag_pos, float2 dims) {
     return float4(final_rgb, color.a);
 }
 
+float4 vt_disk_blur(bool use_new, float2 frag_pos, float2 dims, float radius_px) {
+    if (radius_px <= 0.35) {
+        return use_new ? vt_load_new(frag_pos) : vt_load_old(frag_pos);
+    }
+
+    float2 inv_dims = 1.0 / dims;
+    float base_angle = vt_ign(floor(frag_pos)) * (M_PI_F * 2.0);
+    float golden_angle = 2.39996323;
+
+    float4 acc = float4(0.0, 0.0, 0.0, 0.0);
+    float w_sum = 0.0;
+    [unroll]
+    for (int i = 0; i < 24; i++) {
+        float frac_r = sqrt((float(i) + 0.5) / 24.0);
+        float theta = base_angle + float(i) * golden_angle;
+        float2 offset_px = float2(cos(theta), sin(theta)) * (frac_r * radius_px);
+        float2 uv = (frag_pos + offset_px) * inv_dims;
+        float w = exp(-2.35 * frac_r * frac_r);
+        float4 tex = use_new ? vt_sample_new(uv) : vt_sample_old(uv);
+        acc += tex * w;
+        w_sum += w;
+    }
+    return acc / max(w_sum, 0.0001);
+}
+
+float4 vt_blur_fade(float2 frag_pos, float2 dims) {
+    float scale = max(vt_feather, 1.0);
+    float p = saturate(vt_progress);
+    if (p <= 0.0005) {
+        return vt_load_old(frag_pos);
+    }
+    if (p >= 0.9995) {
+        return vt_load_new(frag_pos);
+    }
+
+    float max_radius = 26.0 * scale;
+    float t_one_third = 1.0 / 3.0;
+    float t_two_thirds = 2.0 / 3.0;
+
+    float old_u = smoothstep(0.0, t_two_thirds, p);
+    float new_u = 1.0 - smoothstep(t_one_third, 1.0, p);
+    float r_old = max_radius * old_u;
+    float r_new = max_radius * new_u;
+
+    float mix_new = smoothstep(t_one_third, t_two_thirds, p);
+    if (mix_new <= 0.0005) {
+        return vt_disk_blur(false, frag_pos, dims, r_old);
+    }
+    if (mix_new >= 0.9995) {
+        return vt_disk_blur(true, frag_pos, dims, r_new);
+    }
+    float4 old_col = vt_disk_blur(false, frag_pos, dims, r_old);
+    float4 new_col = vt_disk_blur(true, frag_pos, dims, r_new);
+    return lerp(old_col, new_col, mix_new);
+}
+
+float4 vt_glitch(float2 frag_pos, float2 dims) {
+    float scale = max(vt_feather, 1.0);
+    float p = saturate(vt_progress);
+    if (p <= 0.0005) {
+        return vt_load_old(frag_pos);
+    }
+    if (p >= 0.9995) {
+        return vt_load_new(frag_pos);
+    }
+
+    float2 uv = frag_pos / dims;
+    float step_t = floor(p * 18.0);
+    float endpoint_env = smoothstep(0.0, 0.04, p) * (1.0 - smoothstep(0.94, 1.0, p));
+
+    float2 macro_cell = floor(uv * float2(6.0, 5.0));
+    float macro_h = vt_hash21(macro_cell + float2(3.1, 7.7));
+
+    float mid_row = floor(uv.y * 16.0);
+    float row_jitter = vt_hash21(float2(mid_row, 11.3));
+    float mid_cols = 2.0 + floor(row_jitter * 4.0);
+    float2 mid_cell = float2(floor((uv.x + row_jitter * 0.37) * mid_cols), mid_row);
+    float mid_h = vt_hash21(mid_cell + float2(19.4, 2.9));
+
+    float sliver_row = floor(uv.y * 54.0);
+    float sliver_h = vt_hash21(float2(sliver_row, step_t * 1.37 + 5.1));
+    float block_flicker = vt_hash21(mid_cell + float2(step_t * 3.13, step_t * 7.41));
+
+    float cell_t = 0.10 + (macro_h * 0.56 + mid_h * 0.44) * 0.76;
+    float delta_t = p - cell_t;
+    float local_win = 0.16;
+    float glitch_amt = saturate(1.0 - abs(delta_t) / local_win) * endpoint_env;
+
+    if (glitch_amt <= 0.001) {
+        return delta_t >= 0.0 ? vt_load_new(frag_pos) : vt_load_old(frag_pos);
+    }
+
+    bool show_new = delta_t >= 0.0;
+    if (abs(delta_t) < 0.065 && block_flicker > 0.56) {
+        show_new = !show_new;
+    }
+    if (sliver_h > 0.84 && glitch_amt > 0.25) {
+        show_new = !show_new;
+    }
+
+    float dir_sign = vt_hash21(mid_cell + float2(step_t * 2.1, 9.4)) > 0.5 ? 1.0 : -1.0;
+    float slice_burst = sliver_h > 0.62 ? 1.0 : 0.35;
+    float shift_px = dir_sign * glitch_amt * (16.0 + 48.0 * slice_burst * block_flicker) * scale;
+    float v_jitter_px = (vt_hash21(float2(mid_row, step_t * 4.7)) - 0.5) * 6.0 * glitch_amt * scale * (sliver_h > 0.78 ? 1.0 : 0.0);
+
+    float ca_px = glitch_amt * (9.0 + 22.0 * slice_burst) * scale;
+    float2 base_p = frag_pos + float2(shift_px, v_jitter_px);
+    float2 uv_r = (base_p - float2(ca_px, 0.0)) / dims;
+    float2 uv_g = base_p / dims;
+    float2 uv_b = (base_p + float2(ca_px * 1.15, 0.0)) / dims;
+
+    float4 col;
+    if (show_new) {
+        float4 g = vt_sample_new(uv_g);
+        col = float4(vt_sample_new(uv_r).r, g.g, vt_sample_new(uv_b).b, g.a);
+    } else {
+        float4 g = vt_sample_old(uv_g);
+        col = float4(vt_sample_old(uv_r).r, g.g, vt_sample_old(uv_b).b, g.a);
+    }
+
+    float scanline = 1.0 - 0.10 * glitch_amt * (0.5 + 0.5 * sin(frag_pos.y * (M_PI_F / scale)));
+    float3 rgb = col.rgb * scanline;
+    if (sliver_h > 0.91 && glitch_amt > 0.35) {
+        float3 tint = block_flicker > 0.5 ? float3(1.0, 0.14, 0.68) : float3(0.08, 0.95, 1.0);
+        rgb = lerp(rgb, tint * col.a, 0.32 * glitch_amt);
+    }
+    return float4(saturate(rgb), col.a);
+}
+
+float vt_smooth_noise2(float2 p) {
+    float a = vt_noise2d(p);
+    float b = vt_noise2d(float2(p.x * 1.72 - p.y * 1.18, p.x * 1.18 + p.y * 1.72) + float2(7.4, 13.1));
+    return a * 0.68 + b * 0.32;
+}
+
+float4 vt_prismatic_blob(float2 frag_pos, float2 dims) {
+    float scale = max(vt_feather, 1.0);
+    float p = saturate(vt_progress);
+    if (p <= 0.0005) {
+        return vt_load_old(frag_pos);
+    }
+    if (p >= 0.9995) {
+        return vt_load_new(frag_pos);
+    }
+
+    float2 delta = frag_pos - vt_origin;
+    float dist = length(delta);
+    float2 dir = delta / max(dist, 0.001);
+    float theta = atan2(delta.y, delta.x);
+
+    float2 seed = frac(vt_origin * float2(0.0137, 0.0193) + float2(0.37, 0.71));
+
+    float band = clamp(min(dims.x, dims.y) * 0.135, 64.0 * scale, 140.0 * scale);
+    float max_r = max(vt_radius, 1.0);
+    float r_base_out = lerp(-band * 0.35, max_r + band * 2.15, p);
+    float r_base_in = lerp(-band * 1.45, max_r + band * 1.15, p);
+
+    float max_amp = band * 0.96;
+    if (dist > r_base_out + max_amp + 12.0 * scale) {
+        return vt_load_old(frag_pos);
+    }
+    if (dist < r_base_in - max_amp - 12.0 * scale) {
+        return vt_load_new(frag_pos);
+    }
+
+    float n_out = vt_smooth_noise2(
+        dir * 1.15 + float2(seed.x * 7.3 + 1.4, seed.y * 5.9 + 2.8) + float2(p * 0.55, -p * 0.38)
+    );
+    float lobes_out = 0.42 * sin(theta * 2.0 + seed.x * 6.28318 + 0.5 + p * 0.65)
+        + 0.33 * sin(theta * 3.0 - seed.y * 6.28318 + 2.1 - p * 0.45)
+        + 0.16 * sin(theta * 4.0 + seed.x * 4.12 - 0.9 + p * 0.35)
+        + 0.09 * sin(theta * 5.0 - seed.y * 3.74 + 1.3);
+    float shape_out = clamp((n_out - 0.5) * 1.05 + lobes_out * 0.78, -1.0, 1.0);
+
+    float n_in = vt_smooth_noise2(
+        dir * 1.25 + float2(seed.y * 9.1 + 11.7, seed.x * 6.4 + 8.3) + float2(-p * 0.42, p * 0.60)
+    );
+    float lobes_in = 0.40 * cos(theta * 2.0 - seed.y * 6.28318 + 1.9 - p * 0.55)
+        + 0.34 * sin(theta * 3.0 + seed.x * 6.28318 + 0.4 + p * 0.50)
+        + 0.18 * cos(theta * 4.0 + seed.y * 5.14 - 1.4 - p * 0.30)
+        + 0.08 * cos(theta * 5.0 + seed.x * 2.91 + 0.8);
+    float shape_in = clamp((n_in - 0.5) * 1.05 + lobes_in * 0.78, -1.0, 1.0);
+
+    float amp_out = min(max_amp, max(r_base_out, 0.0) * 0.44);
+    float amp_in = min(max_amp, max(r_base_in, 0.0) * 0.44);
+
+    float r_outer = r_base_out + amp_out * shape_out;
+    float r_inner = min(r_base_in + amp_in * shape_in, r_outer - band * 0.24);
+
+    float aa = max(2.2 * scale, 1.5);
+    if (dist > r_outer + aa * 1.5) {
+        return vt_load_old(frag_pos);
+    }
+    if (dist < r_inner - aa * 1.5) {
+        return vt_load_new(frag_pos);
+    }
+
+    float band_w = max(r_outer - r_inner, 1.0);
+    float u = saturate((dist - r_inner) / band_w);
+    float ribbon = sin(u * M_PI_F);
+    float2 perp = float2(-dir.y, dir.x);
+
+    float border_dist = min(min(frag_pos.x, dims.x - frag_pos.x), min(frag_pos.y, dims.y - frag_pos.y));
+    float edge_damp = smoothstep(0.0, 24.0 * scale, border_dist);
+
+    float2 swirl_dir = normalize(dir + perp * ((shape_out - shape_in) * 0.58));
+    float max_disp = (32.0 * scale) * (0.26 + 0.74 * ribbon) * edge_damp;
+    float blend_old = smoothstep(0.10, 0.90, u);
+    float2 inv_dims = 1.0 / dims;
+    float jitter = vt_ign(floor(frag_pos)) - 0.5;
+    float tang_wave = sin(u * M_PI_F * 2.0 + (n_out + n_in) * 3.0) * 8.0 * scale * ribbon * edge_damp;
+
+    float3 acc_rgb = float3(0.0, 0.0, 0.0);
+    float3 w_sum = float3(0.0, 0.0, 0.0);
+    float acc_a = 0.0;
+    float a_sum = 0.0;
+    [unroll]
+    for (int i = 0; i < 14; i++) {
+        float s = clamp(((float(i) + 0.5 + jitter) / 14.0) - 0.5, -0.5, 0.5);
+        float2 offset_px = swirl_dir * (s * 2.0 * max_disp) + perp * tang_wave;
+        float2 sample_uv = (frag_pos + offset_px) * inv_dims;
+        float4 tex = lerp(vt_sample_new(sample_uv), vt_sample_old(sample_uv), blend_old);
+        float3 spec_w = vt_spectrum_weight(s, 1.0);
+        float bell = exp(-(s * s) / (2.0 * 0.34 * 0.34));
+        acc_rgb += tex.rgb * spec_w;
+        w_sum += spec_w;
+        acc_a += tex.a * bell;
+        a_sum += bell;
+    }
+    float3 refracted_rgb = acc_rgb / max(w_sum, float3(0.0001, 0.0001, 0.0001));
+    float refracted_a = acc_a / max(a_sum, 0.0001);
+
+    float prism_phase = u * 1.18 + (n_out * 0.55 + n_in * 0.45) * 0.85 + theta / (M_PI_F * 2.0) + p * 0.55;
+    float3 prism_rgb = 0.52 + 0.48 * cos((M_PI_F * 2.0) * (prism_phase + float3(0.0, 0.33, 0.67)));
+
+    float rim_sigma = 4.2 * scale;
+    float outer_rim = exp(-((dist - r_outer) * (dist - r_outer)) / (2.0 * rim_sigma * rim_sigma));
+    float inner_rim = exp(-((dist - r_inner) * (dist - r_inner)) / (2.0 * rim_sigma * rim_sigma));
+    float rim_glow = saturate(outer_rim + inner_rim);
+
+    float luma = dot(refracted_rgb, float3(0.299, 0.587, 0.114));
+    float3 vivid_rgb = saturate(lerp(float3(luma, luma, luma), refracted_rgb, 1.44));
+    float3 band_rgb = lerp(vivid_rgb, prism_rgb * refracted_a, 0.36 * ribbon + 0.28 * rim_glow)
+        + prism_rgb * (0.20 * rim_glow * refracted_a);
+    float4 band_col = float4(saturate(band_rgb), refracted_a);
+
+    float enter_band = smoothstep(r_inner - aa, r_inner + aa, dist);
+    float exit_band = smoothstep(r_outer - aa, r_outer + aa, dist);
+    float4 result = lerp(vt_load_new(frag_pos), band_col, enter_band);
+    result = lerp(result, vt_load_old(frag_pos), exit_band);
+    return result;
+}
+
 float4 view_transition_fragment(float4 position: SV_Position): SV_Target {
     float2 dims = max(vt_viewport_size, float2(1.0, 1.0));
     if (vt_kind == 3u) {
@@ -1837,6 +2093,15 @@ float4 view_transition_fragment(float4 position: SV_Position): SV_Target {
     }
     if (vt_kind == 6u) {
         return vt_chromatic_warp(position.xy, dims);
+    }
+    if (vt_kind == 7u) {
+        return vt_blur_fade(position.xy, dims);
+    }
+    if (vt_kind == 8u) {
+        return vt_glitch(position.xy, dims);
+    }
+    if (vt_kind == 9u) {
+        return vt_prismatic_blob(position.xy, dims);
     }
 
     float4 old_color = vt_load_old(position.xy);
