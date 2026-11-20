@@ -396,6 +396,31 @@ impl Interactivity {
             }));
     }
 
+    /// Makes this element a scroll container that scrolls itself: it takes
+    /// part in the window's scroll routing (see
+    /// [`Window::with_scroll_container`]) as the div scroll containers do,
+    /// and `listener` gets a scroll event only when this element is the one
+    /// the gesture scrolls. `key` identifies it across frames; `can_scroll`
+    /// says whether it can still move for a pixel delta.
+    /// The imperative API equivalent to [`InteractiveElement::custom_scroll`].
+    pub fn custom_scroll(
+        &mut self,
+        key: impl std::hash::Hash,
+        can_scroll: impl Fn(Point<Pixels>) -> bool + 'static,
+        listener: impl Fn(&ScrollEvent, &mut Window, &mut App) + 'static,
+    ) {
+        use std::hash::Hasher as _;
+        let mut hasher = collections::FxHasher::default();
+        key.hash(&mut hasher);
+        self.custom_scroll = Some((hasher.finish() as usize, Rc::new(can_scroll)));
+        self.scroll_listeners
+            .push(Box::new(move |event, phase, hitbox, window, cx| {
+                if phase == DispatchPhase::Bubble && hitbox.is_scroll_target(window) {
+                    (listener)(event, window, cx);
+                }
+            }));
+    }
+
     /// The former name of [`Interactivity::on_scroll`].
     #[deprecated(note = "renamed to `on_scroll`")]
     pub fn on_scroll_wheel(
@@ -1086,6 +1111,18 @@ pub trait InteractiveElement: Sized {
         listener: impl Fn(&ScrollEvent, &mut Window, &mut App) + 'static,
     ) -> Self {
         self.interactivity().on_scroll(listener);
+        self
+    }
+
+    /// Makes this element a scroll container that scrolls itself (see
+    /// [`Interactivity::custom_scroll`]).
+    fn custom_scroll(
+        mut self,
+        key: impl std::hash::Hash,
+        can_scroll: impl Fn(Point<Pixels>) -> bool + 'static,
+        listener: impl Fn(&ScrollEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.interactivity().custom_scroll(key, can_scroll, listener);
         self
     }
 
@@ -2240,6 +2277,8 @@ pub struct Interactivity {
     pub(crate) tracked_scroll_handle: Option<ScrollHandle>,
     pub(crate) scroll_anchor: Option<ScrollAnchor>,
     pub(crate) scroll_offset: Option<Rc<RefCell<Point<Pixels>>>>,
+    /// A scroll container that scrolls itself: its key and `can_scroll`.
+    pub(crate) custom_scroll: Option<(usize, Rc<dyn Fn(Point<Pixels>) -> bool>)>,
     pub(crate) ongoing_scroll: Option<Rc<RefCell<OngoingScroll>>>,
     pub(crate) group: Option<SharedString>,
     /// The base style of the element, before any modifications are applied
@@ -2488,10 +2527,37 @@ impl Interactivity {
                                 None
                             };
 
-                            let scroll_offset =
+                            let (scroll_offset, scroll_max) =
                                 self.clamp_scroll_position(bounds, &style, window, cx);
                             let result = window.with_element_opacity(style.opacity, |window| {
-                                f(&style, scroll_offset, hitbox, window, cx)
+                                // A scroll container: what's inside bubbles
+                                // its scrolling here (Window::with_scroll_container).
+                                match (self.scroll_offset.clone(), hitbox.clone()) {
+                                    (None, Some(container)) if self.custom_scroll.is_some() => {
+                                        let (key, can_scroll) = self.custom_scroll.clone().unwrap();
+                                        window.with_scroll_container(&container, key, move |d| can_scroll(d), |window| {
+                                            f(&style, scroll_offset, hitbox, window, cx)
+                                        })
+                                    }
+                                    (Some(offset), Some(container)) => {
+                                        let key = Rc::as_ptr(&offset) as usize;
+                                        let overflow = style.overflow;
+                                        let restrict = style.restrict_scroll_to_axis;
+                                        let concurrent = style.allow_concurrent_scroll;
+                                        let can_scroll = move |delta: Point<Pixels>| {
+                                            let d = scroll_axes_delta(delta, overflow, restrict, concurrent);
+                                            let now = *offset.borrow();
+                                            let clamp = |p: Point<Pixels>| {
+                                                point(p.x.clamp(-scroll_max.x, px(0.)), p.y.clamp(-scroll_max.y, px(0.)))
+                                            };
+                                            clamp(now + d) != clamp(now)
+                                        };
+                                        window.with_scroll_container(&container, key, can_scroll, |window| {
+                                            f(&style, scroll_offset, hitbox, window, cx)
+                                        })
+                                    }
+                                    _ => f(&style, scroll_offset, hitbox, window, cx),
+                                }
                             });
                             (result, element_state)
                         },
@@ -2507,6 +2573,7 @@ impl Interactivity {
             || style.mouse_cursor.is_some()
             || self.group.is_some()
             || self.scroll_offset.is_some()
+            || self.custom_scroll.is_some()
             || self.tracked_focus_handle.is_some()
             || self.hover_style.is_some()
             || self.group_hover_style.is_some()
@@ -2535,7 +2602,7 @@ impl Interactivity {
         style: &Style,
         window: &mut Window,
         _cx: &mut App,
-    ) -> Point<Pixels> {
+    ) -> (Point<Pixels>, Point<Pixels>) {
         fn round_to_two_decimals(pixels: Pixels) -> Pixels {
             const ROUNDING_FACTOR: f32 = 100.0;
             (pixels * ROUNDING_FACTOR).round() / ROUNDING_FACTOR
@@ -2588,9 +2655,9 @@ impl Interactivity {
                 scroll_handle_state.bounds = bounds;
             }
 
-            *scroll_offset
+            (*scroll_offset, scroll_max)
         } else {
-            Point::default()
+            (Point::default(), Point::default())
         }
     }
 
@@ -3442,7 +3509,7 @@ impl Interactivity {
             let hitbox = hitbox.clone();
             let current_view = window.current_view();
             window.on_mouse_event(move |event: &ScrollEvent, phase, window, cx| {
-                if phase == DispatchPhase::Bubble && hitbox.should_handle_scroll(window) {
+                if phase == DispatchPhase::Bubble && hitbox.is_scroll_target(window) {
                     let mut scroll_offset = scroll_offset.borrow_mut();
                     let old_scroll_offset = *scroll_offset;
                     let mut delta = event.delta.pixel_delta(line_height);
@@ -3456,31 +3523,8 @@ impl Interactivity {
                             .filter(&mut delta, event.touch_phase);
                     }
 
-                    let mut delta_x = match overflow.x {
-                        Overflow::Scroll if !delta.x.is_zero() => delta.x,
-                        Overflow::Scroll
-                            if !restrict_scroll_to_axis && overflow.y != Overflow::Scroll =>
-                        {
-                            delta.y
-                        }
-                        _ => Pixels::ZERO,
-                    };
-                    let mut delta_y = match overflow.y {
-                        Overflow::Scroll if !delta.y.is_zero() => delta.y,
-                        Overflow::Scroll
-                            if !restrict_scroll_to_axis && overflow.x != Overflow::Scroll =>
-                        {
-                            delta.x
-                        }
-                        _ => Pixels::ZERO,
-                    };
-                    if !allow_concurrent_scroll && !delta_x.is_zero() && !delta_y.is_zero() {
-                        if delta_x.abs() > delta_y.abs() {
-                            delta_y = Pixels::ZERO;
-                        } else {
-                            delta_x = Pixels::ZERO;
-                        }
-                    }
+                    let Point { x: delta_x, y: delta_y } =
+                        scroll_axes_delta(delta, overflow, restrict_scroll_to_axis, allow_concurrent_scroll);
                     scroll_offset.y += delta_y;
                     scroll_offset.x += delta_x;
                     if *scroll_offset != old_scroll_offset {
@@ -5816,4 +5860,28 @@ mod tests {
         assert_eq!(bounds("cell-1").origin.x, px(100.));
         assert_eq!(bounds("cell-2").origin.x, px(300.));
     }
+}
+
+/// The part of a pixel scroll delta a container with `overflow` takes: each
+/// axis it scrolls, a vertical wheel scrolling a horizontal-only container
+/// (unless `restrict_to_axis`), and only the larger axis unless `concurrent`.
+fn scroll_axes_delta(delta: Point<Pixels>, overflow: Point<Overflow>, restrict_to_axis: bool, concurrent: bool) -> Point<Pixels> {
+    let mut x = match overflow.x {
+        Overflow::Scroll if !delta.x.is_zero() => delta.x,
+        Overflow::Scroll if !restrict_to_axis && overflow.y != Overflow::Scroll => delta.y,
+        _ => Pixels::ZERO,
+    };
+    let mut y = match overflow.y {
+        Overflow::Scroll if !delta.y.is_zero() => delta.y,
+        Overflow::Scroll if !restrict_to_axis && overflow.x != Overflow::Scroll => delta.x,
+        _ => Pixels::ZERO,
+    };
+    if !concurrent && !x.is_zero() && !y.is_zero() {
+        if x.abs() > y.abs() {
+            y = Pixels::ZERO;
+        } else {
+            x = Pixels::ZERO;
+        }
+    }
+    point(x, y)
 }

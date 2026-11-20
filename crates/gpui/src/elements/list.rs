@@ -1583,8 +1583,22 @@ impl Element for List {
             state.measuring_behavior.reset();
         }
 
+        // A scroll container: what's inside bubbles its scrolling here
+        // (Window::with_scroll_container).
+        // Whether the laid-out list can move up and down: set below, once
+        // this frame's layout is known. In item positions, not pixels: items
+        // that were never measured count as no height.
+        let extent = Rc::new(std::cell::Cell::new((false, false)));
+        let can_scroll = {
+            let extent = extent.clone();
+            move |delta: Point<Pixels>| {
+                let (up, down) = extent.get();
+                (delta.y > px(0.) && up) || (delta.y < px(0.) && down)
+            }
+        };
+        let key = Rc::as_ptr(&self.state.0) as usize;
         let mut autoscroll = true;
-        let layout = loop {
+        let layout = window.with_scroll_container(&hitbox, key, can_scroll, |window| loop {
             match state.prepaint_items(
                 bounds,
                 padding,
@@ -1599,10 +1613,27 @@ impl Element for List {
                     autoscroll = false;
                 }
             }
-        };
+        });
 
         state.last_layout_bounds = Some(bounds);
         state.last_padding = Some(padding);
+        {
+            let top = layout.scroll_top;
+            let up = top.item_ix > 0 || top.offset_in_item > px(0.);
+            // At the end when the last item is laid out and its bottom is in view.
+            let count = state.items.summary().count;
+            let shown: Pixels = layout
+                .item_layouts
+                .iter()
+                .filter(|item| item.index >= top.item_ix)
+                .map(|item| item.size.height)
+                .fold(px(0.), |a, b| a + b)
+                - top.offset_in_item;
+            let room = bounds.size.height - padding.top - padding.bottom;
+            let at_end = count == 0
+                || layout.item_layouts.back().is_some_and(|last| last.index + 1 >= count) && shown <= room + px(0.5);
+            extent.set((up, !at_end));
+        }
         ListPrepaintState { hitbox, layout }
     }
 
@@ -1629,7 +1660,7 @@ impl Element for List {
         let hitbox_id = prepaint.hitbox.id;
         let mut accumulated_scroll_delta = ScrollDelta::default();
         window.on_mouse_event(move |event: &ScrollEvent, phase, window, cx| {
-            if phase == DispatchPhase::Bubble && hitbox_id.should_handle_scroll(window) {
+            if phase == DispatchPhase::Bubble && hitbox_id.is_scroll_target(window) {
                 accumulated_scroll_delta = accumulated_scroll_delta.coalesce(event.delta);
                 let pixel_delta = accumulated_scroll_delta.pixel_delta(px(20.));
                 list_state.0.borrow_mut().scroll(

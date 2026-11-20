@@ -842,6 +842,14 @@ impl HitboxId {
         window.mouse_hit_test.ids.contains(&self)
     }
 
+    /// Whether this scroll container takes the scroll event being dispatched:
+    /// the one [`Window`] picked for the gesture (see
+    /// [`Window::with_scroll_container`]). Scroll containers apply a scroll
+    /// event only when this is true.
+    pub fn is_scroll_target(self, window: &Window) -> bool {
+        window.scroll_target == Some(self)
+    }
+
     fn next(self) -> HitboxId {
         HitboxId(self.0.wrapping_add(1))
     }
@@ -860,6 +868,9 @@ pub struct Hitbox {
     pub content_mask: ContentMask<Pixels>,
     /// Flags that specify hitbox behavior.
     pub behavior: HitboxBehavior,
+    /// The nearest scroll container this hitbox was inserted inside (see
+    /// [`Window::with_scroll_container`]): where a wheel over it bubbles.
+    pub scroll_parent: Option<HitboxId>,
 }
 
 impl Hitbox {
@@ -902,6 +913,12 @@ impl Hitbox {
     /// this sets `HitboxBehavior::BlockMouse` (`InteractiveElement::occlude`).
     pub fn should_handle_scroll(&self, window: &Window) -> bool {
         self.id.should_handle_scroll(window)
+    }
+
+    /// Whether this scroll container takes the scroll event being dispatched
+    /// (see [`HitboxId::is_scroll_target`]).
+    pub fn is_scroll_target(&self, window: &Window) -> bool {
+        self.id.is_scroll_target(window)
     }
 }
 
@@ -1057,6 +1074,30 @@ pub(crate) struct DeferredDraw {
     accessed_entities: FxHashSet<EntityId>,
 }
 
+/// A scroll container in a frame (see [`Window::with_scroll_container`]).
+pub(crate) struct ScrollContainer {
+    pub(crate) hitbox: HitboxId,
+    /// Stable across frames.
+    pub(crate) key: usize,
+    /// Whether it can still move for this pixel delta.
+    pub(crate) can_scroll: Rc<dyn Fn(Point<Pixels>) -> bool>,
+}
+
+/// A scroll gesture latched to one container.
+struct ScrollLatch {
+    key: usize,
+    last_event: Instant,
+    position: Point<Pixels>,
+}
+
+/// A pause this long ends a scroll gesture.
+const SCROLL_LATCH_IDLE: Duration = Duration::from_millis(500);
+/// The pointer moving this far between scroll events ends the gesture, but
+/// only after a pause of [`SCROLL_LATCH_MOVE_DELAY`]: while scrolling goes on,
+/// the pointer drifting over another container doesn't take the scroll.
+const SCROLL_LATCH_MOVE: Pixels = px(4.);
+const SCROLL_LATCH_MOVE_DELAY: Duration = Duration::from_millis(100);
+
 pub(crate) struct Frame {
     pub(crate) focus: Option<FocusId>,
     pub(crate) window_active: bool,
@@ -1066,6 +1107,8 @@ pub(crate) struct Frame {
     pub(crate) dispatch_tree: DispatchTree,
     pub(crate) scene: Scene,
     pub(crate) hitboxes: Vec<Hitbox>,
+    /// The frame's scroll containers, in the order they were inserted.
+    pub(crate) scroll_containers: Vec<ScrollContainer>,
     pub(crate) window_control_hitboxes: Vec<(WindowControlArea, Hitbox)>,
     pub(crate) deferred_draws: Vec<DeferredDraw>,
     pub(crate) input_handlers: Vec<Option<PlatformInputHandler>>,
@@ -1122,6 +1165,7 @@ impl Frame {
             dispatch_tree,
             scene: Scene::default(),
             hitboxes: Vec::new(),
+            scroll_containers: Vec::new(),
             window_control_hitboxes: Vec::new(),
             deferred_draws: Vec::new(),
             input_handlers: Vec::new(),
@@ -1152,6 +1196,7 @@ impl Frame {
         self.tooltip_requests.clear();
         self.cursor_styles.clear();
         self.hitboxes.clear();
+        self.scroll_containers.clear();
         self.window_control_hitboxes.clear();
         self.deferred_draws.clear();
         self.tab_stops.clear();
@@ -1284,6 +1329,12 @@ pub struct Window {
     default_prevented: bool,
     mouse_position: Point<Pixels>,
     mouse_hit_test: HitTest,
+    /// The scroll containers enclosing what's being prepainted, innermost last.
+    scroll_parents: Vec<HitboxId>,
+    /// The scroll container that takes the scroll event being dispatched.
+    scroll_target: Option<HitboxId>,
+    /// The scroll gesture in progress and the container it's latched to.
+    scroll_latch: Option<ScrollLatch>,
     modifiers: Modifiers,
     capslock: Capslock,
     scale_factor: f32,
@@ -2447,6 +2498,9 @@ impl Window {
             default_prevented: true,
             mouse_position,
             mouse_hit_test: HitTest::default(),
+            scroll_parents: Vec::new(),
+            scroll_target: None,
+            scroll_latch: None,
             modifiers,
             capslock,
             scale_factor,
@@ -6023,9 +6077,91 @@ impl Window {
             bounds,
             content_mask,
             behavior,
+            scroll_parent: self.scroll_parents.last().copied(),
         };
         self.next_frame.hitboxes.push(hitbox.clone());
         hitbox
+    }
+
+    /// Prepaints `f` (a scroll container's children) inside the scroll
+    /// container `hitbox`, and registers the container for this frame.
+    ///
+    /// Scrolling works as in a browser. A scroll event goes to the element
+    /// under the pointer and bubbles out through the scroll containers it's
+    /// inside (not through elements merely behind it, so an overlay doesn't
+    /// stop the page around it from scrolling). When a gesture starts, the
+    /// innermost of those that can still move in the gesture's direction
+    /// takes it (`can_scroll`, given the pixel delta); the gesture then stays
+    /// latched to that container, even when the pointer moves over another
+    /// scroll container or the latched one reaches its edge. A gesture ends
+    /// when a new touch begins, after a pause in scrolling, or when the
+    /// pointer moves between events after a short pause.
+    ///
+    /// `key` identifies the container across frames (the address of its
+    /// scroll state).
+    pub fn with_scroll_container<R>(
+        &mut self,
+        hitbox: &Hitbox,
+        key: usize,
+        can_scroll: impl Fn(Point<Pixels>) -> bool + 'static,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_prepaint();
+        self.next_frame.scroll_containers.push(ScrollContainer {
+            hitbox: hitbox.id,
+            key,
+            can_scroll: Rc::new(can_scroll),
+        });
+        self.scroll_parents.push(hitbox.id);
+        let result = f(self);
+        self.scroll_parents.pop();
+        result
+    }
+
+    /// The scroll container that takes `event` (see
+    /// [`Self::with_scroll_container`]), latching the gesture to it.
+    fn resolve_scroll_target(&mut self, event: &crate::ScrollEvent, now: Instant) -> Option<HitboxId> {
+        let delta = event.delta.pixel_delta(self.line_height());
+        let frame = &self.rendered_frame;
+        if let Some(latch) = &mut self.scroll_latch {
+            let idle = now.duration_since(latch.last_event);
+            let moved = (event.position - latch.position).magnitude() > SCROLL_LATCH_MOVE.0 as f64;
+            let continues = event.touch_phase != crate::TouchPhase::Started
+                && idle < SCROLL_LATCH_IDLE
+                && !(moved && idle >= SCROLL_LATCH_MOVE_DELAY);
+            if continues
+                && let Some(container) = frame.scroll_containers.iter().find(|c| c.key == latch.key)
+            {
+                latch.last_event = now;
+                latch.position = event.position;
+                return Some(container.hitbox);
+            }
+            self.scroll_latch = None;
+        }
+        if delta.x.is_zero() && delta.y.is_zero() {
+            // No direction yet (a touch beginning): nothing to pick.
+            return None;
+        }
+        let hit_test = frame.hit_test(event.position);
+        // Bubble from the frontmost element; a `block_mouse_except_scroll`
+        // overlay lets the wheel through, so what's behind it is tried next.
+        let mut starts = vec![hit_test.ids.first().copied()];
+        if hit_test.hover_hitbox_count < hit_test.ids.len() {
+            starts.push(hit_test.ids.get(hit_test.hover_hitbox_count).copied());
+        }
+        for start in starts {
+            let mut current = start;
+            while let Some(id) = current {
+                if let Some(container) = frame.scroll_containers.iter().find(|c| c.hitbox == id)
+                    && (container.can_scroll)(delta)
+                {
+                    self.scroll_latch = Some(ScrollLatch { key: container.key, last_event: now, position: event.position });
+                    return Some(id);
+                }
+                current = frame.hitboxes.iter().find(|h| h.id == id).and_then(|h| h.scroll_parent);
+            }
+        }
+        None
     }
 
     /// Set a hitbox which will act as a control area of the platform window.
@@ -6682,6 +6818,9 @@ impl Window {
 
     fn dispatch_mouse_event(&mut self, event: &dyn Any, cx: &mut App) {
         self.mouse_hit_test = self.rendered_frame.hit_test(self.mouse_position());
+        self.scroll_target = event
+            .downcast_ref::<crate::ScrollEvent>()
+            .and_then(|event| self.resolve_scroll_target(event, cx.background_executor().now()));
 
         #[cfg(any(feature = "inspector", debug_assertions))]
         if self.is_inspector_picking(cx) {

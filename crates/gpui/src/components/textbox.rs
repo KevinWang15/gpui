@@ -141,6 +141,9 @@ pub struct TextBoxState {
     last_line_height: Pixels,
     scroll_x: Pixels,
     scroll_y: Pixels,
+    /// The scroll position and its largest value, for the window's scroll
+    /// routing (`custom_scroll`), which asks between frames.
+    scroll_extent: std::rc::Rc<std::cell::Cell<(Pixels, Pixels)>>,
     is_selecting: bool,
     rows: usize,
     disabled: bool,
@@ -178,6 +181,7 @@ impl TextBoxState {
             last_line_height: px(20.),
             scroll_x: px(0.),
             scroll_y: px(0.),
+            scroll_extent: Default::default(),
             is_selecting: false,
             rows: 4,
             disabled: false,
@@ -720,6 +724,7 @@ impl TextBoxState {
             .unwrap_or(self.last_line_height * self.rows as f32);
         let max_scroll = (content_height - view_height).max(px(0.));
         self.scroll_y = (self.scroll_y - delta.y).clamp(px(0.), max_scroll);
+        self.scroll_extent.set((self.scroll_y, max_scroll));
         cx.notify();
     }
 }
@@ -1222,6 +1227,14 @@ impl Element for MultiLineTextElement {
 
 impl Render for TextBoxState {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        {
+            let content_height = self.last_line_height * self.line_count() as f32;
+            let view_height = self
+                .last_bounds
+                .map(|b| b.size.height)
+                .unwrap_or(self.last_line_height * self.rows as f32);
+            self.scroll_extent.set((self.scroll_y, (content_height - view_height).max(px(0.))));
+        }
         let theme = cx.theme();
         let focused = self.focus_handle.is_focused(window);
         if focused != self.was_focused {
@@ -1301,7 +1314,14 @@ impl Render for TextBoxState {
                     .when(!self.disabled, |el| {
                         el.cursor(CursorStyle::IBeam)
                             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
-                            .on_scroll(cx.listener(Self::on_scroll_wheel))
+                            .custom_scroll(cx.entity_id(), {
+                                // Scrolls itself; can it still move this way?
+                                let extent = self.scroll_extent.clone();
+                                move |delta: crate::Point<Pixels>| {
+                                    let (y, max) = extent.get();
+                                    (delta.y > px(0.) && y > px(0.)) || (delta.y < px(0.) && y < max)
+                                }
+                            }, cx.listener(Self::on_scroll_wheel))
                     })
                     .when(!self.disabled && focused, |el| {
                         el.on_action(cx.listener(Self::backspace))

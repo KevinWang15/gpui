@@ -35,6 +35,8 @@ mod arena;
 mod asset_cache;
 mod assets;
 pub mod backdrop_blur;
+#[cfg(test)]
+mod scroll_routing_tests;
 mod bounds_tree;
 mod color;
 mod element;

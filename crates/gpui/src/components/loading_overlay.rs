@@ -192,10 +192,13 @@ impl RenderOnce for BlurContainer {
                 .justify_center()
                 .p(self.overlay_padding)
                 .when(self.block_interaction, |el| {
+                    // Clicks and hover under the scrim are blocked. The wheel
+                    // isn't: what's covered isn't scrolled (it's not under the
+                    // pointer), and the containers around the overlay still
+                    // are (Window::with_scroll_container).
                     el.occlude()
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
-                        .on_scroll(|_, _, cx| cx.stop_propagation())
                 })
                 .when_some(self.on_overlay_click, |el, cb| {
                     el.cursor_pointer()
