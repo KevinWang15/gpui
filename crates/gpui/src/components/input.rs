@@ -297,6 +297,15 @@ impl InputState {
 
     /// Programmatically replaces the value and emits [`InputEvent::Change`].
     pub fn set_value(&mut self, value: impl Into<String>, cx: &mut Context<Self>) {
+        self.set_value_silent(value, cx);
+        cx.emit(InputEvent::Change(SharedString::from(self.content.clone())));
+    }
+
+    /// Programmatically replaces the value without emitting [`InputEvent::Change`].
+    ///
+    /// Use this when synchronizing an embedded `InputState` from a parent widget (such as
+    /// `ColorPicker`, `NumberInput`, or `TagInput`) to prevent re-entrant deferred change events.
+    pub fn set_value_silent(&mut self, value: impl Into<String>, cx: &mut Context<Self>) {
         let mut next = value.into();
         if let Some(max) = self.max_length {
             next = next.chars().take(max).collect();
@@ -307,8 +316,15 @@ impl InputState {
         self.selection_reversed = false;
         self.marked_range = None;
         self.paint_cache.borrow_mut().scroll_offset = px(0.);
-        cx.emit(InputEvent::Change(SharedString::from(self.content.clone())));
         cx.notify();
+    }
+
+    /// Updates the visual [`ComponentSize`] dynamically.
+    pub fn set_size(&mut self, size: ComponentSize, cx: &mut Context<Self>) {
+        if self.size != size {
+            self.size = size;
+            cx.notify();
+        }
     }
 
     /// Clears the input value and resets selection.
@@ -324,6 +340,11 @@ impl InputState {
     pub fn set_invalid(&mut self, invalid: bool, cx: &mut Context<Self>) {
         self.invalid = invalid;
         cx.notify();
+    }
+
+    /// Returns whether this input is currently disabled.
+    pub fn is_disabled(&self) -> bool {
+        self.disabled
     }
 
     /// Updates the disabled state dynamically.

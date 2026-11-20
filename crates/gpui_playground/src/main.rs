@@ -60,6 +60,9 @@ impl Render for PlaygroundApp {
         let page_content = match self.page {
             Page::Overview => pages::overview::render(self, cx).into_any_element(),
             Page::InteractiveBlur => pages::interactive_blur::render(self, cx).into_any_element(),
+            Page::DataTrees => pages::data_trees::render(self, cx).into_any_element(),
+            Page::PickersForms => pages::pickers_forms::render(self, cx).into_any_element(),
+            Page::MediaExtras => pages::media_extras::render(self, cx).into_any_element(),
             Page::Analytics => pages::analytics::render(self, cx).into_any_element(),
             Page::Buttons => pages::buttons::render(self, cx).into_any_element(),
             Page::Inputs => pages::inputs::render(self, cx).into_any_element(),
@@ -75,6 +78,9 @@ impl Render for PlaygroundApp {
         let comp_items: &[(Page, LucideIcon, Option<&str>)] = &[
             (Page::Overview, LucideIcon::House, None),
             (Page::InteractiveBlur, LucideIcon::Sparkles, Some("12")),
+            (Page::DataTrees, LucideIcon::FolderTree, Some("7")),
+            (Page::PickersForms, LucideIcon::SlidersHorizontal, Some("10")),
+            (Page::MediaExtras, LucideIcon::WandSparkles, Some("10")),
             (Page::Analytics, LucideIcon::ChartColumnStacked, Some("8")),
             (Page::Buttons, LucideIcon::MousePointerClick, Some("3")),
             (Page::Inputs, LucideIcon::TextCursorInput, Some("4")),
@@ -525,6 +531,7 @@ impl Render for PlaygroundApp {
                     ),
             )
             .child(command_palette(&self.command_palette))
+            .child(tour(&self.demo_tour))
             .child(
                 toast_host(self.toasts.clone())
                     .position(self.toast_position)
@@ -597,6 +604,9 @@ mod tests {
         let all_pages = [
             Page::Overview,
             Page::InteractiveBlur,
+            Page::DataTrees,
+            Page::PickersForms,
+            Page::MediaExtras,
             Page::Analytics,
             Page::Buttons,
             Page::Inputs,

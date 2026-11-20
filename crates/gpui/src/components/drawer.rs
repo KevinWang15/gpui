@@ -7,13 +7,19 @@ use std::rc::Rc;
 use smallvec::SmallVec;
 
 use crate::{
-    Animation, AnimationExt, AnyElement, App, ElementId, FontWeight, IntoElement, KeyDownEvent,
-    MouseButton, ParentElement, Pixels, RenderOnce, SharedString, StyleRefinement, Styled, Window,
-    deferred, div, ease_out_quint, prelude::*, px,
+    Animation, AnimationExt, AnyElement, App, ElementId, FocusHandle, FontWeight, IntoElement,
+    KeyDownEvent, MouseButton, ParentElement, Pixels, RenderOnce, SharedString, StyleRefinement,
+    Styled, Window, anchored, deferred, div, ease_out_quint, point, prelude::*, px,
 };
 use crate::icons::{Icon, IconSize, LucideIcon};
 
 use super::theme::{ANIM_NORMAL, ActiveTheme};
+
+struct DrawerFocusState {
+    focus_handle: FocusHandle,
+    previous_focus: Option<FocusHandle>,
+    was_open: bool,
+}
 
 /// Edge from which a [`Drawer`] slides into the window.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -177,21 +183,72 @@ impl Styled for Drawer {
 }
 
 impl RenderOnce for Drawer {
-    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let focus_state = window.use_keyed_state(
+            (self.id.clone(), "drawer-focus"),
+            cx,
+            |_, cx| DrawerFocusState {
+                focus_handle: cx.focus_handle(),
+                previous_focus: None,
+                was_open: false,
+            },
+        );
+        let (focus_handle, just_opened, just_closed) = {
+            let st = focus_state.read(cx);
+            (
+                st.focus_handle.clone(),
+                self.open && !st.was_open,
+                !self.open && st.was_open,
+            )
+        };
+        if just_opened {
+            let prev = window.focused(cx);
+            focus_state.update(cx, |s, _| {
+                s.previous_focus = prev;
+                s.was_open = true;
+            });
+            window.focus(&focus_handle, cx);
+        } else if just_closed {
+            let prev = focus_state.update(cx, |s, _| {
+                s.was_open = false;
+                s.previous_focus.take()
+            });
+            if focus_handle.contains_focused(window, cx) || window.focused(cx).is_none() {
+                if let Some(prev) = prev {
+                    window.focus(&prev, cx);
+                } else {
+                    window.blur(cx);
+                }
+            }
+        }
+
         if !self.open {
             return div().into_any_element();
         }
 
         let theme = cx.theme();
         let reduce_motion = cx.reduce_motion();
-        let extent = self.size.pixels();
+        let raw_extent = self.size.pixels();
+        let extent = if raw_extent.0.is_finite() {
+            raw_extent.max(px(120.))
+        } else {
+            px(420.)
+        };
+        let backdrop_blur = if self.backdrop_blur.0.is_finite() {
+            self.backdrop_blur.max(px(0.))
+        } else {
+            px(0.)
+        };
         let side = self.side;
+        let show_close_button = self.show_close_button && self.on_close.is_some();
         let on_close_backdrop = self.on_close.clone();
         let on_close_key = self.on_close.clone();
         let on_close_btn = self.on_close.clone();
 
         let mut panel = div()
             .id((self.id.clone(), "drawer-panel"))
+            .track_focus(&focus_handle)
+            .occlude()
             .flex()
             .flex_col()
             .bg(theme.popover)
@@ -199,7 +256,7 @@ impl RenderOnce for Drawer {
             .border_color(theme.border)
             .when(theme.elevation_shadows, |el| el.shadow_xl())
             .overflow_hidden()
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+            .on_any_mouse_down(|_, _, cx| cx.stop_propagation());
 
         panel = match side {
             DrawerSide::Right => panel.w(extent).max_w_full().h_full().border_l_1(),
@@ -209,7 +266,7 @@ impl RenderOnce for Drawer {
         };
 
         let has_header =
-            self.title.is_some() || self.description.is_some() || self.icon.is_some() || self.show_close_button;
+            self.title.is_some() || self.description.is_some() || self.icon.is_some() || show_close_button;
         if has_header {
             let hover_bg = theme.surface_hover;
             panel = panel.child(
@@ -275,13 +332,14 @@ impl RenderOnce for Drawer {
                                     }),
                             ),
                     )
-                    .when(self.show_close_button, |el| {
+                    .when(show_close_button, |el| {
                         el.child(
                             div()
                                 .id((self.id.clone(), "drawer-close"))
                                 .flex()
                                 .items_center()
                                 .justify_center()
+                                .flex_shrink_0()
                                 .w(px(28.))
                                 .h(px(28.))
                                 .rounded(theme.radius_md)
@@ -359,23 +417,32 @@ impl RenderOnce for Drawer {
         };
 
         let backdrop_color = theme.backdrop;
-        let backdrop_blur = self.backdrop_blur;
+        let vp = window.viewport_size();
 
         let mut overlay = div()
             .id(self.id.clone())
-            .absolute()
-            .inset_0()
+            .w(vp.width)
+            .h(vp.height)
             .occlude()
             .flex()
             .when(self.dismiss_on_backdrop, |el| {
                 el.when_some(on_close_backdrop, |el, cb| {
-                    el.on_click(move |_, window, cx| cb(&(), window, cx))
+                    el.on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                        cb(&(), window, cx);
+                        cx.stop_propagation();
+                    })
                 })
             })
             .when_some(on_close_key, |el, cb| {
                 el.on_key_down(move |ev: &KeyDownEvent, window, cx| {
-                    if ev.keystroke.key == "escape" {
+                    let mods = &ev.keystroke.modifiers;
+                    if ev.keystroke.key == "escape"
+                        && !mods.control
+                        && !mods.alt
+                        && !mods.platform
+                    {
                         cb(&(), window, cx);
+                        cx.stop_propagation();
                     }
                 })
             });
@@ -409,6 +476,12 @@ impl RenderOnce for Drawer {
                 .into_any_element()
         };
 
-        deferred(final_overlay).priority(48).into_any_element()
+        deferred(
+            anchored()
+                .position(point(px(0.), px(0.)))
+                .child(final_overlay),
+        )
+        .priority(48)
+        .into_any_element()
     }
 }

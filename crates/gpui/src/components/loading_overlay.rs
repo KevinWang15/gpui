@@ -32,6 +32,7 @@ use super::theme::{ANIM_FAST, ActiveTheme, ComponentSize, ThemeMode};
 /// shields ("Click to reveal"), and frosted-glass focus guards.
 #[derive(IntoElement)]
 pub struct BlurContainer {
+    id: Option<ElementId>,
     active: bool,
     blur_radius: Pixels,
     tint: Option<crate::Hsla>,
@@ -60,6 +61,7 @@ impl BlurContainer {
     /// Creates an active [`BlurContainer`] with a default `8px` GPU backdrop blur.
     pub fn new() -> Self {
         Self {
+            id: None,
             active: true,
             blur_radius: px(8.),
             tint: None,
@@ -74,6 +76,12 @@ impl BlurContainer {
         }
     }
 
+    /// Assigns an explicit [`ElementId`] to disambiguate sibling [`BlurContainer`] instances.
+    pub fn id(mut self, id: impl Into<ElementId>) -> Self {
+        self.id = Some(id.into());
+        self
+    }
+
     /// Enables or disables the blur and overlay layer (default `true`).
     pub fn active(mut self, active: bool) -> Self {
         self.active = active;
@@ -82,7 +90,8 @@ impl BlurContainer {
 
     /// Sets the GPU backdrop blur radius in logical pixels (default `8px`; `0px` for dim-only).
     pub fn blur(mut self, radius: impl Into<Pixels>) -> Self {
-        self.blur_radius = radius.into();
+        let r: Pixels = radius.into();
+        self.blur_radius = if r.0.is_finite() { r.max(px(0.)) } else { px(8.) };
         self
     }
 
@@ -94,7 +103,9 @@ impl BlurContainer {
 
     /// Adjusts the default theme-aware frosted scrim opacity (`0.0..=1.0`).
     pub fn scrim_opacity(mut self, opacity: f32) -> Self {
-        self.scrim_opacity = Some(opacity.clamp(0.0, 1.0));
+        if opacity.is_finite() {
+            self.scrim_opacity = Some(opacity.clamp(0.0, 1.0));
+        }
         self
     }
 
@@ -164,14 +175,17 @@ impl RenderOnce for BlurContainer {
             .children(self.children);
 
         if self.active {
+            let has_overlay_click = self.on_overlay_click.is_some();
             let click_id = self
-                .anim_id
+                .id
                 .clone()
+                .or_else(|| self.anim_id.clone())
                 .unwrap_or_else(|| ElementId::Name("blur-scrim-click".into()));
             let mut layer = div()
                 .id((click_id, "scrim"))
                 .absolute()
                 .inset_0()
+                .bg(scrim_color)
                 .flex()
                 .flex_col()
                 .items_center()
@@ -194,7 +208,12 @@ impl RenderOnce for BlurContainer {
                             .flex_col()
                             .items_center()
                             .justify_center()
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            // Allow click-to-reveal overlays to receive clicks on centered prompt too.
+                            .when(!has_overlay_click, |el| {
+                                el.on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                    cx.stop_propagation()
+                                })
+                            })
                             .child(overlay),
                     )
                 });
@@ -209,18 +228,14 @@ impl RenderOnce for BlurContainer {
                     (anim_id, "blur-enter"),
                     Animation::new(ANIM_FAST).with_easing(ease_out_quint()),
                     move |el, delta| {
-                        el.opacity(delta)
-                            .bg(scrim_color.opacity(delta))
-                            .when(blur_radius > px(0.), |el| {
-                                el.backdrop_blur(px(blur_radius.0 * delta))
-                            })
+                        el.opacity(delta).when(blur_radius > px(0.), |el| {
+                            el.backdrop_blur(px(blur_radius.0 * delta))
+                        })
                     },
                 );
                 root = root.child(animated_layer);
             } else {
-                layer = layer
-                    .bg(scrim_color)
-                    .when(blur_radius > px(0.), |el| el.backdrop_blur(blur_radius));
+                layer = layer.when(blur_radius > px(0.), |el| el.backdrop_blur(blur_radius));
                 root = root.child(layer);
             }
         }
@@ -238,6 +253,7 @@ impl RenderOnce for BlurContainer {
 /// both WGPU and Windows DirectX 11 and blocks clicks underneath while `loading == true`.
 #[derive(IntoElement)]
 pub struct LoadingOverlay {
+    id: Option<ElementId>,
     loading: bool,
     blur_radius: Pixels,
     tint: Option<crate::Hsla>,
@@ -268,6 +284,7 @@ impl LoadingOverlay {
     /// Creates a [`LoadingOverlay`] wrapping children; active only when `loading` is `true`.
     pub fn new(loading: bool) -> Self {
         Self {
+            id: None,
             loading,
             blur_radius: px(6.),
             tint: None,
@@ -290,9 +307,16 @@ impl LoadingOverlay {
         }
     }
 
+    /// Assigns an explicit [`ElementId`] to disambiguate sibling [`LoadingOverlay`] instances.
+    pub fn id(mut self, id: impl Into<ElementId>) -> Self {
+        self.id = Some(id.into());
+        self
+    }
+
     /// Sets the GPU backdrop blur radius in pixels (default `6px`).
     pub fn blur(mut self, radius: impl Into<Pixels>) -> Self {
-        self.blur_radius = radius.into();
+        let r: Pixels = radius.into();
+        self.blur_radius = if r.0.is_finite() { r.max(px(0.)) } else { px(6.) };
         self
     }
 
@@ -304,7 +328,9 @@ impl LoadingOverlay {
 
     /// Sets default frosted scrim opacity (`0.0..=1.0`).
     pub fn scrim_opacity(mut self, opacity: f32) -> Self {
-        self.scrim_opacity = Some(opacity);
+        if opacity.is_finite() {
+            self.scrim_opacity = Some(opacity.clamp(0.0, 1.0));
+        }
         self
     }
 
@@ -352,13 +378,28 @@ impl LoadingOverlay {
 
     /// Displays a determinate [`ProgressBar`] (`value` in `0.0..=100.0`) below the spinner.
     pub fn progress(mut self, value: f32) -> Self {
-        self.progress = Some((value, 100.0));
+        let safe = if value.is_finite() {
+            value.clamp(0.0, 100.0)
+        } else {
+            0.0
+        };
+        self.progress = Some((safe, 100.0));
         self
     }
 
     /// Displays a determinate [`ProgressBar`] with an explicit maximum value.
     pub fn progress_of(mut self, value: f32, max: f32) -> Self {
-        self.progress = Some((value, max.max(f32::EPSILON)));
+        let safe_max = if max.is_finite() && max > 0.0 {
+            max
+        } else {
+            100.0
+        };
+        let safe_val = if value.is_finite() {
+            value.clamp(0.0, safe_max)
+        } else {
+            0.0
+        };
+        self.progress = Some((safe_val, safe_max));
         self
     }
 
@@ -424,6 +465,9 @@ impl RenderOnce for LoadingOverlay {
         }
         if let Some(opacity) = self.scrim_opacity {
             container = container.scrim_opacity(opacity);
+        }
+        if let Some(ref id) = self.id {
+            container = container.id(id.clone());
         }
         if let Some(ref anim_id) = self.anim_id {
             container = container.animated(anim_id.clone());
@@ -492,8 +536,9 @@ impl RenderOnce for LoadingOverlay {
 
             let cancel_btn = self.on_cancel.map(|cb| {
                 let btn_id = self
-                    .anim_id
+                    .id
                     .clone()
+                    .or_else(|| self.anim_id.clone())
                     .unwrap_or_else(|| ElementId::Name("loading-overlay".into()));
                 button((btn_id, "cancel"))
                     .secondary()

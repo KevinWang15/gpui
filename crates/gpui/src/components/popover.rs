@@ -327,8 +327,9 @@ pub(crate) fn render_menu_entries(
     min_width: Pixels,
     on_close: Option<Rc<dyn Fn(&(), &mut Window, &mut App) + 'static>>,
     theme: &super::theme::Theme,
-) -> crate::Div {
+) -> crate::Stateful<crate::Div> {
     let mut menu_list = div()
+        .id(id)
         .flex()
         .flex_col()
         .gap(px(2.))
@@ -385,7 +386,7 @@ pub(crate) fn render_menu_entries(
 
                 menu_list = menu_list.child(
                     div()
-                        .id((id.clone(), format!("item-{index}")))
+                        .id(("item", index))
                         .flex()
                         .flex_row()
                         .items_center()

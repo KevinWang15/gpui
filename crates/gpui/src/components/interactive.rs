@@ -2,22 +2,22 @@
 //! - [`Rating`]: interactive star/icon rating control with live hover preview & clear-on-reclick.
 //! - [`CopyButton`]: one-click clipboard copy button with timed `"Copied!"` checkmark feedback.
 //! - [`PinInput`] / [`PinInputState`]: segmented OTP / verification code input with auto-advance,
-//!   backspace navigation, clipboard paste, and completion events.
+//!   backspace navigation, smart clipboard paste, and completion events.
 
 use std::rc::Rc;
 use std::time::Duration;
 
+use crate::icons::{Icon, IconSize, LucideIcon};
 use crate::{
     App, ClipboardItem, Context, ElementId, Entity, EventEmitter, FocusHandle, Focusable,
     FontWeight, Hsla, IntoElement, KeyDownEvent, MouseButton, Render, RenderOnce, SharedString,
     StyleRefinement, Styled, Task, Window, div, prelude::*, px,
 };
-use crate::icons::{Icon, IconSize, LucideIcon};
 
 use super::button::ButtonVariant;
 use super::layout::focus_ring_shadow;
 use super::palette as tw;
-use super::theme::{ActiveTheme, ComponentSize, tabular_numerals};
+use super::theme::{ActiveTheme, ComponentSize, ThemeMode, tabular_numerals};
 
 // ============================================================================
 // Rating
@@ -85,7 +85,7 @@ impl Rating {
         self
     }
 
-    /// Overrides the filled icon color (defaults to Tailwind Amber 400).
+    /// Overrides the filled icon color (defaults to theme-mode-aware Tailwind Amber).
     pub fn color(mut self, color: impl Into<Hsla>) -> Self {
         self.color = Some(color.into());
         self
@@ -133,57 +133,87 @@ impl RenderOnce for Rating {
             cx,
             |_, _| RatingHoverState::default(),
         );
+        // Clear any stale hover state if toggled into `read_only`.
+        if self.read_only && hover_state.read(cx).hovered.is_some() {
+            hover_state.update(cx, |st, _| st.hovered = None);
+        }
         let hovered = if self.read_only {
             None
         } else {
             hover_state.read(cx).hovered
         };
         let display_val = hovered.unwrap_or(self.value).min(self.max);
-        let active_color = self.color.unwrap_or_else(|| Hsla::from(tw::AMBER_400));
-        let inactive_color = theme.border;
+        let active_color = self.color.unwrap_or_else(|| {
+            if theme.mode == ThemeMode::Dark {
+                Hsla::from(tw::AMBER_400)
+            } else {
+                Hsla::from(tw::AMBER_500)
+            }
+        });
+        let inactive_color = if theme.mode == ThemeMode::Dark {
+            theme.muted_foreground.opacity(0.45)
+        } else {
+            theme.input_border
+        };
 
+        let hs_row_leave = hover_state.clone();
         let mut row = div()
-            .id(self.id.clone())
+            .id(self.id)
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(4.));
+            .when(!self.read_only, |el| {
+                // Clear hover only when leaving the whole star group, eliminating flicker between stars.
+                el.on_hover(move |is_hovered, _, cx| {
+                    if !*is_hovered {
+                        hs_row_leave.update(cx, |st, cx| {
+                            if st.hovered.take().is_some() {
+                                cx.notify();
+                            }
+                        });
+                    }
+                })
+            });
 
         for idx in 1..=self.max {
             let filled = idx <= display_val;
             let color = if filled { active_color } else { inactive_color };
-            let hs = hover_state.clone();
+            let hs_enter = hover_state.clone();
+            let hs_click = hover_state.clone();
             let on_change = self.on_change.clone();
             let current = self.value;
             let allow_clear = self.allow_clear;
 
             let star = div()
-                .id((self.id.clone(), format!("star-{idx}")))
+                .id(("star", idx))
                 .flex()
                 .items_center()
                 .justify_center()
-                .p(px(2.))
+                .px(px(3.))
+                .py(px(2.))
                 .rounded(theme.radius_sm)
                 .when(!self.read_only, |el| {
                     el.cursor_pointer()
                         .on_hover(move |is_hovered, _, cx| {
-                            hs.update(cx, |st, cx| {
-                                if *is_hovered {
+                            if *is_hovered {
+                                hs_enter.update(cx, |st, cx| {
                                     if st.hovered != Some(idx) {
                                         st.hovered = Some(idx);
                                         cx.notify();
                                     }
-                                } else if st.hovered == Some(idx) {
-                                    st.hovered = None;
-                                    cx.notify();
-                                }
-                            });
+                                });
+                            }
                         })
-                        .when_some(on_change, |el, cb| {
-                            el.on_click(move |_, window, cx| {
-                                let next = if allow_clear && current == idx { 0 } else { idx };
+                        .on_click(move |_, window, cx| {
+                            let next = if allow_clear && current == idx { 0 } else { idx };
+                            // Reset hover preview on click so clearing to 0 updates immediately under cursor.
+                            hs_click.update(cx, |st, cx| {
+                                st.hovered = None;
+                                cx.notify();
+                            });
+                            if let Some(ref cb) = on_change {
                                 cb(&next, window, cx);
-                            })
+                            }
                         })
                 })
                 .child(Icon::new(self.icon).size(self.size).color(color));
@@ -214,6 +244,7 @@ impl RenderOnce for Rating {
 
 struct CopyButtonState {
     copied: bool,
+    focus_handle: FocusHandle,
     _reset_task: Option<Task<()>>,
 }
 
@@ -226,8 +257,10 @@ pub struct CopyButton {
     label: Option<SharedString>,
     copied_label: SharedString,
     icon_only: bool,
+    disabled: bool,
     size: ComponentSize,
     variant: ButtonVariant,
+    hover_bg_override: Option<Hsla>,
     reset_after: Duration,
     on_copy: Option<Rc<dyn Fn(&SharedString, &mut Window, &mut App) + 'static>>,
     style: StyleRefinement,
@@ -247,8 +280,10 @@ impl CopyButton {
             label: Some("Copy".into()),
             copied_label: "Copied!".into(),
             icon_only: false,
+            disabled: false,
             size: ComponentSize::Sm,
             variant: ButtonVariant::Secondary,
+            hover_bg_override: None,
             reset_after: Duration::from_millis(1800),
             on_copy: None,
             style: StyleRefinement::default(),
@@ -275,6 +310,12 @@ impl CopyButton {
         self
     }
 
+    /// Disables clicking the copy button.
+    pub fn disabled(mut self, disabled: bool) -> Self {
+        self.disabled = disabled;
+        self
+    }
+
     /// Sets button size (default `ComponentSize::Sm`).
     pub fn size(mut self, size: ComponentSize) -> Self {
         self.size = size;
@@ -284,6 +325,12 @@ impl CopyButton {
     /// Sets button visual variant (default `ButtonVariant::Secondary`).
     pub fn variant(mut self, variant: ButtonVariant) -> Self {
         self.variant = variant;
+        self
+    }
+
+    /// Overrides the hover background fill (useful on dark headers such as `CodeBlock`).
+    pub fn hover_bg(mut self, color: impl Into<Hsla>) -> Self {
+        self.hover_bg_override = Some(color.into());
         self
     }
 
@@ -310,17 +357,22 @@ impl Styled for CopyButton {
 }
 
 impl RenderOnce for CopyButton {
-    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(mut self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
         let state = window.use_keyed_state(
             (self.id.clone(), "copy-btn-state"),
             cx,
-            |_, _| CopyButtonState {
+            |_, cx| CopyButtonState {
                 copied: false,
+                focus_handle: cx.focus_handle(),
                 _reset_task: None,
             },
         );
-        let copied = state.read(cx).copied;
+        let (copied, focus_handle) = {
+            let s = state.read(cx);
+            (s.copied, s.focus_handle.clone())
+        };
+        let focused = focus_handle.is_focused(window);
         let value = self.value;
         let reset_after = self.reset_after;
         let on_copy = self.on_copy;
@@ -329,42 +381,97 @@ impl RenderOnce for CopyButton {
         let font_size = self.size.font_size();
         let icon_size = self.size.icon_size();
 
-        let (bg, hover_bg, fg, border_color) = match self.variant {
+        let (bg, default_hover_bg, default_fg, border_color) = match self.variant {
             ButtonVariant::Primary => (
                 theme.primary,
                 theme.primary_hover,
                 theme.primary_foreground,
                 crate::transparent_black(),
             ),
-            ButtonVariant::Ghost => (
+            ButtonVariant::Destructive => (
+                theme.destructive,
+                theme.destructive_hover,
+                theme.destructive_foreground,
+                crate::transparent_black(),
+            ),
+            ButtonVariant::Outline => (
+                crate::transparent_black(),
+                theme.surface_hover,
+                theme.foreground,
+                theme.input_border,
+            ),
+            ButtonVariant::Soft => (
+                if copied {
+                    theme.success_soft
+                } else {
+                    theme.primary_soft
+                },
+                if copied {
+                    theme.success_soft.opacity(0.82)
+                } else {
+                    theme.primary_soft.opacity(0.82)
+                },
+                if copied {
+                    theme.success_soft_foreground
+                } else {
+                    theme.primary_soft_foreground
+                },
+                crate::transparent_black(),
+            ),
+            ButtonVariant::SoftOutline => (
+                if copied {
+                    theme.success_soft
+                } else {
+                    theme.primary_soft
+                },
+                theme.primary_soft.opacity(0.82),
+                if copied {
+                    theme.success_soft_foreground
+                } else {
+                    theme.primary_soft_foreground
+                },
+                theme.primary.opacity(0.35),
+            ),
+            ButtonVariant::Ghost | ButtonVariant::Link => (
                 crate::transparent_black(),
                 theme.surface_hover,
                 theme.foreground,
                 crate::transparent_black(),
             ),
-            ButtonVariant::Soft => (
-                theme.primary_soft,
-                theme.primary_soft,
-                theme.primary_soft_foreground,
-                crate::transparent_black(),
-            ),
-            _ => (
+            ButtonVariant::Secondary => (
                 theme.secondary,
                 theme.secondary_hover,
                 theme.secondary_foreground,
                 theme.input_border,
             ),
         };
+        let hover_bg = self.hover_bg_override.unwrap_or(default_hover_bg);
+
+        // Respect caller `.text_color(...)` for both icon and idle text while keeping copied confirmation green.
+        let custom_fg = self.style.text.color;
+        if copied && !matches!(self.variant, ButtonVariant::Primary | ButtonVariant::Destructive) {
+            self.style.text.color = None;
+        }
+        let idle_fg = custom_fg.unwrap_or(default_fg);
 
         let icon_kind = if copied {
             LucideIcon::Check
         } else {
             LucideIcon::Copy
         };
-        let icon_color = if copied && self.variant != ButtonVariant::Primary {
+        let active_fg = if copied
+            && !matches!(
+                self.variant,
+                ButtonVariant::Primary
+                    | ButtonVariant::Destructive
+                    | ButtonVariant::Soft
+                    | ButtonVariant::SoftOutline
+            ) {
             theme.success
+        } else if copied {
+            default_fg
         } else {
-            fg
+            idle_fg
         };
 
         let text_label = if self.icon_only {
@@ -377,6 +484,7 @@ impl RenderOnce for CopyButton {
 
         let mut btn = div()
             .id(self.id)
+            .when(!self.disabled, |el| el.track_focus(&focus_handle))
             .flex()
             .flex_row()
             .items_center()
@@ -384,7 +492,7 @@ impl RenderOnce for CopyButton {
             .gap(px(6.))
             .h(height)
             .when(self.icon_only, |el| el.w(height))
-            .when(!self.icon_only, |el| el.px(self.size.px_x()))
+            .when(!self.icon_only, |el| el.px(self.size.px_x()).min_w(px(72.)))
             .rounded(theme.radius_md)
             .bg(bg)
             .border_1()
@@ -395,32 +503,35 @@ impl RenderOnce for CopyButton {
             })
             .text_size(font_size)
             .font_weight(FontWeight::MEDIUM)
-            .text_color(if copied && self.variant != ButtonVariant::Primary {
-                theme.success
-            } else {
-                fg
+            .text_color(active_fg)
+            .when(focused && !self.disabled, |el| {
+                let ring = focus_ring_shadow(&theme, false);
+                el.when(!ring.is_empty(), |el| el.shadow(ring))
             })
-            .cursor_pointer()
-            .hover(move |s| s.bg(hover_bg))
-            .on_click(move |_, window, cx| {
-                cx.write_to_clipboard(ClipboardItem::new_string(value.to_string()));
-                if let Some(ref cb) = on_copy {
-                    cb(&value, window, cx);
-                }
-                let state_weak = state.downgrade();
-                state.update(cx, |s, cx| {
-                    s.copied = true;
-                    s._reset_task = Some(cx.spawn(async move |_, cx| {
-                        cx.background_executor().timer(reset_after).await;
-                        let _ = state_weak.update(cx, |s, cx| {
-                            s.copied = false;
+            .when(!self.disabled, |el| {
+                el.cursor_pointer()
+                    .hover(move |s| s.bg(hover_bg))
+                    .on_click(move |_, window, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(value.to_string()));
+                        if let Some(ref cb) = on_copy {
+                            cb(&value, window, cx);
+                        }
+                        state.update(cx, |s, cx| {
+                            s.copied = true;
+                            s._reset_task = Some(cx.spawn(async move |weak_self, cx| {
+                                cx.background_executor().timer(reset_after).await;
+                                let _ = weak_self.update(cx, |s, cx| {
+                                    s.copied = false;
+                                    s._reset_task = None;
+                                    cx.notify();
+                                });
+                            }));
                             cx.notify();
                         });
-                    }));
-                    cx.notify();
-                });
+                    })
             })
-            .child(Icon::new(icon_kind).size(icon_size).color(icon_color))
+            .when(self.disabled, |el| el.opacity(0.5).cursor_not_allowed())
+            .child(Icon::new(icon_kind).size(icon_size).color(active_fg))
             .when_some(text_label, |el, lbl| el.child(lbl));
 
         crate::Refineable::refine(btn.style(), &self.style);
@@ -505,6 +616,14 @@ impl PinInputState {
         self
     }
 
+    /// Dynamically updates disabled state.
+    pub fn set_disabled(&mut self, disabled: bool, cx: &mut Context<Self>) {
+        if self.disabled != disabled {
+            self.disabled = disabled;
+            cx.notify();
+        }
+    }
+
     /// Sets slot box size (`Sm`, `Md`, `Lg`, `Xl`).
     pub fn size(mut self, size: ComponentSize) -> Self {
         self.size = size;
@@ -540,9 +659,14 @@ impl PinInputState {
 
     /// Clears all slots and moves the caret back to slot `0`.
     pub fn clear(&mut self, cx: &mut Context<Self>) {
+        let had_any = self.chars.iter().any(Option::is_some);
         self.chars.fill(None);
         self.active_index = 0;
-        self.emit_after_mutation(cx);
+        if had_any {
+            self.emit_after_mutation(cx);
+        } else {
+            cx.notify();
+        }
     }
 
     /// Updates the invalid state dynamically.
@@ -577,22 +701,31 @@ impl PinInputState {
     }
 
     fn paste_text(&mut self, text: &str, cx: &mut Context<Self>) {
-        let mut cursor = self.active_index;
-        let mut changed = false;
-        for ch in text.chars() {
+        let valid: Vec<char> = text
+            .chars()
+            .filter_map(|c| self.normalize_char(c))
+            .collect();
+        if valid.is_empty() {
+            return;
+        }
+        // When pasting a full OTP code (or more chars than fit from active_index), replace from slot 0
+        // so pasting a fresh 6-digit code over an expired one never truncates or corrupts it.
+        let mut cursor = if valid.len() >= self.length || valid.len() > self.length - self.active_index
+        {
+            self.chars.fill(None);
+            0
+        } else {
+            self.active_index
+        };
+        for ch in valid {
             if cursor >= self.length {
                 break;
             }
-            if let Some(valid) = self.normalize_char(ch) {
-                self.chars[cursor] = Some(valid);
-                cursor += 1;
-                changed = true;
-            }
+            self.chars[cursor] = Some(ch);
+            cursor += 1;
         }
-        if changed {
-            self.active_index = cursor.min(self.length - 1);
-            self.emit_after_mutation(cx);
-        }
+        self.active_index = cursor.min(self.length - 1);
+        self.emit_after_mutation(cx);
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
@@ -617,18 +750,23 @@ impl PinInputState {
 
         match key {
             "backspace" => {
-                if self.chars[self.active_index].is_some() {
-                    self.chars[self.active_index] = None;
+                let mut mutated = false;
+                if self.chars[self.active_index].take().is_some() {
+                    mutated = true;
                 } else if self.active_index > 0 {
                     self.active_index -= 1;
-                    self.chars[self.active_index] = None;
+                    mutated = self.chars[self.active_index].take().is_some();
+                    cx.notify();
                 }
-                self.emit_after_mutation(cx);
+                if mutated {
+                    self.emit_after_mutation(cx);
+                }
                 cx.stop_propagation();
             }
             "delete" => {
-                self.chars[self.active_index] = None;
-                self.emit_after_mutation(cx);
+                if self.chars[self.active_index].take().is_some() {
+                    self.emit_after_mutation(cx);
+                }
                 cx.stop_propagation();
             }
             "left" => {
@@ -683,19 +821,22 @@ impl Render for PinInputState {
             ComponentSize::Xl => (px(52.), px(58.), px(22.)),
         };
         let split_gap_after = (self.length == 6).then_some(2);
+        let disabled = self.disabled;
 
         let mut root = div()
-            .id("pin-input-root")
-            .track_focus(&self.focus_handle)
-            .on_key_down(cx.listener(Self::on_key_down))
+            .id(("pin-input-root", cx.entity_id()))
+            .when(!disabled, |el| {
+                el.track_focus(&self.focus_handle)
+                    .on_key_down(cx.listener(Self::on_key_down))
+            })
             .flex()
             .flex_row()
             .items_center()
             .gap(px(8.))
-            .when(self.disabled, |el| el.opacity(0.55));
+            .when(disabled, |el| el.opacity(0.55).cursor_not_allowed());
 
         for idx in 0..self.length {
-            let is_active = focused && self.active_index == idx && !self.disabled;
+            let is_active = focused && self.active_index == idx && !disabled;
             let val = self.chars[idx];
             let border_color = if self.invalid {
                 theme.destructive
@@ -723,7 +864,7 @@ impl Render for PinInputState {
                 .rounded(theme.radius_lg)
                 .border_1()
                 .border_color(border_color)
-                .bg(if self.disabled {
+                .bg(if disabled {
                     theme.disabled_bg
                 } else {
                     theme.input_bg
@@ -736,23 +877,23 @@ impl Render for PinInputState {
                     let ring = focus_ring_shadow(&theme, self.invalid);
                     el.when(!ring.is_empty(), |el| el.shadow(ring))
                 })
-                .when(!self.disabled, |el| {
-                    el.cursor_text()
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _, window, cx| {
-                                this.active_index = idx;
-                                window.focus(&this.focus_handle, cx);
-                                cx.notify();
-                            }),
-                        )
+                .when(!disabled, |el| {
+                    el.cursor_text().on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            this.active_index = idx;
+                            window.focus(&this.focus_handle, cx);
+                            cx.notify();
+                        }),
+                    )
                 })
+                .when(disabled, |el| el.cursor_not_allowed())
                 .child(if !display.is_empty() {
                     div().child(display).into_any_element()
                 } else if is_active {
                     div()
                         .w(px(2.))
-                        .h(px(20.))
+                        .h(font_px)
                         .rounded_full()
                         .bg(theme.primary)
                         .into_any_element()
@@ -815,9 +956,8 @@ impl RenderOnce for PinInput {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         if self.state.read(cx).frame_style != self.style {
             let style = self.style;
-            self.state.update(cx, |s, cx| {
+            self.state.update(cx, |s, _| {
                 s.frame_style = style;
-                cx.notify();
             });
         }
         self.state

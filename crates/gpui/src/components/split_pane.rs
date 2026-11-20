@@ -9,7 +9,6 @@ use crate::{
     AnyElement, App, Bounds, Context, CursorStyle, ElementId, Entity, EventEmitter, FocusHandle,
     Focusable, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, Pixels, RenderOnce, StyleRefinement, Styled, Window, canvas, div, prelude::*, px,
-    relative,
 };
 
 use super::theme::ActiveTheme;
@@ -37,11 +36,13 @@ pub struct SplitPaneState {
     direction: SplitDirection,
     ratio: f32,
     default_ratio: f32,
+    raw_default_ratio: f32,
     min_ratio: f32,
     max_ratio: f32,
     dragging: bool,
     disabled: bool,
     bounds_cell: Rc<Cell<Option<Bounds<Pixels>>>>,
+    handle_size_cell: Rc<Cell<f32>>,
 }
 
 impl EventEmitter<SplitPaneEvent> for SplitPaneState {}
@@ -60,11 +61,13 @@ impl SplitPaneState {
             direction: SplitDirection::Horizontal,
             ratio: 0.5,
             default_ratio: 0.5,
+            raw_default_ratio: 0.5,
             min_ratio: 0.15,
             max_ratio: 0.85,
             dragging: false,
             disabled: false,
             bounds_cell: Rc::new(Cell::new(None)),
+            handle_size_cell: Rc::new(Cell::new(8.0)),
         }
     }
 
@@ -76,7 +79,13 @@ impl SplitPaneState {
 
     /// Sets the initial and double-click reset split fraction (clamped to `min_ratio..=max_ratio`).
     pub fn default_ratio(mut self, ratio: f32) -> Self {
-        let clamped = ratio.clamp(self.min_ratio, self.max_ratio);
+        let raw = if ratio.is_finite() {
+            ratio.clamp(0.0, 1.0)
+        } else {
+            0.5
+        };
+        self.raw_default_ratio = raw;
+        let clamped = raw.clamp(self.min_ratio, self.max_ratio);
         self.default_ratio = clamped;
         self.ratio = clamped;
         self
@@ -84,19 +93,41 @@ impl SplitPaneState {
 
     /// Sets the allowed `[min, max]` fraction range for the first pane.
     pub fn clamp_range(mut self, min_ratio: f32, max_ratio: f32) -> Self {
-        let min = min_ratio.clamp(0.05, 0.90);
-        let max = max_ratio.clamp(min + 0.05, 0.95);
+        let min = if min_ratio.is_finite() {
+            min_ratio.clamp(0.05, 0.90)
+        } else {
+            0.15
+        };
+        let max = if max_ratio.is_finite() {
+            max_ratio.clamp(min + 0.05, 0.95)
+        } else {
+            0.85_f32.clamp(min + 0.05, 0.95)
+        };
         self.min_ratio = min;
         self.max_ratio = max;
-        self.default_ratio = self.default_ratio.clamp(min, max);
-        self.ratio = self.ratio.clamp(min, max);
+        self.default_ratio = self.raw_default_ratio.clamp(min, max);
+        self.ratio = self.default_ratio;
         self
     }
 
     /// Disables dragging and keyboard resizing.
     pub fn disabled(mut self, disabled: bool) -> Self {
         self.disabled = disabled;
+        if disabled {
+            self.dragging = false;
+        }
         self
+    }
+
+    /// Dynamically updates whether resizing is disabled.
+    pub fn set_disabled(&mut self, disabled: bool, cx: &mut Context<Self>) {
+        if self.disabled != disabled {
+            self.disabled = disabled;
+            if disabled {
+                self.dragging = false;
+            }
+            cx.notify();
+        }
     }
 
     /// Returns the current split orientation.
@@ -116,6 +147,9 @@ impl SplitPaneState {
 
     /// Programmatically updates the split ratio (clamped) and emits [`SplitPaneEvent::Resize`].
     pub fn set_ratio(&mut self, ratio: f32, cx: &mut Context<Self>) {
+        if !ratio.is_finite() {
+            return;
+        }
         let clamped = ratio.clamp(self.min_ratio, self.max_ratio);
         if (clamped - self.ratio).abs() > 0.0005 {
             self.ratio = clamped;
@@ -133,14 +167,15 @@ impl SplitPaneState {
         let Some(bounds) = self.bounds_cell.get() else {
             return;
         };
+        let handle = self.handle_size_cell.get();
         let raw = match self.direction {
             SplitDirection::Horizontal => {
-                let w = bounds.size.width.0.max(1.0);
-                (pos.x.0 - bounds.origin.x.0) / w
+                let usable = (bounds.size.width.0 - handle).max(1.0);
+                (pos.x.0 - bounds.origin.x.0 - handle * 0.5) / usable
             }
             SplitDirection::Vertical => {
-                let h = bounds.size.height.0.max(1.0);
-                (pos.y.0 - bounds.origin.y.0) / h
+                let usable = (bounds.size.height.0 - handle).max(1.0);
+                (pos.y.0 - bounds.origin.y.0 - handle * 0.5) / usable
             }
         };
         self.set_ratio(raw, cx);
@@ -178,11 +213,11 @@ impl SplitPaneState {
         if self.disabled {
             return;
         }
-        let step = if event.keystroke.modifiers.shift {
-            0.10
-        } else {
-            0.025
-        };
+        let mods = &event.keystroke.modifiers;
+        if mods.control || mods.alt || mods.platform {
+            return;
+        }
+        let step = if mods.shift { 0.10 } else { 0.025 };
         match (self.direction, event.keystroke.key.as_str()) {
             (SplitDirection::Horizontal, "left") | (SplitDirection::Vertical, "up") => {
                 self.set_ratio(self.ratio - step, cx);
@@ -246,7 +281,11 @@ impl SplitPane {
 
     /// Sets the interactive hit-area width/height of the divider handle (default `8px`).
     pub fn handle_size(mut self, size: Pixels) -> Self {
-        self.handle_size = size.max(px(4.));
+        self.handle_size = if size.0.is_finite() {
+            size.max(px(4.))
+        } else {
+            px(8.)
+        };
         self
     }
 
@@ -266,7 +305,7 @@ impl Styled for SplitPane {
 impl RenderOnce for SplitPane {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
-        let (direction, ratio, dragging, disabled, focus_handle, bounds_cell) = {
+        let (direction, ratio, dragging, disabled, focus_handle, bounds_cell, handle_size_cell) = {
             let st = self.state.read(cx);
             (
                 st.direction,
@@ -275,15 +314,14 @@ impl RenderOnce for SplitPane {
                 st.disabled,
                 st.focus_handle.clone(),
                 st.bounds_cell.clone(),
+                st.handle_size_cell.clone(),
             )
         };
-        let focused = focus_handle.is_focused(window);
+        handle_size_cell.set(self.handle_size.0);
+        let focused = !disabled && focus_handle.is_focused(window);
         let is_horizontal = direction == SplitDirection::Horizontal;
 
         let state_down = self.state.clone();
-        let state_move = self.state.clone();
-        let state_up = self.state.clone();
-        let state_up_out = self.state.clone();
         let state_key = self.state.clone();
         let state_window_drag = self.state.clone();
 
@@ -295,13 +333,14 @@ impl RenderOnce for SplitPane {
             CursorStyle::ResizeUpDown
         };
 
-        let line_color = if dragging || focused {
+        let active_accent = (dragging || focused) && !disabled;
+        let line_color = if active_accent {
             theme.primary
         } else {
             theme.border
         };
         let hover_bg = theme.primary.opacity(0.14);
-        let grip_color = if dragging || focused {
+        let grip_color = if active_accent {
             theme.primary
         } else {
             theme.muted_foreground.opacity(0.5)
@@ -310,16 +349,20 @@ impl RenderOnce for SplitPane {
         let first_pane = div()
             .flex()
             .flex_col()
-            .flex_shrink_0()
+            .flex_basis(px(0.))
+            .flex_grow(ratio)
+            .min_w_0()
+            .min_h_0()
             .overflow_hidden()
-            .when(is_horizontal, |el| el.w(relative(ratio)).h_full().min_w_0())
-            .when(!is_horizontal, |el| el.h(relative(ratio)).w_full().min_h_0())
+            .when(is_horizontal, |el| el.h_full())
+            .when(!is_horizontal, |el| el.w_full())
             .children(self.first);
 
         let second_pane = div()
             .flex()
             .flex_col()
-            .flex_1()
+            .flex_basis(px(0.))
+            .flex_grow((1.0 - ratio).max(0.0))
             .min_w_0()
             .min_h_0()
             .overflow_hidden()
@@ -329,7 +372,7 @@ impl RenderOnce for SplitPane {
 
         let handle = div()
             .id((self.id.clone(), "split-handle"))
-            .track_focus(&focus_handle)
+            .when(!disabled, |el| el.track_focus(&focus_handle))
             .relative()
             .flex()
             .flex_shrink_0()
@@ -382,15 +425,6 @@ impl RenderOnce for SplitPane {
             .when(is_horizontal, |el| el.flex_row())
             .when(!is_horizontal, |el| el.flex_col())
             .when(dragging, |el| el.cursor(divider_cursor))
-            .on_mouse_move(move |ev: &MouseMoveEvent, _, cx| {
-                state_move.update(cx, |s, cx| s.move_drag(ev, cx));
-            })
-            .on_mouse_up(MouseButton::Left, move |_: &MouseUpEvent, _, cx| {
-                state_up.update(cx, |s, cx| s.end_drag(cx));
-            })
-            .on_mouse_up_out(MouseButton::Left, move |_: &MouseUpEvent, _, cx| {
-                state_up_out.update(cx, |s, cx| s.end_drag(cx));
-            })
             .child(
                 canvas(
                     move |bounds, _, _| {
@@ -398,15 +432,20 @@ impl RenderOnce for SplitPane {
                     },
                     move |_, _, window, _| {
                         if dragging {
+                            window.set_window_cursor_style(divider_cursor);
                             let st_move = state_window_drag.clone();
                             let st_up = state_window_drag;
                             window.on_mouse_event(move |ev: &MouseMoveEvent, phase, _, cx| {
-                                if phase == crate::DispatchPhase::Bubble {
-                                    st_move.update(cx, |s, cx| s.move_drag(ev, cx));
+                                if phase == crate::DispatchPhase::Capture {
+                                    if ev.pressed_button != Some(MouseButton::Left) {
+                                        st_move.update(cx, |s, cx| s.end_drag(cx));
+                                    } else {
+                                        st_move.update(cx, |s, cx| s.move_drag(ev, cx));
+                                    }
                                 }
                             });
                             window.on_mouse_event(move |ev: &MouseUpEvent, phase, _, cx| {
-                                if phase == crate::DispatchPhase::Bubble
+                                if phase == crate::DispatchPhase::Capture
                                     && ev.button == MouseButton::Left
                                 {
                                     st_up.update(cx, |s, cx| s.end_drag(cx));

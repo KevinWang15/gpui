@@ -773,3 +773,8 @@ pub fn init_components(cx: &mut App) {
     super::input::bind_input_keys(cx);
     super::textbox::bind_textbox_keys(cx);
 }
+
+/// Convenience wrapper for the standard non-invalid focus ring shadow.
+pub(crate) fn focus_ring_shadow(theme: &Theme) -> Vec<crate::BoxShadow> {
+    super::layout::focus_ring_shadow(theme, false)
+}

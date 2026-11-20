@@ -167,7 +167,7 @@ impl RenderOnce for Stepper {
         };
 
         let mut root = div()
-            .id(self.id.clone())
+            .id(self.id)
             .flex()
             .w_full()
             .when(self.orientation == StepperOrientation::Horizontal, |el| {
@@ -185,12 +185,16 @@ impl RenderOnce for Stepper {
 
             let (circle_bg, circle_border, circle_fg) = match status {
                 StepStatus::Completed => (theme.primary, theme.primary, theme.primary_foreground),
-                StepStatus::Active => (theme.primary_soft, theme.primary, theme.primary),
+                StepStatus::Active => (
+                    theme.primary_soft,
+                    theme.primary,
+                    theme.primary_soft_foreground,
+                ),
                 StepStatus::Pending => (theme.surface, theme.input_border, theme.muted_foreground),
                 StepStatus::Error => (
                     theme.destructive_soft,
                     theme.destructive,
-                    theme.destructive,
+                    theme.destructive_soft_foreground,
                 ),
             };
 
@@ -249,6 +253,7 @@ impl RenderOnce for Stepper {
             let label_block = div()
                 .flex()
                 .flex_col()
+                .min_w_0()
                 .gap(px(2.))
                 .child(
                     div()
@@ -272,10 +277,11 @@ impl RenderOnce for Stepper {
 
             if self.orientation == StepperOrientation::Horizontal {
                 let step_btn = div()
-                    .id((self.id.clone(), format!("step-{idx}")))
+                    .id(("step", idx))
                     .flex()
                     .flex_row()
                     .items_center()
+                    .min_w_0()
                     .gap(px(10.))
                     .px(px(6.))
                     .py(px(4.))
@@ -296,6 +302,7 @@ impl RenderOnce for Stepper {
                         .flex()
                         .flex_row()
                         .items_center()
+                        .min_w_0()
                         .when(!is_last, |el| el.flex_1())
                         .child(step_btn)
                         .when(!is_last, |el| {
@@ -311,28 +318,37 @@ impl RenderOnce for Stepper {
                         }),
                 );
             } else {
+                let hover_bg = theme.surface_hover;
                 let row = div()
-                    .id((self.id.clone(), format!("step-v-{idx}")))
+                    .id(("step-v", idx))
                     .flex()
                     .flex_row()
-                    .items_start()
+                    .items_stretch()
                     .gap(px(12.))
+                    .px(px(6.))
+                    .py(px(4.))
+                    .rounded(theme.radius_md)
                     .when(clickable, |el| {
-                        el.cursor_pointer().when_some(on_click, |el, cb| {
-                            el.on_click(move |_, window, cx| cb(&idx, window, cx))
-                        })
+                        el.cursor_pointer()
+                            .hover(move |s| s.bg(hover_bg))
+                            .when_some(on_click, |el, cb| {
+                                el.on_click(move |_, window, cx| cb(&idx, window, cx))
+                            })
                     })
                     .child(
                         div()
                             .flex()
                             .flex_col()
                             .items_center()
+                            .self_stretch()
+                            .flex_shrink_0()
                             .child(circle)
                             .when(!is_last, |el| {
                                 el.child(
                                     div()
                                         .w(px(2.))
-                                        .h(px(28.))
+                                        .flex_1()
+                                        .min_h(px(24.))
                                         .my(px(4.))
                                         .rounded_full()
                                         .bg(connector_color),
@@ -341,6 +357,8 @@ impl RenderOnce for Stepper {
                     )
                     .child(
                         div()
+                            .flex_1()
+                            .min_w_0()
                             .pt(px(4.))
                             .pb(if is_last { px(0.) } else { px(12.) })
                             .child(label_block),

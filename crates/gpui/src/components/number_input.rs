@@ -31,13 +31,25 @@ pub struct NumberInputState {
     max: Option<f64>,
     step: f64,
     precision: usize,
+    explicit_precision: bool,
     prefix: Option<SharedString>,
     suffix: Option<SharedString>,
     size: ComponentSize,
+    synced_size: ComponentSize,
     disabled: bool,
     invalid: bool,
-    syncing_text: bool,
     frame_style: StyleRefinement,
+}
+
+fn infer_step_precision(step: f64) -> usize {
+    for p in 0..=6 {
+        let factor = 10f64.powi(p as i32);
+        let scaled = step * factor;
+        if (scaled - scaled.round()).abs() < 1e-6 {
+            return p;
+        }
+    }
+    6
 }
 
 impl EventEmitter<NumberInputEvent> for NumberInputState {}
@@ -54,17 +66,18 @@ impl NumberInputState {
         let input = cx.new(|cx| InputState::new(cx).default_value("0"));
         cx.subscribe(&input, |this, _, ev: &InputEvent, cx| match ev {
             InputEvent::Change(text) => {
-                if this.syncing_text {
-                    return;
-                }
                 if let Ok(parsed) = text.trim().parse::<f64>()
                     && parsed.is_finite()
                 {
-                    let clamped = this.clamp(parsed);
-                    if (clamped - this.value).abs() > 1e-9 {
-                        this.value = clamped;
-                        cx.emit(NumberInputEvent::Change(clamped));
-                        cx.notify();
+                    let in_min = this.min.is_none_or(|m| parsed >= m - 1e-9);
+                    let in_max = this.max.is_none_or(|m| parsed <= m + 1e-9);
+                    if in_min && in_max {
+                        let normalized = this.normalize(parsed);
+                        if (normalized - this.value).abs() > 1e-9 {
+                            this.value = normalized;
+                            cx.emit(NumberInputEvent::Change(normalized));
+                            cx.notify();
+                        }
                     }
                 }
             }
@@ -88,57 +101,87 @@ impl NumberInputState {
             max: None,
             step: 1.0,
             precision: 0,
+            explicit_precision: false,
             prefix: None,
             suffix: None,
             size: ComponentSize::Md,
+            synced_size: ComponentSize::Md,
             disabled: false,
             invalid: false,
-            syncing_text: false,
             frame_style: StyleRefinement::default(),
         }
     }
 
     /// Sets the initial value.
     pub fn default_value(mut self, value: f64, cx: &mut Context<Self>) -> Self {
-        self.value = self.clamp(value);
-        self.sync_input_text(cx);
+        if value.is_finite() {
+            self.value = self.normalize(value);
+            self.sync_input_text(cx);
+        }
         self
     }
 
     /// Sets minimum and maximum bounds.
     pub fn range(mut self, min: f64, max: f64, cx: &mut Context<Self>) -> Self {
-        self.min = Some(min);
-        self.max = Some(max.max(min));
-        self.value = self.clamp(self.value);
-        self.sync_input_text(cx);
+        if min.is_finite() && max.is_finite() {
+            let (lo, hi) = if min <= max { (min, max) } else { (max, min) };
+            self.min = Some(lo);
+            self.max = Some(hi);
+            self.value = self.normalize(self.value);
+            self.sync_input_text(cx);
+        }
         self
     }
 
     /// Sets minimum allowed value.
     pub fn min(mut self, min: f64, cx: &mut Context<Self>) -> Self {
-        self.min = Some(min);
-        self.value = self.clamp(self.value);
-        self.sync_input_text(cx);
+        if min.is_finite() {
+            self.min = Some(min);
+            if let Some(max) = self.max
+                && max < min
+            {
+                self.max = Some(min);
+            }
+            self.value = self.normalize(self.value);
+            self.sync_input_text(cx);
+        }
         self
     }
 
     /// Sets maximum allowed value.
     pub fn max(mut self, max: f64, cx: &mut Context<Self>) -> Self {
-        self.max = Some(max);
-        self.value = self.clamp(self.value);
-        self.sync_input_text(cx);
+        if max.is_finite() {
+            self.max = Some(max);
+            if let Some(min) = self.min
+                && min > max
+            {
+                self.min = Some(max);
+            }
+            self.value = self.normalize(self.value);
+            self.sync_input_text(cx);
+        }
         self
     }
 
     /// Sets the increment/decrement step (default `1.0`).
+    ///
+    /// If [`Self::precision`] has not been explicitly set, decimal precision is automatically
+    /// expanded to represent fractional steps cleanly (up to 6 decimal places).
     pub fn step(mut self, step: f64) -> Self {
-        self.step = step.abs().max(1e-6);
+        if step.is_finite() {
+            self.step = step.abs().max(1e-6);
+            if !self.explicit_precision {
+                self.precision = self.precision.max(infer_step_precision(self.step));
+            }
+        }
         self
     }
 
     /// Sets decimal places shown when formatting (default `0`).
     pub fn precision(mut self, precision: usize, cx: &mut Context<Self>) -> Self {
+        self.explicit_precision = true;
         self.precision = precision.min(6);
+        self.value = self.normalize(self.value);
         self.sync_input_text(cx);
         self
     }
@@ -181,7 +224,11 @@ impl NumberInputState {
 
     /// Programmatically sets the value (clamped & rounded to precision) and emits `Change`.
     pub fn set_value(&mut self, value: f64, cx: &mut Context<Self>) {
-        let clamped = self.round_precision(self.clamp(value));
+        if !value.is_finite() {
+            self.sync_input_text(cx);
+            return;
+        }
+        let clamped = self.normalize(value);
         let changed = (clamped - self.value).abs() > 1e-9;
         self.value = clamped;
         self.sync_input_text(cx);
@@ -193,14 +240,14 @@ impl NumberInputState {
 
     /// Increments the value by `step * multiplier`.
     pub fn increment(&mut self, multiplier: f64, cx: &mut Context<Self>) {
-        if !self.disabled {
+        if !self.disabled && multiplier.is_finite() {
             self.set_value(self.value + self.step * multiplier, cx);
         }
     }
 
     /// Decrements the value by `step * multiplier`.
     pub fn decrement(&mut self, multiplier: f64, cx: &mut Context<Self>) {
-        if !self.disabled {
+        if !self.disabled && multiplier.is_finite() {
             self.set_value(self.value - self.step * multiplier, cx);
         }
     }
@@ -218,8 +265,17 @@ impl NumberInputState {
 
     fn round_precision(&self, v: f64) -> f64 {
         let factor = 10f64.powi(self.precision as i32);
-        let rounded = (v * factor).round() / factor;
+        let scaled = v * factor;
+        let rounded = if scaled.is_finite() {
+            scaled.round() / factor
+        } else {
+            v
+        };
         if rounded.abs() < 1e-12 { 0.0 } else { rounded }
+    }
+
+    fn normalize(&self, raw: f64) -> f64 {
+        self.clamp(self.round_precision(self.clamp(raw)))
     }
 
     fn format_value(&self) -> String {
@@ -228,13 +284,11 @@ impl NumberInputState {
 
     fn sync_input_text(&mut self, cx: &mut Context<Self>) {
         let formatted = self.format_value();
-        self.syncing_text = true;
         self.input.update(cx, |inp, cx| {
             if inp.value() != formatted {
-                inp.set_value(formatted, cx);
+                inp.set_value_silent(formatted, cx);
             }
         });
-        self.syncing_text = false;
     }
 
     fn commit_text(&mut self, cx: &mut Context<Self>, emit_submit: bool) {
@@ -255,11 +309,11 @@ impl NumberInputState {
         if self.disabled {
             return;
         }
-        let mult = if event.keystroke.modifiers.shift {
-            10.0
-        } else {
-            1.0
-        };
+        let mods = &event.keystroke.modifiers;
+        if mods.control || mods.alt || mods.platform {
+            return;
+        }
+        let mult = if mods.shift { 10.0 } else { 1.0 };
         match event.keystroke.key.as_str() {
             "up" => {
                 self.increment(mult, cx);
@@ -276,9 +330,15 @@ impl NumberInputState {
 
 impl Render for NumberInputState {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.synced_size != self.size {
+            self.synced_size = self.size;
+            let size = self.size;
+            self.input.update(cx, |inp, cx| inp.set_size(size, cx));
+        }
         let theme = cx.theme();
-        let focused =
-            self.focus_handle.is_focused(window) || self.input.read(cx).focus_handle(cx).is_focused(window);
+        let focused = !self.disabled
+            && (self.focus_handle.is_focused(window)
+                || self.input.read(cx).focus_handle(cx).is_focused(window));
         let height = self.size.height();
         let font_size = self.size.font_size();
         let btn_w = match self.size {
@@ -306,7 +366,7 @@ impl Render for NumberInputState {
 
         let mut root = div()
             .id("number-input-shell")
-            .track_focus(&self.focus_handle)
+            .when(!self.disabled, |el| el.track_focus(&self.focus_handle))
             .on_key_down(cx.listener(Self::on_key_down))
             .flex()
             .flex_row()
@@ -463,9 +523,8 @@ impl RenderOnce for NumberInput {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         if self.state.read(cx).frame_style != self.style {
             let style = self.style;
-            self.state.update(cx, |s, cx| {
+            self.state.update(cx, |s, _| {
                 s.frame_style = style;
-                cx.notify();
             });
         }
         self.state

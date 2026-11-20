@@ -1,17 +1,23 @@
-//! Keyboard-first Spotlight / `⌘K` [`CommandPalette`] with fuzzy search, grouped commands,
-//! [`Kbd`] shortcut badges, keyboard navigation (`Up`/`Down`/`Enter`/`Escape`), and GPU-blurred
-//! modal backdrop.
+//! Keyboard-first Spotlight / `⌘K` [`CommandPalette`] with cached fuzzy search, grouped
+//! virtualized commands, [`kbd`] shortcut badges, synchronized keyboard navigation
+//! (`Up`/`Down`/`Enter`/`Escape`), focus trapping & restoration, and GPU-blurred modal backdrop.
 
+use std::ops::Range;
+use std::rc::Rc;
+
+use crate::icons::{Icon, IconSize, LucideIcon};
 use crate::{
     Animation, AnimationExt, App, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    FontWeight, IntoElement, KeyDownEvent, MouseButton, Pixels, Render, RenderOnce, ScrollHandle,
-    SharedString, StyleRefinement, Styled, Window, deferred, div, ease_out_quint, prelude::*, px,
+    FontWeight, IntoElement, KeyDownEvent, MouseButton, Pixels, Render, RenderOnce, ScrollStrategy,
+    SharedString, StyleRefinement, Styled, UniformListScrollHandle, Window, deferred, div,
+    ease_out_quint, prelude::*, px, uniform_list,
 };
-use crate::icons::{Icon, IconSize, LucideIcon};
 
 use super::field::kbd;
 use super::input::{Input, InputEvent, InputState};
 use super::theme::{ANIM_FAST, ActiveTheme, ComponentSize};
+
+const CMD_ROW_HEIGHT: f32 = 44.0;
 
 /// Single actionable command listed inside a [`CommandPalette`].
 #[derive(Clone)]
@@ -86,6 +92,36 @@ impl CommandItem {
     }
 }
 
+struct IndexedCommand {
+    item: CommandItem,
+    title_low: String,
+    subtitle_low: Option<String>,
+    keywords_low: String,
+    group_low: String,
+}
+
+impl IndexedCommand {
+    fn new(item: CommandItem) -> Self {
+        let title_low = item.title.to_lowercase();
+        let subtitle_low = item.subtitle.as_deref().map(str::to_lowercase);
+        let keywords_low = item.keywords.to_lowercase();
+        let group_low = item.group.to_lowercase();
+        Self {
+            item,
+            title_low,
+            subtitle_low,
+            keywords_low,
+            group_low,
+        }
+    }
+}
+
+#[derive(Clone)]
+enum PaletteRow {
+    GroupHeader(SharedString),
+    Item { visual_idx: usize, item_idx: usize },
+}
+
 /// Events emitted by [`CommandPaletteState`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CommandPaletteEvent {
@@ -100,12 +136,20 @@ pub enum CommandPaletteEvent {
 /// Entity state backing a [`CommandPalette`].
 pub struct CommandPaletteState {
     focus_handle: FocusHandle,
+    previous_focus: Option<FocusHandle>,
     search_input: Entity<InputState>,
-    scroll_handle: ScrollHandle,
+    scroll_handle: UniformListScrollHandle,
     open: bool,
-    items: Vec<CommandItem>,
+    items: Rc<Vec<IndexedCommand>>,
     selected_idx: usize,
-    placeholder: SharedString,
+    cached_query: SharedString,
+    cache_dirty: bool,
+    /// Visual top-to-bottom order of matching command indices (strictly matching rendered groups!).
+    cached_visual_items: Vec<usize>,
+    /// Mapping `visual_idx -> uniform_list row_idx` for exact `scroll_to_item`.
+    cached_row_indices: Vec<usize>,
+    /// Flattened group headers + command rows for O(visible) `uniform_list` rendering.
+    cached_rows: Rc<Vec<PaletteRow>>,
     empty_message: SharedString,
     backdrop_blur: Pixels,
     max_width: Pixels,
@@ -120,24 +164,24 @@ impl Focusable for CommandPaletteState {
     }
 }
 
-/// Scores a fuzzy subsequence / substring match. Returns `None` if `query` does not match `text`.
-pub(crate) fn fuzzy_match_score(query: &str, text: &str) -> Option<i32> {
-    let q = query.trim().to_lowercase();
-    if q.is_empty() {
+/// Scores a fuzzy subsequence / substring match where `q_low` and `hay_low` are already lowercased.
+fn fuzzy_match_score_lower(q_low: &str, hay_low: &str) -> Option<i32> {
+    if q_low.is_empty() {
         return Some(0);
     }
-    let hay = text.to_lowercase();
-    if let Some(pos) = hay.find(&q) {
-        // Exact prefix / substring match gets highest priority.
-        let prefix_bonus = if pos == 0 { 120 } else { 60 };
-        return Some(prefix_bonus - (pos as i32).min(40));
+    if hay_low == q_low {
+        return Some(1000);
     }
-    // Ordered character subsequence match with word-boundary & consecutive bonuses.
+    if let Some(pos) = hay_low.find(q_low) {
+        let base = if pos == 0 { 600 } else { 350 };
+        return Some(base - (pos as i32).min(80));
+    }
+    // Ordered character subsequence match with bounded bonus so contiguous matches always outrank.
     let mut score = 0i32;
-    let mut q_chars = q.chars().peekable();
+    let mut q_chars = q_low.chars().peekable();
     let mut prev_matched = false;
     let mut prev_char = ' ';
-    for ch in hay.chars() {
+    for ch in hay_low.chars() {
         if let Some(&target) = q_chars.peek()
             && ch == target
         {
@@ -156,10 +200,21 @@ pub(crate) fn fuzzy_match_score(query: &str, text: &str) -> Option<i32> {
         prev_char = ch;
     }
     if q_chars.peek().is_none() {
-        Some(score)
+        Some(score.min(240))
     } else {
         None
     }
+}
+
+/// Scores a fuzzy subsequence / substring match. Returns `None` if `query` does not match `text`.
+#[cfg(test)]
+pub(crate) fn fuzzy_match_score(query: &str, text: &str) -> Option<i32> {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return Some(0);
+    }
+    let hay = text.to_lowercase();
+    fuzzy_match_score_lower(&q, &hay)
 }
 
 impl CommandPaletteState {
@@ -174,7 +229,11 @@ impl CommandPaletteState {
         });
         cx.subscribe(&search_input, |this, _, ev: &InputEvent, cx| match ev {
             InputEvent::Change(_) => {
-                this.selected_idx = 0;
+                this.cache_dirty = true;
+                let query = this.search_input.read(cx).value().to_string();
+                this.ensure_cache(&query);
+                this.selected_idx = this.first_enabled_visual_idx();
+                this.scroll_handle.scroll_to_item(0, ScrollStrategy::Top);
                 cx.notify();
             }
             InputEvent::Submit(_) => {
@@ -184,14 +243,21 @@ impl CommandPaletteState {
         })
         .detach();
 
+        let indexed: Vec<IndexedCommand> = items.into_iter().map(IndexedCommand::new).collect();
+
         Self {
             focus_handle: cx.focus_handle(),
+            previous_focus: None,
             search_input,
-            scroll_handle: ScrollHandle::new(),
+            scroll_handle: UniformListScrollHandle::new(),
             open: false,
-            items,
+            items: Rc::new(indexed),
             selected_idx: 0,
-            placeholder: "Type a command or search...".into(),
+            cached_query: SharedString::default(),
+            cache_dirty: true,
+            cached_visual_items: Vec::new(),
+            cached_row_indices: Vec::new(),
+            cached_rows: Rc::new(Vec::new()),
             empty_message: "No matching commands found.".into(),
             backdrop_blur: px(8.),
             max_width: px(580.),
@@ -200,9 +266,8 @@ impl CommandPaletteState {
     }
 
     /// Sets the search input placeholder.
-    pub fn placeholder(mut self, text: impl Into<SharedString>, cx: &mut Context<Self>) -> Self {
+    pub fn placeholder(self, text: impl Into<SharedString>, cx: &mut Context<Self>) -> Self {
         let s: SharedString = text.into();
-        self.placeholder = s.clone();
         self.search_input.update(cx, |inp, cx| {
             inp.set_placeholder(s, cx);
         });
@@ -217,20 +282,28 @@ impl CommandPaletteState {
 
     /// Sets the GPU backdrop blur radius (default `8px`).
     pub fn backdrop_blur(mut self, radius: impl Into<Pixels>) -> Self {
-        self.backdrop_blur = radius.into();
+        let r: Pixels = radius.into();
+        self.backdrop_blur = if r.0.is_finite() { r.max(px(0.)) } else { px(8.) };
         self
     }
 
     /// Sets the maximum palette dialog width (default `580px`).
     pub fn max_width(mut self, width: Pixels) -> Self {
-        self.max_width = width;
+        self.max_width = if width.0.is_finite() {
+            width.max(px(260.))
+        } else {
+            px(580.)
+        };
         self
     }
 
     /// Replaces the command catalog dynamically.
     pub fn set_items(&mut self, items: Vec<CommandItem>, cx: &mut Context<Self>) {
-        self.items = items;
-        self.selected_idx = 0;
+        self.items = Rc::new(items.into_iter().map(IndexedCommand::new).collect());
+        self.cache_dirty = true;
+        let query = self.search_input.read(cx).value().to_string();
+        self.ensure_cache(&query);
+        self.selected_idx = self.first_enabled_visual_idx();
         cx.notify();
     }
 
@@ -242,9 +315,14 @@ impl CommandPaletteState {
     /// Opens the command palette, clears any prior query, and focuses the search input.
     pub fn open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.open {
+            self.previous_focus = window.focused(cx);
             self.open = true;
-            self.selected_idx = 0;
-            self.search_input.update(cx, |inp, cx| inp.set_value("", cx));
+            self.search_input
+                .update(cx, |inp, cx| inp.set_value_silent(String::new(), cx));
+            self.cache_dirty = true;
+            self.ensure_cache("");
+            self.selected_idx = self.first_enabled_visual_idx();
+            self.scroll_handle.scroll_to_item(0, ScrollStrategy::Top);
             let input_focus = self.search_input.read(cx).focus_handle(cx);
             window.focus(&input_focus, cx);
             cx.emit(CommandPaletteEvent::Open);
@@ -256,6 +334,21 @@ impl CommandPaletteState {
     pub fn close(&mut self, cx: &mut Context<Self>) {
         if self.open {
             self.open = false;
+            self.previous_focus = None;
+            cx.emit(CommandPaletteEvent::Close);
+            cx.notify();
+        }
+    }
+
+    /// Closes the command palette and restores previous window focus.
+    pub fn close_in(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.open {
+            self.open = false;
+            if let Some(prev) = self.previous_focus.take() {
+                window.focus(&prev, cx);
+            } else {
+                window.blur(cx);
+            }
             cx.emit(CommandPaletteEvent::Close);
             cx.notify();
         }
@@ -264,88 +357,165 @@ impl CommandPaletteState {
     /// Toggles the command palette open or closed.
     pub fn toggle(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.open {
-            self.close(cx);
+            self.close_in(window, cx);
         } else {
             self.open(window, cx);
         }
     }
 
-    /// Returns the currently filtered command indices in display order.
-    pub fn filtered_indices(&self, cx: &App) -> Vec<usize> {
-        let query = self.search_input.read(cx).value().to_string();
-        if query.trim().is_empty() {
-            return (0..self.items.len()).collect();
-        }
-        let mut scored: Vec<(i32, usize)> = self
-            .items
+    fn first_enabled_visual_idx(&self) -> usize {
+        self.cached_visual_items
             .iter()
-            .enumerate()
-            .filter_map(|(idx, item)| {
-                let title_score = fuzzy_match_score(&query, &item.title);
-                let sub_score = item
-                    .subtitle
-                    .as_deref()
-                    .and_then(|s| fuzzy_match_score(&query, s))
-                    .map(|s| s - 15);
-                let kw_score = (!item.keywords.is_empty())
-                    .then(|| fuzzy_match_score(&query, &item.keywords))
-                    .flatten()
-                    .map(|s| s - 20);
-                let grp_score = fuzzy_match_score(&query, &item.group).map(|s| s - 25);
-                let best = [title_score, sub_score, kw_score, grp_score]
-                    .into_iter()
-                    .flatten()
-                    .max()?;
-                Some((best, idx))
-            })
-            .collect();
-        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-        scored.into_iter().map(|(_, idx)| idx).collect()
+            .position(|&item_idx| !self.items[item_idx].item.disabled)
+            .unwrap_or(0)
+    }
+
+    fn compute_grouped_for_query(&self, query: &str) -> (Vec<usize>, Vec<usize>, Vec<PaletteRow>) {
+        let q = query.trim().to_lowercase();
+        let scored_indices: Vec<usize> = if q.is_empty() {
+            (0..self.items.len()).collect()
+        } else {
+            let mut scored: Vec<(i32, usize)> = self
+                .items
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, indexed)| {
+                    let title_score = fuzzy_match_score_lower(&q, &indexed.title_low);
+                    let sub_score = indexed
+                        .subtitle_low
+                        .as_deref()
+                        .and_then(|s| fuzzy_match_score_lower(&q, s))
+                        .map(|s| s - 15);
+                    let kw_score = (!indexed.keywords_low.is_empty())
+                        .then(|| fuzzy_match_score_lower(&q, &indexed.keywords_low))
+                        .flatten()
+                        .map(|s| s - 20);
+                    let grp_score =
+                        fuzzy_match_score_lower(&q, &indexed.group_low).map(|s| s - 25);
+                    let best = [title_score, sub_score, kw_score, grp_score]
+                        .into_iter()
+                        .flatten()
+                        .max()?;
+                    Some((best, idx))
+                })
+                .collect();
+            scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+            scored.into_iter().map(|(_, idx)| idx).collect()
+        };
+
+        // Group items in exact top-to-bottom visual order so Up/Down ALWAYS matches what's on screen!
+        let mut group_map: std::collections::HashMap<SharedString, usize> =
+            std::collections::HashMap::new();
+        let mut grouped: Vec<(SharedString, Vec<usize>)> = Vec::new();
+        for item_idx in scored_indices {
+            let g = self.items[item_idx].item.group.clone();
+            if let Some(&pos) = group_map.get(&g) {
+                grouped[pos].1.push(item_idx);
+            } else {
+                let pos = grouped.len();
+                group_map.insert(g.clone(), pos);
+                grouped.push((g, vec![item_idx]));
+            }
+        }
+
+        let mut visual_items = Vec::new();
+        let mut row_indices = Vec::new();
+        let mut rows = Vec::new();
+        for (group_name, item_idxs) in grouped {
+            rows.push(PaletteRow::GroupHeader(group_name));
+            for item_idx in item_idxs {
+                let visual_idx = visual_items.len();
+                let row_idx = rows.len();
+                visual_items.push(item_idx);
+                row_indices.push(row_idx);
+                rows.push(PaletteRow::Item {
+                    visual_idx,
+                    item_idx,
+                });
+            }
+        }
+        (visual_items, row_indices, rows)
+    }
+
+    fn ensure_cache(&mut self, query: &str) {
+        if !self.cache_dirty && self.cached_query.as_ref() == query {
+            return;
+        }
+        let (visual_items, row_indices, rows) = self.compute_grouped_for_query(query);
+        self.cached_visual_items = visual_items;
+        self.cached_row_indices = row_indices;
+        self.cached_rows = Rc::new(rows);
+        self.cached_query = SharedString::from(query.to_owned());
+        self.cache_dirty = false;
+    }
+
+    /// Returns the currently filtered command indices in exact visual display order.
+    pub fn filtered_indices(&self, cx: &App) -> Vec<usize> {
+        let query = self.search_input.read(cx).value();
+        if !self.cache_dirty && self.cached_query.as_ref() == query {
+            return self.cached_visual_items.clone();
+        }
+        self.compute_grouped_for_query(query).0
     }
 
     fn move_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
-        let filtered = self.filtered_indices(cx);
-        if filtered.is_empty() {
+        let query = self.search_input.read(cx).value().to_string();
+        self.ensure_cache(&query);
+        let count = self.cached_visual_items.len();
+        if count == 0 {
             self.selected_idx = 0;
             return;
         }
-        let len = filtered.len() as isize;
+        let len = count as isize;
         let mut next = (self.selected_idx as isize + delta).rem_euclid(len) as usize;
-        // Skip disabled items if possible
-        for _ in 0..filtered.len() {
-            if !self.items[filtered[next]].disabled {
+        for _ in 0..count {
+            if !self.items[self.cached_visual_items[next]].item.disabled {
                 break;
             }
             next = (next as isize + delta.signum()).rem_euclid(len) as usize;
         }
         self.selected_idx = next;
+        if let Some(&row_idx) = self.cached_row_indices.get(next) {
+            self.scroll_handle
+                .scroll_to_item(row_idx, ScrollStrategy::Nearest);
+        }
         cx.notify();
     }
 
-    fn execute_at(&mut self, filtered_pos: usize, cx: &mut Context<Self>) {
-        let filtered = self.filtered_indices(cx);
-        let Some(&item_idx) = filtered.get(filtered_pos) else {
+    fn execute_at(&mut self, visual_pos: usize, window: Option<&mut Window>, cx: &mut Context<Self>) {
+        let query = self.search_input.read(cx).value().to_string();
+        self.ensure_cache(&query);
+        let Some(&item_idx) = self.cached_visual_items.get(visual_pos) else {
             return;
         };
-        let item = &self.items[item_idx];
+        let item = &self.items[item_idx].item;
         if item.disabled {
             return;
         }
         let id = item.id.clone();
         self.open = false;
+        if let Some(window) = window {
+            if let Some(prev) = self.previous_focus.take() {
+                window.focus(&prev, cx);
+            } else {
+                window.blur(cx);
+            }
+        } else {
+            self.previous_focus = None;
+        }
         cx.emit(CommandPaletteEvent::Execute(id));
         cx.emit(CommandPaletteEvent::Close);
         cx.notify();
     }
 
     fn execute_selected(&mut self, cx: &mut Context<Self>) {
-        self.execute_at(self.selected_idx, cx);
+        self.execute_at(self.selected_idx, None, cx);
     }
 
     fn on_key_down(
         &mut self,
         event: &KeyDownEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if !self.open {
@@ -353,7 +523,7 @@ impl CommandPaletteState {
         }
         match event.keystroke.key.as_str() {
             "escape" => {
-                self.close(cx);
+                self.close_in(window, cx);
                 cx.stop_propagation();
             }
             "down" => {
@@ -365,7 +535,13 @@ impl CommandPaletteState {
                 cx.stop_propagation();
             }
             "enter" => {
-                self.execute_selected(cx);
+                self.execute_at(self.selected_idx, Some(window), cx);
+                cx.stop_propagation();
+            }
+            // Trap Tab inside modal palette so focus never escapes behind the backdrop.
+            "tab" => {
+                let delta = if event.keystroke.modifiers.shift { -1 } else { 1 };
+                self.move_selection(delta, cx);
                 cx.stop_propagation();
             }
             _ => {}
@@ -381,174 +557,206 @@ impl Render for CommandPaletteState {
 
         let theme = cx.theme();
         let reduce_motion = cx.reduce_motion();
-        let filtered = self.filtered_indices(cx);
-        if !filtered.is_empty() && self.selected_idx >= filtered.len() {
-            self.selected_idx = 0;
+        let entity = cx.entity();
+        let entity_id = cx.entity_id();
+        let query = self.search_input.read(cx).value().to_string();
+        self.ensure_cache(&query);
+
+        let result_count = self.cached_visual_items.len();
+        if result_count > 0 && self.selected_idx >= result_count {
+            self.selected_idx = self.first_enabled_visual_idx();
         }
 
-        // Preserve section grouping order while keeping filtered items together by group.
-        let mut group_order: Vec<SharedString> = Vec::new();
-        let mut grouped: Vec<(SharedString, Vec<(usize, usize)>)> = Vec::new();
-        for (filtered_pos, &item_idx) in filtered.iter().enumerate() {
-            let group_name = self.items[item_idx].group.clone();
-            if let Some(pos) = group_order.iter().position(|g| g == &group_name) {
-                grouped[pos].1.push((filtered_pos, item_idx));
-            } else {
-                group_order.push(group_name.clone());
-                grouped.push((group_name, vec![(filtered_pos, item_idx)]));
-            }
-        }
+        let rows_rc = Rc::clone(&self.cached_rows);
+        let items_rc = Rc::clone(&self.items);
+        let row_count = rows_rc.len();
+        let selected_idx = self.selected_idx;
 
-        let mut list = div()
-            .id("cmd-palette-scroll")
-            .track_scroll(&self.scroll_handle)
-            .flex_1()
-            .max_h(px(360.))
-            .overflow_y_scroll()
-            .p(px(8.));
-
-        if grouped.is_empty() {
-            list = list.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .justify_center()
-                    .gap(px(8.))
-                    .py(px(36.))
-                    .child(
-                        Icon::new(LucideIcon::SearchX)
-                            .size(IconSize::Xl)
-                            .color(theme.muted_foreground),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(13.5))
-                            .text_color(theme.muted_foreground)
-                            .child(self.empty_message.clone()),
-                    ),
-            );
-        } else {
-            let mut inner = div().flex().flex_col().gap(px(4.));
-            for (group_idx, (group_name, entries)) in grouped.into_iter().enumerate() {
-                inner = inner.child(
+        let list_body = if row_count == 0 {
+            div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap(px(8.))
+                .py(px(36.))
+                .child(
+                    Icon::new(LucideIcon::SearchX)
+                        .size(IconSize::Xl)
+                        .color(theme.muted_foreground),
+                )
+                .child(
                     div()
-                        .px(px(10.))
-                        .pt(if group_idx == 0 { px(4.) } else { px(10.) })
-                        .pb(px(3.))
-                        .text_size(px(11.))
-                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_size(px(13.5))
                         .text_color(theme.muted_foreground)
-                        .child(group_name),
-                );
-                for (filtered_pos, item_idx) in entries {
-                    let item = &self.items[item_idx];
-                    let is_selected = filtered_pos == self.selected_idx;
-                    let disabled = item.disabled;
-                    let row_bg = if is_selected {
-                        theme.primary_soft
-                    } else {
-                        crate::transparent_black()
-                    };
-                    let title_fg = if is_selected {
-                        theme.primary_soft_foreground
-                    } else {
-                        theme.popover_foreground
-                    };
-                    let icon_fg = if is_selected {
-                        theme.primary
-                    } else {
-                        theme.muted_foreground
-                    };
+                        .child(self.empty_message.clone()),
+                )
+                .into_any_element()
+        } else {
+            let list_h = px((row_count as f32 * CMD_ROW_HEIGHT).min(360.0));
+            uniform_list(
+                ("cmd-palette-vlist", entity_id),
+                row_count,
+                move |range: Range<usize>, _window: &mut Window, cx: &mut App| {
+                    let theme = cx.theme();
                     let hover_bg = theme.surface_hover;
+                    range
+                        .map(|row_i| match &rows_rc[row_i] {
+                            PaletteRow::GroupHeader(group_name) => div()
+                                .flex()
+                                .items_end()
+                                .w_full()
+                                .h(px(CMD_ROW_HEIGHT))
+                                .px(px(10.))
+                                .pb(px(6.))
+                                .text_size(px(11.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(theme.muted_foreground)
+                                .child(group_name.clone())
+                                .into_any_element(),
+                            PaletteRow::Item {
+                                visual_idx,
+                                item_idx,
+                            } => {
+                                let item = &items_rc[*item_idx].item;
+                                let visual_pos = *visual_idx;
+                                let is_selected = visual_pos == selected_idx;
+                                let disabled = item.disabled;
+                                let ent_hover = entity.clone();
+                                let ent_click = entity.clone();
 
-                    inner = inner.child(
-                        div()
-                            .id(("cmd-item", item_idx))
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .justify_between()
-                            .gap(px(12.))
-                            .w_full()
-                            .px(px(10.))
-                            .py(px(8.))
-                            .rounded(theme.radius_md)
-                            .bg(row_bg)
-                            .when(!disabled, |el| {
-                                el.cursor_pointer()
-                                    .when(!is_selected, |el| el.hover(move |s| s.bg(hover_bg)))
-                                    .on_mouse_move(cx.listener(move |this, _, _, cx| {
-                                        if this.selected_idx != filtered_pos {
-                                            this.selected_idx = filtered_pos;
-                                            cx.notify();
-                                        }
-                                    }))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.execute_at(filtered_pos, cx);
-                                    }))
-                            })
-                            .when(disabled, |el| el.opacity(0.45).cursor_not_allowed())
-                            .child(
+                                let row_bg = if is_selected {
+                                    theme.primary_soft
+                                } else {
+                                    crate::transparent_black()
+                                };
+                                let title_fg = if is_selected {
+                                    theme.primary_soft_foreground
+                                } else {
+                                    theme.popover_foreground
+                                };
+                                let icon_fg = if is_selected {
+                                    theme.primary_soft_foreground
+                                } else {
+                                    theme.muted_foreground
+                                };
+
                                 div()
+                                    .id(("cmd-item", *item_idx))
                                     .flex()
                                     .flex_row()
                                     .items_center()
-                                    .gap(px(10.))
-                                    .flex_1()
-                                    .min_w_0()
-                                    .when_some(item.icon, |el, ic| {
-                                        el.child(Icon::new(ic).size(IconSize::Md).color(icon_fg))
+                                    .justify_between()
+                                    .gap(px(12.))
+                                    .w_full()
+                                    .h(px(CMD_ROW_HEIGHT))
+                                    .px(px(10.))
+                                    .rounded(theme.radius_md)
+                                    .bg(row_bg)
+                                    .when(!disabled, |el| {
+                                        el.cursor_pointer()
+                                            .when(!is_selected, |el| {
+                                                el.hover(move |s| s.bg(hover_bg))
+                                            })
+                                            .on_mouse_move(move |_, _, cx| {
+                                                ent_hover.update(cx, |this, cx| {
+                                                    if this.selected_idx != visual_pos {
+                                                        this.selected_idx = visual_pos;
+                                                        cx.notify();
+                                                    }
+                                                });
+                                            })
+                                            .on_click(move |_, window, cx| {
+                                                ent_click.update(cx, |this, cx| {
+                                                    this.execute_at(visual_pos, Some(window), cx);
+                                                });
+                                            })
                                     })
+                                    .when(disabled, |el| el.opacity(0.45).cursor_not_allowed())
                                     .child(
                                         div()
                                             .flex()
-                                            .flex_col()
-                                            .gap(px(1.))
+                                            .flex_row()
+                                            .items_center()
+                                            .gap(px(10.))
+                                            .flex_1()
                                             .min_w_0()
+                                            .when_some(item.icon, |el, ic| {
+                                                el.child(
+                                                    Icon::new(ic).size(IconSize::Md).color(icon_fg),
+                                                )
+                                            })
                                             .child(
                                                 div()
-                                                    .text_size(px(13.5))
-                                                    .font_weight(FontWeight::MEDIUM)
-                                                    .text_color(title_fg)
-                                                    .child(item.title.clone()),
-                                            )
-                                            .when_some(item.subtitle.clone(), |el, sub| {
-                                                el.child(
-                                                    div()
-                                                        .text_size(px(12.))
-                                                        .text_color(theme.muted_foreground)
-                                                        .child(sub),
-                                                )
-                                            }),
-                                    ),
-                            )
-                            .when(!item.shortcut.is_empty(), |el| {
-                                el.child(
-                                    div()
-                                        .flex()
-                                        .flex_row()
-                                        .items_center()
-                                        .gap(px(3.))
-                                        .children(
-                                            item.shortcut.iter().cloned().map(kbd),
-                                        ),
-                                )
-                            }),
-                    );
-                }
-            }
-            list = list.child(inner);
-        }
+                                                    .flex()
+                                                    .flex_col()
+                                                    .gap(px(1.))
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .child(
+                                                        div()
+                                                            .truncate()
+                                                            .text_size(px(13.5))
+                                                            .font_weight(FontWeight::MEDIUM)
+                                                            .text_color(title_fg)
+                                                            .child(item.title.clone()),
+                                                    )
+                                                    .when_some(
+                                                        item.subtitle.clone(),
+                                                        |el, sub| {
+                                                            el.child(
+                                                                div()
+                                                                    .truncate()
+                                                                    .text_size(px(11.5))
+                                                                    .text_color(
+                                                                        theme.muted_foreground,
+                                                                    )
+                                                                    .child(sub),
+                                                            )
+                                                        },
+                                                    ),
+                                            ),
+                                    )
+                                    .when(!item.shortcut.is_empty(), |el| {
+                                        el.child(
+                                            div()
+                                                .flex()
+                                                .flex_row()
+                                                .items_center()
+                                                .flex_shrink_0()
+                                                .gap(px(3.))
+                                                .children(item.shortcut.iter().cloned().map(kbd)),
+                                        )
+                                    })
+                                    .into_any_element()
+                            }
+                        })
+                        .collect()
+                },
+            )
+            .track_scroll(&self.scroll_handle)
+            .w_full()
+            .h(list_h)
+            .p(px(6.))
+            .into_any_element()
+        };
+
+        let count_label = if result_count == 1 {
+            "1 result".to_owned()
+        } else {
+            format!("{result_count} results")
+        };
 
         let mut panel = div()
-            .id("cmd-palette-panel")
+            .id(("cmd-palette-panel", entity_id))
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::on_key_down))
+            .occlude()
             .flex()
             .flex_col()
             .w_full()
             .max_w(self.max_width)
+            .max_h_full()
             .rounded(theme.radius_xl)
             .bg(theme.popover)
             .text_color(theme.popover_foreground)
@@ -556,20 +764,23 @@ impl Render for CommandPaletteState {
             .border_color(theme.border)
             .when(theme.elevation_shadows, |el| el.shadow_2xl())
             .overflow_hidden()
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_any_mouse_down(|_, _, cx| cx.stop_propagation())
+            .on_click(|_, _, cx| cx.stop_propagation())
             // Search header
             .child(
                 div()
+                    .flex_shrink_0()
                     .p(px(10.))
                     .border_b_1()
                     .border_color(theme.border)
                     .child(Input::new(&self.search_input).border_0().shadow_none()),
             )
-            // Grouped results
-            .child(list)
+            // Virtualized grouped results
+            .child(div().flex_1().min_h_0().child(list_body))
             // Keyboard hint footer
             .child(
                 div()
+                    .flex_shrink_0()
                     .flex()
                     .flex_row()
                     .items_center()
@@ -613,7 +824,7 @@ impl Render for CommandPaletteState {
                                     .child("Close"),
                             ),
                     )
-                    .child(format!("{} results", filtered.len())),
+                    .child(count_label),
             );
 
         crate::Refineable::refine(panel.style(), &self.panel_style);
@@ -623,7 +834,7 @@ impl Render for CommandPaletteState {
         } else {
             panel
                 .with_animation(
-                    "cmd-palette-enter",
+                    ("cmd-palette-enter", entity_id),
                     Animation::new(ANIM_FAST).with_easing(ease_out_quint()),
                     |el, delta| el.opacity(delta).mt(px(12.0 * (1.0 - delta))),
                 )
@@ -634,7 +845,7 @@ impl Render for CommandPaletteState {
         let backdrop_blur = self.backdrop_blur;
 
         let overlay = div()
-            .id("cmd-palette-backdrop")
+            .id(("cmd-palette-backdrop", entity_id))
             .absolute()
             .inset_0()
             .occlude()
@@ -642,8 +853,12 @@ impl Render for CommandPaletteState {
             .flex_col()
             .items_center()
             .pt(px(84.))
+            .pb(px(20.))
             .px(px(20.))
-            .on_click(cx.listener(|this, _, _, cx| this.close(cx)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| this.close_in(window, cx)),
+            )
             .child(animated_panel);
 
         let final_overlay = if reduce_motion {
@@ -654,7 +869,7 @@ impl Render for CommandPaletteState {
         } else {
             overlay
                 .with_animation(
-                    "cmd-palette-backdrop-anim",
+                    ("cmd-palette-backdrop-anim", entity_id),
                     Animation::new(ANIM_FAST).with_easing(ease_out_quint()),
                     move |el, delta| {
                         el.bg(backdrop_color.opacity(delta))
@@ -700,7 +915,7 @@ impl Styled for CommandPalette {
 
 impl RenderOnce for CommandPalette {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
-        if self.style != StyleRefinement::default() {
+        if self.state.read(cx).panel_style != self.style {
             let style = self.style;
             self.state.update(cx, |s, _| {
                 s.panel_style = style;

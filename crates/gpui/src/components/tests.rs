@@ -1991,3 +1991,1045 @@ fn split_pane_number_input_pin_input_rating_and_copy_button(cx: &mut TestAppCont
     assert!(!pin.read_with(cx, |p, _| p.is_complete()));
     cx.run_until_parked();
 }
+
+#[gpui::test]
+fn tier1_tree_popconfirm_color_picker_dropzone_descriptions_timeline_and_table(
+    cx: &mut TestAppContext,
+) {
+    cx.update(init_components);
+
+    // Hex parsing & formatting sanity checks
+    let parsed = parse_hex_color("#4F46E5").expect("valid 6-char hex");
+    assert_eq!(format_hex(parsed, false), "#4F46E5");
+    let short = parse_hex_color("#0F8").expect("valid 3-char hex");
+    assert_eq!(format_hex(short, false), "#00FF88");
+    assert!(parse_hex_color("not-a-color").is_none());
+    assert_eq!(format_byte_size(512), "512 B");
+    assert_eq!(format_byte_size(1536), "1.5 KB");
+
+    struct Tier1View {
+        tree_st: Entity<TreeState>,
+        color_st: Entity<ColorPickerState>,
+        dz_st: Entity<FileDropzoneState>,
+    }
+    impl Render for Tier1View {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let cols = vec![TableColumn::new("Name"), TableColumn::new("Status")];
+            v_stack()
+                .w(px(720.))
+                .p(px(12.))
+                .spacing(px(12.))
+                .child(tree(&self.tree_st))
+                .child(
+                    popconfirm("t1-pc", "Confirm delete?", button("t1-del").label("Del"))
+                        .description("Irreversible")
+                        .on_confirm(|_, _, _| {}),
+                )
+                .child(color_picker(&self.color_st))
+                .child(file_dropzone(&self.dz_st))
+                .child(
+                    descriptions("t1-desc")
+                        .columns(2)
+                        .item(DescriptionItem::new("Host", "node-1").copyable("node-1"))
+                        .item(DescriptionItem::new("Region", "us-east-1").span(2)),
+                )
+                .child(
+                    timeline()
+                        .mode(TimelineMode::Alternate)
+                        .item(
+                            TimelineItem::new("Step 1")
+                                .timestamp("10:00")
+                                .tone(TimelineTone::Success)
+                                .icon(LucideIcon::Check),
+                        )
+                        .pending("Deploying..."),
+                )
+                .child(
+                    table("t1-tbl", cols.clone())
+                        .selectable(true)
+                        .max_height(px(160.))
+                        .row(
+                            TableRow::new()
+                                .checked(true)
+                                .text("svc-a")
+                                .text("ok")
+                                .expandable(true, crate::div().child("Detail panel")),
+                        )
+                        .row(TableRow::new().checked(false).text("svc-b").text("warn")),
+                )
+                .child(
+                    virtual_table("t1-vtbl", cols, 1_000, |idx, _, _| {
+                        vec![
+                            crate::div().child(format!("row-{idx}")).into_any_element(),
+                            crate::div().child("ok").into_any_element(),
+                        ]
+                    })
+                    .viewport_height(px(120.)),
+                )
+        }
+    }
+
+    let (view, cx) = cx.add_window_view(|_, cx| {
+        let nodes = vec![TreeNode::new("root", "Root").children([
+            TreeNode::new("a", "Alpha"),
+            TreeNode::new("b", "Beta"),
+        ])];
+        let tree_st = cx.new(|cx| {
+            TreeState::new(nodes, cx)
+                .checkable(true)
+                .searchable(true)
+                .default_expanded(["root"])
+        });
+        let color_st = cx.new(|cx| ColorPickerState::new(cx).inline(true));
+        let dz_st = cx.new(|cx| FileDropzoneState::new(cx).accept(&["rs", "md"]).max_files(2));
+        Tier1View {
+            tree_st,
+            color_st,
+            dz_st,
+        }
+    });
+    cx.run_until_parked();
+
+    let (tree_st, color_st, dz_st) = view.read_with(cx, |v, _| {
+        (v.tree_st.clone(), v.color_st.clone(), v.dz_st.clone())
+    });
+
+    // Tree tri-state checkbox cascade
+    cx.update(|_, cx| tree_st.update(cx, |t, cx| t.toggle_check("a", cx)));
+    assert_eq!(tree_st.read_with(cx, |t, _| t.checked_ids()), vec![SharedString::from("a")]);
+    cx.update(|_, cx| tree_st.update(cx, |t, cx| t.toggle_check("root", cx)));
+    assert_eq!(
+        tree_st.read_with(cx, |t, _| t.checked_ids()),
+        vec![SharedString::from("a"), SharedString::from("b")]
+    );
+    cx.update(|_, cx| tree_st.update(cx, |t, cx| t.toggle_check("root", cx)));
+    assert!(tree_st.read_with(cx, |t, _| t.checked_ids().is_empty()));
+
+    // ColorPicker set_color updates hex cleanly
+    cx.update(|_, cx| {
+        color_st.update(cx, |c, cx| c.set_color(palette::EMERALD_500.into(), cx));
+    });
+    assert!(color_st.read_with(cx, |c, _| c.hex().starts_with('#')));
+
+    // FileDropzone extension filtering & max_files cap
+    cx.update(|_, cx| {
+        dz_st.update(cx, |dz, cx| {
+            dz.add_paths(
+                vec![
+                    std::path::PathBuf::from("ok1.rs"),
+                    std::path::PathBuf::from("blocked.exe"),
+                    std::path::PathBuf::from("ok2.md"),
+                    std::path::PathBuf::from("overflow.rs"),
+                ],
+                cx,
+            );
+        });
+    });
+    assert_eq!(dz_st.read_with(cx, |dz, _| dz.files().len()), 2);
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+fn tier2_range_slider_date_time_list_typography_result_transfer_and_tag_input(
+    cx: &mut TestAppContext,
+) {
+    cx.update(init_components);
+
+    // TimeValue formatting (24h & 12h midnight/noon edge cases)
+    assert_eq!(TimeValue::new(0, 5, 9).format(true, false), "12:05 AM");
+    assert_eq!(TimeValue::new(12, 30, 0).format(true, false), "12:30 PM");
+    assert_eq!(TimeValue::new(15, 45, 7).format(false, true), "15:45:07");
+
+    struct Tier2View {
+        range_sl: Entity<RangeSliderState>,
+        marked_sl: Entity<SliderState>,
+        dp: Entity<DatePickerState>,
+        tp: Entity<TimePickerState>,
+        editable: Entity<EditableTextState>,
+        xfer: Entity<TransferState>,
+        tags: Entity<TagInputState>,
+    }
+    impl Render for Tier2View {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            v_stack()
+                .w(px(720.))
+                .p(px(12.))
+                .spacing(px(12.))
+                .child(range_slider(&self.range_sl))
+                .child(slider(&self.marked_sl))
+                .child(date_picker(&self.dp))
+                .child(time_picker(&self.tp))
+                .child(
+                    list("t2-list")
+                        .item(ListItem::new("Row 1").subtitle("Sub").selected(true)),
+                )
+                .child(
+                    virtual_list("t2-vlist", 500, |i, _, _| {
+                        crate::div().h(px(28.)).child(format!("Item {i}")).into_any_element()
+                    })
+                    .viewport_height(px(100.)),
+                )
+                .child(heading(HeadingLevel::H2, "Heading"))
+                .child(ui_text("inline_fn()").code().copyable("t2-cp"))
+                .child(editable_text(&self.editable))
+                .child(truncated_text("t2-tr", "A".repeat(200), 60))
+                .child(code_block("t2-cb", "fn main() {}\n").language("rust"))
+                .child(
+                    result_view(ResultStatus::NotFound, "Not Found")
+                        .subtitle("Missing resource")
+                        .action(button("t2-back").label("Back")),
+                )
+                .child(transfer(&self.xfer))
+                .child(tag_input(&self.tags))
+        }
+    }
+
+    let (view, cx) = cx.add_window_view(|_, cx| {
+        let range_sl = cx.new(|cx| {
+            RangeSliderState::new(cx)
+                .range(0.0, 100.0)
+                .step(5.0)
+                .default_range(20.0, 70.0)
+                .marks([SliderMark::new(0.0, "0"), SliderMark::new(100.0, "100")])
+        });
+        let marked_sl = cx.new(|cx| {
+            SliderState::new(cx)
+                .marks([SliderMark::new(0.0, "Low"), SliderMark::new(100.0, "High")])
+        });
+        let dp = cx.new(|cx| DatePickerState::new(cx).default_date(CalendarDate::new(2026, 11, 20)));
+        let tp = cx.new(|cx| TimePickerState::new(cx).use_12h(true));
+        let editable = cx.new(|cx| EditableTextState::new("Initial", cx));
+        let xfer = cx.new(|cx| {
+            TransferState::new(
+                vec![
+                    TransferItem::new("k1", "One"),
+                    TransferItem::new("k2", "Two"),
+                ],
+                ["k1"],
+                cx,
+            )
+        });
+        let tags = cx.new(|cx| TagInputState::new(cx).default_tags(["rust"]).max_tags(2));
+        Tier2View {
+            range_sl,
+            marked_sl,
+            dp,
+            tp,
+            editable,
+            xfer,
+            tags,
+        }
+    });
+    cx.run_until_parked();
+
+    let (range_sl, tags, xfer) = view.read_with(cx, |v, _| {
+        (v.range_sl.clone(), v.tags.clone(), v.xfer.clone())
+    });
+
+    // RangeSlider orders & clamps inverted inputs
+    cx.update(|_, cx| range_sl.update(cx, |r, cx| r.set_values(90.0, 10.0, cx)));
+    assert_eq!(range_sl.read_with(cx, |r, _| r.values()), (10.0, 90.0));
+
+    // TagInput deduplication & max_tags cap
+    assert!(!cx.update(|_, cx| tags.update(cx, |t, cx| t.add_tag_str("RUST", cx))));
+    assert!(cx.update(|_, cx| tags.update(cx, |t, cx| t.add_tag_str("gpui", cx))));
+    assert!(!cx.update(|_, cx| tags.update(cx, |t, cx| t.add_tag_str("third", cx))));
+    assert_eq!(tags.read_with(cx, |t, _| t.tags().len()), 2);
+
+    // Transfer initial target keys
+    assert_eq!(
+        xfer.read_with(cx, |t, _| t.target_keys()),
+        vec![SharedString::from("k1")]
+    );
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+fn tier3_image_preview_tree_select_cascader_tour_menu_carousel_extras_and_form(
+    cx: &mut TestAppContext,
+) {
+    cx.update(init_components);
+
+    // 1. Verify QrMatrix structure (Version 1 = 21x21, Version 3 = 29x29, finder corners dark)
+    let qr_short = QrMatrix::encode(b"HELLO");
+    assert_eq!(qr_short.size, 21);
+    assert!(qr_short.get(0, 0) && qr_short.get(6, 0) && qr_short.get(0, 6));
+    assert!(qr_short.get(3, 3), "finder center must be dark");
+    assert!(qr_short.get(8, qr_short.size - 8), "dark module must be set");
+    let qr_url = QrMatrix::encode(b"https://github.com/KevinWang15/gpui");
+    assert!(qr_url.size >= 25);
+
+    // 2. Verify FormState rules (Required, Email, Matches, NumericRange, Custom, reset)
+    let mut form = FormState::new()
+        .field(
+            "email",
+            "",
+            vec![
+                FormRule::required("Required"),
+                FormRule::email("Invalid email"),
+            ],
+        )
+        .field(
+            "pw",
+            "",
+            vec![FormRule::min_length(6, "Too short")],
+        )
+        .field(
+            "confirm",
+            "",
+            vec![FormRule::matches("pw", "Mismatch")],
+        )
+        .field(
+            "age",
+            "25",
+            vec![FormRule::numeric_range(18.0, 120.0, "Out of range")],
+        );
+    assert!(!form.is_dirty());
+    assert!(!form.validate_all());
+    assert_eq!(form.error("email").as_deref(), Some("Required"));
+    form.set_value("email", "bad-email");
+    assert_eq!(form.error("email").as_deref(), Some("Invalid email"));
+    form.set_value("email", "ada@gpui.dev");
+    form.set_value("pw", "secret123");
+    form.set_value("confirm", "secret123");
+    assert!(form.is_dirty());
+    assert!(form.validate_all());
+    assert!(form.is_valid());
+    form.reset();
+    assert!(!form.is_dirty());
+
+    // 3. Render ImagePreview, TreeSelect, Cascader, Tour, Menu (V+H), Carousel, FAB, Watermark, QRCode
+    struct Tier3View {
+        img_prev: Entity<ImagePreviewState>,
+        ts: Entity<TreeSelectState>,
+        casc: Entity<CascaderState>,
+        tour_st: Entity<TourState>,
+        vmenu: Entity<MenuState>,
+        hmenu: Entity<MenuState>,
+        car: Entity<CarouselState>,
+    }
+    impl Render for Tier3View {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            crate::div()
+                .relative()
+                .w(px(800.))
+                .h(px(600.))
+                .child(
+                    v_stack()
+                        .p(px(12.))
+                        .spacing(px(10.))
+                        .child(tour_target(&self.tour_st, "step1", image_preview(&self.img_prev)))
+                        .child(tree_select(&self.ts))
+                        .child(cascader(&self.casc))
+                        .child(nav_menu(&self.hmenu))
+                        .child(nav_menu(&self.vmenu))
+                        .child(
+                            carousel("t3-car", &self.car)
+                                .slide(crate::div().child("Slide A"))
+                                .slide(crate::div().child("Slide B")),
+                        )
+                        .child(
+                            watermark("CONFIDENTIAL")
+                                .subtext("2026")
+                                .child(qr_code("https://github.com/KevinWang15/gpui").icon(LucideIcon::Sparkles)),
+                        ),
+                )
+                .child(
+                    float_button_group("t3-fab", LucideIcon::Plus)
+                        .action(float_button("t3-fab-1", LucideIcon::Bell).badge_dot(true)),
+                )
+                .child(tour(&self.tour_st))
+        }
+    }
+
+    let (view, cx) = cx.add_window_view(|_, cx| {
+        let img_prev = cx.new(|cx| {
+            ImagePreviewState::new(
+                vec![
+                    ImagePreviewItem::custom("One", |_, _| crate::div().into_any_element()),
+                    ImagePreviewItem::custom("Two", |_, _| crate::div().into_any_element()),
+                ],
+                cx,
+            )
+        });
+        let ts = cx.new(|cx| {
+            TreeSelectState::new(vec![TreeNode::new("n1", "Node 1")], cx)
+        });
+        let casc = cx.new(|cx| {
+            CascaderState::new(
+                vec![CascaderOption::new("us", "United States").children([
+                    CascaderOption::new("sf", "San Francisco"),
+                ])],
+                cx,
+            )
+            .default_path(["us", "sf"])
+        });
+        let tour_st = cx.new(|cx| {
+            TourState::new(
+                vec![
+                    TourStep::target("step1", "Gallery", "Inspect images"),
+                    TourStep::centered("Done", "All set"),
+                ],
+                cx,
+            )
+        });
+        let nodes = vec![MenuNode::submenu(
+            "m1",
+            "Group",
+            [MenuNode::item("c1", "Child 1")],
+        )];
+        let vmenu = cx.new(|cx| MenuState::new(nodes.clone(), cx).default_open(["m1"]));
+        let hmenu = cx.new(|cx| MenuState::new(nodes, cx).mode(MenuMode::Horizontal));
+        let car = cx.new(|cx| CarouselState::new(2, cx));
+        Tier3View {
+            img_prev,
+            ts,
+            casc,
+            tour_st,
+            vmenu,
+            hmenu,
+            car,
+        }
+    });
+    cx.run_until_parked();
+
+    let (img_prev, casc, tour_st, car) = view.read_with(cx, |v, _| {
+        (v.img_prev.clone(), v.casc.clone(), v.tour_st.clone(), v.car.clone())
+    });
+
+    // Cascader label path resolution
+    assert_eq!(
+        casc.read_with(cx, |c, _| c.selected_labels()),
+        vec![SharedString::from("United States"), SharedString::from("San Francisco")]
+    );
+
+    // ImagePreview lightbox zoom/rotate/next/close
+    cx.update(|window, cx| img_prev.update(cx, |p, cx| p.open(0, window, cx)));
+    cx.run_until_parked();
+    assert!(img_prev.read_with(cx, |p, _| p.is_open()));
+    cx.update(|_, cx| img_prev.update(cx, |p, cx| p.adjust_zoom(5.0, cx)));
+    assert!((img_prev.read_with(cx, |p, _| p.zoom()) - 3.0).abs() < 1e-4);
+    cx.update(|_, cx| img_prev.update(cx, |p, cx| p.rotate(90, cx)));
+    assert_eq!(img_prev.read_with(cx, |p, _| p.rotation_deg()), 90);
+    cx.update(|_, cx| img_prev.update(cx, |p, cx| p.close(cx)));
+    assert!(!img_prev.read_with(cx, |p, _| p.is_open()));
+
+    // Tour start -> next -> finish
+    cx.update(|window, cx| tour_st.update(cx, |t, cx| t.start(window, cx)));
+    cx.run_until_parked();
+    assert_eq!(tour_st.read_with(cx, |t, _| t.current_step()), Some(0));
+    cx.update(|_, cx| tour_st.update(cx, |t, cx| t.next(cx)));
+    assert_eq!(tour_st.read_with(cx, |t, _| t.current_step()), Some(1));
+    cx.update(|_, cx| tour_st.update(cx, |t, cx| t.next(cx)));
+    assert!(!tour_st.read_with(cx, |t, _| t.is_open()));
+
+    // Carousel navigation & wrap
+    cx.update(|_, cx| car.update(cx, |c, cx| c.next(cx)));
+    assert_eq!(car.read_with(cx, |c, _| c.active_index()), 1);
+    cx.update(|_, cx| car.update(cx, |c, cx| c.next(cx)));
+    assert_eq!(car.read_with(cx, |c, _| c.active_index()), 0);
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+fn audit_regression_edge_cases_and_soak(cx: &mut TestAppContext) {
+    use std::cell::{Cell, RefCell};
+    use std::time::Duration;
+
+    cx.update(init_components);
+
+    // 1. parse_hex_color: multibyte UTF-8 never panics; valid 3/4/6/8-digit hex parses cleanly
+    for bad in ["红", "🚀", "颜色", "🎨🚀", "#红红红", "#gg0000", "", "#12", "#1234567"] {
+        assert!(parse_hex_color(bad).is_none(), "expected None for {bad:?}");
+    }
+    assert!(parse_hex_color("#f0a").is_some());
+    assert!(parse_hex_color("#f0a8").is_some());
+    assert!(parse_hex_color("#3b82f6").is_some());
+    assert!(parse_hex_color("#3b82f6cc").is_some());
+
+    // 2. QrMatrix: ECC levels L/M/Q/H, out-of-bounds get(), and UTF-8 char-boundary truncation
+    for ecc in [
+        QrEccLevel::Low,
+        QrEccLevel::Medium,
+        QrEccLevel::Quartile,
+        QrEccLevel::High,
+    ] {
+        let m = QrMatrix::encode_with_ecc(b"https://github.com/KevinWang15/gpui", ecc);
+        assert!(m.size >= 21 && m.size <= 41);
+        assert!(!m.get(999, 999));
+        assert!(!m.get(m.size, 0));
+    }
+    let long_utf8 = "中文🚀".repeat(60); // > 400 bytes, multibyte boundary stress
+    let m_utf8 = QrMatrix::encode_with_ecc(long_utf8.as_bytes(), QrEccLevel::High);
+    assert!(m_utf8.size >= 21);
+
+    // 3. FormState: strict email, optional empty skipping, live is_valid(), transitive Matches
+    let mut form = FormState::new()
+        .field(
+            "email",
+            "",
+            vec![FormRule::email("Invalid email")],
+        )
+        .field(
+            "age",
+            "",
+            vec![FormRule::numeric_range(10.0, 2.0, "Out of range")],
+        )
+        .field(
+            "bio",
+            "",
+            vec![FormRule::min_length(5, "Too short")],
+        )
+        .field("pw", "secret123", vec![FormRule::required("Required")])
+        .field("pw2", "secret123", vec![FormRule::matches("pw", "Mismatch")])
+        .field("pw3", "secret123", vec![FormRule::matches("pw2", "Mismatch")]);
+
+    // Optional fields pass when empty, live is_valid() works before validate_all()
+    assert!(form.is_valid());
+    for bad_email in ["a@b@c.com", "a b@c.com", "a@b..c", ".a@b.c", "a@.b.c", "a@b.c."] {
+        form.set_value("email", bad_email);
+        assert!(!form.validate_field("email"), "should reject {bad_email}");
+        assert!(!form.is_valid());
+    }
+    form.set_value("email", "ke.wang+tag@example.co.uk");
+    assert!(form.validate_field("email"));
+
+    // Normalized inverted NumericRange (10..=2 -> 2..=10)
+    form.set_value("age", "5");
+    assert!(form.validate_field("age"));
+    form.set_value("age", "12");
+    assert!(!form.validate_field("age"));
+    form.set_value("age", "");
+    assert!(form.validate_field("age"));
+
+    // Transitive Matches revalidation (pw -> pw2 -> pw3)
+    form.set_value("pw", "newpass");
+    assert!(form.error("pw2").is_some());
+    form.set_value("pw2", "newpass");
+    assert!(form.error("pw2").is_none());
+    assert!(form.error("pw3").is_some());
+    form.set_value("pw3", "newpass");
+    assert!(form.error("pw3").is_none());
+    assert!(form.is_valid());
+
+    // Untouched form with failing rule reports is_valid() == false immediately
+    let fresh_invalid = FormState::new().field("req", "", vec![FormRule::required("Required")]);
+    assert!(!fresh_invalid.is_valid());
+    assert!(!fresh_invalid.has_errors());
+
+    // 4. CommandPalette fuzzy score ranking (prefix > scattered subsequence in long string)
+    let prefix = super::command_palette::fuzzy_match_score("open", "Open File").unwrap();
+    let scattered = super::command_palette::fuzzy_match_score(
+        "open",
+        "Organization Policy Enforcement Notification Settings Manager Panel",
+    )
+    .unwrap();
+    assert!(
+        prefix > scattered,
+        "prefix ({prefix}) must beat scattered ({scattered})"
+    );
+
+    // 5. Interactive entity regression tests inside a live window
+    struct RegressionView {
+        picker: Entity<ColorPickerState>,
+        slider_nan: Entity<SliderState>,
+        slider_step: Entity<SliderState>,
+        range_nan: Entity<RangeSliderState>,
+        split_nan: Entity<SplitPaneState>,
+        num_frac: Entity<NumberInputState>,
+        pin: Entity<PinInputState>,
+        tree_st: Entity<TreeState>,
+        tree_sel: Entity<TreeSelectState>,
+        casc: Entity<CascaderState>,
+        tags: Entity<TagInputState>,
+        xfer: Entity<TransferState>,
+        tour_st: Entity<TourState>,
+        img_prev: Entity<ImagePreviewState>,
+        car_zero: Entity<CarouselState>,
+        palette: Entity<CommandPaletteState>,
+        drawer_open: bool,
+        tick: usize,
+    }
+
+    impl Render for RegressionView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            crate::div()
+                .relative()
+                .w(px(900.))
+                .h(px(700.))
+                .child(
+                    v_stack()
+                        .p(px(10.))
+                        .spacing(px(8.))
+                        .child(color_picker(&self.picker))
+                        .child(slider(&self.slider_nan))
+                        .child(slider(&self.slider_step))
+                        .child(range_slider(&self.range_nan))
+                        .child(
+                            crate::div().w_full().h(px(120.)).child(
+                                split_pane("reg-split", &self.split_nan)
+                                    .first(crate::div().child("A"))
+                                    .second(crate::div().child("B")),
+                            ),
+                        )
+                        .child(number_input(&self.num_frac))
+                        .child(pin_input(&self.pin))
+                        .child(tree(&self.tree_st))
+                        .child(tree_select(&self.tree_sel))
+                        .child(cascader(&self.casc))
+                        .child(tag_input(&self.tags))
+                        .child(transfer(&self.xfer))
+                        .child(carousel("reg-car", &self.car_zero))
+                        .child(
+                            tour_target(
+                                &self.tour_st,
+                                "t1",
+                                image_preview(&self.img_prev),
+                            ),
+                        ),
+                )
+                .child(command_palette(&self.palette))
+                .child(tour(&self.tour_st))
+                .child(
+                    drawer("reg-drawer", self.drawer_open)
+                        .size(DrawerSize::Custom(px(f32::NAN)))
+                        .backdrop_blur(px(f32::NAN))
+                        .title("Edge Drawer")
+                        .on_close(|_, _, _| {}),
+                )
+        }
+    }
+
+    let color_changes = Rc::new(Cell::new(0usize));
+    let num_changes = Rc::new(Cell::new(0usize));
+    let ts_changes = Rc::new(Cell::new(0usize));
+    let pin_changes = Rc::new(Cell::new(0usize));
+    let pal_exec = Rc::new(RefCell::new(Vec::<SharedString>::new()));
+
+    let cc = color_changes.clone();
+    let nc = num_changes.clone();
+    let tc = ts_changes.clone();
+    let pc = pin_changes.clone();
+    let pe = pal_exec.clone();
+
+    let (view, cx) = cx.add_window_view(|_, cx| {
+        let picker = cx.new(|cx| {
+            ColorPickerState::new(cx)
+                .default_color(crate::rgba(0x3b82f6ff), cx)
+        });
+        cx.subscribe(&picker, move |_, _, ev: &ColorPickerEvent, _| {
+            if matches!(ev, ColorPickerEvent::Change(_)) {
+                cc.set(cc.get() + 1);
+            }
+        })
+        .detach();
+
+        let slider_nan = cx.new(|cx| {
+            SliderState::new(cx)
+                .range(f32::NAN, 10.0)
+                .step(f32::INFINITY)
+                .default_value(f32::NAN)
+        });
+        let slider_step = cx.new(|cx| {
+            SliderState::new(cx)
+                .range(0.0, 10.0)
+                .step(3.0)
+                .default_value(0.0)
+        });
+        let range_nan = cx.new(|cx| {
+            RangeSliderState::new(cx)
+                .range(10.0, 10.0)
+                .step(f32::NAN)
+                .default_range(f32::NAN, f32::INFINITY)
+        });
+
+        let split_nan = cx.new(|cx| {
+            SplitPaneState::new(cx)
+                .default_ratio(0.10)
+                .clamp_range(0.05, 0.95)
+        });
+
+        let num_frac = cx.new(|cx| {
+            NumberInputState::new(cx)
+                .step(0.1)
+                .default_value(0.0, cx)
+        });
+        cx.subscribe(&num_frac, move |_, _, ev: &NumberInputEvent, _| {
+            if matches!(ev, NumberInputEvent::Change(_)) {
+                nc.set(nc.get() + 1);
+            }
+        })
+        .detach();
+
+        let pin = cx.new(|cx| PinInputState::new(6, cx));
+        cx.subscribe(&pin, move |_, _, ev: &PinInputEvent, _| {
+            if matches!(ev, PinInputEvent::Change(_)) {
+                pc.set(pc.get() + 1);
+            }
+        })
+        .detach();
+
+        let tree_nodes = vec![
+            TreeNode::new("root", "Root").children([
+                TreeNode::new("leaf-a", "Leaf A"),
+                TreeNode::new("disabled-branch", "Locked")
+                    .disabled(true)
+                    .children([TreeNode::new("leaf-locked", "Locked Child")]),
+            ]),
+        ];
+        let tree_st = cx.new(|cx| {
+            TreeState::new(tree_nodes, cx)
+                .checkable(true)
+                .searchable(true)
+                .default_expanded(["root", "disabled-branch"])
+                .default_checked(["root"])
+        });
+
+        let tree_sel = cx.new(|cx| {
+            TreeSelectState::new(
+                vec![TreeNode::new("n1", "Node 1"), TreeNode::new("n2", "Node 2")],
+                cx,
+            )
+        });
+        cx.subscribe(&tree_sel, move |_, _, ev: &TreeSelectEvent, _| {
+            if matches!(ev, TreeSelectEvent::Change(_)) {
+                tc.set(tc.get() + 1);
+            }
+        })
+        .detach();
+
+        let casc = cx.new(|cx| {
+            CascaderState::new(
+                vec![CascaderOption::new("us", "US").children([
+                    CascaderOption::new("sf", "SF"),
+                ])],
+                cx,
+            )
+            .default_path(["us", "sf"])
+        });
+
+        let tags = cx.new(|cx| {
+            TagInputState::new(cx)
+                .max_tags(3)
+                .default_tags(["Café", "café", "Rust", "GPUI", "Overflow"])
+        });
+
+        let xfer = cx.new(|cx| {
+            TransferState::new(
+                vec![
+                    TransferItem::new("a", "Alpha"),
+                    TransferItem::new("b", "Beta"),
+                ],
+                Vec::<SharedString>::new(),
+                cx,
+            )
+        });
+
+        let tour_st = cx.new(|cx| {
+            TourState::new(
+                vec![
+                    TourStep::target("t1", "Step 1", "Desc 1"),
+                    TourStep::centered("Step 2", "Desc 2"),
+                ],
+                cx,
+            )
+        });
+
+        let img_prev = cx.new(|cx| {
+            ImagePreviewState::new(
+                vec![ImagePreviewItem::custom("One", |_, _| {
+                    crate::div().into_any_element()
+                })],
+                cx,
+            )
+        });
+
+        let car_zero = cx.new(|cx| CarouselState::new(0, cx).autoplay(Duration::ZERO, cx));
+
+        // Grouped out-of-order items to verify visual display order matches execution
+        let palette = cx.new(|cx| {
+            CommandPaletteState::new(
+                vec![
+                    CommandItem::new("g1-a", "First G1").group("Group 1"),
+                    CommandItem::new("g2-a", "First G2").group("Group 2"),
+                    CommandItem::new("g1-b", "Second G1").group("Group 1"),
+                ],
+                cx,
+            )
+        });
+        cx.subscribe(&palette, move |_, _, ev: &CommandPaletteEvent, _| {
+            if let CommandPaletteEvent::Execute(id) = ev {
+                pe.borrow_mut().push(id.clone());
+            }
+        })
+        .detach();
+
+        RegressionView {
+            picker,
+            slider_nan,
+            slider_step,
+            range_nan,
+            split_nan,
+            num_frac,
+            pin,
+            tree_st,
+            tree_sel,
+            casc,
+            tags,
+            xfer,
+            tour_st,
+            img_prev,
+            car_zero,
+            palette,
+            drawer_open: false,
+            tick: 0,
+        }
+    });
+    cx.run_until_parked();
+
+    // Verify ColorPicker: default_color emitted 0, set_color emits ONCE
+    assert_eq!(color_changes.get(), 0);
+    let picker = view.read_with(cx, |v, _| v.picker.clone());
+    cx.update(|_, cx| picker.update(cx, |p, cx| p.set_color(crate::rgba(0xef4444ff).into(), cx)));
+    cx.run_until_parked();
+    assert_eq!(color_changes.get(), 1);
+
+    // Verify Slider / RangeSlider NaN safety & reachable max
+    let (slider_nan, slider_step, range_nan) = view.read_with(cx, |v, _| {
+        (
+            v.slider_nan.clone(),
+            v.slider_step.clone(),
+            v.range_nan.clone(),
+        )
+    });
+    assert!(slider_nan.read_with(cx, |s, _| s.fraction().is_finite()));
+    cx.update(|_, cx| slider_step.update(cx, |s, cx| s.set_value(10.0, cx)));
+    assert!((slider_step.read_with(cx, |s, _| s.value()) - 10.0).abs() < 1e-4);
+    let (rs, re) = range_nan.read_with(cx, |r, _| r.values());
+    assert!(rs.is_finite() && re.is_finite() && rs <= re);
+
+    // Verify SplitPane builder order & NaN immunity
+    let split_nan = view.read_with(cx, |v, _| v.split_nan.clone());
+    assert!((split_nan.read_with(cx, |s, _| s.ratio()) - 0.10).abs() < 1e-4);
+    cx.update(|_, cx| split_nan.update(cx, |s, cx| s.set_ratio(f32::NAN, cx)));
+    assert!((split_nan.read_with(cx, |s, _| s.ratio()) - 0.10).abs() < 1e-4);
+
+    // Verify NumberInput: 0 spurious events on default_value, step(0.1) advances cleanly, NaN ignored
+    assert_eq!(num_changes.get(), 0);
+    let num_frac = view.read_with(cx, |v, _| v.num_frac.clone());
+    cx.update(|_, cx| num_frac.update(cx, |n, cx| n.increment(1.0, cx)));
+    cx.run_until_parked();
+    assert!((num_frac.read_with(cx, |n, _| n.value()) - 0.1).abs() < 1e-6);
+    assert_eq!(num_changes.get(), 1);
+    cx.update(|_, cx| num_frac.update(cx, |n, cx| n.set_value(f64::NAN, cx)));
+    assert!((num_frac.read_with(cx, |n, _| n.value()) - 0.1).abs() < 1e-6);
+
+    // Verify PinInput: empty Backspace emits 0 spurious Change events
+    let pin = view.read_with(cx, |v, _| v.pin.clone());
+    cx.update(|window, cx| {
+        let fh = pin.read(cx).focus_handle(cx);
+        window.focus(&fh, cx);
+    });
+    cx.simulate_keystrokes("backspace");
+    cx.run_until_parked();
+    assert_eq!(pin_changes.get(), 0);
+
+    // Verify Tree: default_checked(["root"]) normalized to enabled leaves (not locked child!), set_nodes prunes
+    let tree_st = view.read_with(cx, |v, _| v.tree_st.clone());
+    let checked = tree_st.read_with(cx, |t, _| t.checked_ids());
+    assert!(checked.contains(&SharedString::from("leaf-a")));
+    assert!(!checked.contains(&SharedString::from("leaf-locked")));
+    assert!(!checked.contains(&SharedString::from("root")));
+    // Typing space inside Tree search_input must NOT toggle tree check state
+    cx.update(|window, cx| {
+        let fh = tree_st.read(cx).search_input().read(cx).focus_handle(cx);
+        window.focus(&fh, cx);
+    });
+    cx.simulate_keystrokes("space");
+    cx.run_until_parked();
+    assert_eq!(tree_st.read_with(cx, |t, _| t.checked_ids()), checked);
+    // Pruning stale IDs on set_nodes
+    cx.update(|_, cx| {
+        tree_st.update(cx, |t, cx| {
+            t.set_nodes(vec![TreeNode::new("fresh", "Fresh")], cx);
+        });
+    });
+    assert!(tree_st.read_with(cx, |t, _| t.checked_ids()).is_empty());
+
+    // Verify TreeSelect: set_selected emits ONCE, clear allows re-select
+    let tree_sel = view.read_with(cx, |v, _| v.tree_sel.clone());
+    cx.update(|_, cx| tree_sel.update(cx, |t, cx| t.set_selected(Some("n1".into()), cx)));
+    cx.run_until_parked();
+    assert_eq!(ts_changes.get(), 1);
+    cx.update(|_, cx| tree_sel.update(cx, |t, cx| t.set_selected(None, cx)));
+    cx.run_until_parked();
+    assert_eq!(ts_changes.get(), 2);
+    cx.update(|_, cx| tree_sel.update(cx, |t, cx| t.set_selected(Some("n1".into()), cx)));
+    cx.run_until_parked();
+    assert_eq!(ts_changes.get(), 3);
+    assert_eq!(tree_sel.read_with(cx, |t, _| t.selected().cloned()), Some("n1".into()));
+
+    // Verify Cascader: re-clicking already-selected leaf still closes popover
+    let casc = view.read_with(cx, |v, _| v.casc.clone());
+    cx.update(|_, cx| {
+        casc.update(cx, |c, cx| {
+            c.click_option(1, "sf".into(), true, cx);
+        });
+    });
+    assert!(!casc.read_with(cx, |c, _| c.is_open()));
+
+    // Verify TagInput: Unicode case-insensitive dedup + max_tags cap + comma-rejection safety
+    let tags = view.read_with(cx, |v, _| v.tags.clone());
+    assert_eq!(
+        tags.read_with(cx, |t, _| t.tags().to_vec()),
+        vec![
+            SharedString::from("Café"),
+            SharedString::from("Rust"),
+            SharedString::from("GPUI"),
+        ]
+    );
+    // Remove one so we're under cap, test duplicate with comma does NOT turn next char into a tag
+    cx.update(|_, cx| tags.update(cx, |t, cx| t.remove_at(2, cx)));
+    cx.update(|_, cx| {
+        let inp = tags.read(cx).text_input().clone();
+        inp.update(cx, |i, cx| i.set_value("rust,", cx));
+    });
+    cx.run_until_parked();
+    assert_eq!(tags.read_with(cx, |t, _| t.tags().len()), 2);
+    cx.update(|_, cx| {
+        let inp = tags.read(cx).text_input().clone();
+        inp.update(cx, |i, cx| i.set_value("rust,g", cx));
+    });
+    cx.run_until_parked();
+    assert_eq!(tags.read_with(cx, |t, _| t.tags().len()), 2);
+
+    // Verify Transfer: hidden checked item is NOT moved when filtered out
+    let xfer = view.read_with(cx, |v, _| v.xfer.clone());
+    cx.update(|_, cx| {
+        xfer.update(cx, |x, cx| x.toggle_item(false, "b".into(), cx));
+        let left_s = xfer.read(cx).left_search_input().clone();
+        left_s.update(cx, |i, cx| i.set_value("Alpha", cx));
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| xfer.update(cx, |x, cx| x.move_right(cx)));
+    assert!(xfer.read_with(cx, |x, _| x.target_keys()).is_empty());
+
+    // Verify Tour: pressing Enter advances step instead of self-dismissing!
+    let tour_st = view.read_with(cx, |v, _| v.tour_st.clone());
+    cx.update(|window, cx| tour_st.update(cx, |t, cx| t.start(window, cx)));
+    cx.run_until_parked();
+    assert_eq!(tour_st.read_with(cx, |t, _| t.current_step()), Some(0));
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert!(tour_st.read_with(cx, |t, _| t.is_open()));
+    assert_eq!(tour_st.read_with(cx, |t, _| t.current_step()), Some(1));
+    cx.update(|window, cx| tour_st.update(cx, |t, cx| t.next_in(window, cx)));
+
+    // Verify ImagePreview: pressing Space does NOT self-dismiss lightbox!
+    let img_prev = view.read_with(cx, |v, _| v.img_prev.clone());
+    cx.update(|window, cx| img_prev.update(cx, |p, cx| p.open(0, window, cx)));
+    cx.run_until_parked();
+    cx.simulate_keystrokes("space");
+    cx.run_until_parked();
+    assert!(img_prev.read_with(cx, |p, _| p.is_open()));
+    cx.update(|window, cx| img_prev.update(cx, |p, cx| p.close_in(window, cx)));
+    cx.run_until_parked();
+    assert!(!img_prev.read_with(cx, |p, _| p.is_open()));
+
+    // Verify Carousel: Duration::ZERO disables autoplay & 0 slides doesn't panic
+    let car_zero = view.read_with(cx, |v, _| v.car_zero.clone());
+    assert!(!car_zero.read_with(cx, |c, _| c.is_autoplaying()));
+    cx.update(|_, cx| {
+        car_zero.update(cx, |c, cx| {
+            c.next(cx);
+            c.prev(cx);
+            c.go_to(5, cx);
+        });
+    });
+    assert_eq!(car_zero.read_with(cx, |c, _| c.active_index()), 0);
+
+    // Verify CommandPalette grouped visual order: Down from index 0 selects "g1-b" (Second G1), NOT "g2-a"!
+    let palette = view.read_with(cx, |v, _| v.palette.clone());
+    cx.update(|window, cx| palette.update(cx, |p, cx| p.open(window, cx)));
+    cx.run_until_parked();
+    cx.simulate_keystrokes("down enter");
+    cx.run_until_parked();
+    assert_eq!(pal_exec.borrow().as_slice(), &[SharedString::from("g1-b")]);
+
+    // 6. Deterministic 120-step multi-component soak loop (Light/Dark + open/close + mutations)
+    let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut next_u64 = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    for step in 0..120usize {
+        let r = next_u64();
+        cx.update(|window, cx| {
+            if step.is_multiple_of(15) {
+                let theme = if step.is_multiple_of(30) {
+                    Theme::dark()
+                } else {
+                    Theme::light()
+                };
+                Theme::set_global(theme, cx);
+            }
+            match r % 6 {
+                0 => {
+                    view.update(cx, |v, cx| {
+                        v.drawer_open = !v.drawer_open;
+                        v.tick += 1;
+                        cx.notify();
+                    });
+                }
+                1 => {
+                    picker.update(cx, |p, cx| {
+                        let rgb = ((r & 0x00ff_ffff) << 8) as u32 | 0xff;
+                        p.set_color(crate::rgba(rgb).into(), cx);
+                    });
+                }
+                2 => {
+                    num_frac.update(cx, |n, cx| {
+                        if r.is_multiple_of(2) {
+                            n.increment(1.0, cx);
+                        } else {
+                            n.decrement(1.0, cx);
+                        }
+                    });
+                }
+                3 => {
+                    split_nan.update(cx, |s, cx| {
+                        let frac = ((r % 100) as f32) / 100.0;
+                        s.set_ratio(frac, cx);
+                    });
+                }
+                4 => {
+                    tree_st.update(cx, |t, cx| {
+                        if r.is_multiple_of(3) {
+                            t.set_nodes(Vec::new(), cx);
+                        } else {
+                            t.set_nodes(
+                                vec![TreeNode::new("r", "Root").children([
+                                    TreeNode::new("c1", "Child 1"),
+                                    TreeNode::new("c2", "Child 2"),
+                                ])],
+                                cx,
+                            );
+                        }
+                    });
+                }
+                _ => {
+                    palette.update(cx, |p, cx| {
+                        if p.is_open() {
+                            p.close_in(window, cx);
+                        } else {
+                            p.open(window, cx);
+                        }
+                    });
+                }
+            }
+        });
+        cx.run_until_parked();
+    }
+}

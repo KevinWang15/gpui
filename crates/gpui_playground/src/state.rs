@@ -13,6 +13,9 @@ use crate::accent::AccentPreset;
 pub enum Page {
     Overview,
     InteractiveBlur,
+    DataTrees,
+    PickersForms,
+    MediaExtras,
     Analytics,
     Buttons,
     Inputs,
@@ -29,6 +32,9 @@ impl Page {
         match self {
             Self::Overview => "Overview",
             Self::InteractiveBlur => "Interactive & Blur",
+            Self::DataTrees => "Trees, Lists & Tables",
+            Self::PickersForms => "Pickers, Dropzone & Forms",
+            Self::MediaExtras => "Media, Menus & Extras",
             Self::Analytics => "Analytics & Charts",
             Self::Buttons => "Buttons & Groups",
             Self::Inputs => "Input & TextBox",
@@ -46,6 +52,15 @@ impl Page {
             Self::Overview => "overview home welcome playground dashboard",
             Self::InteractiveBlur => {
                 "blur container loading overlay spinner dots bars pulse progress ring command palette drawer sheet context menu right click split pane resizable number input stepper wizard rating stars copy clipboard pin otp"
+            }
+            Self::DataTrees => {
+                "tree hierarchy checkbox virtual table expandable rows sticky header list uniform descriptions metadata timeline audit log"
+            }
+            Self::PickersForms => {
+                "color picker hsv hex swatch file dropzone upload drag drop date picker time picker range slider marks tree select cascader transfer shuttle tag input form validation"
+            }
+            Self::MediaExtras => {
+                "popconfirm confirm tour spotlight walkthrough image preview lightbox zoom rotate menu submenu carousel slides typography heading editable text truncated code block result 404 qr code watermark float button fab"
             }
             Self::Analytics => {
                 "analytics charts stacked bar line breakdown filter bar time date range picker calendar kpi stat segmented theme switcher radial"
@@ -236,6 +251,44 @@ pub struct PlaygroundApp {
     pub otp_input: Entity<PinInputState>,
     pub otp_masked: bool,
     pub ring_slider: Entity<SliderState>,
+
+    // Trees, Lists & Tables page state
+    pub demo_tree: Entity<TreeState>,
+    pub table_checked_rows: Vec<bool>,
+    pub table_expanded_rows: Vec<bool>,
+    pub desc_bordered: bool,
+    pub timeline_alternate: bool,
+    pub list_selected_idx: Option<usize>,
+
+    // Pickers, Dropzone & Forms page state
+    pub inline_color_picker: Entity<ColorPickerState>,
+    pub popover_color_picker: Entity<ColorPickerState>,
+    pub demo_dropzone: Entity<FileDropzoneState>,
+    pub demo_date_picker: Entity<DatePickerState>,
+    pub demo_time_picker_24: Entity<TimePickerState>,
+    pub demo_time_picker_12: Entity<TimePickerState>,
+    pub demo_range_slider: Entity<RangeSliderState>,
+    pub demo_marked_slider: Entity<SliderState>,
+    pub demo_tree_select: Entity<TreeSelectState>,
+    pub demo_cascader: Entity<CascaderState>,
+    pub demo_transfer: Entity<TransferState>,
+    pub demo_tag_input: Entity<TagInputState>,
+    pub validated_form: FormState,
+    pub vf_name: Entity<InputState>,
+    pub vf_email: Entity<InputState>,
+    pub vf_password: Entity<InputState>,
+    pub vf_confirm: Entity<InputState>,
+
+    // Media, Menus & Extras page state
+    pub demo_tour: Entity<TourState>,
+    pub demo_image_preview: Entity<ImagePreviewState>,
+    pub demo_vmenu: Entity<MenuState>,
+    pub demo_hmenu: Entity<MenuState>,
+    pub demo_carousel: Entity<CarouselState>,
+    pub demo_editable_title: Entity<EditableTextState>,
+    pub demo_result_status: ResultStatus,
+    pub demo_qr_input: Entity<InputState>,
+    pub popconfirm_count: usize,
 }
 
 impl PlaygroundApp {
@@ -551,6 +604,21 @@ impl PlaygroundApp {
                 .icon(LucideIcon::Sparkles)
                 .shortcut(&["G", "I"])
                 .keywords("blur spin loading drawer split rating copy otp stepper"),
+            CommandItem::new("nav-data-trees", "Trees, Lists & Tables")
+                .group("Navigation")
+                .subtitle("Tree, VirtualTable, Expandable Rows, VirtualList, Descriptions & Timeline")
+                .icon(LucideIcon::FolderTree)
+                .keywords("tree table virtual list descriptions timeline"),
+            CommandItem::new("nav-pickers-forms", "Pickers, Dropzone & Forms")
+                .group("Navigation")
+                .subtitle("ColorPicker, FileDropzone, Date/TimePicker, RangeSlider, Cascader, Transfer & Form")
+                .icon(LucideIcon::SlidersHorizontal)
+                .keywords("color picker dropzone upload date time range cascader transfer tag form"),
+            CommandItem::new("nav-media-extras", "Media, Menus & Extras")
+                .group("Navigation")
+                .subtitle("Popconfirm, Tour, ImagePreview, Nested Menu, Carousel, Typography, Result, QRCode & FAB")
+                .icon(LucideIcon::WandSparkles)
+                .keywords("popconfirm tour lightbox menu carousel typography result qr watermark fab"),
             CommandItem::new("nav-analytics", "Analytics & Charts")
                 .group("Navigation")
                 .subtitle("Stacked bars, line charts, drag zoom & KPI strips")
@@ -611,6 +679,9 @@ impl PlaygroundApp {
                     this.log_event("CommandPalette", format!("Execute(\"{id}\")"), cx);
                     match id.as_ref() {
                         "nav-interactive" => this.page = Page::InteractiveBlur,
+                        "nav-data-trees" => this.page = Page::DataTrees,
+                        "nav-pickers-forms" => this.page = Page::PickersForms,
+                        "nav-media-extras" => this.page = Page::MediaExtras,
                         "nav-analytics" => this.page = Page::Analytics,
                         "nav-buttons" => this.page = Page::Buttons,
                         "nav-inputs" => this.page = Page::Inputs,
@@ -749,6 +820,491 @@ impl PlaygroundApp {
             cx.notify();
         })
         .detach();
+
+        // --- Trees, Lists & Tables state ---
+        let sample_tree_nodes = vec![
+            TreeNode::new("workspace", "gpui-workspace")
+                .icon(LucideIcon::Boxes)
+                .badge("3")
+                .children([
+                    TreeNode::new("crates", "crates")
+                        .children([
+                            TreeNode::new("gpui", "gpui")
+                                .children([
+                                    TreeNode::new("components", "src/components")
+                                        .children([
+                                            TreeNode::new("tree-rs", "tree.rs").icon(LucideIcon::FileCode),
+                                            TreeNode::new("color-rs", "color_picker.rs").icon(LucideIcon::FileCode),
+                                            TreeNode::new("blur-rs", "loading_overlay.rs").icon(LucideIcon::FileCode),
+                                        ]),
+                                    TreeNode::new("scene-rs", "src/scene.rs").icon(LucideIcon::FileCode),
+                                ]),
+                            TreeNode::new("gpui-wgpu", "gpui_wgpu")
+                                .children([
+                                    TreeNode::new("wgpu-rs", "wgpu_renderer.rs").icon(LucideIcon::FileCode),
+                                    TreeNode::new("wgsl", "shaders_backdrop_blur.wgsl").icon(LucideIcon::Sparkles),
+                                ]),
+                            TreeNode::new("gpui-win", "gpui_windows")
+                                .children([
+                                    TreeNode::new("dx-rs", "directx_renderer.rs").icon(LucideIcon::FileCode),
+                                    TreeNode::new("hlsl", "shaders.hlsl").icon(LucideIcon::Sparkles),
+                                ]),
+                        ]),
+                    TreeNode::new("docs", "docs")
+                        .children([
+                            TreeNode::new("doc-perf", "performance.md").icon(LucideIcon::FileText),
+                            TreeNode::new("doc-theme", "theming.md").icon(LucideIcon::FileText),
+                        ]),
+                    TreeNode::new("readme", "README.md").icon(LucideIcon::BookOpen),
+                ]),
+        ];
+        let demo_tree = cx.new(|cx| {
+            TreeState::new(sample_tree_nodes.clone(), cx)
+                .checkable(true)
+                .searchable(true)
+                .default_expanded(["workspace", "crates", "gpui", "components"])
+                .default_selected("tree-rs")
+                .default_checked(["tree-rs", "blur-rs"])
+        });
+        cx.subscribe(&demo_tree, |this, _, ev: &TreeEvent, cx| match ev {
+            TreeEvent::Select(id) => this.log_event("Tree", format!("Select(\"{id}\")"), cx),
+            TreeEvent::ToggleExpand { id, expanded } => {
+                this.log_event("Tree", format!("Expand(\"{id}\") -> {expanded}"), cx)
+            }
+            TreeEvent::CheckChange(ids) => {
+                this.log_event("Tree", format!("Checked {} leaves", ids.len()), cx)
+            }
+        })
+        .detach();
+
+        // --- Pickers, Dropzone & Forms state ---
+        let inline_color_picker = cx.new(|cx| {
+            ColorPickerState::new(cx)
+                .default_color(gpui::components::palette::INDIGO_600, cx)
+                .inline(true)
+        });
+        cx.subscribe(&inline_color_picker, |this, ent, _: &ColorPickerEvent, cx| {
+            let hex = ent.read(cx).hex();
+            this.log_event("ColorPicker(Inline)", hex, cx);
+        })
+        .detach();
+
+        let popover_color_picker = cx.new(|cx| {
+            ColorPickerState::new(cx)
+                .default_color(gpui::components::palette::EMERALD_500, cx)
+                .inline(false)
+        });
+        cx.subscribe(&popover_color_picker, |this, ent, _: &ColorPickerEvent, cx| {
+            let hex = ent.read(cx).hex();
+            this.log_event("ColorPicker(Popover)", hex, cx);
+        })
+        .detach();
+
+        let demo_dropzone = cx.new(|cx| {
+            FileDropzoneState::new(cx)
+                .accept(&["png", "jpg", "svg", "pdf", "json", "rs", "md"])
+                .default_files(vec![
+                    FileEntry::synthetic(1, "release-notes.md", 18_420, FileStatus::Done, Some(100.0)),
+                    FileEntry::synthetic(2, "architecture-diagram.png", 1_480_200, FileStatus::Uploading, Some(64.0)),
+                    FileEntry::synthetic(3, "telemetry-export.json", 420_110, FileStatus::Ready, None),
+                ])
+        });
+        cx.subscribe(&demo_dropzone, |this, _, ev: &FileDropzoneEvent, cx| match ev {
+            FileDropzoneEvent::FilesAdded(list) => {
+                this.log_event("FileDropzone", format!("added {} file(s)", list.len()), cx)
+            }
+            FileDropzoneEvent::FileRemoved(id) => {
+                this.log_event("FileDropzone", format!("removed #{id}"), cx)
+            }
+            FileDropzoneEvent::Rejected(msg) => {
+                this.log_event("FileDropzone", format!("rejected: {msg}"), cx);
+                this.push_toast(ToastVariant::Warning, "File rejected", Some(msg.as_ref()), cx);
+            }
+        })
+        .detach();
+
+        let demo_date_picker = cx.new(|cx| {
+            DatePickerState::new(cx).default_date(CalendarDate::today_utc())
+        });
+        cx.subscribe(&demo_date_picker, |this, _, ev: &DatePickerEvent, cx| {
+            let DatePickerEvent::Change(d) = ev;
+            this.log_event("DatePicker", format!("{d:?}"), cx);
+        })
+        .detach();
+
+        let demo_time_picker_24 = cx.new(|cx| {
+            TimePickerState::new(cx)
+                .default_time(TimeValue::new(14, 30, 0))
+                .show_seconds(true)
+        });
+        cx.subscribe(&demo_time_picker_24, |this, _, ev: &TimePickerEvent, cx| {
+            let TimePickerEvent::Change(t) = ev;
+            this.log_event("TimePicker(24h)", t.format(false, true), cx);
+        })
+        .detach();
+
+        let demo_time_picker_12 = cx.new(|cx| {
+            TimePickerState::new(cx)
+                .default_time(TimeValue::new(9, 15, 0))
+                .use_12h(true)
+        });
+        cx.subscribe(&demo_time_picker_12, |this, _, ev: &TimePickerEvent, cx| {
+            let TimePickerEvent::Change(t) = ev;
+            this.log_event("TimePicker(12h)", t.format(true, false), cx);
+        })
+        .detach();
+
+        let demo_range_slider = cx.new(|cx| {
+            RangeSliderState::new(cx)
+                .range(0.0, 1000.0)
+                .step(25.0)
+                .default_range(150.0, 725.0)
+                .label("Latency Budget Window (ms)")
+                .marks([
+                    SliderMark::new(0.0, "0"),
+                    SliderMark::new(250.0, "250"),
+                    SliderMark::new(500.0, "500"),
+                    SliderMark::new(750.0, "750"),
+                    SliderMark::new(1000.0, "1s"),
+                ])
+        });
+        cx.subscribe(&demo_range_slider, |this, _, ev: &RangeSliderEvent, cx| {
+            let RangeSliderEvent::Change(a, b) = ev;
+            this.log_event("RangeSlider", format!("{a:.0}..={b:.0}"), cx);
+        })
+        .detach();
+
+        let demo_marked_slider = cx.new(|cx| {
+            SliderState::new(cx)
+                .range(0.0, 100.0)
+                .step(10.0)
+                .default_value(60.0)
+                .label("Worker Concurrency (%)")
+                .marks([
+                    SliderMark::new(0.0, "0%"),
+                    SliderMark::new(25.0, "25%"),
+                    SliderMark::new(50.0, "50%"),
+                    SliderMark::new(75.0, "75%"),
+                    SliderMark::new(100.0, "Max"),
+                ])
+        });
+
+        let demo_tree_select = cx.new(|cx| {
+            TreeSelectState::new(sample_tree_nodes, cx)
+                .default_selected("blur-rs", cx)
+        });
+        cx.subscribe(&demo_tree_select, |this, _, ev: &TreeSelectEvent, cx| {
+            let TreeSelectEvent::Change(sel) = ev;
+            this.log_event("TreeSelect", format!("{sel:?}"), cx);
+        })
+        .detach();
+
+        let demo_cascader = cx.new(|cx| {
+            CascaderState::new(
+                vec![
+                    CascaderOption::new("na", "North America").children([
+                        CascaderOption::new("us", "United States").children([
+                            CascaderOption::new("sf", "San Francisco"),
+                            CascaderOption::new("nyc", "New York"),
+                            CascaderOption::new("sea", "Seattle"),
+                        ]),
+                        CascaderOption::new("ca", "Canada").children([
+                            CascaderOption::new("tor", "Toronto"),
+                            CascaderOption::new("van", "Vancouver"),
+                        ]),
+                    ]),
+                    CascaderOption::new("eu", "Europe").children([
+                        CascaderOption::new("de", "Germany").children([
+                            CascaderOption::new("fra", "Frankfurt"),
+                            CascaderOption::new("ber", "Berlin"),
+                        ]),
+                        CascaderOption::new("uk", "United Kingdom").children([
+                            CascaderOption::new("lon", "London"),
+                        ]),
+                    ]),
+                    CascaderOption::new("apac", "Asia-Pacific").children([
+                        CascaderOption::new("jp", "Japan").children([
+                            CascaderOption::new("tyo", "Tokyo"),
+                        ]),
+                        CascaderOption::new("sg", "Singapore").children([
+                            CascaderOption::new("sin", "Singapore"),
+                        ]),
+                    ]),
+                ],
+                cx,
+            )
+            .default_path(["na", "us", "sf"])
+        });
+        cx.subscribe(&demo_cascader, |this, _, ev: &CascaderEvent, cx| {
+            let CascaderEvent::Change(path) = ev;
+            this.log_event("Cascader", format!("{path:?}"), cx);
+        })
+        .detach();
+
+        let demo_transfer = cx.new(|cx| {
+            TransferState::new(
+                vec![
+                    TransferItem::new("read-metrics", "Read Metrics").description("Query time-series & charts"),
+                    TransferItem::new("write-alerts", "Manage Alerts").description("Create & mute rules"),
+                    TransferItem::new("deploy-prod", "Deploy Production").description("Trigger canary releases"),
+                    TransferItem::new("rotate-keys", "Rotate API Keys").description("Generate signing tokens"),
+                    TransferItem::new("audit-export", "Export Audit Logs").description("Download CSV / JSON"),
+                    TransferItem::new("billing-admin", "Billing Admin").description("Invoices & quotas"),
+                ],
+                ["read-metrics", "write-alerts"],
+                cx,
+            )
+            .titles("Available Scopes", "Granted Scopes")
+        });
+        cx.subscribe(&demo_transfer, |this, _, ev: &TransferEvent, cx| {
+            let TransferEvent::Change(keys) = ev;
+            this.log_event("Transfer", format!("granted {} scope(s)", keys.len()), cx);
+        })
+        .detach();
+
+        let demo_tag_input = cx.new(|cx| {
+            TagInputState::new(cx)
+                .default_tags(["rust", "gpui", "directx11", "vulkan"])
+                .max_tags(8)
+        });
+        cx.subscribe(&demo_tag_input, |this, _, ev: &TagInputEvent, cx| {
+            let TagInputEvent::Change(tags) = ev;
+            this.log_event("TagInput", format!("{} tag(s)", tags.len()), cx);
+        })
+        .detach();
+
+        let validated_form = FormState::new()
+            .field(
+                "name",
+                "",
+                vec![
+                    FormRule::required("Full name is required."),
+                    FormRule::min_length(2, "Name must be at least 2 characters."),
+                ],
+            )
+            .field(
+                "email",
+                "",
+                vec![
+                    FormRule::required("Work email is required."),
+                    FormRule::email("Enter a valid email address."),
+                ],
+            )
+            .field(
+                "password",
+                "",
+                vec![
+                    FormRule::required("Password is required."),
+                    FormRule::min_length(8, "Password must be at least 8 characters."),
+                ],
+            )
+            .field(
+                "confirm",
+                "",
+                vec![
+                    FormRule::required("Please confirm your password."),
+                    FormRule::matches("password", "Passwords do not match."),
+                ],
+            );
+
+        let vf_name = cx.new(|cx| InputState::new(cx).placeholder("Ada Lovelace").leading_icon(LucideIcon::User));
+        cx.subscribe(&vf_name, |this, inp, ev: &InputEvent, cx| {
+            if let InputEvent::Change(val) = ev {
+                this.validated_form.set_value("name", val.clone());
+                let bad = this.validated_form.error("name").is_some();
+                inp.update(cx, |s, cx| s.set_invalid(bad, cx));
+                cx.notify();
+            }
+        })
+        .detach();
+        let vf_email = cx.new(|cx| InputState::new(cx).placeholder("ada@company.dev").leading_icon(LucideIcon::Mail));
+        cx.subscribe(&vf_email, |this, inp, ev: &InputEvent, cx| {
+            if let InputEvent::Change(val) = ev {
+                this.validated_form.set_value("email", val.clone());
+                let bad = this.validated_form.error("email").is_some();
+                inp.update(cx, |s, cx| s.set_invalid(bad, cx));
+                cx.notify();
+            }
+        })
+        .detach();
+        let vf_password = cx.new(|cx| InputState::new(cx).placeholder("Minimum 8 characters").masked(true).leading_icon(LucideIcon::Lock));
+        cx.subscribe(&vf_password, |this, inp, ev: &InputEvent, cx| {
+            if let InputEvent::Change(val) = ev {
+                this.validated_form.set_value("password", val.clone());
+                let bad = this.validated_form.error("password").is_some();
+                inp.update(cx, |s, cx| s.set_invalid(bad, cx));
+                let bad_c = this.validated_form.error("confirm").is_some();
+                this.vf_confirm.update(cx, |s, cx| s.set_invalid(bad_c, cx));
+                cx.notify();
+            }
+        })
+        .detach();
+        let vf_confirm = cx.new(|cx| InputState::new(cx).placeholder("Repeat password").masked(true).leading_icon(LucideIcon::ShieldCheck));
+        cx.subscribe(&vf_confirm, |this, inp, ev: &InputEvent, cx| {
+            if let InputEvent::Change(val) = ev {
+                this.validated_form.set_value("confirm", val.clone());
+                let bad = this.validated_form.error("confirm").is_some();
+                inp.update(cx, |s, cx| s.set_invalid(bad, cx));
+                cx.notify();
+            }
+        })
+        .detach();
+
+        // --- Media, Menus & Extras state ---
+        let demo_tour = cx.new(|cx| {
+            TourState::new(
+                vec![
+                    TourStep::target(
+                        "tour-popconfirm",
+                        "Inline Popconfirm",
+                        "Attach lightweight confirmations right on destructive buttons without hijacking the full window.",
+                    )
+                    .icon(LucideIcon::ShieldCheck),
+                    TourStep::target(
+                        "tour-lightbox",
+                        "GPU-Blurred Lightbox",
+                        "Click any preview thumbnail to zoom (50–300%), rotate 90°, or step through items with arrow keys.",
+                    )
+                    .icon(LucideIcon::ZoomIn),
+                    TourStep::target(
+                        "tour-qr",
+                        "Live Pure-Rust QRCode",
+                        "Type any URL or payload to generate a real ISO/IEC 18004 scannable QR code on GPU quads.",
+                    )
+                    .icon(LucideIcon::QrCode),
+                ],
+                cx,
+            )
+        });
+        cx.subscribe(&demo_tour, |this, _, ev: &TourEvent, cx| match ev {
+            TourEvent::StepChange(i) => this.log_event("Tour", format!("step #{}", i + 1), cx),
+            TourEvent::Finish => {
+                this.log_event("Tour", "finished!", cx);
+                this.push_toast(ToastVariant::Success, "Tour completed", Some("You explored all highlighted features."), cx);
+            }
+            TourEvent::Close => this.log_event("Tour", "dismissed", cx),
+        })
+        .detach();
+
+        let demo_image_preview = cx.new(|cx| {
+            let make_card = |label: &'static str, accent: u32, icon: LucideIcon| {
+                ImagePreviewItem::custom(label, move |_, _| {
+                    gpui::div()
+                        .size_full()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .gap(gpui::px(8.))
+                        .bg(gpui::rgb(accent))
+                        .text_color(gpui::components::palette::WHITE)
+                        .child(gpui::icons::Icon::new(icon).size(IconSize::TwoXl))
+                        .child(
+                            gpui::div()
+                                .text_size(gpui::px(14.))
+                                .font_weight(gpui::FontWeight::BOLD)
+                                .child(label),
+                        )
+                        .into_any_element()
+                })
+            };
+            ImagePreviewState::new(
+                vec![
+                    make_card("Dual-Kawase Shader", 0x4F46E5, LucideIcon::Sparkles)
+                        .subtitle("WGPU + DirectX 11"),
+                    make_card("GPU Scene Pipeline", 0x059669, LucideIcon::Cpu)
+                        .subtitle("Zero-relayout 120 FPS"),
+                    make_card("Design Token System", 0xE11D48, LucideIcon::Palette)
+                        .subtitle("Light / Dark / Accents"),
+                    make_card("Native OS Overlays", 0x0284C7, LucideIcon::AppWindow)
+                        .subtitle("DialogWindow & PopUp"),
+                ],
+                cx,
+            )
+        });
+
+        let menu_nodes = vec![
+            MenuNode::item("dash", "Dashboard").icon(LucideIcon::LayoutDashboard),
+            MenuNode::submenu(
+                "infra",
+                "Infrastructure",
+                [
+                    MenuNode::item("clusters", "Clusters").icon(LucideIcon::Server).badge("4"),
+                    MenuNode::item("workers", "Worker Nodes").icon(LucideIcon::Cpu),
+                    MenuNode::submenu(
+                        "net",
+                        "Networking",
+                        [
+                            MenuNode::item("dns", "DNS Zones").icon(LucideIcon::Globe),
+                            MenuNode::item("tls", "TLS Certificates").icon(LucideIcon::Lock),
+                        ],
+                    )
+                    .icon(LucideIcon::Network),
+                ],
+            )
+            .icon(LucideIcon::Boxes),
+            MenuNode::submenu(
+                "obs",
+                "Observability",
+                [
+                    MenuNode::item("traces", "Distributed Traces").icon(LucideIcon::Activity),
+                    MenuNode::item("logs", "Live Logs").icon(LucideIcon::Terminal),
+                ],
+            )
+            .icon(LucideIcon::Radar),
+            MenuNode::Divider,
+            MenuNode::item("settings", "Settings").icon(LucideIcon::Settings),
+        ];
+        let demo_vmenu = cx.new(|cx| {
+            MenuState::new(menu_nodes.clone(), cx)
+                .mode(MenuMode::Vertical)
+                .default_open(["infra", "net"])
+                .default_active("clusters")
+        });
+        cx.subscribe(&demo_vmenu, |this, _, ev: &MenuEvent, cx| {
+            let MenuEvent::Select(k) = ev;
+            this.log_event("Menu(Vertical)", format!("Select(\"{k}\")"), cx);
+        })
+        .detach();
+        let demo_hmenu = cx.new(|cx| {
+            MenuState::new(menu_nodes, cx)
+                .mode(MenuMode::Horizontal)
+                .default_active("dash")
+        });
+        cx.subscribe(&demo_hmenu, |this, _, ev: &MenuEvent, cx| {
+            let MenuEvent::Select(k) = ev;
+            this.log_event("Menu(Horizontal)", format!("Select(\"{k}\")"), cx);
+        })
+        .detach();
+
+        let demo_carousel = cx.new(|cx| CarouselState::new(3, cx));
+        cx.subscribe(&demo_carousel, |this, _, ev: &CarouselEvent, cx| {
+            let CarouselEvent::Change(idx) = ev;
+            this.log_event("Carousel", format!("slide #{}", idx + 1), cx);
+        })
+        .detach();
+
+        let demo_editable_title = cx.new(|cx| {
+            EditableTextState::new("Click this heading to edit it inline", cx)
+                .font_size(gpui::px(18.))
+                .font_weight(gpui::FontWeight::BOLD)
+        });
+        cx.subscribe(&demo_editable_title, |this, _, ev: &EditableTextEvent, cx| {
+            if let EditableTextEvent::Commit(val) = ev {
+                this.log_event("EditableText", format!("Commit(\"{val}\")"), cx);
+            }
+        })
+        .detach();
+
+        let demo_qr_input = cx.new(|cx| {
+            InputState::new(cx)
+                .default_value("https://github.com/KevinWang15/gpui")
+                .placeholder("Enter URL or text for QR code...")
+                .leading_icon(LucideIcon::QrCode)
+                .clearable(true)
+        });
+        cx.subscribe(&demo_qr_input, |_, _, _: &InputEvent, cx| cx.notify())
+            .detach();
 
         let mut app = Self {
             page: Page::InteractiveBlur,
@@ -894,6 +1450,41 @@ impl PlaygroundApp {
             otp_input,
             otp_masked: false,
             ring_slider,
+
+            demo_tree,
+            table_checked_rows: vec![true, false, true, false, false],
+            table_expanded_rows: vec![true, false, false, false, false],
+            desc_bordered: true,
+            timeline_alternate: false,
+            list_selected_idx: Some(0),
+
+            inline_color_picker,
+            popover_color_picker,
+            demo_dropzone,
+            demo_date_picker,
+            demo_time_picker_24,
+            demo_time_picker_12,
+            demo_range_slider,
+            demo_marked_slider,
+            demo_tree_select,
+            demo_cascader,
+            demo_transfer,
+            demo_tag_input,
+            validated_form,
+            vf_name,
+            vf_email,
+            vf_password,
+            vf_confirm,
+
+            demo_tour,
+            demo_image_preview,
+            demo_vmenu,
+            demo_hmenu,
+            demo_carousel,
+            demo_editable_title,
+            demo_result_status: ResultStatus::Success,
+            demo_qr_input,
+            popconfirm_count: 0,
         };
 
         app.log_event(

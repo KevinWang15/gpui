@@ -646,7 +646,14 @@ impl<T: Clone + PartialEq + 'static> Render for SelectState<T> {
                 .border_1()
                 .border_color(theme.border)
                 .shadow_lg()
-                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                .on_mouse_down_out(cx.listener(|this, ev: &crate::MouseDownEvent, _, cx| {
+                    if this
+                        .trigger_bounds
+                        .get()
+                        .is_some_and(|b| b.contains(&ev.position))
+                    {
+                        return;
+                    }
                     this.close_menu(cx);
                 }))
                 .child(list_items)
