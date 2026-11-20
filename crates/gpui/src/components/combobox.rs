@@ -801,6 +801,7 @@ impl<T: Clone + PartialEq + 'static> Render for ComboBoxState<T> {
                         .items_center()
                         .flex_1()
                         .min_w_0()
+                        .h(input_h)
                         .when_some(selected_label, |el, label| {
                             let label_color = if self.disabled {
                                 theme.disabled_foreground
@@ -1169,6 +1170,7 @@ impl<T: Clone + PartialEq + 'static> Render for ComboBoxState<T> {
                 .flex()
                 .flex_col()
                 .min_w(menu_min_w)
+                .max_w(menu_min_w.max(px(520.)))
                 .rounded(theme.radius_lg)
                 .bg(theme.popover)
                 .text_color(theme.popover_foreground)

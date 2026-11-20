@@ -19,8 +19,8 @@ use crate::{
 use crate::icons::{Icon, IconSize, LucideIcon};
 
 use super::completion::{
-    CompletionConfig, CompletionController, CompletionKeyOutcome, SuggestionItem, SuggestionSource,
-    run_completion_query,
+    CompletionConfig, CompletionController, SuggestionItem, SuggestionSource,
+    dispatch_completion_key_down, run_completion_query, wrap_with_completion_popover,
 };
 use super::cursor_blink::{CursorBlink, is_mounted_and_focused};
 use super::layout::focus_ring_shadow;
@@ -1068,32 +1068,16 @@ impl InputState {
         if !self.can_edit() {
             return;
         }
-        let Some(ctrl) = self.completions.as_mut() else {
-            return;
-        };
-        match ctrl.handle_key_down(event) {
-            CompletionKeyOutcome::Ignored => {}
-            CompletionKeyOutcome::ClosedPassThrough => {
-                cx.notify();
-            }
-            CompletionKeyOutcome::Consumed => {
-                cx.stop_propagation();
-                cx.notify();
-            }
-            CompletionKeyOutcome::RequestOpen(edge) => {
-                let query = self.content.clone();
-                if query.trim().chars().count() >= ctrl.config().min_chars {
-                    ctrl.set_pending_highlight(edge);
-                    self.refresh_completions(true, cx);
-                    cx.stop_propagation();
-                    cx.notify();
-                }
-            }
-            CompletionKeyOutcome::Accept(item) => {
-                self.accept_suggestion(item, Some(window), cx);
-                cx.stop_propagation();
-            }
-        }
+        dispatch_completion_key_down(
+            self,
+            event,
+            window,
+            cx,
+            |this| this.completions.as_mut(),
+            |this, _| this.content.clone(),
+            Self::refresh_completions,
+            |this, item, window, cx| this.accept_suggestion(item, Some(window), cx),
+        );
     }
 
     fn on_mouse_down(
@@ -1890,19 +1874,7 @@ impl Render for InputState {
                 |this, item, window, cx| this.accept_suggestion(item, Some(window), cx),
                 |this, cx| this.close_completions(cx),
             );
-            frame = frame.relative().child(ctrl.bounds_canvas());
-            let mut wrapper = div().flex().flex_col();
-            if self.frame_style.size.width.is_none() {
-                wrapper = wrapper.w_full();
-            }
-            wrapper.style().flex_grow = self.frame_style.flex_grow;
-            wrapper.style().flex_shrink = self.frame_style.flex_shrink;
-            wrapper.style().flex_basis = self.frame_style.flex_basis;
-            wrapper.style().min_size.width = self.frame_style.min_size.width;
-            wrapper
-                .child(frame)
-                .when_some(popover, |el, pop| el.child(div().h_0().w_full().child(pop)))
-                .into_any_element()
+            wrap_with_completion_popover(frame, &self.frame_style, ctrl, popover)
         } else {
             frame.into_any_element()
         }

@@ -16,8 +16,8 @@ use crate::{
 use super::badge::{BadgeColor, badge};
 use super::button::button;
 use super::completion::{
-    CompletionConfig, CompletionController, CompletionKeyOutcome, SuggestionItem, SuggestionSource,
-    run_completion_query,
+    CompletionConfig, CompletionController, SuggestionItem, SuggestionSource,
+    dispatch_completion_key_down, run_completion_query, wrap_with_completion_popover,
 };
 use super::input::{Input, InputEvent, InputState, input_actions};
 use super::theme::{ActiveTheme, ComponentSize, focus_ring_shadow, tabular_numerals};
@@ -1337,32 +1337,18 @@ impl Render for TagInputState {
                         if this.is_at_cap() {
                             return;
                         }
-                        let Some(ctrl) = this.suggestions.as_mut() else {
-                            return;
-                        };
-                        match ctrl.handle_key_down(ev) {
-                            CompletionKeyOutcome::Ignored => {}
-                            CompletionKeyOutcome::ClosedPassThrough => {
-                                cx.notify();
-                            }
-                            CompletionKeyOutcome::Consumed => {
-                                cx.stop_propagation();
-                                cx.notify();
-                            }
-                            CompletionKeyOutcome::RequestOpen(edge) => {
-                                let query = this.input.read(cx).value().to_owned();
-                                if query.trim().chars().count() >= ctrl.config().min_chars {
-                                    ctrl.set_pending_highlight(edge);
-                                    this.refresh_suggestions(true, cx);
-                                    cx.stop_propagation();
-                                    cx.notify();
-                                }
-                            }
-                            CompletionKeyOutcome::Accept(item) => {
-                                this.accept_suggestion(item, Some(window), cx);
-                                cx.stop_propagation();
-                            }
-                        }
+                        dispatch_completion_key_down(
+                            this,
+                            ev,
+                            window,
+                            cx,
+                            |this| this.suggestions.as_mut(),
+                            |this, cx| this.input.read(cx).value().to_owned(),
+                            Self::refresh_suggestions,
+                            |this, item, window, cx| {
+                                this.accept_suggestion(item, Some(window), cx)
+                            },
+                        );
                     }))
             })
             .children(self.tags.iter().enumerate().map(|(idx, tag)| {
@@ -1400,19 +1386,7 @@ impl Render for TagInputState {
                 |this, item, window, cx| this.accept_suggestion(item, Some(window), cx),
                 |this, cx| this.close_suggestions(cx),
             );
-            root = root.relative().child(ctrl.bounds_canvas());
-            let mut wrapper = div().flex().flex_col();
-            if self.frame_style.size.width.is_none() {
-                wrapper = wrapper.w_full();
-            }
-            wrapper.style().flex_grow = self.frame_style.flex_grow;
-            wrapper.style().flex_shrink = self.frame_style.flex_shrink;
-            wrapper.style().flex_basis = self.frame_style.flex_basis;
-            wrapper.style().min_size.width = self.frame_style.min_size.width;
-            wrapper
-                .child(root)
-                .when_some(popover, |el, pop| el.child(div().h_0().w_full().child(pop)))
-                .into_any_element()
+            wrap_with_completion_popover(root, &self.frame_style, ctrl, popover)
         } else {
             root.into_any_element()
         }

@@ -11,10 +11,10 @@ use std::time::Duration;
 
 use crate::icons::{Icon, IconSize, LucideIcon};
 use crate::{
-    Anchor, Animation, AnimationExt, AnyElement, App, AsyncApp, Bounds, Context, Entity,
+    Anchor, Animation, AnimationExt, AnyElement, App, AsyncApp, Bounds, Context, Div, Entity,
     FontWeight, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, ScrollStrategy,
-    SharedString, Task, UniformListScrollHandle, WeakEntity, Window, anchored, canvas, deferred,
-    div, ease_out_quint, point, prelude::*, px, transparent_black, uniform_list,
+    SharedString, StyleRefinement, Task, UniformListScrollHandle, WeakEntity, Window, anchored,
+    canvas, deferred, div, ease_out_quint, point, prelude::*, px, transparent_black, uniform_list,
 };
 
 use super::feedback::{Spinner, SpinnerVariant};
@@ -543,7 +543,6 @@ pub(crate) struct CompletionController {
     open: bool,
     loading: bool,
     error: Option<SharedString>,
-    query: SharedString,
     /// Items ordered strictly in top-to-bottom visual display order (matching rendered groups).
     items: Rc<Vec<SuggestionItem>>,
     rows: Rc<Vec<CompletionRow>>,
@@ -565,7 +564,6 @@ impl CompletionController {
             open: false,
             loading: false,
             error: None,
-            query: SharedString::default(),
             items: Rc::new(Vec::new()),
             rows: Rc::new(Vec::new()),
             item_to_row: Vec::new(),
@@ -728,6 +726,17 @@ impl CompletionController {
         self.has_descriptions = false;
     }
 
+    fn step_highlight(&mut self, key: &str) {
+        let enabled: Vec<bool> = self.items.iter().map(|i| !i.disabled).collect();
+        if let Some(next) = list_step(key, self.highlighted, &enabled, PAGE_STEP_SIZE, false) {
+            self.highlighted = Some(next);
+            if let Some(&row_idx) = self.item_to_row.get(next) {
+                self.scroll_handle
+                    .scroll_to_item(row_idx, ScrollStrategy::Nearest);
+            }
+        }
+    }
+
     /// Handles completion navigation keys (`Down`, `Up`, `PageDown`, `PageUp`, `Escape`, `Tab`,
     /// and fallback `Enter`). Always leaves `Left`/`Right`/`Home`/`End` untouched for the text
     /// input caret.
@@ -774,14 +783,7 @@ impl CompletionController {
                     return CompletionKeyOutcome::Consumed;
                 }
                 if !self.items.is_empty() {
-                    let enabled: Vec<bool> = self.items.iter().map(|i| !i.disabled).collect();
-                    if let Some(next) = list_step(key, self.highlighted, &enabled, PAGE_STEP_SIZE, false) {
-                        self.highlighted = Some(next);
-                        if let Some(&row_idx) = self.item_to_row.get(next) {
-                            self.scroll_handle
-                                .scroll_to_item(row_idx, ScrollStrategy::Nearest);
-                        }
-                    }
+                    self.step_highlight(key);
                     return CompletionKeyOutcome::Consumed;
                 }
                 if self.is_visible_popover() {
@@ -792,16 +794,7 @@ impl CompletionController {
             }
             "pagedown" | "pageup" if self.is_visible_popover() => {
                 if !self.items.is_empty() {
-                    let enabled: Vec<bool> = self.items.iter().map(|i| !i.disabled).collect();
-                    if let Some(next) =
-                        list_step(key, self.highlighted, &enabled, PAGE_STEP_SIZE, false)
-                    {
-                        self.highlighted = Some(next);
-                        if let Some(&row_idx) = self.item_to_row.get(next) {
-                            self.scroll_handle
-                                .scroll_to_item(row_idx, ScrollStrategy::Nearest);
-                        }
-                    }
+                    self.step_highlight(key);
                     CompletionKeyOutcome::Consumed
                 } else if self.loading {
                     CompletionKeyOutcome::Consumed
@@ -873,7 +866,7 @@ impl CompletionController {
             .flex()
             .flex_col()
             .min_w(menu_min_w)
-            .max_w(px(520.))
+            .max_w(menu_min_w.max(px(520.)))
             .rounded(theme.radius_lg)
             .bg(theme.popover)
             .text_color(theme.popover_foreground)
@@ -1201,7 +1194,6 @@ pub(crate) fn run_completion_query<V: 'static>(
             return;
         };
         ctrl.open = true;
-        ctrl.query = SharedString::from(query.to_owned());
         ctrl.generation = ctrl.generation.wrapping_add(1);
         ctrl.pending_task = None;
         ctrl.generation
@@ -1323,6 +1315,75 @@ pub(crate) fn run_completion_query<V: 'static>(
             }
         }
     }
+}
+
+/// Shared key-down dispatcher for any host entity owning a [`CompletionController`].
+pub(crate) fn dispatch_completion_key_down<V: 'static>(
+    this: &mut V,
+    event: &KeyDownEvent,
+    window: &mut Window,
+    cx: &mut Context<V>,
+    get_ctrl: fn(&mut V) -> Option<&mut CompletionController>,
+    current_query: fn(&V, &App) -> String,
+    refresh: fn(&mut V, bool, &mut Context<V>),
+    accept: fn(&mut V, SuggestionItem, &mut Window, &mut Context<V>),
+) {
+    let outcome = {
+        let Some(ctrl) = get_ctrl(this) else {
+            return;
+        };
+        ctrl.handle_key_down(event)
+    };
+    match outcome {
+        CompletionKeyOutcome::Ignored => {}
+        CompletionKeyOutcome::ClosedPassThrough => {
+            cx.notify();
+        }
+        CompletionKeyOutcome::Consumed => {
+            cx.stop_propagation();
+            cx.notify();
+        }
+        CompletionKeyOutcome::RequestOpen(edge) => {
+            let query = current_query(this, cx);
+            let eligible = get_ctrl(this)
+                .is_some_and(|ctrl| query.trim().chars().count() >= ctrl.config().min_chars);
+            if eligible {
+                if let Some(ctrl) = get_ctrl(this) {
+                    ctrl.set_pending_highlight(edge);
+                }
+                refresh(this, true, cx);
+                cx.stop_propagation();
+                cx.notify();
+            }
+        }
+        CompletionKeyOutcome::Accept(item) => {
+            accept(this, item, window, cx);
+            cx.stop_propagation();
+        }
+    }
+}
+
+/// Attaches the bounds-measuring canvas to `anchor` and wraps it with an optional deferred
+/// completion popover while forwarding flex/width layout properties from `frame_style`.
+pub(crate) fn wrap_with_completion_popover(
+    anchor: impl IntoElement + ParentElement + Styled,
+    frame_style: &StyleRefinement,
+    ctrl: &CompletionController,
+    popover: Option<AnyElement>,
+) -> AnyElement {
+    let anchor = anchor.relative().child(ctrl.bounds_canvas());
+    let mut wrapper: Div = div().flex().flex_col();
+    if frame_style.size.width.is_none() {
+        wrapper = wrapper.w_full();
+    }
+    wrapper.style().flex_grow = frame_style.flex_grow;
+    wrapper.style().flex_shrink = frame_style.flex_shrink;
+    wrapper.style().flex_basis = frame_style.flex_basis;
+    wrapper.style().min_size.width = frame_style.min_size.width;
+    wrapper
+        .child(anchor)
+        .when_some(popover, |el, pop| el.child(div().h_0().w_full().child(pop)))
+        .into_any_element()
 }
 
 #[cfg(test)]
