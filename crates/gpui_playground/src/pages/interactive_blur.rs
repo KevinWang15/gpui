@@ -1081,6 +1081,12 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
     let accent = app.accent;
     let fx_cards: &[(ThemeTransitionStyle, LucideIcon, &str, &str)] = &[
         (
+            ThemeTransitionStyle::ChromaticWarp,
+            LucideIcon::Aperture,
+            "Chromatic Warp",
+            "Hyper-zoom & whip-spin tunnel + mirror tiling + prismatic RGB aberration",
+        ),
+        (
             ThemeTransitionStyle::Shockwave,
             LucideIcon::WavesHorizontal,
             "Shockwave",

@@ -964,6 +964,10 @@ fn view_transition_physical_shader_modes_evaluate_cleanly() {
             crate::ViewTransition::liquid_dissolve(origin),
             crate::SceneTransitionKind::LiquidDissolve,
         ),
+        (
+            crate::ViewTransition::chromatic_warp(origin),
+            crate::SceneTransitionKind::ChromaticWarp,
+        ),
     ] {
         let active = crate::ActiveViewTransition {
             started_at: now,

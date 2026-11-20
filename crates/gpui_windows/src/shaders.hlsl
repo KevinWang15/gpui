@@ -1383,7 +1383,8 @@ float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Targe
 //   0: RadialExpand, 1: RadialCollapse, 2: CrossFade,
 //   3: Shockwave (optical refraction + RGB dispersion + caustic ridge),
 //   4: PageCurl (3D cylindrical curl + specular ridge + cast shadow),
-//   5: LiquidDissolve (domain-warped FBM liquid melt + meniscus refraction).
+//   5: LiquidDissolve (domain-warped FBM liquid melt + meniscus refraction),
+//   6: ChromaticWarp (hyper-zoom & whip-spin + mirror tunnel + prismatic chromatic aberration).
 cbuffer ViewTransitionParams: register(b2) {
     float2 vt_origin;
     float vt_radius;
@@ -1678,6 +1679,151 @@ float4 vt_liquid_dissolve(float2 frag_pos, float2 dims) {
     return float4(saturate(lit_rgb), color.a);
 }
 
+float2 vt_mirror_uv(float2 uv) {
+    float2 t = abs(uv - 2.0 * floor(uv * 0.5));
+    return 1.0 - abs(t - 1.0);
+}
+
+float2 vt_rotate2d(float2 v, float angle) {
+    float c = cos(angle);
+    float s = sin(angle);
+    return float2(v.x * c - v.y * s, v.x * s + v.y * c);
+}
+
+float vt_ign(float2 p) {
+    return frac(52.9829189 * frac(dot(p, float2(0.06711056, 0.00583715))));
+}
+
+float3 vt_spectrum_weight(float s, float chroma) {
+    float bell = exp(-(s * s) / (2.0 * 0.34 * 0.34));
+    float wr = exp(-((s + 0.34) * (s + 0.34)) / (2.0 * 0.20 * 0.20));
+    float wg = exp(-(s * s) / (2.0 * 0.18 * 0.18));
+    float wb = exp(-((s - 0.34) * (s - 0.34)) / (2.0 * 0.20 * 0.20));
+    return lerp(float3(bell, bell, bell), float3(wr, wg, wb), chroma);
+}
+
+float4 vt_chromatic_warp_layer(
+    bool use_new,
+    float2 p_rel,
+    float r,
+    float aspect,
+    float2 pivot,
+    float base_zoom,
+    float base_angle,
+    float swirl,
+    float barrel,
+    float blur_radial,
+    float blur_rot,
+    float chroma,
+    float jitter
+) {
+    float3 acc_rgb = float3(0.0, 0.0, 0.0);
+    float3 w_sum = float3(0.0, 0.0, 0.0);
+    float acc_a = 0.0;
+    float a_sum = 0.0;
+    float2 inv_aspect = float2(1.0 / aspect, 1.0);
+
+    [unroll]
+    for (int i = 0; i < 24; i++) {
+        float s = ((float(i) + jitter) / 24.0) - 0.5;
+        float tap_zoom = max(base_zoom * exp(s * blur_radial), 0.06);
+        float tap_angle = base_angle + s * blur_rot + swirl * r;
+        float2 p_rot = vt_rotate2d(p_rel, tap_angle);
+        float radial_k = 1.0 / max(1.0 + barrel * r * r, 0.25);
+        float2 p_warped = (p_rot * radial_k) / tap_zoom;
+        float2 sample_uv = vt_mirror_uv(p_warped * inv_aspect + pivot);
+
+        float4 tex = use_new ? vt_sample_new(sample_uv) : vt_sample_old(sample_uv);
+        float3 spec_w = vt_spectrum_weight(s, chroma);
+        float bell = exp(-(s * s) / (2.0 * 0.34 * 0.34));
+        acc_rgb += tex.rgb * spec_w;
+        w_sum += spec_w;
+        acc_a += tex.a * bell;
+        a_sum += bell;
+    }
+
+    float3 out_rgb = acc_rgb / max(w_sum, float3(0.0001, 0.0001, 0.0001));
+    float out_a = acc_a / max(a_sum, 0.0001);
+    return float4(saturate(out_rgb), saturate(out_a));
+}
+
+float4 vt_chromatic_warp(float2 frag_pos, float2 dims) {
+    float p = saturate(vt_progress);
+    if (p <= 0.0005) {
+        return vt_load_old(frag_pos);
+    }
+    if (p >= 0.9995) {
+        return vt_load_new(frag_pos);
+    }
+
+    float2 uv = frag_pos / dims;
+    float aspect = dims.x / max(dims.y, 1.0);
+    float2 norm_origin = saturate(vt_origin / dims);
+    float2 pivot = lerp(float2(0.5, 0.5), norm_origin, 0.14);
+    float2 p_rel = (uv - pivot) * float2(aspect, 1.0);
+    float r = length(p_rel);
+
+    float jitter = vt_ign(floor(frag_pos) + float2(floor(p * 120.0) * 5.588238, 0.0));
+
+    float vel = pow(sin(p * M_PI_F), 1.35);
+    float apex = exp(-((p - 0.5) * (p - 0.5)) / (2.0 * 0.08 * 0.08));
+    float chroma = smoothstep(0.0, 0.06, vel);
+
+    float a = saturate(p / 0.55);
+    float e_out = pow(a, 2.25);
+    float zoom_old = exp(1.42 * e_out);
+    float ang_old = 0.62 * e_out;
+    float swirl_old = 0.34 * e_out;
+    float barrel_old = 1.18 * e_out;
+    float blur_r_old = vel * (0.20 + 0.92 * r);
+    float blur_rot_old = vel * (0.24 + 0.12 * r);
+
+    float b = saturate((1.0 - p) / 0.55);
+    float e_in = pow(b, 1.95);
+    float zoom_new = exp(-1.66 * e_in);
+    float ang_new = -0.68 * e_in;
+    float swirl_new = -0.30 * e_in;
+    float barrel_new = 0.80 * e_in;
+    float blur_r_new = vel * (0.22 + 0.96 * r);
+    float blur_rot_new = vel * (0.22 + 0.10 * r);
+
+    float mix_new = smoothstep(0.44, 0.54, p);
+    float4 color;
+    if (mix_new <= 0.0005) {
+        color = vt_chromatic_warp_layer(
+            false, p_rel, r, aspect, pivot,
+            zoom_old, ang_old, swirl_old, barrel_old,
+            blur_r_old, blur_rot_old, chroma, jitter
+        );
+    } else if (mix_new >= 0.9995) {
+        color = vt_chromatic_warp_layer(
+            true, p_rel, r, aspect, pivot,
+            zoom_new, ang_new, swirl_new, barrel_new,
+            blur_r_new, blur_rot_new, chroma, jitter
+        );
+    } else {
+        float4 old_col = vt_chromatic_warp_layer(
+            false, p_rel, r, aspect, pivot,
+            zoom_old, ang_old, swirl_old, barrel_old,
+            blur_r_old, blur_rot_old, chroma, jitter
+        );
+        float4 new_col = vt_chromatic_warp_layer(
+            true, p_rel, r, aspect, pivot,
+            zoom_new, ang_new, swirl_new, barrel_new,
+            blur_r_new, blur_rot_new, chroma, jitter
+        );
+        color = lerp(old_col, new_col, mix_new);
+    }
+
+    float luma = dot(color.rgb, float3(0.299, 0.587, 0.114));
+    float sat_boost = 1.0 + 0.28 * vel;
+    float3 boosted = lerp(float3(luma, luma, luma), color.rgb, sat_boost);
+    float vignette = 1.0 - 0.12 * vel * clamp(r * r, 0.0, 1.4);
+    float core_glow = apex * smoothstep(0.95, 0.0, r) * 0.06 * color.a;
+    float3 final_rgb = saturate(boosted * vignette + float3(core_glow, core_glow, core_glow));
+    return float4(final_rgb, color.a);
+}
+
 float4 view_transition_fragment(float4 position: SV_Position): SV_Target {
     float2 dims = max(vt_viewport_size, float2(1.0, 1.0));
     if (vt_kind == 3u) {
@@ -1688,6 +1834,9 @@ float4 view_transition_fragment(float4 position: SV_Position): SV_Target {
     }
     if (vt_kind == 5u) {
         return vt_liquid_dissolve(position.xy, dims);
+    }
+    if (vt_kind == 6u) {
+        return vt_chromatic_warp(position.xy, dims);
     }
 
     float4 old_color = vt_load_old(position.xy);

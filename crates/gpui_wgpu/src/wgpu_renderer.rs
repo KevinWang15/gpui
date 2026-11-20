@@ -4361,6 +4361,64 @@ mod tests {
                 "{name} at p=1 must match dark_scene, got {p1:?}"
             );
         }
+
+        // ChromaticWarp: full-viewport hyper-zoom & whip-spin with prismatic chromatic aberration.
+        for (tag, progress) in [
+            ("start", 0.0_f32),
+            ("f1_out", 0.16),
+            ("f2_peak_out", 0.36),
+            ("f3_apex", 0.50),
+            ("f4_in_mirror", 0.68),
+            ("f5_settle", 0.88),
+            ("end", 1.0),
+        ] {
+            let t = SceneTransition {
+                kind: SceneTransitionKind::ChromaticWarp,
+                origin,
+                radius: ScaledPixels(diag),
+                feather: ScaledPixels(1.0),
+                progress,
+            };
+            headless
+                .core
+                .render_frame_with_transition(&dark_scene, t, &target_view, size)
+                .expect("chromatic_warp frame");
+            let img = headless.read_image().expect("read chromatic_warp");
+            if tag == "start" {
+                let px0 = img.get_pixel(400, 300);
+                assert!(
+                    px0[0] > 200 && px0[1] > 200 && px0[2] > 200,
+                    "chromatic_warp at p=0 must match light_scene, got {px0:?}"
+                );
+            } else if tag == "end" {
+                let px1 = img.get_pixel(24, 575);
+                assert!(
+                    px1[0] < 60 && px1[1] < 60 && px1[2] < 80,
+                    "chromatic_warp at p=1 must match dark_scene, got {px1:?}"
+                );
+            } else if tag == "f2_peak_out" || tag == "f3_apex" || tag == "f4_in_mirror" {
+                // Verify real prismatic RGB chromatic separation across the warped frame.
+                let mut max_rgb_spread = 0i32;
+                for y in (0..h).step_by(8) {
+                    for x in (0..w).step_by(8) {
+                        let px = img.get_pixel(x, y);
+                        let spread = (px[0] as i32 - px[2] as i32).abs();
+                        if spread > max_rgb_spread {
+                            max_rgb_spread = spread;
+                        }
+                    }
+                }
+                assert!(
+                    max_rgb_spread > 20,
+                    "chromatic_warp at {tag} (p={progress}) should exhibit visible RGB chromatic aberration, got max |R-B|={max_rgb_spread}"
+                );
+            }
+            if let Some(ref dir) = dump_dir {
+                let path =
+                    std::path::Path::new(dir).join(format!("transition_chromatic_warp_{tag}.png"));
+                img.save(&path).expect("save chromatic_warp preview png");
+            }
+        }
     }
 
     #[test]

@@ -298,13 +298,16 @@ pub enum ThemeTransitionStyle {
     PageCurl,
     /// Organic domain-warped liquid dissolve with edge refraction and iridescent meniscus.
     LiquidDissolve,
+    /// Cinema hyper-zoom & whip-spin warp with mirror-tiled radial streaks and heavy chromatic aberration.
+    ChromaticWarp,
     /// Gentle full-window cross-fade.
     CrossFade,
 }
 
 impl ThemeTransitionStyle {
     /// All available transition styles in display order.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
+        Self::ChromaticWarp,
         Self::Shockwave,
         Self::PageCurl,
         Self::LiquidDissolve,
@@ -319,6 +322,7 @@ impl ThemeTransitionStyle {
             Self::Shockwave => "Shockwave",
             Self::PageCurl => "Page Curl",
             Self::LiquidDissolve => "Liquid",
+            Self::ChromaticWarp => "Chromatic Warp",
             Self::CrossFade => "Cross-Fade",
         }
     }
@@ -345,6 +349,9 @@ impl ThemeTransitionStyle {
             })),
             Self::LiquidDissolve => {
                 ViewTransition::liquid_dissolve(origin.unwrap_or_else(fallback_origin))
+            }
+            Self::ChromaticWarp => {
+                ViewTransition::chromatic_warp(origin.unwrap_or_else(fallback_origin))
             }
             Self::CrossFade => ViewTransition::cross_fade(),
         }

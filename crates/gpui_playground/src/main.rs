@@ -354,6 +354,9 @@ impl Render for PlaygroundApp {
                                         .child({
                                             let active_style = self.theme_transition_style;
                                             let next_style = match active_style {
+                                                ThemeTransitionStyle::ChromaticWarp => {
+                                                    ThemeTransitionStyle::Shockwave
+                                                }
                                                 ThemeTransitionStyle::Shockwave => {
                                                     ThemeTransitionStyle::PageCurl
                                                 }
@@ -367,7 +370,7 @@ impl Render for PlaygroundApp {
                                                     ThemeTransitionStyle::CrossFade
                                                 }
                                                 ThemeTransitionStyle::CrossFade => {
-                                                    ThemeTransitionStyle::Shockwave
+                                                    ThemeTransitionStyle::ChromaticWarp
                                                 }
                                             };
                                             button("nav-transition-fx-btn")

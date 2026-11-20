@@ -1626,7 +1626,7 @@ impl PlaygroundApp {
         let mut app = Self {
             page: Page::InteractiveBlur,
             accent: AccentPreset::Indigo,
-            theme_transition_style: ThemeTransitionStyle::Shockwave,
+            theme_transition_style: ThemeTransitionStyle::ChromaticWarp,
             show_event_log: false,
             event_log: Vec::new(),
             next_event_seq: 1,

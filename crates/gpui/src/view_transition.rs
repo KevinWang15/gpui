@@ -21,6 +21,13 @@ pub fn view_transition_ease_in_out(t: f32) -> f32 {
     }
 }
 
+/// Linear progress curve (`t`) for transitions that shape their own multi-phase kinematics
+/// directly inside the fragment shader (such as [`ViewTransitionKind::ChromaticWarp`]).
+#[inline]
+pub fn view_transition_linear(t: f32) -> f32 {
+    t.clamp(0.0, 1.0)
+}
+
 /// The visual geometry of a GPU-composited full-window view transition.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ViewTransitionKind {
@@ -55,6 +62,12 @@ pub enum ViewTransitionKind {
     /// refraction and an iridescent meniscus frontier.
     LiquidDissolve {
         /// Logical pixel coordinate inside the window where the liquid bloom starts.
+        origin: Point<Pixels>,
+    },
+    /// High-energy cinema hyper-zoom & whip-spin warp with mirror-tiled radial streaks and
+    /// heavy prismatic RGB chromatic aberration.
+    ChromaticWarp {
+        /// Logical pixel coordinate gently biasing the optical warp pivot.
         origin: Point<Pixels>,
     },
 }
@@ -146,6 +159,18 @@ impl ViewTransition {
         }
     }
 
+    /// Creates a cinema hyper-zoom & whip-spin warp with mirror-tiled radial streaks and heavy
+    /// prismatic RGB chromatic aberration.
+    pub fn chromatic_warp(origin: Point<Pixels>) -> Self {
+        Self {
+            kind: ViewTransitionKind::ChromaticWarp { origin },
+            duration: Duration::from_millis(740),
+            easing: view_transition_linear,
+            feather: px(1.5),
+            reduce_motion_crossfade: false,
+        }
+    }
+
     /// Overrides the transition duration.
     pub fn duration(mut self, duration: Duration) -> Self {
         self.duration = duration;
@@ -187,6 +212,8 @@ pub enum SceneTransitionKind {
     PageCurl = 4,
     /// Organic domain-warped liquid dissolve with gradient refraction and luminous meniscus rim.
     LiquidDissolve = 5,
+    /// Cinema hyper-zoom & whip-spin warp with mirror-tiled streaks and prismatic chromatic aberration.
+    ChromaticWarp = 6,
 }
 
 /// GPU-ready per-frame transition parameters attached to a [`Scene`](crate::Scene).
@@ -317,6 +344,20 @@ impl ActiveViewTransition {
                 let max_radius = max_corner_distance(origin_px, viewport_w, viewport_h).max(1.0);
                 Some(SceneTransition {
                     kind: SceneTransitionKind::LiquidDissolve,
+                    origin: origin_px,
+                    radius: ScaledPixels(max_radius),
+                    feather: ScaledPixels(scale_factor.max(0.5)),
+                    progress: eased,
+                })
+            }
+            ViewTransitionKind::ChromaticWarp { origin } => {
+                let origin_px = point(
+                    ScaledPixels(origin.x.0 * scale_factor),
+                    ScaledPixels(origin.y.0 * scale_factor),
+                );
+                let max_radius = max_corner_distance(origin_px, viewport_w, viewport_h).max(1.0);
+                Some(SceneTransition {
+                    kind: SceneTransitionKind::ChromaticWarp,
                     origin: origin_px,
                     radius: ScaledPixels(max_radius),
                     feather: ScaledPixels(scale_factor.max(0.5)),
