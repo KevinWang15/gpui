@@ -35,6 +35,8 @@ mod keyboard_tests;
 mod keyboard_tests_controls;
 #[cfg(test)]
 mod keyboard_tests_fields;
+#[cfg(test)]
+mod keyboard_tests_arrows;
 pub mod file_dropzone;
 pub mod filter_bar;
 pub mod form;

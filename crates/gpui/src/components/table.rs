@@ -446,7 +446,12 @@ impl RenderOnce for Table {
             &theme,
         );
 
-        let mut body_inner = div().flex().flex_col().w_full();
+        // Up and Down move between the rows' controls.
+        let mut body_inner = div()
+            .arrow_navigation(crate::ArrowNavigation::Vertical)
+            .flex()
+            .flex_col()
+            .w_full();
         if !has_rows {
             body_inner = body_inner.child(
                 div()

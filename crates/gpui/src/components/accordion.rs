@@ -229,6 +229,7 @@ impl RenderOnce for Accordion {
         let theme = cx.theme();
         let count = self.children.len();
         let mut root = div()
+            .arrow_navigation(crate::ArrowNavigation::Vertical)
             .flex()
             .flex_col()
             .flex_shrink_0()

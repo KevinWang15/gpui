@@ -15,6 +15,7 @@
 //! and utility-style styling that you can use to build your own custom elements. Div is
 //! constructed by combining these two systems into an all-in-one element.
 
+use crate::FocusStep;
 use crate::{
     Action, AnyDrag, AnyElement, AnyTooltip, AnyView, App, BackGestureEvent, Bounds, ClickEvent,
     DispatchPhase, Display, Element, ElementId, Entity, EntityId, ExternalDragPayload,
@@ -874,6 +875,16 @@ pub trait InteractiveElement: Sized {
         self
     }
 
+    /// Let the arrow keys move focus between the tab stops inside this
+    /// element, in tab order, wrapping around; Home and End go to the first
+    /// and last. For a list, a toolbar, a sidebar: each item stays a tab
+    /// stop, and the arrows are a quicker way along. Arrow keys a focused
+    /// item handles itself (a text field's Left and Right) stay with it.
+    fn arrow_navigation(mut self, arrows: ArrowNavigation) -> Self {
+        self.interactivity().arrow_navigation = Some(arrows);
+        self
+    }
+
     /// Keep Tab and Shift+Tab inside this element while focus is in it: the
     /// tab order wraps around within it (a modal dialog's behavior). The
     /// element becomes focusable, so a modal can focus it when it opens and
@@ -1393,6 +1404,18 @@ pub trait InteractiveElement: Sized {
         self.interactivity().focus_visible_style = Some(Box::new(f(StyleRefinement::default())));
         self
     }
+}
+
+/// Which arrow keys move focus inside an element with
+/// [`InteractiveElement::arrow_navigation`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArrowNavigation {
+    /// Up and Down (a column).
+    Vertical,
+    /// Left and Right (a row).
+    Horizontal,
+    /// All four, Up and Left back, Down and Right on (wrapped rows).
+    Both,
 }
 
 /// A trait for elements that want to use the standard GPUI interactivity features
@@ -2333,6 +2356,7 @@ pub struct Interactivity {
     pub(crate) tab_index: Option<isize>,
     pub(crate) tab_group: bool,
     pub(crate) focus_trap: bool,
+    pub(crate) arrow_navigation: Option<ArrowNavigation>,
     pub(crate) tab_stop: bool,
 
     pub(crate) a11y_action_listeners:
@@ -3487,6 +3511,38 @@ impl Interactivity {
             window.on_key_event(move |event: &KeyDownEvent, phase, window, cx| {
                 listener(event, phase, window, cx);
             })
+        }
+
+        // After the focused item's own listeners (bubble phase), so an
+        // arrow key it handles stays with it.
+        if let Some(arrows) = self.arrow_navigation {
+            window.on_key_event(move |event: &KeyDownEvent, phase, window, cx| {
+                if !phase.bubble() || window.default_prevented() {
+                    return;
+                }
+                let stroke = &event.keystroke;
+                if stroke.modifiers.modified() {
+                    return;
+                }
+                let vertical = arrows != ArrowNavigation::Horizontal;
+                let horizontal = arrows != ArrowNavigation::Vertical;
+                let step = match stroke.key.as_str() {
+                    "down" if vertical => FocusStep::Next,
+                    "right" if horizontal => FocusStep::Next,
+                    "up" if vertical => FocusStep::Prev,
+                    "left" if horizontal => FocusStep::Prev,
+                    "home" => FocusStep::First,
+                    "end" => FocusStep::Last,
+                    _ => return,
+                };
+                // This listener's own node is the group.
+                let Some(group) = window.dispatching_key_node else {
+                    return;
+                };
+                if window.focus_within(group, step, cx) {
+                    cx.stop_propagation();
+                }
+            });
         }
 
         for listener in key_up_listeners {

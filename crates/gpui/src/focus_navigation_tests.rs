@@ -6,7 +6,7 @@ use crate::{
     Context, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, Keystroke, Modifiers,
     MouseButton, ParentElement, Render, StatefulInteractiveElement, Styled, TestAppContext,
     VisualTestContext, Window,
-    deferred, div, point, px,
+    deferred, div, point, prelude::FluentBuilder as _, px,
 };
 
 /// A column of 20 px rows, 100 px wide in a 200 px wide window: `a` (a tab
@@ -254,4 +254,88 @@ fn enter_clicks_the_focused_element_unless_something_took_it(cx: &mut TestAppCon
 #[crate::test]
 fn an_enter_a_parent_took_doesnt_click(cx: &mut TestAppContext) {
     assert_eq!(press_enter(cx, true), 0);
+}
+
+/// Three tab stops in a column with arrow navigation, then one outside it.
+/// The second one takes Down itself when `second_takes_down`.
+struct ArrowList {
+    rows: Vec<FocusHandle>,
+    outside: FocusHandle,
+    second_takes_down: bool,
+}
+
+impl Render for ArrowList {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let takes = self.second_takes_down;
+        div()
+            .child(
+                // No id needed.
+                div()
+                    .arrow_navigation(crate::ArrowNavigation::Vertical)
+                    .children(self.rows.iter().enumerate().map(|(i, h)| {
+                        div()
+                            .track_focus(h)
+                            .h(px(20.))
+                            .when(i == 1 && takes, |d| {
+                                d.on_key_down(|e, _, cx| {
+                                    if e.keystroke.key == "down" {
+                                        cx.stop_propagation();
+                                    }
+                                })
+                            })
+                    })),
+            )
+            .child(div().track_focus(&self.outside).h(px(20.)))
+    }
+}
+
+fn arrow_setup(cx: &mut TestAppContext, second_takes_down: bool) -> (&mut VisualTestContext, Vec<FocusHandle>) {
+    let (view, cx) = cx.add_window_view(move |_, cx| ArrowList {
+        rows: (0..3).map(|_| cx.focus_handle().tab_stop(true)).collect(),
+        outside: cx.focus_handle().tab_stop(true),
+        second_takes_down,
+    });
+    cx.run_until_parked();
+    let mut handles = cx.update(|_, cx| view.read(cx).rows.clone());
+    handles.push(cx.update(|_, cx| view.read(cx).outside.clone()));
+    (cx, handles)
+}
+
+fn key(cx: &mut VisualTestContext, key: &'static str) {
+    cx.simulate_event(KeyDownEvent {
+        keystroke: Keystroke::parse(key).unwrap(),
+        is_held: false,
+        prefer_character_input: false,
+    });
+    cx.run_until_parked();
+}
+
+#[crate::test]
+fn arrows_move_focus_inside_a_group(cx: &mut TestAppContext) {
+    let (cx, h) = arrow_setup(cx, false);
+    tab(cx, false);
+    assert_eq!(focused(cx, &h), Some(0));
+    key(cx, "down");
+    assert_eq!(focused(cx, &h), Some(1));
+    key(cx, "down");
+    key(cx, "down");
+    assert_eq!(focused(cx, &h), Some(0), "wraps inside the group, never to the row outside");
+    key(cx, "up");
+    assert_eq!(focused(cx, &h), Some(2));
+    key(cx, "home");
+    assert_eq!(focused(cx, &h), Some(0));
+    key(cx, "end");
+    assert_eq!(focused(cx, &h), Some(2));
+    key(cx, "left");
+    assert_eq!(focused(cx, &h), Some(2), "a vertical group ignores Left");
+}
+
+#[crate::test]
+fn an_arrow_the_item_handles_stays_with_it(cx: &mut TestAppContext) {
+    let (cx, h) = arrow_setup(cx, true);
+    tab(cx, false);
+    key(cx, "down");
+    assert_eq!(focused(cx, &h), Some(1));
+    key(cx, "down");
+    assert_eq!(focused(cx, &h), Some(1));
 }

@@ -179,6 +179,7 @@ impl RenderOnce for List {
 
         let mut root = div()
             .id(self.id.clone())
+            .arrow_navigation(crate::ArrowNavigation::Vertical)
             .flex()
             .flex_col()
             .w_full()

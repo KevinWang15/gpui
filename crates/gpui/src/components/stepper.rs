@@ -168,6 +168,7 @@ impl RenderOnce for Stepper {
 
         let mut root = div()
             .id(self.id)
+            .arrow_navigation(crate::ArrowNavigation::Both)
             .flex()
             .w_full()
             .when(self.orientation == StepperOrientation::Horizontal, |el| {

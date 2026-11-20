@@ -1249,6 +1249,8 @@ impl RenderOnce for Sidebar {
             .child(
                 div()
                     .id(self.id)
+                    // Up and Down move between the items.
+                    .arrow_navigation(crate::ArrowNavigation::Vertical)
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()

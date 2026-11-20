@@ -772,6 +772,15 @@ pub(crate) struct HitTest {
     pub(crate) hover_hitbox_count: usize,
 }
 
+/// A move of focus inside a group (see [`Window::focus_within`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FocusStep {
+    Next,
+    Prev,
+    First,
+    Last,
+}
+
 /// A type of window control area that corresponds to the platform window.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WindowControlArea {
@@ -1381,6 +1390,8 @@ pub struct Window {
     /// Whether something handled the last key down (stopped it or prevented
     /// its default): then its key up doesn't click the focused element.
     pub(crate) key_down_handled: bool,
+    /// The dispatch node whose key listeners are running.
+    pub(crate) dispatching_key_node: Option<DispatchNodeId>,
     focus_enabled: bool,
     /// Incremented every time focus moves. Used to invalidate a
     /// pending keyboard activation state when focus changes.
@@ -2547,6 +2558,7 @@ impl Window {
             focus: None,
             focus_visible: false,
             key_down_handled: false,
+            dispatching_key_node: None,
             focus_enabled: true,
             focus_generation: 0,
             pending_input: None,
@@ -2870,6 +2882,40 @@ impl Window {
     /// Move focus to the previous tab stop (Shift+Tab); see [`Self::focus_next`].
     pub fn focus_prev(&mut self, cx: &mut App) {
         self.move_focus(false, cx);
+    }
+
+    /// Moves focus by `step` among the tab stops inside the dispatch node
+    /// `group` (of the frame on screen), wrapping around; whether a tab stop
+    /// got focus.
+    pub(crate) fn focus_within(
+        &mut self,
+        group: DispatchNodeId,
+        step: FocusStep,
+        cx: &mut App,
+    ) -> bool {
+        if !self.focus_enabled {
+            return false;
+        }
+        let frame = &mut self.rendered_frame;
+        let tree = &frame.dispatch_tree;
+        let inside = |id: FocusId| {
+            tree.focusable_node_id(id)
+                .is_some_and(|node| node != group && tree.node_contains(group, node))
+        };
+        let focused = self.focus.filter(|id| inside(*id));
+        let next = match step {
+            FocusStep::Next => frame.tab_stops.next_where(focused.as_ref(), inside),
+            FocusStep::Prev => frame.tab_stops.prev_where(focused.as_ref(), inside),
+            FocusStep::First => frame.tab_stops.next_where(None, inside),
+            FocusStep::Last => frame.tab_stops.prev_where(None, inside),
+        };
+        match next {
+            Some(handle) => {
+                self.focus(&handle, cx);
+                true
+            }
+            None => false,
+        }
     }
 
     fn move_focus(&mut self, forward: bool, cx: &mut App) {
@@ -7293,7 +7339,9 @@ impl Window {
             let node = self.rendered_frame.dispatch_tree.node(*node_id);
 
             for key_listener in node.key_listeners.clone() {
+                self.dispatching_key_node = Some(*node_id);
                 key_listener(event, DispatchPhase::Capture, self, cx);
+                self.dispatching_key_node = None;
                 if !cx.propagate_event {
                     return;
                 }
@@ -7305,7 +7353,9 @@ impl Window {
             // Handle low level key events
             let node = self.rendered_frame.dispatch_tree.node(*node_id);
             for key_listener in node.key_listeners.clone() {
+                self.dispatching_key_node = Some(*node_id);
                 key_listener(event, DispatchPhase::Bubble, self, cx);
+                self.dispatching_key_node = None;
                 if !cx.propagate_event {
                     return;
                 }

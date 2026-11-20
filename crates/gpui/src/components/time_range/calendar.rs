@@ -3,7 +3,8 @@
 use std::rc::Rc;
 
 use crate::{
-    App, ClickEvent, ElementId, FontWeight, IntoElement, ParentElement, RenderOnce,
+    App, ClickEvent, ElementId, FocusHandle, FontWeight, IntoElement, KeyDownEvent, ParentElement,
+    RenderOnce,
     StyleRefinement, Styled, Window, div, prelude::*, px,
 };
 use crate::icons::{Icon, IconSize, LucideIcon};
@@ -36,6 +37,7 @@ pub struct CalendarGrid {
     style: StyleRefinement,
     on_select: Option<Rc<dyn Fn(CalendarDate, &mut Window, &mut App) + 'static>>,
     on_month_change: Option<Rc<dyn Fn(CalendarDate, &mut Window, &mut App) + 'static>>,
+    focus_active_day: bool,
 }
 
 /// Convenience constructor for [`CalendarGrid::new`].
@@ -56,6 +58,7 @@ impl CalendarGrid {
             style: StyleRefinement::default(),
             on_select: None,
             on_month_change: None,
+            focus_active_day: false,
         }
     }
 
@@ -102,14 +105,57 @@ impl CalendarGrid {
     }
 }
 
+impl CalendarGrid {
+    /// Moves focus to the active day (the calendar's tab stop) when this
+    /// renders: for a picker opened from the keyboard. Pass `true` for one
+    /// render only.
+    pub fn focus_active_day(mut self, focus: bool) -> Self {
+        self.focus_active_day = focus;
+        self
+    }
+}
+
 impl Styled for CalendarGrid {
     fn style(&mut self) -> &mut StyleRefinement {
         &mut self.style
     }
 }
 
+/// Where an arrow key moves the calendar's active day (see the module
+/// rules in `components::focus`): a day or a week, to the week's ends, or a
+/// month with Page Up / Page Down.
+fn day_step(key: &str, from: CalendarDate) -> Option<CalendarDate> {
+    let shift_month = |date: CalendarDate, forward: bool| {
+        let first = if forward {
+            date.first_of_month().next_month()
+        } else {
+            date.first_of_month().prev_month()
+        };
+        let last_day = days_in_month(first.year, first.month);
+        CalendarDate::new(first.year, first.month, date.day.min(last_day))
+    };
+    Some(match key {
+        "left" => from.add_days(-1),
+        "right" => from.add_days(1),
+        "up" => from.add_days(-7),
+        "down" => from.add_days(7),
+        "home" => from.add_days(-(from.weekday_mon0() as i64)),
+        "end" => from.add_days(6 - from.weekday_mon0() as i64),
+        "pageup" => shift_month(from, false),
+        "pagedown" => shift_month(from, true),
+        _ => return None,
+    })
+}
+
+/// The calendar's keyboard state: the day that's its tab stop, and a focus
+/// handle per grid cell.
+struct DayFocus {
+    active: Option<CalendarDate>,
+    cells: Vec<FocusHandle>,
+}
+
 impl RenderOnce for CalendarGrid {
-    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
         let month_first = self.visible_month.first_of_month();
         let leading_days = month_first.weekday_mon0() as i64;
@@ -136,6 +182,7 @@ impl RenderOnce for CalendarGrid {
 
         let prev_btn = div()
             .id((self.id.clone(), "cal-prev"))
+            .map(|el| super::super::focus::tab_stop(el, can_prev, &theme))
             .flex()
             .items_center()
             .justify_center()
@@ -161,6 +208,7 @@ impl RenderOnce for CalendarGrid {
 
         let next_btn = div()
             .id((self.id.clone(), "cal-next"))
+            .map(|el| super::super::focus::tab_stop(el, can_next, &theme))
             .flex()
             .items_center()
             .justify_center()
@@ -218,7 +266,69 @@ impl RenderOnce for CalendarGrid {
             );
         }
 
+        // One tab stop, the active day: the one last moved to in this month,
+        // else the selected day, else today, else the 1st. The arrow keys
+        // move it, and Enter or Space picks it.
+        let keyboard = window.use_keyed_state((self.id.clone(), "days"), cx, |_, cx| DayFocus {
+            active: None,
+            cells: (0..42).map(|_| cx.focus_handle()).collect(),
+        });
+        let in_view = |d: &CalendarDate| d.year == month_first.year && d.month == month_first.month;
+        let today = CalendarDate::today_utc();
+        let active = {
+            let k = keyboard.read(cx);
+            k.active
+                .filter(in_view)
+                .or(self.selected.filter(in_view))
+                .or(Some(today).filter(in_view))
+                .unwrap_or(month_first)
+        };
+        let cells = keyboard.read(cx).cells.clone();
+        if self.focus_active_day {
+            let handle = cells[active.days_since(grid_start).clamp(0, 41) as usize].clone();
+            window.defer(cx, move |window, cx| window.focus(&handle, cx));
+        }
         let mut weeks = div().flex().flex_col().gap(px(2.));
+        {
+            let cells = cells.clone();
+            let (min, max) = (self.min_date, self.max_date);
+            let on_month_change = self.on_month_change.clone();
+            weeks = weeks.on_key_down(move |event: &KeyDownEvent, window, cx| {
+                if event.keystroke.modifiers.modified() {
+                    return;
+                }
+                let Some(from) = cells
+                    .iter()
+                    .position(|h| h.is_focused(window))
+                    .map(|i| grid_start.add_days(i as i64))
+                else {
+                    return;
+                };
+                let Some(mut to) = day_step(&event.keystroke.key, from) else {
+                    return;
+                };
+                cx.stop_propagation();
+                if let Some(min) = min {
+                    to = to.max(min);
+                }
+                if let Some(max) = max {
+                    to = to.min(max);
+                }
+                let mut start = grid_start;
+                if to.first_of_month() != month_first {
+                    // Another month: turn the page, if the calendar can.
+                    let Some(cb) = on_month_change.as_ref() else {
+                        return;
+                    };
+                    cb(to.first_of_month(), window, cx);
+                    let first = to.first_of_month();
+                    start = first.add_days(-(first.weekday_mon0() as i64));
+                }
+                keyboard.update(cx, |k, _| k.active = Some(to));
+                let cell = to.days_since(start).clamp(0, 41) as usize;
+                window.focus(&cells[cell], cx);
+            });
+        }
         for week in 0..(total_cells / 7) {
             let mut row = div().flex().items_center();
             for col in 0..7 {
@@ -256,8 +366,12 @@ impl RenderOnce for CalendarGrid {
                 };
 
                 let day_label = DAY_LABELS[(date.day.clamp(1, 31) - 1) as usize];
+                let handle = &cells[offset as usize];
+                let ring = super::super::focus::focus_visible_ring(handle, window, &theme);
                 let cell = div()
                     .id(("day", offset as usize))
+                    .track_focus(&handle.clone().tab_stop(date == active && !is_disabled))
+                    .when_some(ring, |el, ring| el.shadow(ring))
                     .w(px(34.))
                     .h(px(32.))
                     .flex()

@@ -185,6 +185,33 @@ pub(crate) fn choice_step(key: &str, from: usize, enabled: &[bool]) -> Option<us
     }
 }
 
+/// The key listener of a roving list: one tab stop (see
+/// [`choice_item_handle`]), and the arrows, Home and End move focus among
+/// `handles` without choosing; Enter or Space picks the focused item (its
+/// click). `scroll` is the list's scroll handle, if it scrolls, so the
+/// focused item comes into view.
+pub(crate) fn roving_keys(
+    handles: Vec<FocusHandle>,
+    scroll: Option<crate::ScrollHandle>,
+) -> impl Fn(&crate::KeyDownEvent, &mut Window, &mut App) + 'static {
+    move |event, window, cx| {
+        if event.keystroke.modifiers.modified() {
+            return;
+        }
+        let Some(from) = handles.iter().position(|h| h.is_focused(window)) else {
+            return;
+        };
+        let enabled = vec![true; handles.len()];
+        if let Some(to) = choice_step(&event.keystroke.key, from, &enabled) {
+            cx.stop_propagation();
+            window.focus(&handles[to], cx);
+            if let Some(scroll) = scroll.as_ref() {
+                scroll.scroll_to_item(to);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -297,7 +297,13 @@ impl Render for ImagePreviewState {
         let tw_w = self.thumb_width;
         let tw_h = self.thumb_height;
 
-        let mut thumbs = div().flex().flex_row().flex_wrap().gap(px(10.)).w_full();
+        let mut thumbs = div()
+            .arrow_navigation(crate::ArrowNavigation::Both)
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .gap(px(10.))
+            .w_full();
 
         if self.items.is_empty() {
             thumbs = thumbs.child(

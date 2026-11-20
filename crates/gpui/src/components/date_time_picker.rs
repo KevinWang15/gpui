@@ -38,6 +38,10 @@ pub enum DatePickerEvent {
 /// Entity state backing a standalone [`DatePicker`].
 pub struct DatePickerState {
     focus_handle: FocusHandle,
+    /// The popup's: it keeps Tab inside while focus is in the calendar.
+    popup_focus: FocusHandle,
+    /// Move focus into the calendar on the next render (opened by keyboard).
+    focus_calendar: bool,
     selected: Option<CalendarDate>,
     visible_month: CalendarDate,
     min_date: Option<CalendarDate>,
@@ -65,6 +69,8 @@ impl DatePickerState {
         let today = CalendarDate::today_utc();
         Self {
             focus_handle: cx.focus_handle(),
+            popup_focus: cx.focus_handle(),
+            focus_calendar: false,
             selected: None,
             visible_month: today.first_of_month(),
             min_date: None,
@@ -225,8 +231,10 @@ impl DatePickerState {
         }
     }
 
-    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.disabled {
+    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // Only the trigger's own keys: the calendar's (an Enter on a day)
+        // bubble through here too.
+        if self.disabled || !self.focus_handle.is_focused(window) {
             return;
         }
         let mods = event.keystroke.modifiers;
@@ -242,14 +250,28 @@ impl DatePickerState {
             "tab" if self.open => self.close(cx),
             "enter" | "space" => {
                 self.open = !self.open;
+                // Opened from the keyboard: the calendar takes focus.
+                self.focus_calendar = self.open;
                 cx.notify();
                 cx.stop_propagation();
             }
-            "down" if !self.open => {
+            "down" => {
                 self.open(cx);
+                self.focus_calendar = true;
+                cx.notify();
                 cx.stop_propagation();
             }
             _ => {}
+        }
+    }
+
+    /// Keys while focus is in the popup: Escape closes it and gives focus
+    /// back to the trigger. (Tab stays inside, the arrows move the day.)
+    fn on_popup_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if event.keystroke.key == "escape" && !event.keystroke.modifiers.modified() {
+            self.close(cx);
+            window.focus(&self.focus_handle, cx);
+            cx.stop_propagation();
         }
     }
 }
@@ -301,9 +323,12 @@ impl Render for DatePickerState {
                     }
                     this.close(cx);
                 }))
-                .on_key_down(cx.listener(Self::on_key_down))
+                .track_focus(&self.popup_focus)
+                .focus_trap()
+                .on_key_down(cx.listener(Self::on_popup_key_down))
                 .child(
                     CalendarGrid::new(("dp-cal", entity_id), self.visible_month)
+                        .focus_active_day(std::mem::take(&mut self.focus_calendar))
                         .selected(self.selected)
                         .min_date(self.min_date)
                         .max_date(self.max_date)
@@ -312,13 +337,15 @@ impl Render for DatePickerState {
                         .border_0()
                         .shadow_none()
                         .bg(transparent_black())
-                        .on_select(move |date, _, cx| {
+                        .on_select(move |date, window, cx| {
                             if let Some(ent) = entity_weak_sel.upgrade() {
-                                ent.update(cx, |this, cx| {
+                                let trigger = ent.update(cx, |this, cx| {
                                     this.open = false;
                                     this.set_date(Some(date), cx);
                                     cx.notify();
+                                    this.focus_handle.clone()
                                 });
+                                window.focus(&trigger, cx);
                             }
                         })
                         .on_month_change(move |next_month, _, cx| {
@@ -624,6 +651,11 @@ pub enum TimePickerEvent {
 /// Entity state backing an interactive scrollable-column [`TimePicker`].
 pub struct TimePickerState {
     focus_handle: FocusHandle,
+    /// The popup's: it keeps Tab inside while focus is in the columns.
+    popup_focus: FocusHandle,
+    /// Move focus into the hours column on the next render (opened by
+    /// keyboard).
+    focus_columns: bool,
     value: TimeValue,
     use_12h: bool,
     show_seconds: bool,
@@ -649,6 +681,8 @@ impl TimePickerState {
     pub fn new(cx: &mut Context<Self>) -> Self {
         Self {
             focus_handle: cx.focus_handle(),
+            popup_focus: cx.focus_handle(),
+            focus_columns: false,
             value: TimeValue::new(9, 30, 0),
             use_12h: false,
             show_seconds: false,
@@ -751,8 +785,10 @@ impl TimePickerState {
         }
     }
 
-    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.disabled {
+    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // Only the trigger's own keys: the columns' (an Enter on an hour)
+        // bubble through here too.
+        if self.disabled || !self.focus_handle.is_focused(window) {
             return;
         }
         let mods = event.keystroke.modifiers;
@@ -768,6 +804,8 @@ impl TimePickerState {
             "tab" if self.open => self.close(cx),
             "enter" | "space" => {
                 self.open = !self.open;
+                // Opened from the keyboard: the columns take focus.
+                self.focus_columns = self.open;
                 cx.notify();
                 cx.stop_propagation();
             }
@@ -778,6 +816,39 @@ impl TimePickerState {
             _ => {}
         }
     }
+}
+
+impl TimePickerState {
+    /// Keys while focus is in the popup: Escape closes it and gives focus
+    /// back to the trigger. (Tab stays inside; Up and Down move along a
+    /// column, Enter or Space picks.)
+    fn on_popup_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if event.keystroke.key == "escape" && !event.keystroke.modifiers.modified() {
+            self.close(cx);
+            window.focus(&self.focus_handle, cx);
+            cx.stop_propagation();
+        }
+    }
+}
+
+/// A time column's keyboard state: a focus handle per value, and its
+/// scroll, so the focused value comes into view.
+fn time_column_focus(
+    id: (&'static str, crate::EntityId),
+    count: usize,
+    window: &mut Window,
+    cx: &mut App,
+) -> (Vec<FocusHandle>, crate::ScrollHandle) {
+    let handles = super::focus::choice_focus((id.0, id.1), count, window, cx);
+    let scroll = window
+        .use_keyed_state(
+            (crate::ElementId::from((id.0, id.1)), "scroll"),
+            cx,
+            |_, _| crate::ScrollHandle::new(),
+        )
+        .read(cx)
+        .clone();
+    (handles, scroll)
 }
 
 impl Render for TimePickerState {
@@ -794,6 +865,44 @@ impl Render for TimePickerState {
         let bounds_cell = self.trigger_bounds.clone();
         let bounds_for_out = self.trigger_bounds.clone();
         let captured_bounds = self.trigger_bounds.get();
+
+        // Each column is one tab stop, its value; Up and Down move along it.
+        let hour_count = if use_12h { 12 } else { 24 };
+        let (hour_keys, hour_scroll) =
+            time_column_focus(("tp-hours-focus", entity_id), hour_count, window, cx);
+        let (min_keys, min_scroll) = time_column_focus(
+            ("tp-mins-focus", entity_id),
+            (0usize..60).step_by(self.minute_step as usize).count(),
+            window,
+            cx,
+        );
+        let (sec_keys, sec_scroll) = time_column_focus(
+            ("tp-secs-focus", entity_id),
+            (0usize..60).step_by(self.second_step as usize).count(),
+            window,
+            cx,
+        );
+        let (ampm_keys, _) = time_column_focus(("tp-ampm-focus", entity_id), 2, window, cx);
+        let hour_index = if use_12h {
+            (match cur.hour % 12 {
+                0 => 12,
+                n => n,
+            }) as usize
+                - 1
+        } else {
+            cur.hour as usize
+        };
+        if std::mem::take(&mut self.focus_columns) && self.open {
+            let handle = hour_keys[hour_index.min(hour_count - 1)].clone();
+            window.defer(cx, move |window, cx| window.focus(&handle, cx));
+        }
+        let ring_for = |handle: &FocusHandle, window: &Window| {
+            super::focus::focus_visible_ring(handle, window, &theme)
+        };
+        let hour_rings: Vec<_> = hour_keys.iter().map(|h| ring_for(h, window)).collect();
+        let min_rings: Vec<_> = min_keys.iter().map(|h| ring_for(h, window)).collect();
+        let sec_rings: Vec<_> = sec_keys.iter().map(|h| ring_for(h, window)).collect();
+        let ampm_rings: Vec<_> = ampm_keys.iter().map(|h| ring_for(h, window)).collect();
 
         let popover = (self.open && !self.disabled).then(|| {
             let cur_h_display = if use_12h {
@@ -828,14 +937,18 @@ impl Render for TimePickerState {
                 .child(
                     div()
                         .id(("tp-hours", entity_id))
+                        .track_scroll(&hour_scroll)
+                        .on_key_down(super::focus::roving_keys(hour_keys.clone(), Some(hour_scroll.clone())))
                         .flex()
                         .flex_col()
                         .h(px(184.))
                         .overflow_y_scroll()
-                        .children(hour_range.map(|h| {
+                        .children(hour_range.enumerate().map(|(i, h)| {
                             let active = h == cur_h_display;
                             div()
                                 .id(("tp-h", h as usize))
+                                .track_focus(&super::focus::choice_item_handle(&hour_keys, i, Some(hour_index)))
+                                .when_some(hour_rings[i].clone(), |el, ring| el.shadow(ring))
                                 .flex()
                                 .items_center()
                                 .justify_center()
@@ -897,15 +1010,20 @@ impl Render for TimePickerState {
                 .child(
                     div()
                         .id(("tp-mins", entity_id))
+                        .track_scroll(&min_scroll)
+                        .on_key_down(super::focus::roving_keys(min_keys.clone(), Some(min_scroll.clone())))
                         .flex()
                         .flex_col()
                         .h(px(184.))
                         .overflow_y_scroll()
-                        .children((0usize..60).step_by(min_step).map(|m| {
+                        .children((0usize..60).step_by(min_step).enumerate().map(|(i, m)| {
                             let m_u8 = m as u8;
                             let active = m_u8 == cur.minute;
+                            let tab_item = (0usize..60).step_by(min_step).position(|v| v as u8 == cur.minute).or(Some(0));
                             div()
                                 .id(("tp-m", m))
+                                .track_focus(&super::focus::choice_item_handle(&min_keys, i, tab_item))
+                                .when_some(min_rings[i].clone(), |el, ring| el.shadow(ring))
                                 .flex()
                                 .items_center()
                                 .justify_center()
@@ -958,15 +1076,20 @@ impl Render for TimePickerState {
                     .child(
                         div()
                             .id(("tp-secs", entity_id))
+                            .track_scroll(&sec_scroll)
+                            .on_key_down(super::focus::roving_keys(sec_keys.clone(), Some(sec_scroll.clone())))
                             .flex()
                             .flex_col()
                             .h(px(184.))
                             .overflow_y_scroll()
-                            .children((0usize..60).step_by(sec_step).map(|s| {
+                            .children((0usize..60).step_by(sec_step).enumerate().map(|(i, s)| {
                                 let s_u8 = s as u8;
                                 let active = s_u8 == cur.second;
+                                let tab_item = (0usize..60).step_by(sec_step).position(|v| v as u8 == cur.second).or(Some(0));
                                 div()
                                     .id(("tp-s", s))
+                                    .track_focus(&super::focus::choice_item_handle(&sec_keys, i, tab_item))
+                                    .when_some(sec_rings[i].clone(), |el, ring| el.shadow(ring))
                                     .flex()
                                     .items_center()
                                     .justify_center()
@@ -1017,10 +1140,13 @@ impl Render for TimePickerState {
                     .border_l_1()
                     .border_color(theme.border)
                     .child(col_header(""))
-                    .children([(false, "AM"), (true, "PM")].into_iter().map(|(pm, lbl)| {
+                    .on_key_down(super::focus::roving_keys(ampm_keys.clone(), None))
+                    .children([(false, "AM"), (true, "PM")].into_iter().enumerate().map(|(i, (pm, lbl))| {
                         let active = is_pm == pm;
                         div()
                             .id(("tp-ap", usize::from(pm)))
+                            .track_focus(&super::focus::choice_item_handle(&ampm_keys, i, Some(usize::from(is_pm))))
+                            .when_some(ampm_rings[i].clone(), |el, ring| el.shadow(ring))
                             .flex()
                             .items_center()
                             .justify_center()
@@ -1080,7 +1206,9 @@ impl Render for TimePickerState {
                     }
                     this.close(cx);
                 }))
-                .on_key_down(cx.listener(Self::on_key_down))
+                .track_focus(&self.popup_focus)
+                .focus_trap()
+                .on_key_down(cx.listener(Self::on_popup_key_down))
                 .child(
                     div()
                         .flex()

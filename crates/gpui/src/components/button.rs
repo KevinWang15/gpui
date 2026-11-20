@@ -428,6 +428,7 @@ impl RenderOnce for ButtonGroup {
         let theme = cx.theme();
         let count = self.children.len();
         let mut el = div()
+            .arrow_navigation(crate::ArrowNavigation::Horizontal)
             .flex()
             .flex_row()
             .items_center()

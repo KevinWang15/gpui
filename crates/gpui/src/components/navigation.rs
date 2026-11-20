@@ -93,6 +93,7 @@ impl RenderOnce for Breadcrumb {
         let count = self.items.len();
         let mut root = div()
             .id(self.id.clone())
+            .arrow_navigation(crate::ArrowNavigation::Horizontal)
             .flex()
             .flex_row()
             .flex_wrap()
@@ -284,6 +285,7 @@ impl RenderOnce for Pagination {
 
         let mut root = div()
             .id(self.id.clone())
+            .arrow_navigation(crate::ArrowNavigation::Horizontal)
             .flex()
             .flex_row()
             .items_center()

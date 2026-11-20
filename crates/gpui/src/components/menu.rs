@@ -530,6 +530,7 @@ impl Render for MenuState {
                 );
                 let mut root = div()
                     .id(("vmenu-root", entity_id))
+                    .arrow_navigation(crate::ArrowNavigation::Vertical)
                     .track_focus(&self.focus_handle)
                     .on_key_down(cx.listener(Self::on_key_down))
                     .flex()

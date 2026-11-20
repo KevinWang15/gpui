@@ -612,6 +612,18 @@ impl DispatchTree {
         &mut self.nodes[active_node_id.0]
     }
 
+    /// Whether `node` is `ancestor` or inside it.
+    pub fn node_contains(&self, ancestor: DispatchNodeId, node: DispatchNodeId) -> bool {
+        let mut current = Some(node);
+        while let Some(id) = current {
+            if id == ancestor {
+                return true;
+            }
+            current = self.nodes.get(id.0).and_then(|n| n.parent);
+        }
+        false
+    }
+
     /// The innermost focus trap that `focused` is inside, itself included.
     pub fn focus_trap_around(&self, focused: FocusId) -> Option<FocusId> {
         let mut current = self.focusable_node_ids.get(&focused).copied();

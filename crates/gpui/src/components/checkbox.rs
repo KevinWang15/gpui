@@ -303,6 +303,7 @@ impl RenderOnce for CheckboxGroup {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
         let mut el = div()
+            .arrow_navigation(crate::ArrowNavigation::Both)
             .flex()
             .flex_col()
             .gap(px(8.))

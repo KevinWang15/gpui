@@ -526,7 +526,7 @@ impl ColorPickerState {
         }
     }
 
-    fn render_panel(&self, cx: &mut Context<Self>) -> crate::Stateful<crate::Div> {
+    fn render_panel(&self, window: &mut Window, cx: &mut Context<Self>) -> crate::Stateful<crate::Div> {
         let theme = cx.theme();
         let is_dark = theme.mode == ThemeMode::Dark;
         let current_rgba = self.rgba();
@@ -797,8 +797,27 @@ impl ColorPickerState {
         let a_pct = (current_rgba.a * 100.0).round() as u8;
 
         let current_hex = format_hex(self.color().into(), true);
+        // The presets are one tab stop (the current color's, else the
+        // first); the arrows move along them and Enter or Space picks one.
+        let preset_keys = super::focus::choice_focus(
+            ("cp-presets", cx.entity_id()),
+            self.presets.len(),
+            window,
+            cx,
+        );
+        let preset_tab = self
+            .presets
+            .iter()
+            .position(|p| format_hex((*p).into(), true) == current_hex)
+            .or(Some(0))
+            .filter(|_| !disabled);
+        let preset_rings: Vec<_> = preset_keys
+            .iter()
+            .map(|h| super::focus::focus_visible_ring(h, window, &theme))
+            .collect();
         let presets_row = (!self.presets.is_empty()).then(|| {
             div()
+                .on_key_down(super::focus::roving_keys(preset_keys.clone(), None))
                 .flex()
                 .flex_row()
                 .flex_wrap()
@@ -810,6 +829,8 @@ impl ColorPickerState {
                     let selected = format_hex(preset.into(), true) == current_hex;
                     div()
                         .id(("cp-preset", idx))
+                        .track_focus(&super::focus::choice_item_handle(&preset_keys, idx, preset_tab))
+                        .when_some(preset_rings[idx].clone(), |el, ring| el.shadow(ring))
                         .w(px(20.))
                         .h(px(20.))
                         .rounded(theme.radius_sm)
@@ -960,7 +981,7 @@ impl Render for ColorPickerState {
         }
 
         if self.inline {
-            let mut panel = self.render_panel(cx).when(!self.disabled, |el| {
+            let mut panel = self.render_panel(window, cx).when(!self.disabled, |el| {
                 el.track_focus(&self.focus_handle)
                     .on_key_down(cx.listener(Self::on_key_down))
             });
@@ -979,7 +1000,7 @@ impl Render for ColorPickerState {
 
         let popover = (self.open && !self.disabled).then(|| {
             let panel = self
-                .render_panel(cx)
+                .render_panel(window, cx)
                 .on_key_down(cx.listener(Self::on_key_down))
                 // A click on the popup's background keeps focus where it was.
                 .on_any_mouse_down(|_, window, _| window.prevent_default())
