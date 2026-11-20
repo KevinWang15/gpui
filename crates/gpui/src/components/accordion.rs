@@ -106,6 +106,7 @@ impl RenderOnce for Disclosure {
                 |icon, phase| icon.rotate(radians(phase.0 * std::f32::consts::PI)),
             );
 
+        let has_toggle = self.on_toggle.is_some();
         let header = div()
             .id((self.id.clone(), "trigger"))
             .flex()
@@ -154,6 +155,8 @@ impl RenderOnce for Disclosure {
                     ),
             )
             .child(chevron_el);
+        // The header is a tab stop; Enter and Space reach its `on_click`.
+        let header = super::focus::tab_stop_inset(header, has_toggle, &theme);
 
         let mut root = div()
             .id(self.id)

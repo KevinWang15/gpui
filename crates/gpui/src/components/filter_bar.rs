@@ -269,7 +269,7 @@ impl FilterBarState {
             facet_provider: Rc::new(facet_provider),
             cached_facets: RefCell::new(None),
             scroll_handle: UniformListScrollHandle::new(),
-            focus_handle: cx.focus_handle(),
+            focus_handle: cx.focus_handle().tab_stop(true),
         }
     }
 
@@ -694,8 +694,21 @@ impl FilterBarState {
         }
     }
 
+    /// How far the draft clause has got: field, operator, then value.
+    fn draft_step(&self) -> u8 {
+        match self.draft {
+            FilterDraft::Field => 0,
+            FilterDraft::Operator { .. } => 1,
+            FilterDraft::SingleValue { .. } | FilterDraft::MultiValue { .. } => 2,
+        }
+    }
+
     fn handle_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
+        if key == "tab" {
+            self.handle_tab(event, cx);
+            return;
+        }
         match key {
             "escape" => {
                 self.open = false;
@@ -734,32 +747,7 @@ impl FilterBarState {
                     }
                 }
             }
-            "enter" | "tab" => match &self.draft {
-                FilterDraft::Field => {
-                    let fields = self.matching_fields();
-                    if let Some(field) = fields.get(self.highlighted) {
-                        self.choose_field(field, cx);
-                    }
-                }
-                FilterDraft::Operator { field, .. } => {
-                    let ops = self.matching_operators(field.as_ref());
-                    if let Some(&op) = ops.get(self.highlighted) {
-                        self.choose_operator(op, cx);
-                    }
-                }
-                FilterDraft::SingleValue { field, .. } => {
-                    let facets = self.matching_facets(field.as_ref());
-                    if let Some(opt) = facets.get(self.highlighted) {
-                        self.commit_single_value(opt.value.clone(), cx);
-                    } else if !self.query.trim().is_empty() {
-                        let custom: SharedString = self.query.trim().to_string().into();
-                        self.commit_single_value(custom, cx);
-                    }
-                }
-                FilterDraft::MultiValue { .. } => {
-                    self.commit_multi_values(cx);
-                }
-            },
+            "enter" => self.commit_step(cx),
             _ => {
                 if !event.keystroke.modifiers.control
                     && !event.keystroke.modifiers.platform
@@ -772,6 +760,59 @@ impl FilterBarState {
                     cx.notify();
                 }
             }
+        }
+    }
+
+    /// Enter: completes the draft's current step (picks the highlighted
+    /// field, operator or value; commits a multi-value clause).
+    fn commit_step(&mut self, cx: &mut Context<Self>) {
+        match &self.draft {
+            FilterDraft::Field => {
+                let fields = self.matching_fields();
+                if let Some(field) = fields.get(self.highlighted) {
+                    self.choose_field(field, cx);
+                }
+            }
+            FilterDraft::Operator { field, .. } => {
+                let ops = self.matching_operators(field.as_ref());
+                if let Some(&op) = ops.get(self.highlighted) {
+                    self.choose_operator(op, cx);
+                }
+            }
+            FilterDraft::SingleValue { field, .. } => {
+                let facets = self.matching_facets(field.as_ref());
+                if let Some(opt) = facets.get(self.highlighted) {
+                    self.commit_single_value(opt.value.clone(), cx);
+                } else if !self.query.trim().is_empty() {
+                    let custom: SharedString = self.query.trim().to_string().into();
+                    self.commit_single_value(custom, cx);
+                }
+            }
+            FilterDraft::MultiValue { .. } => {
+                self.commit_multi_values(cx);
+            }
+        }
+    }
+
+    /// Tab completes the draft's current step as Enter does, and then moves
+    /// focus on, except when that step started the next one of a clause in
+    /// progress (field -> operator -> value): then focus stays so the user
+    /// can finish the clause, as Tab completion does in a shell. A Tab with
+    /// nothing typed and no draft just moves on, so tabbing through the bar
+    /// doesn't pick a field.
+    fn handle_tab(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        let mods = event.keystroke.modifiers;
+        let writing = self.draft_step() > 0 || !self.query.is_empty();
+        if mods.shift || !writing {
+            self.close_menu(cx);
+            return;
+        }
+        let before = self.draft_step();
+        self.commit_step(cx);
+        if self.draft_step() > before {
+            cx.stop_propagation();
+        } else {
+            self.close_menu(cx);
         }
     }
 }
@@ -1397,6 +1438,8 @@ impl FilterBar {
             .shadow_lg()
             .flex()
             .flex_col()
+            // A click on a suggestion keeps focus in the bar.
+            .on_mouse_down(crate::MouseButton::Left, |_, window, _| window.prevent_default())
             .on_mouse_down_out(move |_, _, cx| {
                 state_out.update(cx, |s, cx| s.close_menu(cx));
             })

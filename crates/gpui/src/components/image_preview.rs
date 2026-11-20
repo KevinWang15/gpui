@@ -314,9 +314,10 @@ impl Render for ImagePreviewState {
         } else {
             for (idx, item) in self.items.iter().enumerate() {
                 let content = render_media(&item.media, window, cx);
+                // Each thumbnail is a tab stop; Enter or Space opens it.
+                let thumb = div().id(("img-thumb", idx));
                 thumbs = thumbs.child(
-                    div()
-                        .id(("img-thumb", idx))
+                    super::focus::tab_stop(thumb, true, &theme)
                         .group("img-prev-card")
                         .relative()
                         .w(tw_w)
@@ -390,9 +391,9 @@ impl Render for ImagePreviewState {
             };
             let blur_r = self.backdrop_blur;
 
+            // The lightbox's buttons are tab stops, so Tab cycles them.
             let toolbar_btn = |id: &'static str, icon: LucideIcon, disabled: bool| {
-                div()
-                    .id((id, entity_id))
+                super::focus::tab_stop(div().id((id, entity_id)), !disabled, &theme)
                     .flex()
                     .items_center()
                     .justify_center()
@@ -414,6 +415,8 @@ impl Render for ImagePreviewState {
                 div()
                     .id(("img-lightbox-backdrop", entity_id))
                     .track_focus(&self.focus_handle)
+                    // Modal: Tab stays inside.
+                    .focus_trap()
                     .on_key_down(cx.listener(Self::on_key_down))
                     .w(vp.width)
                     .h(vp.height)

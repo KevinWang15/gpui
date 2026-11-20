@@ -248,6 +248,8 @@ impl RenderOnce for Drawer {
         let mut panel = div()
             .id((self.id.clone(), "drawer-panel"))
             .track_focus(&focus_handle)
+            // Modal: Tab stays inside (`focus` module docs).
+            .focus_trap()
             .occlude()
             .flex()
             .flex_col()

@@ -165,7 +165,7 @@ impl FileDropzoneState {
     /// Creates a new [`FileDropzoneState`] accepting multiple files.
     pub fn new(cx: &mut Context<Self>) -> Self {
         Self {
-            focus_handle: cx.focus_handle(),
+            focus_handle: cx.focus_handle().tab_stop(true),
             files: Vec::new(),
             next_id: 1,
             accept_extensions: Vec::new(),
@@ -459,6 +459,7 @@ impl Render for FileDropzoneState {
         let drag_bg = theme.primary_soft.opacity(0.65);
         let entity_id = cx.entity_id();
         let is_focused = self.focus_handle.is_focused(window);
+        let is_focus_visible = self.focus_handle.is_focus_visible(window);
         let disabled = self.disabled;
 
         let zone = div()
@@ -483,7 +484,8 @@ impl Render for FileDropzoneState {
             } else {
                 theme.input_border
             })
-            .when(is_focused && !disabled, |el| {
+            // Ring for keyboard focus only (`focus` module docs).
+            .when(is_focus_visible && !disabled, |el| {
                 el.shadow(focus_ring_shadow(&theme))
             })
             .bg(theme.surface_muted.opacity(0.35))
@@ -624,8 +626,11 @@ impl Render for FileDropzoneState {
                                     .gap(px(6.))
                                     .child(status_badge)
                                     .child(
-                                        div()
-                                            .id(("dz-rm", id))
+                                        super::focus::tab_stop(
+                                            div().id(("dz-rm", id)),
+                                            !disabled,
+                                            &theme,
+                                        )
                                             .flex()
                                             .items_center()
                                             .justify_center()

@@ -5,9 +5,10 @@ use std::rc::Rc;
 use smallvec::SmallVec;
 
 use crate::{
-    Anchor, Animation, AnimationExt, AnyElement, App, ClickEvent, ElementId, FontWeight,
-    IntoElement, ParentElement, Pixels, RenderOnce, SharedString, StyleRefinement, Styled, Window,
-    anchored, deferred, div, ease_out_quint, point, prelude::*, px,
+    Anchor, Animation, AnimationExt, AnyElement, App, ClickEvent, ElementId, FocusHandle,
+    FontWeight, IntoElement, KeyDownEvent, ParentElement, Pixels, RenderOnce, SharedString,
+    StyleRefinement, Styled, Window, anchored, deferred, div, ease_out_quint, point, prelude::*,
+    px,
 };
 use crate::icons::{Icon, IconSize, LucideIcon};
 
@@ -384,9 +385,11 @@ pub(crate) fn render_menu_entries(
                 };
                 let on_close = on_close.clone();
 
+                // Items are tab stops so the arrow keys (`menu_arrow_key`) can
+                // move focus through them; Enter or Space picks one.
+                let item = div().id(("item", index));
                 menu_list = menu_list.child(
-                    div()
-                        .id(("item", index))
+                    super::focus::tab_stop(item, !disabled, theme)
                         .flex()
                         .flex_row()
                         .items_center()
@@ -453,16 +456,101 @@ pub(crate) fn render_menu_entries(
     menu_list
 }
 
+/// Up and Down move focus through an open menu's items. The menu is a focus
+/// trap, so they wrap around. Returns whether `ev` was one of them.
+pub(crate) fn menu_arrow_key(ev: &KeyDownEvent, window: &mut Window, cx: &mut App) -> bool {
+    if ev.keystroke.modifiers.modified() {
+        return false;
+    }
+    match ev.keystroke.key.as_str() {
+        "down" => window.focus_next(cx),
+        "up" => window.focus_prev(cx),
+        _ => return false,
+    }
+    cx.stop_propagation();
+    true
+}
+
+/// An open [`DropdownMenu`]'s focus: it takes focus when it opens (so the
+/// arrow keys reach its items) and gives it back to `previous`, normally the
+/// trigger, when it closes.
+struct DropdownFocusState {
+    handle: FocusHandle,
+    was_open: bool,
+    previous: Option<FocusHandle>,
+}
+
 impl RenderOnce for DropdownMenu {
-    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
+        let state = window.use_keyed_state((self.id.clone(), "dropdown-focus"), cx, |_, cx| {
+            DropdownFocusState {
+                handle: cx.focus_handle(),
+                was_open: false,
+                previous: None,
+            }
+        });
+        let (handle, was_open) = {
+            let s = state.read(cx);
+            (s.handle.clone(), s.was_open)
+        };
+        if self.open && !was_open {
+            let previous = window.focused(cx);
+            state.update(cx, |s, _| {
+                s.was_open = true;
+                s.previous = previous;
+            });
+            let handle = handle.clone();
+            window.defer(cx, move |window, cx| window.focus(&handle, cx));
+        } else if !self.open && was_open {
+            let previous = state.update(cx, |s, _| {
+                s.was_open = false;
+                s.previous.take()
+            });
+            let handle = handle.clone();
+            window.defer(cx, move |window, cx| {
+                let focus_inside = handle.contains_focused(window, cx);
+                if let Some(previous) = previous
+                    && (focus_inside || window.focused(cx).is_none())
+                {
+                    window.focus(&previous, cx);
+                }
+            });
+        }
+
+        let on_close_key = self.on_close.clone();
         let menu_list = render_menu_entries(
             self.id.clone(),
             self.entries,
             self.min_width,
             self.on_close.clone(),
             &theme,
-        );
+        )
+        .track_focus(&handle)
+        .focus_trap()
+        .on_key_down(move |ev: &KeyDownEvent, window, cx| {
+            if menu_arrow_key(ev, window, cx) {
+                return;
+            }
+            let key = ev.keystroke.key.as_str();
+            if key != "escape" && key != "tab" {
+                return;
+            }
+            if let Some(close) = &on_close_key {
+                close(&(), window, cx);
+            }
+            if key == "escape" {
+                // Focus goes back to the trigger once the menu has closed.
+                cx.stop_propagation();
+            } else {
+                // As a browser's menu button: Tab closes the menu and moves
+                // on from the trigger.
+                let previous = state.update(cx, |s, _| s.previous.clone());
+                if let Some(previous) = previous {
+                    window.focus(&previous, cx);
+                }
+            }
+        });
 
         let mut pop = Popover::new(self.id, self.open).p(px(4.));
         if let Some(trigger) = self.trigger {

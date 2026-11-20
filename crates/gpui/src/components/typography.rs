@@ -17,7 +17,7 @@ use super::button::{ButtonVariant, button};
 use super::input::{Input, InputEvent, InputState};
 use super::interactive::copy_button;
 use super::palette;
-use super::theme::{ActiveTheme, ComponentSize, ThemeMode, focus_ring_shadow, tabular_numerals};
+use super::theme::{ActiveTheme, ComponentSize, ThemeMode, tabular_numerals};
 
 // ============================================================================
 // Heading
@@ -440,7 +440,7 @@ impl Render for EditableTextState {
         let theme = cx.theme();
         let hover_bg = theme.surface_hover;
         let entity_id = cx.entity_id();
-        let focused = self.focus_handle.is_focused(window);
+        let ring = super::focus::focus_visible_ring(&self.focus_handle, window, &theme);
 
         let mut root = if self.editing {
             div()
@@ -492,22 +492,16 @@ impl Render for EditableTextState {
                 .id(("editable-text-display", entity_id))
                 .when(!self.disabled, |el| {
                     el.track_focus(&self.focus_handle)
+                        .tab_stop(true)
                         .cursor_pointer()
                         .hover(move |s| s.bg(hover_bg))
-                        .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
-                            if matches!(ev.keystroke.key.as_str(), "enter" | "space") {
-                                this.start_editing(window, cx);
-                                cx.stop_propagation();
-                            }
-                        }))
+                        // Enter and Space come here too, as a keyboard click.
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.start_editing(window, cx);
                         }))
                 })
                 .when(self.disabled, |el| el.opacity(0.55).cursor_not_allowed())
-                .when(focused && !self.disabled, |el| {
-                    el.shadow(focus_ring_shadow(&theme))
-                })
+                .when(!self.disabled, |el| el.when_some(ring, |el, ring| el.shadow(ring)))
                 .flex()
                 .flex_row()
                 .items_center()
@@ -670,8 +664,7 @@ impl RenderOnce for TruncatedText {
             .child(div().w_full().child(display))
             .when(needs_trunc, |el| {
                 el.child(
-                    div()
-                        .id((self.id, "trunc-toggle"))
+                    super::focus::tab_stop(div().id((self.id, "trunc-toggle")), true, &theme)
                         .self_start()
                         .text_size(px(12.5))
                         .font_weight(FontWeight::MEDIUM)

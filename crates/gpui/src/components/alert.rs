@@ -208,9 +208,9 @@ impl RenderOnce for Alert {
             );
 
         if let (Some(dismiss_id), Some(on_dismiss)) = (self.dismiss_id, self.on_dismiss) {
+            let dismiss = div().id(dismiss_id);
             root = root.child(
-                div()
-                    .id(dismiss_id)
+                super::focus::tab_stop(dismiss, true, &theme)
                     .flex()
                     .items_center()
                     .justify_center()

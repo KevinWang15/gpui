@@ -318,7 +318,8 @@ impl RenderOnce for SplitPane {
             )
         };
         handle_size_cell.set(self.handle_size.0);
-        let focused = !disabled && focus_handle.is_focused(window);
+        // A click focuses the divider too; the accent shows keyboard focus only.
+        let focused = !disabled && focus_handle.is_focus_visible(window);
         let is_horizontal = direction == SplitDirection::Horizontal;
 
         let state_down = self.state.clone();
@@ -372,7 +373,7 @@ impl RenderOnce for SplitPane {
 
         let handle = div()
             .id((self.id.clone(), "split-handle"))
-            .when(!disabled, |el| el.track_focus(&focus_handle))
+            .when(!disabled, |el| el.track_focus(&focus_handle).tab_stop(true))
             .relative()
             .flex()
             .flex_shrink_0()

@@ -4,7 +4,8 @@
 
 use crate::{
     Context, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, Keystroke, Modifiers,
-    MouseButton, ParentElement, Render, Styled, TestAppContext, VisualTestContext, Window,
+    MouseButton, ParentElement, Render, StatefulInteractiveElement, Styled, TestAppContext,
+    VisualTestContext, Window,
     deferred, div, point, px,
 };
 
@@ -124,7 +125,6 @@ fn press(cx: &mut VisualTestContext, x: f32, y: f32) {
 }
 
 const A: usize = 0;
-const B: usize = 1;
 const C: usize = 2;
 const D: usize = 4;
 const E: usize = 5;
@@ -191,4 +191,67 @@ fn pressing_inside_a_focusable_container_focuses_it(cx: &mut TestAppContext) {
     // is no gap, so press a row, then check the row (the nearest) took it.
     press(cx, 10., 90.);
     assert_eq!(focused(cx, &h), Some(E));
+}
+
+/// A focused button inside a parent that takes Enter: `parent_takes_enter`
+/// decides whether the parent stops Enter's key down.
+struct EnterPage {
+    button: FocusHandle,
+    parent_takes_enter: bool,
+    clicks: std::rc::Rc<std::cell::Cell<u32>>,
+}
+
+impl Render for EnterPage {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let takes = self.parent_takes_enter;
+        let clicks = self.clicks.clone();
+        div()
+            .on_key_down(move |event, _, cx| {
+                if takes && event.keystroke.key == "enter" {
+                    cx.stop_propagation();
+                }
+            })
+            .child(
+                div()
+                    .id("button")
+                    .track_focus(&self.button)
+                    .w(px(50.))
+                    .h(px(20.))
+                    .on_click(move |_, _, _| clicks.set(clicks.get() + 1)),
+            )
+    }
+}
+
+fn press_enter(cx: &mut TestAppContext, parent_takes_enter: bool) -> u32 {
+    let clicks = std::rc::Rc::new(std::cell::Cell::new(0));
+    let c = clicks.clone();
+    let (view, cx) = cx.add_window_view(move |_, cx| EnterPage {
+        button: cx.focus_handle(),
+        parent_takes_enter,
+        clicks: c,
+    });
+    cx.update(|window, cx| {
+        let handle = view.read(cx).button.clone();
+        window.focus(&handle, cx);
+    });
+    cx.run_until_parked();
+    let keystroke = Keystroke::parse("enter").unwrap();
+    cx.simulate_event(KeyDownEvent {
+        keystroke: keystroke.clone(),
+        is_held: false,
+        prefer_character_input: false,
+    });
+    cx.simulate_event(crate::KeyUpEvent { keystroke });
+    cx.run_until_parked();
+    clicks.get()
+}
+
+#[crate::test]
+fn enter_clicks_the_focused_element_unless_something_took_it(cx: &mut TestAppContext) {
+    assert_eq!(press_enter(cx, false), 1);
+}
+
+#[crate::test]
+fn an_enter_a_parent_took_doesnt_click(cx: &mut TestAppContext) {
+    assert_eq!(press_enter(cx, true), 0);
 }

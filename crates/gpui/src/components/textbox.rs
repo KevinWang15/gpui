@@ -1307,7 +1307,8 @@ impl Render for TextBoxState {
                     .py(px(8.))
                     .overflow_hidden()
                     .key_context("GpuiTextBox")
-                    .track_focus(&self.focus_handle)
+                    // One tab stop, unless disabled.
+                    .track_focus(&self.focus_handle.clone().tab_stop(!self.disabled))
                     .text_size(px(14.))
                     .line_height(px(20.))
                     .text_color(text_color)

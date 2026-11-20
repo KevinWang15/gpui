@@ -8,7 +8,7 @@ use smallvec::SmallVec;
 
 use crate::{
     AnimationExt, AnyElement, App, BorderStyle, Bounds, ClickEvent, Corners, Edges, ElementId,
-    FontWeight, Hsla, Interpolate, IntoElement, KeyDownEvent, ParentElement, Point,
+    FontWeight, Hsla, Interpolate, IntoElement, ParentElement, Point,
     QuadAnimationCurve, QuadAnimationMode, RenderOnce, SharedString, Size, SpringAnimation,
     StyleRefinement, Styled, Window, canvas, div, prelude::*, px, quad, transparent_black,
 };
@@ -161,6 +161,17 @@ impl RenderOnce for Toggle {
         let travel_end = track_w - thumb_size - pad;
         let checked = self.checked;
         let with_icons = self.with_icons;
+        // The row is the tab stop, but the ring goes on the track, as a
+        // browser draws it; so the row tracks a handle the track can ask about.
+        let focus = (!self.disabled).then(|| {
+            window
+                .use_keyed_state((self.id.clone(), "focus"), cx, |_, cx| cx.focus_handle())
+                .read(cx)
+                .clone()
+        });
+        let ring = focus
+            .as_ref()
+            .and_then(|handle| super::focus::focus_visible_ring(handle, window, &theme));
 
         let track = if !with_icons {
             // Zero-relayout GPU scene-animated track color + sliding thumb.
@@ -213,6 +224,9 @@ impl RenderOnce for Toggle {
                 .flex_shrink_0()
                 .w(track_w)
                 .h(track_h)
+                // The canvas paints the pill; the rounding shapes the ring.
+                .rounded_full()
+                .when_some(ring, |el, ring| el.shadow(ring))
                 .child(
                     canvas(
                         |_, _, _| {},
@@ -316,6 +330,7 @@ impl RenderOnce for Toggle {
                 .w(track_w)
                 .h(track_h)
                 .rounded_full()
+                .when_some(ring, |el, ring| el.shadow(ring))
                 .child(thumb)
                 .with_spring(
                     track_id,
@@ -358,6 +373,7 @@ impl RenderOnce for Toggle {
         let on_change = self.on_change;
         let mut root = div()
             .id(self.id)
+            .when_some(focus, |el, handle| el.track_focus(&handle).tab_stop(true))
             .flex()
             .flex_row()
             .items_center()
@@ -381,17 +397,10 @@ impl RenderOnce for Toggle {
         if !self.disabled
             && let Some(handler) = on_change
         {
-            let handler = std::rc::Rc::new(handler);
-            let click_handler = handler.clone();
-            root = root
-                .on_click(move |_: &ClickEvent, window, cx| {
-                    click_handler(&next_checked, window, cx);
-                })
-                .on_key_down(move |event: &KeyDownEvent, window, cx| {
-                    if event.keystroke.key == "space" || event.keystroke.key == "enter" {
-                        handler(&next_checked, window, cx);
-                    }
-                });
+            // Enter and Space come here too, as a keyboard click.
+            root = root.on_click(move |_: &ClickEvent, window, cx| {
+                handler(&next_checked, window, cx);
+            });
         }
 
         crate::Refineable::refine(root.style(), &self.style);
@@ -478,7 +487,7 @@ impl RenderOnce for ToggleButton {
         };
         let fg = self.style.text.color.unwrap_or(default_fg);
 
-        let mut el = div()
+        let el = div()
             .id(self.id)
             .flex()
             .flex_row()
@@ -505,7 +514,8 @@ impl RenderOnce for ToggleButton {
             .when_some(self.icon, |el, icon| {
                 el.child(Icon::new(icon).size(self.size.icon_size()).color(fg))
             })
-            .when_some(self.label, |el, label| el.child(label))
+            .when_some(self.label, |el, label| el.child(label));
+        let mut el = super::focus::tab_stop(el, !self.disabled, &theme)
             .when(!self.disabled, |el| {
                 el.when_some(self.on_toggle, |el, handler| {
                     el.on_click(move |_, window, cx| handler(&next, window, cx))

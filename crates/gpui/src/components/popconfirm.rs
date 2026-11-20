@@ -195,6 +195,7 @@ impl RenderOnce for Popconfirm {
         let captured_bounds = bounds_cell.get();
 
         let st_toggle = state.clone();
+        let st_key_open = state.clone();
         let st_cancel = state.clone();
         let st_confirm = state.clone();
         let st_outside = state.clone();
@@ -214,6 +215,8 @@ impl RenderOnce for Popconfirm {
             let mut card = div()
                 .id((self.id.clone(), "popconfirm-card"))
                 .track_focus(&focus_handle)
+                // Modal while open: Tab cycles its buttons.
+                .focus_trap()
                 .flex()
                 .flex_col()
                 .gap(px(12.))
@@ -236,20 +239,25 @@ impl RenderOnce for Popconfirm {
                     }
                     st_outside.update(cx, |s, cx| s.close(window, cx));
                 })
-                .on_key_down(move |ev: &KeyDownEvent, window, cx| {
-                    if ev.keystroke.key == "escape" {
-                        st_escape.update(cx, |s, cx| s.close(window, cx));
-                        cx.stop_propagation();
-                    } else if ev.keystroke.key == "enter"
-                        && !ev.keystroke.modifiers.control
-                        && !ev.keystroke.modifiers.platform
-                        && !ev.keystroke.modifiers.alt
-                    {
-                        st_escape.update(cx, |s, cx| s.close(window, cx));
-                        if let Some(ref cb) = on_confirm_key {
-                            cb(&ClickEvent::default(), window, cx);
+                .on_key_down({
+                    let focus_handle = focus_handle.clone();
+                    move |ev: &KeyDownEvent, window, cx| {
+                        if ev.keystroke.key == "escape" {
+                            st_escape.update(cx, |s, cx| s.close(window, cx));
+                            cx.stop_propagation();
+                        } else if ev.keystroke.key == "enter"
+                            // On a focused button, Enter presses that button.
+                            && focus_handle.is_focused(window)
+                            && !ev.keystroke.modifiers.control
+                            && !ev.keystroke.modifiers.platform
+                            && !ev.keystroke.modifiers.alt
+                        {
+                            st_escape.update(cx, |s, cx| s.close(window, cx));
+                            if let Some(ref cb) = on_confirm_key {
+                                cb(&ClickEvent::default(), window, cx);
+                            }
+                            cx.stop_propagation();
                         }
-                        cx.stop_propagation();
                     }
                 })
                 .child(
@@ -373,7 +381,26 @@ impl RenderOnce for Popconfirm {
                     .id((self.id, "pc-trigger"))
                     .relative()
                     .when(!self.disabled, |el| {
-                        el.cursor_pointer().on_click(move |_, window, cx| {
+                        el.cursor_pointer()
+                            // Enter or Space on a focused trigger (a button,
+                            // say) opens it, as a click does.
+                            .on_key_down(move |ev: &KeyDownEvent, window, cx| {
+                                let key = ev.keystroke.key.as_str();
+                                if (key == "enter" || key == "space")
+                                    && !ev.keystroke.modifiers.modified()
+                                {
+                                    st_key_open.update(cx, |s, cx| {
+                                        if !s.open {
+                                            s.previous_focus = window.focused(cx);
+                                            s.open = true;
+                                            window.focus(&s.focus_handle, cx);
+                                            cx.notify();
+                                        }
+                                    });
+                                    cx.stop_propagation();
+                                }
+                            })
+                            .on_click(move |_, window, cx| {
                             st_toggle.update(cx, |s, cx| {
                                 if s.open {
                                     s.close(window, cx);

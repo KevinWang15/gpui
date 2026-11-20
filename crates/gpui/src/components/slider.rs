@@ -128,7 +128,7 @@ impl SliderState {
     /// Creates a new slider defaulting to `0.0..=100.0` with step `1.0`.
     pub fn new(cx: &mut Context<Self>) -> Self {
         Self {
-            focus_handle: cx.focus_handle(),
+            focus_handle: cx.focus_handle().tab_stop(true),
             value: 50.0,
             min: 0.0,
             max: 100.0,
@@ -300,7 +300,8 @@ impl SliderState {
 impl Render for SliderState {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let focused = self.focus_handle.is_focused(window);
+        // Ring for keyboard focus only (`focus` module docs).
+        let focused = self.focus_handle.is_focus_visible(window);
         let pct = self.fraction();
         let bounds_cell = self.track_bounds.clone();
         let dragging = self.dragging;
@@ -541,7 +542,11 @@ enum ActiveThumb {
 
 /// Entity state backing a dual-thumb [`RangeSlider`].
 pub struct RangeSliderState {
+    /// The start thumb's handle (tracked on the track).
     focus_handle: FocusHandle,
+    /// The end thumb's handle: each thumb is a tab stop, as in a browser, so
+    /// Tab goes start -> end -> out and Shift+Tab comes back in on the end.
+    end_focus_handle: FocusHandle,
     start: f32,
     end: f32,
     min: f32,
@@ -569,7 +574,8 @@ impl RangeSliderState {
     /// Creates a dual-thumb range slider defaulting to `20..=80` within `0..=100`.
     pub fn new(cx: &mut Context<Self>) -> Self {
         Self {
-            focus_handle: cx.focus_handle(),
+            focus_handle: cx.focus_handle().tab_stop(true),
+            end_focus_handle: cx.focus_handle().tab_stop(true),
             start: 20.0,
             end: 80.0,
             min: 0.0,
@@ -713,15 +719,26 @@ impl RangeSliderState {
         if self.disabled {
             return;
         }
-        window.focus(&self.focus_handle, cx);
         let Some(target) = self.value_at_x(event.position.x) else {
+            window.focus(&self.focus_handle, cx);
             return;
         };
         let thumb = self.pick_thumb_for_target(target);
+        // Focus follows the thumb the press moves; the default would focus
+        // the track's (start) handle.
+        window.focus(&self.thumb_handle(thumb).clone(), cx);
+        window.prevent_default();
         self.active_thumb = thumb;
         self.dragging = Some(thumb);
         self.apply_thumb_value(thumb, target, cx);
         cx.notify();
+    }
+
+    fn thumb_handle(&self, thumb: ActiveThumb) -> &FocusHandle {
+        match thumb {
+            ActiveThumb::Start => &self.focus_handle,
+            ActiveThumb::End => &self.end_focus_handle,
+        }
     }
 
     fn apply_thumb_value(&mut self, thumb: ActiveThumb, raw: f32, cx: &mut Context<Self>) {
@@ -738,7 +755,7 @@ impl RangeSliderState {
         }
     }
 
-    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if self.disabled {
             return;
         }
@@ -746,20 +763,15 @@ impl RangeSliderState {
         if mods.control || mods.platform || mods.alt {
             return;
         }
+        // The keys move the focused thumb. Tab isn't handled here: the
+        // thumbs are two tab stops, so Tab moves between them and out.
+        self.active_thumb = if self.end_focus_handle.is_focused(window) {
+            ActiveThumb::End
+        } else {
+            ActiveThumb::Start
+        };
         let mult = if mods.shift { 10.0 } else { 1.0 };
         match event.keystroke.key.as_str() {
-            // Avoid WCAG 2.1.2 keyboard trap: only consume Tab between Start->End and Shift+Tab between End->Start.
-            "tab" => {
-                if !mods.shift && self.active_thumb == ActiveThumb::Start {
-                    self.active_thumb = ActiveThumb::End;
-                    cx.notify();
-                    cx.stop_propagation();
-                } else if mods.shift && self.active_thumb == ActiveThumb::End {
-                    self.active_thumb = ActiveThumb::Start;
-                    cx.notify();
-                    cx.stop_propagation();
-                }
-            }
             "left" | "down" => {
                 let cur = if self.active_thumb == ActiveThumb::Start {
                     self.start
@@ -820,7 +832,15 @@ impl RangeSliderState {
 impl Render for RangeSliderState {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let focused = self.focus_handle.is_focused(window);
+        if self.end_focus_handle.is_focused(window) {
+            self.active_thumb = ActiveThumb::End;
+        } else if self.focus_handle.is_focused(window) {
+            self.active_thumb = ActiveThumb::Start;
+        }
+        // Ring for keyboard focus only (`focus` module docs).
+        let focused = self.focus_handle.is_focus_visible(window)
+            || self.end_focus_handle.is_focus_visible(window);
+        let end_focus = (!self.disabled).then(|| self.end_focus_handle.clone());
         let start_pct = safe_fraction(self.start, self.min, self.max);
         let end_pct = safe_fraction(self.end, self.min, self.max).max(start_pct);
         let bounds_cell = self.track_bounds.clone();
@@ -837,8 +857,9 @@ impl Render for RangeSliderState {
             )
         });
 
-        let make_thumb = |pct: f32, is_active: bool| {
+        let make_thumb = |pct: f32, is_active: bool, focus: Option<&FocusHandle>| {
             div()
+                .when_some(focus, |el, focus| el.track_focus(focus))
                 .absolute()
                 .left(relative(pct))
                 .ml(px(-9.))
@@ -857,9 +878,15 @@ impl Render for RangeSliderState {
 
         // Render active thumb second so it always paints on top when start == end.
         let (first_thumb, second_thumb) = if self.active_thumb == ActiveThumb::Start {
-            (make_thumb(end_pct, false), make_thumb(start_pct, true))
+            (
+                make_thumb(end_pct, false, end_focus.as_ref()),
+                make_thumb(start_pct, true, None),
+            )
         } else {
-            (make_thumb(start_pct, false), make_thumb(end_pct, true))
+            (
+                make_thumb(start_pct, false, None),
+                make_thumb(end_pct, true, end_focus.as_ref()),
+            )
         };
 
         let mut root = div()
@@ -1004,8 +1031,8 @@ impl Render for RangeSliderState {
                                     el.cursor_pointer()
                                         .hover(|s| s.text_color(theme.foreground))
                                         .on_click(cx.listener(move |this, _, window, cx| {
-                                            window.focus(&this.focus_handle, cx);
                                             let thumb = this.pick_thumb_for_target(target_val);
+                                            window.focus(&this.thumb_handle(thumb).clone(), cx);
                                             this.active_thumb = thumb;
                                             this.apply_thumb_value(thumb, target_val, cx);
                                         }))

@@ -412,8 +412,11 @@ impl TransferState {
                             let disabled = col_disabled || item.disabled;
                             let ent = entity.clone();
 
-                            div()
-                                .id((ElementId::from(prefix), key.clone()))
+                            let row = div()
+                                .id((ElementId::from(prefix), key.clone()));
+                            // Each row is a checkbox, so a tab stop; Enter or
+                            // Space toggles it.
+                            super::focus::tab_stop(row, !disabled, &theme)
                                 .flex()
                                 .flex_row()
                                 .items_center()
@@ -537,7 +540,9 @@ impl TransferState {
                             .items_center()
                             .gap(px(8.))
                             .when(can_select_all, |el| {
-                                el.cursor_pointer().on_click(cx.listener(move |this, _, _, cx| {
+                                super::focus::tab_stop(el, true, &theme)
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
                                     this.toggle_all_visible(is_right, cx);
                                 }))
                             })
@@ -980,7 +985,11 @@ impl Render for TagInputState {
 
         let mut root = div()
             .id(("tag-input-shell", entity_id))
-            .when(!disabled, |el| el.track_focus(&self.focus_handle))
+            // The text field is the one tab stop; at the cap it's gone, so the
+            // shell takes its place (Backspace there removes the last tag).
+            .when(!disabled, |el| {
+                el.track_focus(&self.focus_handle.clone().tab_stop(at_cap))
+            })
             .flex()
             .flex_row()
             .flex_wrap()

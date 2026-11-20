@@ -14,7 +14,7 @@ use crate::{
 };
 
 use super::palette;
-use super::theme::{ANIM_NORMAL, ActiveTheme, focus_ring_shadow};
+use super::theme::{ANIM_NORMAL, ActiveTheme};
 
 const MIN_AUTOPLAY_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -48,7 +48,8 @@ impl CarouselState {
     /// Creates a new [`CarouselState`] for `slide_count` slides starting at slide `0`.
     pub fn new(slide_count: usize, cx: &mut Context<Self>) -> Self {
         Self {
-            focus_handle: cx.focus_handle(),
+            // A tab stop: the arrow keys change slides once it has focus.
+            focus_handle: cx.focus_handle().tab_stop(true),
             active_index: 0,
             slide_count,
             looping: true,
@@ -272,7 +273,9 @@ impl RenderOnce for Carousel {
                 st.focus_handle.clone(),
             )
         };
-        let focused = focus_handle.is_focused(window);
+        // Clicking the arrows or dots focuses the carousel too; the ring is for
+        // keyboard focus only.
+        let ring = super::focus::focus_visible_ring(&focus_handle, window, &theme);
         let can_prev = slide_count > 1 && (looping || active_idx > 0);
         let can_next = slide_count > 1 && (looping || active_idx + 1 < slide_count);
 
@@ -301,7 +304,6 @@ impl RenderOnce for Carousel {
         let mut root = div()
             .id(self.id)
             .track_focus(&focus_handle)
-            .tab_stop(true)
             .on_hover(move |is_hovered, _, cx| {
                 state_hover.update(cx, |s, _| {
                     s.hovered = *is_hovered;
@@ -341,8 +343,8 @@ impl RenderOnce for Carousel {
             .min_h(px(180.))
             .rounded(theme.radius_xl)
             .border_1()
-            .border_color(if focused { theme.ring } else { theme.border })
-            .when(focused, |el| el.shadow(focus_ring_shadow(&theme)))
+            .border_color(if ring.is_some() { theme.ring } else { theme.border })
+            .when_some(ring, |el, ring| el.shadow(ring))
             .bg(theme.surface)
             .overflow_hidden()
             .child(animated_slide)

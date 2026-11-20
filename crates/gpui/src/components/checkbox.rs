@@ -120,8 +120,19 @@ impl Styled for Checkbox {
 }
 
 impl RenderOnce for Checkbox {
-    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
+        // The row is the tab stop, but the ring goes on the box, as a
+        // browser draws it; so the row tracks a handle the box can ask about.
+        let focus = (!self.disabled).then(|| {
+            window
+                .use_keyed_state((self.id.clone(), "focus"), cx, |_, cx| cx.focus_handle())
+                .read(cx)
+                .clone()
+        });
+        let ring = focus
+            .as_ref()
+            .and_then(|handle| super::focus::focus_visible_ring(handle, window, &theme));
         let active = !matches!(self.state, CheckState::Unchecked);
         let off_bg = if self.disabled {
             theme.disabled_bg
@@ -159,6 +170,7 @@ impl RenderOnce for Checkbox {
             .rounded(theme.radius_sm)
             .border_1()
             .when(!active && !self.disabled, |el| el.shadow_2xs())
+            .when_some(ring, |el, ring| el.shadow(ring))
             .when_some(icon_opt, |el, icon| {
                 el.child(
                     div()
@@ -195,6 +207,7 @@ impl RenderOnce for Checkbox {
 
         let mut root = div()
             .id(self.id)
+            .when_some(focus, |el, handle| el.track_focus(&handle).tab_stop(true))
             .flex()
             .flex_row()
             .items_start()

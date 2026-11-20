@@ -208,8 +208,7 @@ impl RenderOnce for Toast {
             )
             .when_some(self.on_dismiss, |el, handler| {
                 el.child(
-                    div()
-                        .id((self.id, "close"))
+                    super::focus::tab_stop(div().id((self.id, "close")), true, &theme)
                         .flex()
                         .items_center()
                         .justify_center()
@@ -649,8 +648,7 @@ impl Render for ToastWindowView {
                     }),
             )
             .child(
-                div()
-                    .id("native-toast-close")
+                super::focus::tab_stop(div().id("native-toast-close"), true, &theme)
                     .flex()
                     .items_center()
                     .justify_center()

@@ -238,6 +238,8 @@ impl DatePickerState {
                 self.close(cx);
                 cx.stop_propagation();
             }
+            // As a browser's select: Tab closes the popup and still moves on.
+            "tab" if self.open => self.close(cx),
             "enter" | "space" => {
                 self.open = !self.open;
                 cx.notify();
@@ -261,6 +263,7 @@ impl Render for DatePickerState {
         let entity_weak_sel = cx.entity().downgrade();
         let entity_weak_mon = cx.entity().downgrade();
         let is_focused = self.focus_handle.is_focused(window);
+        let focus_visible = self.focus_handle.is_focus_visible(window);
         let bounds_cell = self.trigger_bounds.clone();
         let bounds_for_out = self.trigger_bounds.clone();
         let captured_bounds = self.trigger_bounds.get();
@@ -282,7 +285,13 @@ impl Render for DatePickerState {
                 .border_1()
                 .border_color(theme.border)
                 .when(theme.elevation_shadows, |el| el.shadow_xl())
-                .on_any_mouse_down(|_, _, cx| cx.stop_propagation())
+                // A click in the popup (its buttons are focusable) keeps
+                // focus on the trigger, so the keys still work after it.
+                .on_any_mouse_down(cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                    window.focus(&this.focus_handle, cx);
+                    window.prevent_default();
+                    cx.stop_propagation()
+                }))
                 .on_mouse_down_out(cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
                     if bounds_for_out
                         .get()
@@ -395,7 +404,7 @@ impl Render for DatePickerState {
             .id(("dp-trigger", entity_id))
             .relative()
             .when(!self.disabled, |el| {
-                el.track_focus(&self.focus_handle)
+                el.track_focus(&self.focus_handle.clone().tab_stop(true))
                     .on_key_down(cx.listener(Self::on_key_down))
             })
             .flex()
@@ -413,7 +422,8 @@ impl Render for DatePickerState {
             } else {
                 theme.input_border
             })
-            .when((self.open || is_focused) && !self.disabled, |el| {
+            // Ring for keyboard focus only (`focus` module docs).
+            .when((self.open || focus_visible) && !self.disabled, |el| {
                 el.shadow(focus_ring_shadow(&theme))
             })
             .bg(if self.disabled {
@@ -426,7 +436,7 @@ impl Render for DatePickerState {
             .when(!self.disabled, |el| {
                 el.cursor_pointer()
                     .hover(move |s| s.bg(hover_bg))
-                    .on_click(cx.listener(|this, _, window, cx| {
+                    .on_click(cx.listener(|this, _: &crate::ClickEvent, window, cx| {
                         window.focus(&this.focus_handle, cx);
                         this.open = !this.open;
                         cx.notify();
@@ -754,6 +764,8 @@ impl TimePickerState {
                 self.close(cx);
                 cx.stop_propagation();
             }
+            // As a browser's select: Tab closes the popup and still moves on.
+            "tab" if self.open => self.close(cx),
             "enter" | "space" => {
                 self.open = !self.open;
                 cx.notify();
@@ -778,6 +790,7 @@ impl Render for TimePickerState {
         let use_12h = self.use_12h;
         let show_seconds = self.show_seconds;
         let is_focused = self.focus_handle.is_focused(window);
+        let focus_visible = self.focus_handle.is_focus_visible(window);
         let bounds_cell = self.trigger_bounds.clone();
         let bounds_for_out = self.trigger_bounds.clone();
         let captured_bounds = self.trigger_bounds.get();
@@ -1051,7 +1064,13 @@ impl Render for TimePickerState {
                 .border_1()
                 .border_color(theme.border)
                 .when(theme.elevation_shadows, |el| el.shadow_xl())
-                .on_any_mouse_down(|_, _, cx| cx.stop_propagation())
+                // A click in the popup (its buttons are focusable) keeps
+                // focus on the trigger, so the keys still work after it.
+                .on_any_mouse_down(cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                    window.focus(&this.focus_handle, cx);
+                    window.prevent_default();
+                    cx.stop_propagation()
+                }))
                 .on_mouse_down_out(cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
                     if bounds_for_out
                         .get()
@@ -1130,7 +1149,7 @@ impl Render for TimePickerState {
             .id(("tp-trigger", entity_id))
             .relative()
             .when(!self.disabled, |el| {
-                el.track_focus(&self.focus_handle)
+                el.track_focus(&self.focus_handle.clone().tab_stop(true))
                     .on_key_down(cx.listener(Self::on_key_down))
             })
             .flex()
@@ -1148,7 +1167,8 @@ impl Render for TimePickerState {
             } else {
                 theme.input_border
             })
-            .when((self.open || is_focused) && !self.disabled, |el| {
+            // Ring for keyboard focus only (`focus` module docs).
+            .when((self.open || focus_visible) && !self.disabled, |el| {
                 el.shadow(focus_ring_shadow(&theme))
             })
             .bg(if self.disabled {
@@ -1162,7 +1182,7 @@ impl Render for TimePickerState {
             .when(!self.disabled, |el| {
                 el.cursor_pointer()
                     .hover(move |s| s.bg(hover_bg))
-                    .on_click(cx.listener(|this, _, window, cx| {
+                    .on_click(cx.listener(|this, _: &crate::ClickEvent, window, cx| {
                         window.focus(&this.focus_handle, cx);
                         this.open = !this.open;
                         cx.notify();

@@ -12,7 +12,7 @@ use crate::{
     Window, anchored, deferred, div, ease_out_quint, prelude::*, px,
 };
 
-use super::popover::{MenuEntry, render_menu_entries};
+use super::popover::{MenuEntry, menu_arrow_key, render_menu_entries};
 use super::theme::{ANIM_FAST, ActiveTheme};
 
 struct ContextMenuOpenState {
@@ -157,6 +157,8 @@ impl RenderOnce for ContextMenu {
             let card = div()
                 .id((self.id.clone(), "ctx-panel"))
                 .track_focus(&focus_handle)
+                // The arrow keys move through the items and wrap inside.
+                .focus_trap()
                 .occlude()
                 .flex()
                 .flex_col()
@@ -174,6 +176,9 @@ impl RenderOnce for ContextMenu {
                     close_context_menu(&state_close_out, window, cx);
                 })
                 .on_key_down(move |ev: &KeyDownEvent, window, cx| {
+                    if menu_arrow_key(ev, window, cx) {
+                        return;
+                    }
                     let mods = &ev.keystroke.modifiers;
                     if ev.keystroke.key == "escape"
                         && !mods.control
@@ -182,6 +187,10 @@ impl RenderOnce for ContextMenu {
                     {
                         close_context_menu(&state_close_key, window, cx);
                         cx.stop_propagation();
+                    } else if ev.keystroke.key == "tab" {
+                        // Tab closes the menu (focus goes back to where it
+                        // was) and moves on from there.
+                        close_context_menu(&state_close_key, window, cx);
                     }
                 })
                 .child(menu_list);

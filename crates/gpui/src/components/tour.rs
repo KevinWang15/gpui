@@ -258,6 +258,8 @@ impl TourState {
                 self.close_in(window, cx);
                 cx.stop_propagation();
             }
+            // Enter on one of the card's buttons presses that button instead.
+            "enter" if !self.focus_handle.is_focused(window) => {}
             "right" | "enter" => {
                 self.next_in(window, cx);
                 cx.stop_propagation();
@@ -567,6 +569,8 @@ impl Render for TourState {
             div()
                 .id(("tour-overlay-spotlight", entity_id))
                 .track_focus(&self.focus_handle)
+                // Modal: Tab stays on the step card's buttons.
+                .focus_trap()
                 .on_key_down(cx.listener(Self::on_key_down))
                 .relative()
                 .w(vp.width)
@@ -626,6 +630,8 @@ impl Render for TourState {
             div()
                 .id(("tour-overlay-center", entity_id))
                 .track_focus(&self.focus_handle)
+                // Modal: Tab stays on the step card's buttons.
+                .focus_trap()
                 .on_key_down(cx.listener(Self::on_key_down))
                 .w(vp.width)
                 .h(vp.height)

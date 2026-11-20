@@ -43,6 +43,25 @@ pub(crate) fn tab_stop<E: StatefulInteractiveElement + Styled>(
         .focus_visible(move |style| style.shadow(ring))
 }
 
+/// [`tab_stop`] with the ring drawn inside the element, for a
+/// control flush against the edge of a parent that clips its children (an
+/// accordion's header, a table's header cells), where an outside ring would
+/// be cut off.
+pub(crate) fn tab_stop_inset<E: StatefulInteractiveElement + Styled>(
+    el: E,
+    enabled: bool,
+    theme: &Theme,
+) -> E {
+    if !enabled {
+        return el;
+    }
+    let ring: Vec<_> = focus_ring_shadow(theme, false)
+        .into_iter()
+        .map(|shadow| shadow.inset())
+        .collect();
+    tab_stop(el, true, theme).focus_visible(move |style| style.shadow(ring))
+}
+
 /// The keyboard-focus ring for an element that tracks its own handle: the
 /// ring when `handle` has keyboard focus, else nothing.
 pub(crate) fn focus_visible_ring(

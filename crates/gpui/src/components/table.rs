@@ -15,6 +15,7 @@ use crate::{
 use crate::icons::{Icon, IconSize, LucideIcon};
 
 use super::checkbox::CheckState;
+use super::focus::tab_stop_inset;
 use super::theme::{ActiveTheme, tabular_numerals};
 
 /// Horizontal cell alignment for [`TableColumn`].
@@ -312,9 +313,10 @@ fn render_table_header(
         let is_on = header_check_state != CheckState::Unchecked;
         let next_all = header_check_state != CheckState::Checked;
         let interactive = has_rows && on_select_all.is_some();
+        // The table clips its children, so these rings are drawn inside.
+        let select_all = tab_stop_inset(div().id("select-all"), interactive, theme);
         header_row = header_row.child(
-            div()
-                .id("select-all")
+            select_all
                 .flex()
                 .items_center()
                 .justify_center()
@@ -374,8 +376,8 @@ fn render_table_header(
             None
         };
 
-        let cell = div()
-            .id(("col", col_idx))
+        // A sortable header is a button.
+        let cell = tab_stop_inset(div().id(("col", col_idx)), can_sort, theme)
             .flex()
             .flex_row()
             .items_center()
@@ -500,9 +502,9 @@ impl RenderOnce for Table {
                 if has_expand {
                     let on_expand = self.on_toggle_expand.clone();
                     let can_expand = has_row_expand && on_expand.is_some();
+                    let expander = tab_stop_inset(div().id(("exp", row_idx)), can_expand, &theme);
                     row_el = row_el.child(
-                        div()
-                            .id(("exp", row_idx))
+                        expander
                             .flex()
                             .items_center()
                             .justify_center()
@@ -549,9 +551,9 @@ impl RenderOnce for Table {
                     let next_checked = !row.checked;
                     let on_sel = self.on_select_row.clone();
                     let can_select = on_sel.is_some();
+                    let check = tab_stop_inset(div().id(("chk", row_idx)), can_select, &theme);
                     row_el = row_el.child(
-                        div()
-                            .id(("chk", row_idx))
+                        check
                             .flex()
                             .items_center()
                             .justify_center()

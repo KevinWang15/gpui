@@ -3,7 +3,8 @@
 use std::rc::Rc;
 
 use crate::{
-    AnimationExt, App, ClickEvent, ElementId, FontWeight, IntoElement, RenderOnce, SharedString,
+    AnimationExt, App, ClickEvent, ElementId, FontWeight, IntoElement, KeyDownEvent, RenderOnce,
+    SharedString,
     SpringAnimation, StyleRefinement, Styled, Window, div, prelude::*, px,
 };
 use crate::icons::{Icon, IconSize, LucideIcon};
@@ -145,7 +146,7 @@ impl<T: Clone + PartialEq + 'static> Styled for RadioGroup<T> {
 }
 
 impl<T: Clone + PartialEq + 'static> RenderOnce for RadioGroup<T> {
-    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
         let mut container = div()
             .id(self.id.clone())
@@ -153,6 +154,44 @@ impl<T: Clone + PartialEq + 'static> RenderOnce for RadioGroup<T> {
             .w_full()
             .when(self.horizontal, |el| el.flex_row().flex_wrap().gap(px(12.)))
             .when(!self.horizontal, |el| el.flex_col().gap(px(10.)));
+
+        // One tab stop, the selected option; the arrow keys move the choice
+        // (`focus` module docs).
+        let enabled: Vec<bool> = self
+            .options
+            .iter()
+            .map(|option| !self.disabled && !option.disabled)
+            .collect();
+        let handles = super::focus::choice_focus(
+            (self.id.clone(), "radio-focus"),
+            self.options.len(),
+            window,
+            cx,
+        );
+        let selected_index = self
+            .options
+            .iter()
+            .position(|option| self.selected.as_ref() == Some(&option.value));
+        let tab_item = super::focus::choice_tab_item(selected_index, &enabled);
+        if let Some(on_change) = self.on_change.clone() {
+            let values: Vec<T> = self.options.iter().map(|option| option.value.clone()).collect();
+            let handles = handles.clone();
+            container = container.on_key_down(move |event: &KeyDownEvent, window, cx| {
+                let Some(from) = handles.iter().position(|h| h.is_focused(window)) else {
+                    return;
+                };
+                if event.keystroke.modifiers.modified() {
+                    return;
+                }
+                let Some(to) = super::focus::choice_step(&event.keystroke.key, from, &enabled)
+                else {
+                    return;
+                };
+                cx.stop_propagation();
+                on_change(&values[to], window, cx);
+                window.focus(&handles[to], cx);
+            });
+        }
 
         for (index, option) in self.options.into_iter().enumerate() {
             let is_selected = self
@@ -163,6 +202,9 @@ impl<T: Clone + PartialEq + 'static> RenderOnce for RadioGroup<T> {
             let item_id = (self.id.clone(), format!("opt-{index}"));
             let value = option.value.clone();
             let on_change = self.on_change.clone();
+            let focus = (!item_disabled)
+                .then(|| super::focus::choice_item_handle(&handles, index, tab_item));
+            let ring = super::focus::focus_visible_ring(&handles[index], window, &theme);
 
             let row = match self.variant {
                 RadioVariant::List => {
@@ -195,6 +237,7 @@ impl<T: Clone + PartialEq + 'static> RenderOnce for RadioGroup<T> {
                         .mt(px(1.))
                         .rounded_full()
                         .border_1()
+                        .when_some(ring, |el, ring| el.shadow(ring))
                         .child(dot)
                         .with_spring(
                             circle_id,
@@ -245,6 +288,7 @@ impl<T: Clone + PartialEq + 'static> RenderOnce for RadioGroup<T> {
                     let card_anim_id = (self.id.clone(), format!("radio-card-{index}"));
                     let card_div = div()
                         .id(item_id)
+                        .when_some(focus.clone(), |el, handle| el.track_focus(&handle))
                         .flex()
                         .flex_row()
                         .items_start()
@@ -256,6 +300,7 @@ impl<T: Clone + PartialEq + 'static> RenderOnce for RadioGroup<T> {
                         .rounded(theme.radius_lg)
                         .border_1()
                         .shadow_2xs()
+                        .when_some(ring, |el, ring| el.shadow(ring))
                         .when(!item_disabled, |el| {
                             el.cursor_pointer().hover(|s| {
                                 if is_selected {
@@ -336,14 +381,18 @@ impl<T: Clone + PartialEq + 'static> RenderOnce for RadioGroup<T> {
                 }
             };
 
+            // The wrapper takes the clicks, so it's also what holds focus:
+            // a keyboard click goes to the focused element.
             let row = if self.variant == RadioVariant::List
-                && !item_disabled
-                && let Some(handler) = on_change
+                && let Some(handle) = focus
             {
                 div()
                     .id((self.id.clone(), format!("radio-wrap-{index}")))
-                    .on_click(move |_: &ClickEvent, window, cx| {
-                        handler(&value, window, cx);
+                    .track_focus(&handle)
+                    .when_some(on_change, |el, handler| {
+                        el.on_click(move |_: &ClickEvent, window, cx| {
+                            handler(&value, window, cx);
+                        })
                     })
                     .child(row)
                     .into_any_element()

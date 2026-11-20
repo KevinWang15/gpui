@@ -289,7 +289,7 @@ impl TimeRangePickerState {
             self.active_popover = ActivePopover::QuickSelect;
             self.quick_unit_open = false;
             self.calendar_target = None;
-            window.focus(&self.focus_handle, cx);
+            self.focus_bar(window, cx);
         }
         cx.notify();
     }
@@ -305,9 +305,17 @@ impl TimeRangePickerState {
             self.calendar_month = self.range.end.first_of_month();
             self.active_popover = ActivePopover::StartAndEnd;
             self.quick_unit_open = false;
-            window.focus(&self.focus_handle, cx);
+            self.focus_bar(window, cx);
         }
         cx.notify();
+    }
+
+    /// Focuses the bar (whose key handler drives the popovers), unless a
+    /// button in it already has focus, which keeps its place and ring.
+    fn focus_bar(&self, window: &mut Window, cx: &mut App) {
+        if !self.focus_handle.contains_focused(window, cx) {
+            window.focus(&self.focus_handle, cx);
+        }
     }
 
     fn toggle_calendar_target(&mut self, target: CalendarTarget, cx: &mut Context<Self>) {
@@ -359,6 +367,8 @@ impl TimeRangePickerState {
     fn handle_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         match event.keystroke.key.as_str() {
             "escape" => self.close_popover(cx),
+            // As a browser's select: Tab closes the popover and still moves on.
+            "tab" => self.close_popover(cx),
             "enter" => match self.active_popover {
                 ActivePopover::QuickSelect => self.apply_quick_select(cx),
                 ActivePopover::StartAndEnd => {
@@ -537,8 +547,8 @@ impl TimeRangePicker {
         state: Entity<TimeRangePickerState>,
     ) -> impl IntoElement {
         let hover_bg = theme.surface_hover;
-        div()
-            .id(id)
+        // Each of the bar's buttons is a tab stop.
+        crate::components::focus::tab_stop(div().id(id), enabled, theme)
             .flex()
             .items_center()
             .justify_center()
@@ -568,8 +578,7 @@ impl TimeRangePicker {
         let quick_open = snap.active_popover == ActivePopover::QuickSelect;
         let custom_open = snap.active_popover == ActivePopover::StartAndEnd;
 
-        let quick_btn = div()
-            .id("quick-trigger")
+        let quick_btn = crate::components::focus::tab_stop(div().id("quick-trigger"), true, theme)
             .flex()
             .items_center()
             .gap(px(4.))
@@ -605,8 +614,7 @@ impl TimeRangePicker {
             });
 
         let is_sub_day = snap.preset.duration_hours().is_some();
-        let range_label_btn = div()
-            .id("range-trigger")
+        let range_label_btn = crate::components::focus::tab_stop(div().id("range-trigger"), true, theme)
             .flex()
             .items_center()
             .gap(px(8.))
@@ -679,6 +687,20 @@ impl TimeRangePicker {
         let mut bar = div()
             .id("bar")
             .track_focus(&snap.focus_handle)
+            // Enter applies an open popover. Taken in the capture phase so the
+            // focused button under it doesn't also get a key-up click (which
+            // would open the popover again).
+            .capture_key_down({
+                let state = self.state.clone();
+                move |event: &KeyDownEvent, _, cx| {
+                    if event.keystroke.key == "enter"
+                        && state.read(cx).active_popover != ActivePopover::None
+                    {
+                        state.update(cx, |s, cx| s.handle_key_down(event, cx));
+                        cx.stop_propagation();
+                    }
+                }
+            })
             .on_key_down({
                 let state = self.state.clone();
                 move |event: &KeyDownEvent, _, cx| {
@@ -905,6 +927,18 @@ impl TimeRangePicker {
             .shadow_lg()
             .flex()
             .flex_col()
+            // A click in the popover keeps focus in the bar, whose key
+            // handler types the amount and applies (Enter).
+            .on_any_mouse_down({
+                let state = self.state.clone();
+                move |_, window, cx| {
+                    let bar = state.read(cx).focus_handle.clone();
+                    if !bar.contains_focused(window, cx) {
+                        window.focus(&bar, cx);
+                    }
+                    window.prevent_default();
+                }
+            })
             .on_mouse_down_out(move |_, _, cx| {
                 state_out.update(cx, |s, cx| s.close_popover(cx));
             })
@@ -1071,6 +1105,18 @@ impl TimeRangePicker {
             .flex()
             .flex_col()
             .gap(px(12.))
+            // A click in the popover keeps focus in the bar, whose key
+            // handler types the amount and applies (Enter).
+            .on_any_mouse_down({
+                let state = self.state.clone();
+                move |_, window, cx| {
+                    let bar = state.read(cx).focus_handle.clone();
+                    if !bar.contains_focused(window, cx) {
+                        window.focus(&bar, cx);
+                    }
+                    window.prevent_default();
+                }
+            })
             .on_mouse_down_out(move |_, _, cx| {
                 state_out.update(cx, |s, cx| s.close_popover(cx));
             })

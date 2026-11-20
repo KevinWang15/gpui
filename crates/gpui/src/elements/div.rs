@@ -3255,7 +3255,12 @@ impl Interactivity {
                                 {
                                     let pending =
                                         std::mem::take(&mut *pending_keyboard_down.borrow_mut());
-                                    if pending != Some(window.focus_generation) {
+                                    // Not when something on the way out handled
+                                    // the key down (an Enter that confirms a
+                                    // popup, say), as in a browser.
+                                    if pending != Some(window.focus_generation)
+                                        || window.key_down_handled
+                                    {
                                         return;
                                     }
 

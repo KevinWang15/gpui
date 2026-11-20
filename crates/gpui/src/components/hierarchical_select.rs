@@ -229,6 +229,7 @@ impl TreeSelectState {
                 window.focus(&self.focus_handle, cx);
                 cx.stop_propagation();
             }
+            "tab" if self.open => self.close(cx),
             "enter" | "space" if !self.open => {
                 self.open(window, cx);
                 cx.stop_propagation();
@@ -240,6 +241,22 @@ impl TreeSelectState {
             _ => {}
         }
     }
+
+    /// Tab inside the popup moves between its search field and its tree;
+    /// Tab out of either end closes it and moves on from the trigger, as a
+    /// browser's select does (the popup comes last in the tab order).
+    fn on_popup_tab(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let tree = self.tree.read(cx);
+        let leaving = if ev.keystroke.modifiers.shift {
+            tree.search_input().read(cx).focus_handle(cx)
+        } else {
+            tree.focus_handle(cx)
+        };
+        if leaving.is_focused(window) {
+            self.close(cx);
+            window.focus(&self.focus_handle, cx);
+        }
+    }
 }
 
 impl Render for TreeSelectState {
@@ -249,6 +266,7 @@ impl Render for TreeSelectState {
         let hover_bg = theme.surface_hover;
         let entity_id = cx.entity_id();
         let is_focused = self.focus_handle.is_focused(window);
+        let focus_visible = self.focus_handle.is_focus_visible(window);
         let bounds_cell = self.trigger_bounds.clone();
         let bounds_for_out = self.trigger_bounds.clone();
         let captured_bounds = self.trigger_bounds.get();
@@ -271,7 +289,12 @@ impl Render for TreeSelectState {
                 .border_1()
                 .border_color(theme.border)
                 .when(theme.elevation_shadows, |el| el.shadow_xl())
-                .on_any_mouse_down(|_, _, cx| cx.stop_propagation())
+                // A click in the popup keeps focus where it was (the trigger,
+                // or the field or tree the click focused).
+                .on_any_mouse_down(|_, window, cx| {
+                    window.prevent_default();
+                    cx.stop_propagation()
+                })
                 .on_mouse_down_out(cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
                     if bounds_for_out
                         .get()
@@ -286,6 +309,8 @@ impl Render for TreeSelectState {
                         this.close(cx);
                         window.focus(&this.focus_handle, cx);
                         cx.stop_propagation();
+                    } else if ev.keystroke.key == "tab" && this.open {
+                        this.on_popup_tab(ev, window, cx);
                     }
                 }))
                 // `TreeState` already renders its search bar pinned above its virtualized body!
@@ -321,7 +346,7 @@ impl Render for TreeSelectState {
             .id(("ts-trigger", entity_id))
             .relative()
             .when(!self.disabled, |el| {
-                el.track_focus(&self.focus_handle)
+                el.track_focus(&self.focus_handle.clone().tab_stop(true))
                     .on_key_down(cx.listener(Self::on_key_down))
             })
             .flex()
@@ -339,7 +364,8 @@ impl Render for TreeSelectState {
             } else {
                 theme.input_border
             })
-            .when((self.open || is_focused) && !self.disabled, |el| {
+            // Ring for keyboard focus only (`focus` module docs).
+            .when((self.open || focus_visible) && !self.disabled, |el| {
                 el.shadow(focus_ring_shadow(&theme))
             })
             .bg(if self.disabled {
@@ -698,6 +724,8 @@ impl CascaderState {
                 self.close(cx);
                 cx.stop_propagation();
             }
+            // As a browser's select: Tab closes the popup and still moves on.
+            "tab" if self.open => self.close(cx),
             "enter" | "space" => {
                 self.open = !self.open;
                 if self.open {
@@ -724,6 +752,7 @@ impl Render for CascaderState {
         let hover_bg = theme.surface_hover;
         let entity_id = cx.entity_id();
         let is_focused = self.focus_handle.is_focused(window);
+        let focus_visible = self.focus_handle.is_focus_visible(window);
         let bounds_cell = self.trigger_bounds.clone();
         let bounds_for_out = self.trigger_bounds.clone();
         let captured_bounds = self.trigger_bounds.get();
@@ -781,7 +810,12 @@ impl Render for CascaderState {
                 .border_1()
                 .border_color(theme.border)
                 .when(theme.elevation_shadows, |el| el.shadow_xl())
-                .on_any_mouse_down(|_, _, cx| cx.stop_propagation())
+                // A click in the popup keeps focus where it was (the trigger,
+                // or the field or tree the click focused).
+                .on_any_mouse_down(|_, window, cx| {
+                    window.prevent_default();
+                    cx.stop_propagation()
+                })
                 .on_mouse_down_out(cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
                     if bounds_for_out
                         .get()
@@ -901,7 +935,7 @@ impl Render for CascaderState {
             .id(("casc-trigger", entity_id))
             .relative()
             .when(!self.disabled, |el| {
-                el.track_focus(&self.focus_handle)
+                el.track_focus(&self.focus_handle.clone().tab_stop(true))
                     .on_key_down(cx.listener(Self::on_key_down))
             })
             .flex()
@@ -919,7 +953,8 @@ impl Render for CascaderState {
             } else {
                 theme.input_border
             })
-            .when((self.open || is_focused) && !self.disabled, |el| {
+            // Ring for keyboard focus only (`focus` module docs).
+            .when((self.open || focus_visible) && !self.disabled, |el| {
                 el.shadow(focus_ring_shadow(&theme))
             })
             .bg(if self.disabled {
@@ -931,7 +966,7 @@ impl Render for CascaderState {
             .when(!self.disabled, |el| {
                 el.cursor_pointer()
                     .hover(move |s| s.bg(hover_bg))
-                    .on_click(cx.listener(|this, _, window, cx| {
+                    .on_click(cx.listener(|this, _: &crate::ClickEvent, window, cx| {
                         window.focus(&this.focus_handle, cx);
                         this.open = !this.open;
                         if this.open {

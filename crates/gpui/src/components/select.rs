@@ -344,6 +344,8 @@ impl<T: Clone + PartialEq + 'static> SelectState<T> {
                 self.close_menu(cx);
                 cx.stop_propagation();
             }
+            // As a browser's select: Tab closes the menu and still moves on.
+            "tab" if self.open => self.close_menu(cx),
             _ => {
                 // Single-character typeahead jump
                 if let Some(ch) = event.keystroke.key_char.as_deref()
@@ -377,6 +379,7 @@ impl<T: Clone + PartialEq + 'static> Render for SelectState<T> {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let focused = self.focus_handle.is_focused(window);
+        let focus_visible = self.focus_handle.is_focus_visible(window);
         let entity = cx.entity();
 
         let border_color = if self.invalid {
@@ -422,7 +425,7 @@ impl<T: Clone + PartialEq + 'static> Render for SelectState<T> {
                 el.cursor_pointer()
                     .when(theme.elevation_shadows, |el| el.shadow_2xs())
             })
-            .when((focused || self.open) && !self.disabled, |el| {
+            .when((focus_visible || self.open) && !self.disabled, |el| {
                 let ring = focus_ring_shadow(&theme, self.invalid);
                 el.when(!ring.is_empty(), |el| el.shadow(ring))
             })
@@ -435,10 +438,10 @@ impl<T: Clone + PartialEq + 'static> Render for SelectState<T> {
                 el.hover(move |s| s.border_color(hover_border))
             })
             .when(self.disabled, |el| el.opacity(0.6).cursor_not_allowed())
-            .track_focus(&self.focus_handle)
+            .track_focus(&self.focus_handle.clone().tab_stop(!self.disabled))
             .on_key_down(cx.listener(Self::on_key_down))
             .when(!self.disabled, |el| {
-                el.on_click(cx.listener(|this, _, window, cx| {
+                el.on_click(cx.listener(|this, _: &crate::ClickEvent, window, cx| {
                     window.focus(&this.focus_handle, cx);
                     this.toggle_menu(cx);
                 }))
@@ -646,6 +649,8 @@ impl<T: Clone + PartialEq + 'static> Render for SelectState<T> {
                 .border_1()
                 .border_color(theme.border)
                 .shadow_lg()
+                // Clicking an option keeps focus on the trigger, as a native select does.
+                .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
                 .on_mouse_down_out(cx.listener(|this, ev: &crate::MouseDownEvent, _, cx| {
                     if this
                         .trigger_bounds

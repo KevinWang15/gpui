@@ -163,6 +163,7 @@ pub struct InputState {
     undo_stack: Vec<UndoEntry>,
     redo_stack: Vec<UndoEntry>,
     was_focused: bool,
+    tab_stop: bool,
     frame_style: StyleRefinement,
 }
 
@@ -201,8 +202,16 @@ impl InputState {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             was_focused: false,
+            tab_stop: true,
             frame_style: StyleRefinement::default(),
         }
+    }
+
+    /// Leaves the input out of the tab order, for a composite control whose
+    /// tab stop is another handle (see the `focus` module docs).
+    pub(crate) fn tab_stop(mut self, tab_stop: bool) -> Self {
+        self.tab_stop = tab_stop;
+        self
     }
 
     /// Builder setter for initial value.
@@ -1371,7 +1380,13 @@ impl Render for InputState {
             .px(self.size.px_x())
             .gap(px(8.))
             .key_context("GpuiInput")
-            .track_focus(&self.focus_handle)
+            // One tab stop, unless disabled or a composite owns the stop.
+            .track_focus(
+                &self
+                    .focus_handle
+                    .clone()
+                    .tab_stop(self.tab_stop && !self.disabled),
+            )
             .text_size(font_size)
             .line_height(line_height)
             .text_color(text_color)

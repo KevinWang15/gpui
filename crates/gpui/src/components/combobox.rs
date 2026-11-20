@@ -147,6 +147,8 @@ impl<T: Clone + PartialEq + 'static> ComboBoxState<T> {
                 .size(ComponentSize::Sm)
                 .leading_icon(LucideIcon::Search)
                 .clearable(true)
+                // The trigger is the combobox's one tab stop.
+                .tab_stop(false)
         });
         let sub = cx.subscribe(&search_input, |this, _input, event: &InputEvent, cx| {
             match event {
@@ -227,7 +229,8 @@ impl<T: Clone + PartialEq + 'static> ComboBoxState<T> {
                 .placeholder(placeholder)
                 .size(ComponentSize::Sm)
                 .leading_icon(LucideIcon::Search)
-                .clearable(true);
+                .clearable(true)
+                .tab_stop(false);
         });
         self
     }
@@ -487,6 +490,12 @@ impl<T: Clone + PartialEq + 'static> ComboBoxState<T> {
                 window.focus(&self.focus_handle, cx);
                 cx.stop_propagation();
             }
+            // As a browser's select: Tab closes the menu and moves on from
+            // the trigger (the popup comes last in the tab order).
+            "tab" if self.open => {
+                self.close_menu(cx);
+                window.focus(&self.focus_handle, cx);
+            }
             "backspace" if self.multiple && self.search_input.read(cx).value().is_empty() => {
                 if self.selected.pop().is_some() {
                     cx.emit(ComboBoxEvent::Change(self.selected.clone()));
@@ -508,8 +517,11 @@ impl<T: Clone + PartialEq + 'static> ComboBoxState<T> {
 impl<T: Clone + PartialEq + 'static> Render for ComboBoxState<T> {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let focused = self.focus_handle.is_focused(window)
-            || self.search_input.focus_handle(cx).is_focused(window);
+        let search_focused = self.search_input.focus_handle(cx).is_focused(window);
+        let focused = self.focus_handle.is_focused(window) || search_focused;
+        // The trigger shows its ring for keyboard focus only; typing in the
+        // search field keeps it.
+        let ring_focus = self.focus_handle.is_focus_visible(window) || search_focused;
         let entity = cx.entity();
 
         let border_color = if self.invalid {
@@ -654,7 +666,7 @@ impl<T: Clone + PartialEq + 'static> Render for ComboBoxState<T> {
                 el.cursor_pointer()
                     .when(theme.elevation_shadows, |el| el.shadow_2xs())
             })
-            .when((focused || self.open) && !self.disabled, |el| {
+            .when((ring_focus || self.open) && !self.disabled, |el| {
                 let ring = focus_ring_shadow(&theme, self.invalid);
                 el.when(!ring.is_empty(), |el| el.shadow(ring))
             })
@@ -667,7 +679,7 @@ impl<T: Clone + PartialEq + 'static> Render for ComboBoxState<T> {
                 el.hover(move |s| s.border_color(hover_border))
             })
             .when(self.disabled, |el| el.opacity(0.6).cursor_not_allowed())
-            .track_focus(&self.focus_handle)
+            .track_focus(&self.focus_handle.clone().tab_stop(!self.disabled))
             .on_key_down(cx.listener(Self::on_key_down))
             .when(!self.disabled, |el| {
                 el.on_click(cx.listener(|this, _, window, cx| {
@@ -904,6 +916,8 @@ impl<T: Clone + PartialEq + 'static> Render for ComboBoxState<T> {
                 .border_color(theme.border)
                 .shadow_lg()
                 .on_key_down(cx.listener(Self::on_key_down))
+                // Clicking an option keeps focus in the search field.
+                .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
                 .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                     this.close_menu(cx);
                 }))

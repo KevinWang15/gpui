@@ -23,7 +23,7 @@ use crate::{
 };
 
 use super::palette;
-use super::theme::{ANIM_FAST, ActiveTheme, focus_ring_shadow};
+use super::theme::{ANIM_FAST, ActiveTheme};
 use super::tooltip::Tooltip;
 
 // ============================================================================
@@ -133,10 +133,13 @@ impl Styled for FloatButton {
 impl RenderOnce for FloatButton {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
-        let fh_state =
-            window.use_keyed_state((self.id.clone(), "fab-fh"), cx, |_, cx| cx.focus_handle());
+        let fh_state = window.use_keyed_state((self.id.clone(), "fab-fh"), cx, |_, cx| {
+            cx.focus_handle().tab_stop(true)
+        });
         let focus_handle = fh_state.read(cx).clone();
-        let focused = focus_handle.is_focused(window);
+        let ring = (!self.disabled)
+            .then(|| super::focus::focus_visible_ring(&focus_handle, window, &theme))
+            .flatten();
 
         let (bg, hover_bg, fg, border_color) = if self.primary {
             (
@@ -176,9 +179,7 @@ impl RenderOnce for FloatButton {
             .border_1()
             .border_color(border_color)
             .when(theme.elevation_shadows, |el| el.shadow_lg())
-            .when(focused && !self.disabled, |el| {
-                el.shadow(focus_ring_shadow(&theme))
-            })
+            .when_some(ring, |el, ring| el.shadow(ring))
             .when(!self.disabled, |el| {
                 el.cursor_pointer()
                     .hover(move |s| s.bg(hover_bg))
@@ -218,6 +219,22 @@ impl RenderOnce for FloatButton {
 struct FabGroupOpen {
     open: bool,
     focus_handle: FocusHandle,
+    /// Tracked on the action stack, to tell when focus is on an action.
+    actions_focus: FocusHandle,
+}
+
+impl FabGroupOpen {
+    /// Closes the stack. If an action had focus, it goes away with the
+    /// stack, so focus moves to the group and Tab goes on from there.
+    fn close(&mut self, window: &mut Window, cx: &mut crate::Context<Self>) {
+        if self.open {
+            self.open = false;
+            if self.actions_focus.contains_focused(window, cx) {
+                window.focus(&self.focus_handle, cx);
+            }
+            cx.notify();
+        }
+    }
 }
 
 /// Corner-anchored expandable [`FloatButtonGroup`] (speed-dial FAB stack).
@@ -293,11 +310,12 @@ impl RenderOnce for FloatButtonGroup {
             FabGroupOpen {
                 open: false,
                 focus_handle: cx.focus_handle(),
+                actions_focus: cx.focus_handle(),
             }
         });
-        let (open, focus_handle) = {
+        let (open, focus_handle, actions_focus) = {
             let s = state.read(cx);
-            (s.open, s.focus_handle.clone())
+            (s.open, s.focus_handle.clone(), s.actions_focus.clone())
         };
         let is_top = matches!(
             self.position,
@@ -316,7 +334,9 @@ impl RenderOnce for FloatButtonGroup {
         .on_click(move |_, window, cx| {
             st_toggle.update(cx, |s, cx| {
                 s.open = !s.open;
-                if s.open {
+                // Focus inside the group lets Escape reach it. When the
+                // trigger already has focus (Enter or Space), leave it there.
+                if s.open && !s.focus_handle.contains_focused(window, cx) {
                     window.focus(&s.focus_handle, cx);
                 }
                 cx.notify();
@@ -325,18 +345,18 @@ impl RenderOnce for FloatButtonGroup {
 
         let auto_close = self.auto_close;
         let actions_col = open.then(|| {
-            let mut col = div().flex().flex_col().items_center().gap(px(10.));
+            let mut col = div()
+                .track_focus(&actions_focus)
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(10.));
             for mut act in self.actions {
                 if auto_close {
                     let prev_cb = act.on_click.take();
                     let st_act = state.clone();
                     act.on_click = Some(Rc::new(move |ev, window, cx| {
-                        st_act.update(cx, |s, cx| {
-                            if s.open {
-                                s.open = false;
-                                cx.notify();
-                            }
-                        });
+                        st_act.update(cx, |s, cx| s.close(window, cx));
                         if let Some(ref cb) = prev_cb {
                             cb(ev, window, cx);
                         }
@@ -373,14 +393,9 @@ impl RenderOnce for FloatButtonGroup {
                         }
                     });
                 })
-                .on_key_down(move |ev: &KeyDownEvent, _, cx| {
+                .on_key_down(move |ev: &KeyDownEvent, window, cx| {
                     if ev.keystroke.key == "escape" {
-                        st_esc.update(cx, |s, cx| {
-                            if s.open {
-                                s.open = false;
-                                cx.notify();
-                            }
-                        });
+                        st_esc.update(cx, |s, cx| s.close(window, cx));
                         cx.stop_propagation();
                     }
                 })

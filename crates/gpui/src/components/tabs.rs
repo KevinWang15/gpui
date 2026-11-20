@@ -4,7 +4,8 @@
 use std::rc::Rc;
 
 use crate::{
-    AnimationExt, App, ClickEvent, ElementId, FontWeight, IntoElement, RenderOnce, SharedString,
+    AnimationExt, App, ClickEvent, ElementId, FontWeight, IntoElement, KeyDownEvent, RenderOnce,
+    SharedString,
     SpringAnimation, StyleRefinement, Styled, Window, div, prelude::*, px,
 };
 use crate::icons::{Icon, IconSize, LucideIcon};
@@ -142,7 +143,7 @@ impl Styled for Tabs {
 }
 
 impl RenderOnce for Tabs {
-    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
         let mut bar = match self.variant {
             TabsVariant::Underline => div()
@@ -169,6 +170,35 @@ impl RenderOnce for Tabs {
                 .bg(theme.surface_muted)
                 .when(self.full_width, |el| el.w_full()),
         };
+
+        // One tab stop, the selected tab; the arrow keys move the choice
+        // (`focus` module docs).
+        let enabled: Vec<bool> = self.items.iter().map(|item| !item.disabled).collect();
+        let handles = super::focus::choice_focus(
+            (self.id.clone(), "tabs-focus"),
+            self.items.len(),
+            window,
+            cx,
+        );
+        let tab_item = super::focus::choice_tab_item(Some(self.selected_index), &enabled);
+        if let Some(on_change) = self.on_change.clone() {
+            let handles = handles.clone();
+            bar = bar.on_key_down(move |event: &KeyDownEvent, window, cx| {
+                let Some(from) = handles.iter().position(|h| h.is_focused(window)) else {
+                    return;
+                };
+                if event.keystroke.modifiers.modified() {
+                    return;
+                }
+                let Some(to) = super::focus::choice_step(&event.keystroke.key, from, &enabled)
+                else {
+                    return;
+                };
+                cx.stop_propagation();
+                on_change(&to, window, cx);
+                window.focus(&handles[to], cx);
+            });
+        }
 
         for (index, item) in self.items.into_iter().enumerate() {
             let active = index == self.selected_index;
@@ -246,7 +276,11 @@ impl RenderOnce for Tabs {
             if item.disabled {
                 tab = tab.opacity(0.45).cursor_not_allowed();
             } else {
-                tab = tab.cursor_pointer().when(!active, |el| {
+                let ring = super::focus::focus_visible_ring(&handles[index], window, &theme);
+                tab = tab
+                    .track_focus(&super::focus::choice_item_handle(&handles, index, tab_item))
+                    .when_some(ring, |el, ring| el.shadow(ring))
+                    .cursor_pointer().when(!active, |el| {
                     el.hover(|s| match self.variant {
                         TabsVariant::Underline => s.text_color(theme.foreground),
                         TabsVariant::Pills => {

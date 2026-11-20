@@ -1378,6 +1378,9 @@ pub struct Window {
     /// Whether the focus got where it is by keyboard (see
     /// [`FocusHandle::is_focus_visible`]).
     focus_visible: bool,
+    /// Whether something handled the last key down (stopped it or prevented
+    /// its default): then its key up doesn't click the focused element.
+    pub(crate) key_down_handled: bool,
     focus_enabled: bool,
     /// Incremented every time focus moves. Used to invalidate a
     /// pending keyboard activation state when focus changes.
@@ -2543,6 +2546,7 @@ impl Window {
             activation_observers: SingleSubscriberSet::new(),
             focus: None,
             focus_visible: false,
+            key_down_handled: false,
             focus_enabled: true,
             focus_generation: 0,
             pending_input: None,
@@ -6677,6 +6681,9 @@ impl Window {
             self.dispatch_mouse_event(any_mouse_event, cx);
         } else if let Some(any_key_event) = event.keyboard_event() {
             self.dispatch_key_event(any_key_event, cx);
+            if matches!(event, PlatformInput::KeyDown(_)) {
+                self.key_down_handled = !cx.propagate_event || self.default_prevented;
+            }
         } else if let Some(touch_event) = event.touch_event() {
             self.dispatch_touch_event(touch_event, cx);
         }

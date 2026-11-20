@@ -160,6 +160,10 @@ pub struct MenuState {
     /// Active top-level dropdown key when in [`MenuMode::Horizontal`].
     open_dropdown: Option<SharedString>,
     dropdown_trigger_bounds: Rc<RefCell<HashMap<SharedString, Bounds<Pixels>>>>,
+    /// The open dropdown's handle (a focus trap the arrow keys move through).
+    dropdown_focus: FocusHandle,
+    /// The trigger to give focus back to when the dropdown closes.
+    dropdown_return: Option<FocusHandle>,
     frame_style: StyleRefinement,
 }
 
@@ -183,6 +187,8 @@ impl MenuState {
             open_submenus: HashSet::new(),
             open_dropdown: None,
             dropdown_trigger_bounds: Rc::new(RefCell::new(HashMap::new())),
+            dropdown_focus: cx.focus_handle(),
+            dropdown_return: None,
             frame_style: StyleRefinement::default(),
         }
     }
@@ -263,6 +269,24 @@ impl MenuState {
             cx.stop_propagation();
         }
     }
+
+    /// Opens the dropdown under the top-level trigger `trigger`; from the
+    /// keyboard, focus goes into it (Down then reaches its first item).
+    fn open_dropdown_from(
+        &mut self,
+        key: SharedString,
+        trigger: FocusHandle,
+        keyboard: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_dropdown = Some(key);
+        self.dropdown_return = Some(trigger);
+        if keyboard {
+            window.focus(&self.dropdown_focus, cx);
+        }
+        cx.notify();
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -325,9 +349,10 @@ fn render_vertical_nodes(
                     (crate::transparent_black(), base_fg, theme.muted_foreground)
                 };
 
+                let item = div().id((ElementId::from("vmenu-item"), key.clone()));
                 out.push(
-                    div()
-                        .id((ElementId::from("vmenu-item"), key.clone()))
+                    // Each item is a tab stop, as a link in a sidebar is.
+                    super::focus::tab_stop(item, !*disabled, theme)
                         .flex()
                         .flex_row()
                         .items_center()
@@ -386,8 +411,8 @@ fn render_vertical_nodes(
                 let key_clone = key.clone();
                 let ent = entity.clone();
 
-                let header = div()
-                    .id((ElementId::from("vmenu-sub"), key.clone()))
+                let header = div().id((ElementId::from("vmenu-sub"), key.clone()));
+                let header = super::focus::tab_stop(header, !*disabled, theme)
                     .flex()
                     .flex_row()
                     .items_center()
@@ -473,12 +498,21 @@ fn render_vertical_nodes(
 }
 
 impl Render for MenuState {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let reduce_motion = cx.reduce_motion();
         let hover_bg = theme.surface_hover;
         let entity = cx.entity();
         let entity_id = cx.entity_id();
+
+        // A dropdown closed with focus inside it (an item was picked, or
+        // Escape): focus goes back to its trigger.
+        if self.open_dropdown.is_none()
+            && let Some(trigger) = self.dropdown_return.take()
+            && self.dropdown_focus.contains_focused(window, cx)
+        {
+            window.focus(&trigger, cx);
+        }
 
         match self.mode {
             MenuMode::Vertical => {
@@ -512,10 +546,57 @@ impl Render for MenuState {
                 root
             }
             MenuMode::Horizontal => {
+                // The top-level items are one tab stop (the active one, or the
+                // first); Left and Right move between them, as in a menubar.
+                let tops: Vec<(bool, bool)> = self
+                    .nodes
+                    .iter()
+                    .filter_map(|node| match node {
+                        MenuNode::Divider => None,
+                        MenuNode::Item { key, disabled, .. } => {
+                            Some((!*disabled, self.active_key.as_ref() == Some(key)))
+                        }
+                        MenuNode::SubMenu { key, disabled, .. } => {
+                            Some((!*disabled, self.active_ancestors.contains(key)))
+                        }
+                    })
+                    .collect();
+                let enabled: Vec<bool> = tops.iter().map(|t| t.0).collect();
+                let tab_item =
+                    super::focus::choice_tab_item(tops.iter().position(|t| t.1), &enabled);
+                let handles =
+                    super::focus::choice_focus(("hmenu-focus", entity_id), tops.len(), window, cx);
+                let mut top_index = 0;
+
                 let mut bar = div()
                     .id(("hmenu-root", entity_id))
                     .track_focus(&self.focus_handle)
                     .on_key_down(cx.listener(Self::on_key_down))
+                    .on_key_down({
+                        let handles = handles.clone();
+                        let entity = entity.clone();
+                        move |ev: &KeyDownEvent, window, cx| {
+                            let key = ev.keystroke.key.as_str();
+                            if ev.keystroke.modifiers.modified()
+                                || !matches!(key, "left" | "right" | "home" | "end")
+                            {
+                                return;
+                            }
+                            let Some(from) = handles.iter().position(|h| h.is_focused(window))
+                            else {
+                                return;
+                            };
+                            if let Some(to) = super::focus::choice_step(key, from, &enabled) {
+                                entity.update(cx, |this, cx| {
+                                    if this.open_dropdown.take().is_some() {
+                                        cx.notify();
+                                    }
+                                });
+                                window.focus(&handles[to], cx);
+                                cx.stop_propagation();
+                            }
+                        }
+                    })
                     .flex()
                     .flex_row()
                     .flex_wrap()
@@ -544,9 +625,16 @@ impl Render for MenuState {
                             let is_active = self.active_key.as_ref() == Some(key);
                             let key_click = key.clone();
                             let ent = entity.clone();
+                            let index = top_index;
+                            top_index += 1;
+                            let handle =
+                                super::focus::choice_item_handle(&handles, index, tab_item);
+                            let ring = super::focus::focus_visible_ring(&handle, window, &theme);
                             bar = bar.child(
                                 div()
                                     .id((ElementId::from("hmenu-item"), key.clone()))
+                                    .when(!*disabled, |el| el.track_focus(&handle))
+                                    .when_some(ring, |el, ring| el.shadow(ring))
                                     .flex()
                                     .flex_row()
                                     .items_center()
@@ -599,6 +687,16 @@ impl Render for MenuState {
                         } => {
                             let is_open = !*disabled && self.open_dropdown.as_ref() == Some(key);
                             let has_active = self.active_ancestors.contains(key);
+                            let index = top_index;
+                            top_index += 1;
+                            let handle =
+                                super::focus::choice_item_handle(&handles, index, tab_item);
+                            let ring = super::focus::focus_visible_ring(&handle, window, &theme);
+                            let trigger_click = handle.clone();
+                            let trigger_down = handle.clone();
+                            let trigger_tab = handle.clone();
+                            let key_down = key.clone();
+                            let ent_down = entity.clone();
                             let key_toggle = key.clone();
                             let key_bounds = key.clone();
                             let key_out = key.clone();
@@ -625,6 +723,9 @@ impl Render for MenuState {
                                 let ent_key = entity.clone();
                                 let card = div()
                                     .id((ElementId::from("hmenu-pop"), key.clone()))
+                                    // Up and Down move through the items, wrapping.
+                                    .track_focus(&self.dropdown_focus)
+                                    .focus_trap()
                                     .flex()
                                     .flex_col()
                                     .gap(px(2.))
@@ -654,14 +755,24 @@ impl Render for MenuState {
                                             }
                                         });
                                     })
-                                    .on_key_down(move |ev: &KeyDownEvent, _, cx| {
-                                        if ev.keystroke.key == "escape" {
+                                    .on_key_down(move |ev: &KeyDownEvent, window, cx| {
+                                        if super::popover::menu_arrow_key(ev, window, cx) {
+                                            return;
+                                        }
+                                        let key = ev.keystroke.key.as_str();
+                                        if key == "escape" || key == "tab" {
                                             ent_key.update(cx, |this, cx| {
                                                 if this.open_dropdown.take().is_some() {
                                                     cx.notify();
                                                 }
                                             });
+                                        }
+                                        if key == "escape" {
+                                            // Focus goes back to the trigger on the next render.
                                             cx.stop_propagation();
+                                        } else if key == "tab" {
+                                            // Tab closes it and moves on from the trigger.
+                                            window.focus(&trigger_tab, cx);
                                         }
                                     })
                                     .children(rendered_sub);
@@ -697,6 +808,27 @@ impl Render for MenuState {
                                     .child(
                                         div()
                                             .id((ElementId::from("hmenu-sub"), key.clone()))
+                                            .when(!*disabled, |el| {
+                                                el.track_focus(&handle).on_key_down(
+                                                    move |ev: &KeyDownEvent, window, cx| {
+                                                        // Down opens the dropdown and goes into it.
+                                                        if ev.keystroke.key != "down"
+                                                            || ev.keystroke.modifiers.modified()
+                                                        {
+                                                            return;
+                                                        }
+                                                        let key = key_down.clone();
+                                                        let trigger = trigger_down.clone();
+                                                        ent_down.update(cx, |this, cx| {
+                                                            this.open_dropdown_from(
+                                                                key, trigger, true, window, cx,
+                                                            );
+                                                        });
+                                                        cx.stop_propagation();
+                                                    },
+                                                )
+                                            })
+                                            .when_some(ring, |el, ring| el.shadow(ring))
                                             .relative()
                                             .flex()
                                             .flex_row()
@@ -722,18 +854,24 @@ impl Render for MenuState {
                                                     .when(!is_open && !has_active, |el| {
                                                         el.hover(move |s| s.bg(hover_bg))
                                                     })
-                                                    .on_click(move |_, window, cx| {
+                                                    .on_click(move |ev, window, cx| {
                                                         ent_toggle.update(cx, |this, cx| {
-                                                            window.focus(&this.focus_handle, cx);
                                                             if this.open_dropdown.as_ref()
                                                                 == Some(&key_toggle)
                                                             {
                                                                 this.open_dropdown = None;
+                                                                cx.notify();
                                                             } else {
-                                                                this.open_dropdown =
-                                                                    Some(key_toggle.clone());
+                                                                // Focus stays on the trigger the
+                                                                // press focused.
+                                                                this.open_dropdown_from(
+                                                                    key_toggle.clone(),
+                                                                    trigger_click.clone(),
+                                                                    ev.is_keyboard(),
+                                                                    window,
+                                                                    cx,
+                                                                );
                                                             }
-                                                            cx.notify();
                                                         });
                                                     })
                                             })

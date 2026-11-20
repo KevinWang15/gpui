@@ -1030,8 +1030,9 @@ impl RenderOnce for SidebarItem {
             )
         };
 
-        let mut el = div()
-            .id(self.id)
+        let clickable = self.on_click.is_some();
+        let el = div().id(self.id);
+        let mut el = super::focus::tab_stop(el, clickable, &theme)
             .flex()
             .flex_row()
             .items_center()
@@ -1627,3 +1628,4 @@ pub(crate) fn focus_ring_shadow(theme: &Theme, invalid: bool) -> Vec<crate::BoxS
             .spread_radius(theme.focus_ring_width),
     ]
 }
+

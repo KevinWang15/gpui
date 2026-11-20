@@ -151,6 +151,18 @@ impl RenderOnce for Rating {
             theme.input_border
         };
 
+        // One tab stop, the star of the current rating; the arrow keys move
+        // the rating (`focus` module docs).
+        let enabled = vec![!self.read_only; self.max];
+        let handles = super::focus::choice_focus(
+            (self.id.clone(), "rating-focus"),
+            self.max,
+            window,
+            cx,
+        );
+        let tab_item =
+            super::focus::choice_tab_item(self.value.checked_sub(1), &enabled);
+
         let hs_row_leave = hover_state.clone();
         let mut row =
             div()
@@ -170,6 +182,26 @@ impl RenderOnce for Rating {
                         }
                     })
                 });
+        if !self.read_only
+            && let Some(on_change) = self.on_change.clone()
+        {
+            let handles = handles.clone();
+            row = row.on_key_down(move |event: &KeyDownEvent, window, cx| {
+                let Some(from) = handles.iter().position(|h| h.is_focused(window)) else {
+                    return;
+                };
+                if event.keystroke.modifiers.modified() {
+                    return;
+                }
+                let Some(to) = super::focus::choice_step(&event.keystroke.key, from, &enabled)
+                else {
+                    return;
+                };
+                cx.stop_propagation();
+                on_change(&(to + 1), window, cx);
+                window.focus(&handles[to], cx);
+            });
+        }
 
         for idx in 1..=self.max {
             let filled = idx <= display_val;
@@ -180,8 +212,17 @@ impl RenderOnce for Rating {
             let current = self.value;
             let allow_clear = self.allow_clear;
 
+            let ring = super::focus::focus_visible_ring(&handles[idx - 1], window, &theme);
             let star = div()
                 .id(("star", idx))
+                .when(!self.read_only, |el| {
+                    el.track_focus(&super::focus::choice_item_handle(
+                        &handles,
+                        idx - 1,
+                        tab_item,
+                    ))
+                })
+                .when_some(ring, |el, ring| el.shadow(ring))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -362,7 +403,7 @@ impl RenderOnce for CopyButton {
         let state = window.use_keyed_state((self.id.clone(), "copy-btn-state"), cx, |_, cx| {
             CopyButtonState {
                 copied: false,
-                focus_handle: cx.focus_handle(),
+                focus_handle: cx.focus_handle().tab_stop(true),
                 _reset_task: None,
             }
         });
@@ -370,7 +411,9 @@ impl RenderOnce for CopyButton {
             let s = state.read(cx);
             (s.copied, s.focus_handle.clone())
         };
-        let focused = focus_handle.is_focused(window);
+        let ring = (!self.disabled)
+            .then(|| super::focus::focus_visible_ring(&focus_handle, window, &theme))
+            .flatten();
         let value = self.value;
         let reset_after = self.reset_after;
         let on_copy = self.on_copy;
@@ -507,10 +550,7 @@ impl RenderOnce for CopyButton {
             .text_size(font_size)
             .font_weight(FontWeight::MEDIUM)
             .text_color(active_fg)
-            .when(focused && !self.disabled, |el| {
-                let ring = focus_ring_shadow(&theme, false);
-                el.when(!ring.is_empty(), |el| el.shadow(ring))
-            })
+            .when_some(ring, |el, ring| el.shadow(ring))
             .when(!self.disabled, |el| {
                 el.cursor_pointer()
                     .hover(move |s| s.bg(hover_bg))
@@ -830,6 +870,7 @@ impl Render for PinInputState {
             .id(("pin-input-root", cx.entity_id()))
             .when(!disabled, |el| {
                 el.track_focus(&self.focus_handle)
+                    .tab_stop(true)
                     .on_key_down(cx.listener(Self::on_key_down))
             })
             .flex()

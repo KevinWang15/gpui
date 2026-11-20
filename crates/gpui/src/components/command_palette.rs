@@ -750,6 +750,9 @@ impl Render for CommandPaletteState {
         let mut panel = div()
             .id(("cmd-palette-panel", entity_id))
             .track_focus(&self.focus_handle)
+            // Modal: Tab moves the selection (below), and anything else that
+            // moves focus stays inside.
+            .focus_trap()
             .on_key_down(cx.listener(Self::on_key_down))
             .occlude()
             .flex()

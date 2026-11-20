@@ -312,7 +312,8 @@ impl ColorPickerState {
         .detach();
 
         Self {
-            focus_handle: cx.focus_handle(),
+            // The trigger (or the inline panel) is the tab stop.
+            focus_handle: cx.focus_handle().tab_stop(true),
             hue: h,
             sat: s,
             val: v,
@@ -475,6 +476,13 @@ impl ColorPickerState {
         if self.disabled {
             return;
         }
+        // As a browser's select: Tab closes the popup and moves on from the
+        // trigger (the popup comes last in the tab order).
+        if event.keystroke.key == "tab" && !self.inline && self.open {
+            self.close(cx);
+            window.focus(&self.focus_handle, cx);
+            return;
+        }
         if self.hex_input.read(cx).focus_handle(cx).is_focused(window) {
             if event.keystroke.key == "escape" && !self.inline && self.open {
                 self.close(cx);
@@ -490,6 +498,8 @@ impl ColorPickerState {
         match event.keystroke.key.as_str() {
             "escape" if !self.inline && self.open => {
                 self.close(cx);
+                // Focus may be on a button in the popup.
+                window.focus(&self.focus_handle, cx);
                 cx.stop_propagation();
             }
             "enter" | "space" if !self.inline => {
@@ -962,6 +972,7 @@ impl Render for ColorPickerState {
         let hex = self.hex();
         let hover_bg = theme.surface_hover;
         let is_focused = self.focus_handle.is_focused(window);
+        let focus_visible = self.focus_handle.is_focus_visible(window);
         let bounds_cell = self.trigger_bounds.clone();
         let bounds_for_out = self.trigger_bounds.clone();
         let captured_bounds = self.trigger_bounds.get();
@@ -970,6 +981,8 @@ impl Render for ColorPickerState {
             let panel = self
                 .render_panel(cx)
                 .on_key_down(cx.listener(Self::on_key_down))
+                // A click on the popup's background keeps focus where it was.
+                .on_any_mouse_down(|_, window, _| window.prevent_default())
                 .on_mouse_down_out(cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
                     if bounds_for_out
                         .get()
@@ -1028,7 +1041,8 @@ impl Render for ColorPickerState {
             } else {
                 theme.input_border
             })
-            .when(is_focused && !self.disabled, |el| {
+            // Ring for keyboard focus only (`focus` module docs).
+            .when(focus_visible && !self.disabled, |el| {
                 el.shadow(focus_ring_shadow(&theme))
             })
             .bg(theme.input_bg)
@@ -1039,7 +1053,7 @@ impl Render for ColorPickerState {
             .when(!self.disabled, |el| {
                 el.cursor_pointer()
                     .hover(move |s| s.bg(hover_bg))
-                    .on_click(cx.listener(|this, _, window, cx| {
+                    .on_click(cx.listener(|this, _: &crate::ClickEvent, window, cx| {
                         window.focus(&this.focus_handle, cx);
                         this.open = !this.open;
                         if !this.open {

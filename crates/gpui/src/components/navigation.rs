@@ -126,7 +126,7 @@ impl RenderOnce for Breadcrumb {
                 .child(item.label);
 
             if let Some(handler) = item.on_click {
-                seg = seg
+                seg = super::focus::tab_stop(seg, true, &theme)
                     .cursor_pointer()
                     .hover(|s| s.text_color(theme.foreground).underline())
                     .on_click(move |ev, window, cx| handler(ev, window, cx));
@@ -226,6 +226,7 @@ impl RenderOnce for Pagination {
 
         let on_prev = self.on_page_change.clone();
         let on_next = self.on_page_change.clone();
+        let operable = self.on_page_change.is_some();
 
         let prev_btn = div()
             .id((self.id.clone(), "prev"))
@@ -252,6 +253,7 @@ impl RenderOnce for Pagination {
             .when(!has_prev, |el| el.opacity(0.45).cursor_not_allowed())
             .child(Icon::new(LucideIcon::ChevronLeft).size(IconSize::Sm))
             .child("Previous");
+        let prev_btn = super::focus::tab_stop(prev_btn, operable && has_prev, &theme);
 
         let next_btn = div()
             .id((self.id.clone(), "next"))
@@ -278,6 +280,7 @@ impl RenderOnce for Pagination {
             .when(!has_next, |el| el.opacity(0.45).cursor_not_allowed())
             .child("Next")
             .child(Icon::new(LucideIcon::ChevronRight).size(IconSize::Sm));
+        let next_btn = super::focus::tab_stop(next_btn, operable && has_next, &theme);
 
         let mut root = div()
             .id(self.id.clone())
@@ -305,41 +308,40 @@ impl RenderOnce for Pagination {
                 Some(page) => {
                     let active = page == self.current_page;
                     let on_change = self.on_page_change.clone();
-                    root = root.child(
-                        div()
-                            .id((self.id.clone(), format!("page-{slot_idx}")))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .min_w(px(34.))
-                            .h(px(34.))
-                            .px(px(8.))
-                            .rounded(theme.radius_md)
-                            .border_1()
-                            .border_color(if active {
-                                theme.primary
-                            } else {
-                                theme.input_border
-                            })
-                            .bg(if active { theme.primary } else { theme.surface })
-                            .text_color(if active {
-                                theme.primary_foreground
-                            } else {
-                                theme.foreground
-                            })
-                            .text_size(px(13.))
-                            .font_weight(if active {
-                                FontWeight::SEMIBOLD
-                            } else {
-                                FontWeight::MEDIUM
-                            })
-                            .cursor_pointer()
-                            .when(!active, |el| el.hover(|s| s.bg(theme.surface_hover)))
-                            .when_some(on_change, |el, cb| {
-                                el.on_click(move |_, window, cx| cb(&page, window, cx))
-                            })
-                            .child(page.to_string()),
-                    );
+                    let page_btn = div()
+                        .id((self.id.clone(), format!("page-{slot_idx}")))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .min_w(px(34.))
+                        .h(px(34.))
+                        .px(px(8.))
+                        .rounded(theme.radius_md)
+                        .border_1()
+                        .border_color(if active {
+                            theme.primary
+                        } else {
+                            theme.input_border
+                        })
+                        .bg(if active { theme.primary } else { theme.surface })
+                        .text_color(if active {
+                            theme.primary_foreground
+                        } else {
+                            theme.foreground
+                        })
+                        .text_size(px(13.))
+                        .font_weight(if active {
+                            FontWeight::SEMIBOLD
+                        } else {
+                            FontWeight::MEDIUM
+                        })
+                        .cursor_pointer()
+                        .when(!active, |el| el.hover(|s| s.bg(theme.surface_hover)))
+                        .when_some(on_change, |el, cb| {
+                            el.on_click(move |_, window, cx| cb(&page, window, cx))
+                        })
+                        .child(page.to_string());
+                    root = root.child(super::focus::tab_stop(page_btn, operable, &theme));
                 }
             }
         }

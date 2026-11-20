@@ -167,7 +167,8 @@ impl TreeState {
         .detach();
 
         Self {
-            focus_handle: cx.focus_handle(),
+            // The rows are one tab stop; the arrow keys move inside.
+            focus_handle: cx.focus_handle().tab_stop(true),
             nodes,
             expanded: HashSet::new(),
             collapsed_during_search: HashSet::new(),
@@ -838,7 +839,8 @@ impl Render for TreeState {
         let checkable = self.checkable;
         let show_lines = self.show_lines;
         let show_icons = self.show_icons;
-        let is_focused = self.focus_handle.is_focused(window);
+        // Ring for keyboard focus only (`focus` module docs).
+        let is_focused = self.focus_handle.is_focus_visible(window);
 
         let list_body = if row_count == 0 {
             div()

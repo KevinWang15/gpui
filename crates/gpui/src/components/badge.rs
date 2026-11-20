@@ -316,9 +316,9 @@ impl RenderOnce for Badge {
             .child(self.label);
 
         if let (Some(remove_id), Some(on_remove)) = (self.remove_id, self.on_remove) {
+            let remove = div().id(remove_id);
             el = el.child(
-                div()
-                    .id(remove_id)
+                super::focus::tab_stop(remove, true, &theme)
                     .flex()
                     .items_center()
                     .justify_center()

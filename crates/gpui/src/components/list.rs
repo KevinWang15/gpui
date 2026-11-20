@@ -231,9 +231,11 @@ impl RenderOnce for List {
                 };
                 let clickable = !item.disabled && item.on_click.is_some();
 
+                // A clickable row is a tab stop, like a link. The bordered
+                // list clips its children, so the ring is drawn inside.
+                let row = super::focus::tab_stop_inset(div().id(("li", idx)), clickable, &theme);
                 root = root.child(
-                    div()
-                        .id(("li", idx))
+                    row
                         .flex()
                         .flex_row()
                         .items_center()

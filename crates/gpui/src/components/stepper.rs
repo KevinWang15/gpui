@@ -296,6 +296,7 @@ impl RenderOnce for Stepper {
                     })
                     .child(circle)
                     .child(label_block);
+                let step_btn = super::focus::tab_stop(step_btn, clickable, &theme);
 
                 root = root.child(
                     div()
@@ -363,6 +364,7 @@ impl RenderOnce for Stepper {
                             .pb(if is_last { px(0.) } else { px(12.) })
                             .child(label_block),
                     );
+                let row = super::focus::tab_stop(row, clickable, &theme);
                 root = root.child(row);
             }
         }
