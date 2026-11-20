@@ -100,8 +100,9 @@ impl StackedBarInteractionState {
         }
         let plot = PlotRect::from_bounds(self.plot_bounds?, STACKED_BAR_MARGINS);
         let scale = BandScale::new(plot.left, plot.width(), point_count, BAND_PADDING_INNER);
-        let a = self.drag_anchor_x?.clamp(plot.left, plot.right - 0.01);
-        let b = self.drag_current_x?.clamp(plot.left, plot.right - 0.01);
+        let max_x = (plot.right - 0.01).max(plot.left);
+        let a = self.drag_anchor_x?.clamp(plot.left, max_x);
+        let b = self.drag_current_x?.clamp(plot.left, max_x);
         let i0 = scale.index_at_x(a.min(b)).unwrap_or(0);
         let i1 = scale
             .index_at_x(a.max(b))
@@ -421,7 +422,7 @@ impl RenderOnce for StackedBarChart {
                 // 5. Auto-thinned X-axis labels
                 let n = points_paint.len();
                 if n > 0 {
-                    let max_labels = ((plot.width() / 68.0).floor() as usize).clamp(2, n);
+                    let max_labels = ((plot.width() / 68.0).floor() as usize).clamp(2.min(n), n);
                     let stride = (n.saturating_sub(1))
                         .div_ceil(max_labels.saturating_sub(1).max(1))
                         .max(1);
@@ -435,7 +436,9 @@ impl RenderOnce for StackedBarChart {
                         }
                         let cx_pos = band_scale.band_center(idx);
                         let label_w = 56.0_f32;
-                        let (align, label_x) = if idx == 0 {
+                        let (align, label_x) = if n == 1 {
+                            (TextAlign::Center, cx_pos - label_w * 0.5)
+                        } else if idx == 0 {
                             (TextAlign::Left, plot.left)
                         } else if is_last {
                             (TextAlign::Right, (plot.right - label_w).max(plot.left))
