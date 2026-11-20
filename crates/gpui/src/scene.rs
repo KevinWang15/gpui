@@ -58,7 +58,7 @@ struct Layer {
     primitives: SmallVec<[Range<usize>; 1]>,
     bounds: Bounds<ScaledPixels>,
     max_kind: PrimitiveKind,
-    max_shared_kind: PrimitiveKind,
+    max_shared_kind: Option<PrimitiveKind>,
 }
 
 #[derive(Default)]
@@ -279,7 +279,7 @@ impl Scene {
             primitives: SmallVec::new(),
             bounds: Bounds::default(),
             max_kind: PrimitiveKind::BackdropBlur,
-            max_shared_kind: PrimitiveKind::Surface,
+            max_shared_kind: Some(PrimitiveKind::Surface),
         });
         self.paint_operations.push(PaintOperation::StartLayer);
     }
@@ -327,6 +327,15 @@ impl Scene {
         if clipped_bounds.is_empty() {
             return false;
         }
+        // A blur reads beyond its bounds: it must come after everything
+        // painted before it within that reach.
+        let clipped_bounds = match &primitive {
+            Primitive::BackdropBlur(blur) => match crate::backdrop_blur::BlurPlan::for_radius(blur.blur_radius.0) {
+                Some(plan) => clipped_bounds.dilate(ScaledPixels(plan.reach())),
+                None => return false,
+            },
+            _ => clipped_bounds,
+        };
 
         let kind = primitive.kind();
         if let Some(&layer) = self.layer_stack.last()
@@ -629,12 +638,17 @@ impl PrimitiveKind {
     /// paint order. So, a primitive can only share the draw order of the
     /// topmost primitive it overlaps if that primitive's kind is at most the
     /// one returned here. Otherwise, it needs a new draw order.
-    fn max_shared_kind(self) -> Self {
+    fn max_shared_kind(self) -> Option<Self> {
         match self {
-            Self::MonochromeSprite => Self::Underline,
-            Self::SubpixelSprite => Self::MonochromeSprite,
-            Self::PolychromeSprite => Self::SubpixelSprite,
-            kind => kind,
+            // A blur copies what's drawn before it, so it can't share a draw
+            // order with anything it overlaps: within an order it is drawn
+            // first, before the others. Primitives painted after it may
+            // share its order (they draw after the blur, as painted).
+            Self::BackdropBlur => None,
+            Self::MonochromeSprite => Some(Self::Underline),
+            Self::SubpixelSprite => Some(Self::MonochromeSprite),
+            Self::PolychromeSprite => Some(Self::SubpixelSprite),
+            kind => Some(kind),
         }
     }
 }
@@ -798,12 +812,16 @@ impl<'a> Iterator for BatchIterator<'a> {
 
         match batch_kind {
             PrimitiveKind::BackdropBlur => {
+                // One draw order per batch: a blur at a later order must see
+                // the blurs before it, so they can't be composited from the
+                // same copy.
                 let blurs_start = self.backdrop_blurs_start;
                 let mut blurs_end = blurs_start + 1;
+                let order = first.0;
                 self.backdrop_blurs_iter.next();
                 while self
                     .backdrop_blurs_iter
-                    .next_if(|blur| (blur.order, batch_kind) < max_order_and_kind)
+                    .next_if(|blur| Some(blur.order) == order && (blur.order, batch_kind) < max_order_and_kind)
                     .is_some()
                 {
                     blurs_end += 1;
@@ -957,6 +975,7 @@ impl<'a> Iterator for BatchIterator<'a> {
     allow(dead_code)
 )]
 #[allow(missing_docs)]
+#[derive(Clone)]
 pub enum PrimitiveBatch {
     BackdropBlurs(Range<usize>),
     Shadows(Range<usize>),
@@ -1014,16 +1033,16 @@ impl PrimitiveBatch {
     }
 }
 
-/// GPU frosted-glass backdrop blur primitive (`backdrop-filter: blur(...)`).
-///
-/// Backends with blur support (such as `gpui_wgpu` via Dual-Kawase downsample/upsample passes)
-/// blur everything already painted behind `bounds` and composite the rounded region in paint order.
+/// GPU frosted-glass backdrop blur primitive (`backdrop-filter: blur(...)`): everything
+/// already painted behind `bounds`, blurred, in the rounded region. What renderers draw, and how,
+/// is in [`crate::backdrop_blur`].
 #[derive(Debug, Copy, Clone)]
 #[repr(C)]
 pub struct BackdropBlur {
     /// Draw order assigned by [`Scene`].
     pub order: DrawOrder,
-    /// Blur radius in scaled device pixels.
+    /// Blur radius in scaled device pixels: the blur's standard deviation, as in CSS
+    /// (see [`crate::backdrop_blur::BlurPlan`]).
     pub blur_radius: ScaledPixels,
     /// Region bounds in scaled device pixels.
     pub bounds: Bounds<ScaledPixels>,

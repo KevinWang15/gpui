@@ -5173,11 +5173,10 @@ impl Window {
         )
     }
 
-    /// Paints a GPU frosted-glass backdrop blur region behind subsequent primitives.
-    ///
-    /// On GPU backends with backdrop-blur pipelines (`gpui_wgpu`), everything already painted
-    /// behind `bounds` is blurred via Dual-Kawase downsample/upsample passes and composited with
-    /// exact rounded-rectangle SDF antialiasing and the current content mask.
+    /// Paints a backdrop blur: everything already painted behind `bounds`, blurred with
+    /// `blur_radius` as its standard deviation (as CSS `backdrop-filter: blur()`), inside the
+    /// rounded rectangle and the current content mask. Every renderer draws it the same way
+    /// ([`crate::backdrop_blur`]). Don't call it inside [`Self::paint_layer`].
     pub fn paint_backdrop_blur(
         &mut self,
         bounds: Bounds<Pixels>,

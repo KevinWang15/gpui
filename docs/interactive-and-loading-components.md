@@ -6,7 +6,7 @@ This guide documents the loading, GPU backdrop-blur, and high-interactivity comp
 
 ## 1. `BlurContainer` & `LoadingOverlay`
 
-Both components use GPUI's native GPU Dual-Kawase `.backdrop_blur(px(...))` pipeline — accelerated on both **WGPU (Linux/Vulkan)** and **DirectX 11 (`gpui_windows`)** — while keeping any overlaid UI 100% razor-sharp on top and blocking pointer clicks/scrolls underneath.
+Both components use `.backdrop_blur(px(...))`: what's behind them, blurred on the GPU, with any UI painted over it left sharp, and pointer clicks and scrolls underneath blocked. The radius is a standard deviation, as in CSS `backdrop-filter: blur()`. Every renderer (DirectX 11 on Windows, Metal on macOS, WGPU elsewhere) draws it the same way, defined in `crates/gpui/src/backdrop_blur.rs` and tested against a CPU reference.
 
 ### `LoadingOverlay`
 

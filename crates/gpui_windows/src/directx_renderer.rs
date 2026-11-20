@@ -46,7 +46,7 @@ pub(crate) struct DirectXRenderer {
     font_info: &'static FontInfo,
     /// The frames of a running view transition, once one is captured.
     transition: Option<TransitionFrames>,
-    /// Lazy-allocated half/quarter resolution targets for Dual-Kawase backdrop blur.
+    /// Offscreen textures for backdrop blurs, made on first use (`gpui::backdrop_blur`).
     backdrop_blur: Option<BackdropBlurTargets>,
 
     width: u32,
@@ -128,25 +128,26 @@ struct ViewTransitionParams {
     _pad: [u32; 2],
 }
 
-/// Lazy offscreen textures for Dual-Kawase backdrop blur (`scene` snapshot, `half`, `quarter`).
+/// Offscreen textures for backdrop blurs (`gpui::backdrop_blur`): `snapshot`
+/// is level 0, the copy of the target taken for each blur batch; `levels[k -
+/// 1]` is level `k`. Made on first use, again when the size changes.
 struct BackdropBlurTargets {
     width: u32,
     height: u32,
-    half_width: u32,
-    half_height: u32,
-    quarter_width: u32,
-    quarter_height: u32,
-    scene: ID3D11Texture2D,
-    scene_srv: Option<ID3D11ShaderResourceView>,
-    _half: ID3D11Texture2D,
-    half_rtv: Option<ID3D11RenderTargetView>,
-    half_srv: Option<ID3D11ShaderResourceView>,
-    _quarter: ID3D11Texture2D,
-    quarter_rtv: Option<ID3D11RenderTargetView>,
-    quarter_srv: Option<ID3D11ShaderResourceView>,
+    snapshot: ID3D11Texture2D,
+    snapshot_srv: Option<ID3D11ShaderResourceView>,
+    levels: Vec<BlurLevel>,
 }
 
-/// Shaders, constant buffer, clamp sampler, and blend state for Dual-Kawase backdrop blur.
+struct BlurLevel {
+    _texture: ID3D11Texture2D,
+    rtv: Option<ID3D11RenderTargetView>,
+    srv: Option<ID3D11ShaderResourceView>,
+    width: u32,
+    height: u32,
+}
+
+/// Shaders, constant buffer and clamp sampler for backdrop blurs.
 struct BackdropBlurPipeline {
     downsample_vs: ID3D11VertexShader,
     downsample_ps: ID3D11PixelShader,
@@ -156,7 +157,6 @@ struct BackdropBlurPipeline {
     composite_ps: ID3D11PixelShader,
     params: Option<ID3D11Buffer>,
     clamp_sampler: Option<ID3D11SamplerState>,
-    blend_state: ID3D11BlendState,
 }
 
 /// `BackdropBlurParams` in shaders.hlsl (80 bytes, 16-byte aligned).
@@ -165,9 +165,8 @@ struct BackdropBlurPipeline {
 struct BackdropBlurParams {
     viewport_size: [f32; 2],
     texel_size: [f32; 2],
-    blur_radius: f32,
-    kawase_offset: f32,
-    _pad: [u32; 2],
+    offset: f32,
+    _pad: [u32; 3],
     bounds_origin: [f32; 2],
     bounds_size: [f32; 2],
     corner_radii: [f32; 4],
@@ -611,35 +610,9 @@ impl DirectXRenderer {
                     let _annotation = annotation
                         .as_ref()
                         .map(|annotation| Annotation::new(annotation, HSTRING::from(batch.label())));
-                    let owned_batch = match batch {
-                        PrimitiveBatch::BackdropBlurs(r) => PrimitiveBatch::BackdropBlurs(r.clone()),
-                        PrimitiveBatch::Shadows(r) => PrimitiveBatch::Shadows(r.clone()),
-                        PrimitiveBatch::Quads(r) => PrimitiveBatch::Quads(r.clone()),
-                        PrimitiveBatch::Paths(r) => PrimitiveBatch::Paths(r.clone()),
-                        PrimitiveBatch::Underlines(r) => PrimitiveBatch::Underlines(r.clone()),
-                        PrimitiveBatch::MonochromeSprites { texture_id, range } => {
-                            PrimitiveBatch::MonochromeSprites {
-                                texture_id: *texture_id,
-                                range: range.clone(),
-                            }
-                        }
-                        PrimitiveBatch::SubpixelSprites { texture_id, range } => {
-                            PrimitiveBatch::SubpixelSprites {
-                                texture_id: *texture_id,
-                                range: range.clone(),
-                            }
-                        }
-                        PrimitiveBatch::PolychromeSprites { texture_id, range } => {
-                            PrimitiveBatch::PolychromeSprites {
-                                texture_id: *texture_id,
-                                range: range.clone(),
-                            }
-                        }
-                        PrimitiveBatch::Surfaces(r) => PrimitiveBatch::Surfaces(r.clone()),
-                    };
                     self.draw_scene_batch(
                         scene,
-                        owned_batch,
+                        batch.clone(),
                         depth_scale,
                         &mut quad_cursor,
                         &mut path_tile_cursor,
@@ -719,8 +692,10 @@ impl DirectXRenderer {
         })
     }
 
+    /// Draws one blur batch ([`draw_blur_batch`]), then restores the state
+    /// the scene's pipelines expect.
     fn apply_backdrop_blurs(&mut self, blurs: &[BackdropBlur], restore_paths: bool) -> Result<()> {
-        if blurs.is_empty() {
+        if gpui::backdrop_blur::group_by_plan(blurs).is_empty() {
             return Ok(());
         }
         let devices = self.devices.as_ref().context("devices missing")?;
@@ -729,163 +704,20 @@ impl DirectXRenderer {
             .render_target
             .as_ref()
             .context("render target missing")?;
-
-        if !self
-            .backdrop_blur
-            .as_ref()
-            .is_some_and(|t| t.width == self.width && t.height == self.height)
-        {
-            self.backdrop_blur = Some(BackdropBlurTargets::new(&devices.device, render_target)?);
-        }
-
-        let targets = self
-            .backdrop_blur
-            .as_ref()
-            .context("backdrop blur targets missing")?;
-        let pipeline = &self.pipelines.backdrop_blur;
-        let params_buf = pipeline
-            .params
-            .as_ref()
-            .context("backdrop blur params missing")?;
+        draw_blur_batch(
+            &devices.device,
+            &devices.device_context,
+            &self.pipelines.backdrop_blur,
+            &mut self.backdrop_blur,
+            render_target,
+            &resources.render_target_view,
+            &resources.viewport,
+            blurs,
+        )?;
         let context = &devices.device_context;
-
-        let max_radius = blurs
-            .iter()
-            .map(|b| b.blur_radius.0)
-            .fold(0.0f32, f32::max);
-        let kawase_offset = (max_radius / 5.0).clamp(0.75, 4.0);
-        let vw = targets.width as f32;
-        let vh = targets.height as f32;
-        let hw = targets.half_width as f32;
-        let hh = targets.half_height as f32;
-        let qw = targets.quarter_width as f32;
-        let qh = targets.quarter_height as f32;
-
-        let half_viewport = D3D11_VIEWPORT {
-            TopLeftX: 0.0,
-            TopLeftY: 0.0,
-            Width: hw,
-            Height: hh,
-            MinDepth: 0.0,
-            MaxDepth: 1.0,
-        };
-        let quarter_viewport = D3D11_VIEWPORT {
-            TopLeftX: 0.0,
-            TopLeftY: 0.0,
-            Width: qw,
-            Height: qh,
-            MinDepth: 0.0,
-            MaxDepth: 1.0,
-        };
-
         unsafe {
-            // Snapshot everything drawn into the render target before this blur batch.
-            context.CopyResource(&targets.scene, render_target);
-
-            // Common state for Kawase downsample/upsample passes (no blend, no depth).
-            context.OMSetBlendState(None, None, 0xFFFFFFFF);
-            context.OMSetDepthStencilState(None, 0);
-            context.IASetInputLayout(None);
-            context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-            context.VSSetConstantBuffers(2, Some(slice::from_ref(&pipeline.params)));
-            context.PSSetConstantBuffers(2, Some(slice::from_ref(&pipeline.params)));
-            context.PSSetSamplers(0, Some(slice::from_ref(&pipeline.clamp_sampler)));
-            context.PSSetShaderResources(0, Some(&[None]));
-
-            // Pass 1: Downsample full -> half
-            update_buffer(
-                context,
-                params_buf,
-                &[BackdropBlurParams {
-                    texel_size: [1.0 / vw, 1.0 / vh],
-                    kawase_offset,
-                    ..Default::default()
-                }],
-            )?;
-            context.OMSetRenderTargets(Some(slice::from_ref(&targets.half_rtv)), None);
-            context.RSSetViewports(Some(slice::from_ref(&half_viewport)));
-            context.VSSetShader(&pipeline.downsample_vs, None);
-            context.PSSetShader(&pipeline.downsample_ps, None);
-            context.PSSetShaderResources(0, Some(slice::from_ref(&targets.scene_srv)));
-            context.Draw(3, 0);
-            context.PSSetShaderResources(0, Some(&[None]));
-
-            // Pass 2: Downsample half -> quarter
-            update_buffer(
-                context,
-                params_buf,
-                &[BackdropBlurParams {
-                    texel_size: [1.0 / hw, 1.0 / hh],
-                    kawase_offset,
-                    ..Default::default()
-                }],
-            )?;
-            context.OMSetRenderTargets(Some(slice::from_ref(&targets.quarter_rtv)), None);
-            context.RSSetViewports(Some(slice::from_ref(&quarter_viewport)));
-            context.PSSetShaderResources(0, Some(slice::from_ref(&targets.half_srv)));
-            context.Draw(3, 0);
-            context.PSSetShaderResources(0, Some(&[None]));
-
-            // Pass 3: Upsample quarter -> half
-            update_buffer(
-                context,
-                params_buf,
-                &[BackdropBlurParams {
-                    texel_size: [1.0 / qw, 1.0 / qh],
-                    kawase_offset,
-                    ..Default::default()
-                }],
-            )?;
-            context.OMSetRenderTargets(Some(slice::from_ref(&targets.half_rtv)), None);
-            context.RSSetViewports(Some(slice::from_ref(&half_viewport)));
-            context.VSSetShader(&pipeline.upsample_vs, None);
-            context.PSSetShader(&pipeline.upsample_ps, None);
-            context.PSSetShaderResources(0, Some(slice::from_ref(&targets.quarter_srv)));
-            context.Draw(3, 0);
-            context.PSSetShaderResources(0, Some(&[None]));
-
-            // Pass 4: Composite each rounded BackdropBlur region back onto render_target.
-            context.OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
-            context.RSSetViewports(Some(slice::from_ref(&resources.viewport)));
-            context.OMSetBlendState(&pipeline.blend_state, None, 0xFFFFFFFF);
-            context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-            context.VSSetShader(&pipeline.composite_vs, None);
-            context.PSSetShader(&pipeline.composite_ps, None);
-            context.PSSetShaderResources(0, Some(slice::from_ref(&targets.half_srv)));
-
-            for blur in blurs {
-                update_buffer(
-                    context,
-                    params_buf,
-                    &[BackdropBlurParams {
-                        viewport_size: [vw, vh],
-                        texel_size: [1.0 / hw, 1.0 / hh],
-                        blur_radius: blur.blur_radius.0,
-                        kawase_offset,
-                        _pad: [0; 2],
-                        bounds_origin: [blur.bounds.origin.x.0, blur.bounds.origin.y.0],
-                        bounds_size: [blur.bounds.size.width.0, blur.bounds.size.height.0],
-                        corner_radii: [
-                            blur.corner_radii.top_left.0,
-                            blur.corner_radii.top_right.0,
-                            blur.corner_radii.bottom_right.0,
-                            blur.corner_radii.bottom_left.0,
-                        ],
-                        mask_origin: [
-                            blur.content_mask.bounds.origin.x.0,
-                            blur.content_mask.bounds.origin.y.0,
-                        ],
-                        mask_size: [
-                            blur.content_mask.bounds.size.width.0,
-                            blur.content_mask.bounds.size.height.0,
-                        ],
-                    }],
-                )?;
-                context.Draw(4, 0);
-            }
-
-            // Unbind blur SRV and restore main scene render targets, depth buffer, and constant buffers.
-            context.PSSetShaderResources(0, Some(&[None]));
+            // Restore what the scene's pipelines expect.
+            context.PSSetShaderResources(0, Some(&[None, None]));
             context.OMSetRenderTargets(
                 Some(slice::from_ref(&resources.render_target_view)),
                 resources.depth_stencil_view.as_ref(),
@@ -1422,6 +1254,134 @@ impl DirectXResources {
     }
 }
 
+/// Draws one blur batch as `gpui::backdrop_blur` defines it: copy the target
+/// (level 0), run each plan's passes, then composite every blur with blending
+/// off. Leaves the render target bound without its depth buffer; the caller
+/// restores the rest of its state.
+#[allow(clippy::too_many_arguments)]
+fn draw_blur_batch(
+    device: &ID3D11Device,
+    context: &ID3D11DeviceContext,
+    pipeline: &BackdropBlurPipeline,
+    targets: &mut Option<BackdropBlurTargets>,
+    render_target: &ID3D11Texture2D,
+    render_target_view: &Option<ID3D11RenderTargetView>,
+    target_viewport: &D3D11_VIEWPORT,
+    blurs: &[BackdropBlur],
+) -> Result<()> {
+        use gpui::backdrop_blur::{BlurPassKind, group_by_plan};
+        let groups = group_by_plan(blurs);
+        if groups.is_empty() {
+            return Ok(());
+        }
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        unsafe { render_target.GetDesc(&mut desc) };
+        if !targets.as_ref().is_some_and(|t| t.width == desc.Width.max(1) && t.height == desc.Height.max(1)) {
+            *targets = Some(BackdropBlurTargets::new(device, render_target)?);
+        }
+        let targets = targets.as_ref().context("backdrop blur targets missing")?;
+        let params_buf = pipeline
+            .params
+            .as_ref()
+            .context("backdrop blur params missing")?;
+        let viewport = |width: u32, height: u32| D3D11_VIEWPORT {
+            TopLeftX: 0.0,
+            TopLeftY: 0.0,
+            Width: width as f32,
+            Height: height as f32,
+            MinDepth: 0.0,
+            MaxDepth: 1.0,
+        };
+        let (vw, vh) = (targets.width as f32, targets.height as f32);
+        let unbind_inputs = || unsafe { context.PSSetShaderResources(0, Some(&[None, None])) };
+
+        unsafe {
+            context.CopyResource(&targets.snapshot, render_target);
+
+            context.OMSetBlendState(None, None, 0xFFFFFFFF);
+            context.OMSetDepthStencilState(None, 0);
+            context.IASetInputLayout(None);
+            context.VSSetConstantBuffers(2, Some(slice::from_ref(&pipeline.params)));
+            context.PSSetConstantBuffers(2, Some(slice::from_ref(&pipeline.params)));
+            context.PSSetSamplers(0, Some(slice::from_ref(&pipeline.clamp_sampler)));
+
+            for (plan, members) in &groups {
+                context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                for pass in plan.passes() {
+                    let (source_srv, sw, sh) = if pass.source == 0 {
+                        (&targets.snapshot_srv, targets.width, targets.height)
+                    } else {
+                        let l = &targets.levels[pass.source as usize - 1];
+                        (&l.srv, l.width, l.height)
+                    };
+                    let target = &targets.levels[pass.target as usize - 1];
+                    update_buffer(
+                        context,
+                        params_buf,
+                        &[BackdropBlurParams {
+                            texel_size: [1.0 / sw as f32, 1.0 / sh as f32],
+                            offset: plan.offset,
+                            ..Default::default()
+                        }],
+                    )?;
+                    unbind_inputs();
+                    context.OMSetRenderTargets(Some(slice::from_ref(&target.rtv)), None);
+                    context.RSSetViewports(Some(&[viewport(target.width, target.height)]));
+                    let (vs, ps) = match pass.kind {
+                        BlurPassKind::Downsample => (&pipeline.downsample_vs, &pipeline.downsample_ps),
+                        BlurPassKind::Upsample => (&pipeline.upsample_vs, &pipeline.upsample_ps),
+                    };
+                    context.VSSetShader(vs, None);
+                    context.PSSetShader(ps, None);
+                    context.PSSetShaderResources(0, Some(slice::from_ref(source_srv)));
+                    context.Draw(3, 0);
+                }
+
+                // Composite: the last upsample, from level 1, mixed into the
+                // target by each blur's coverage.
+                let level1 = &targets.levels[0];
+                unbind_inputs();
+                context.OMSetRenderTargets(Some(slice::from_ref(render_target_view)), None);
+                context.RSSetViewports(Some(slice::from_ref(target_viewport)));
+                context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+                context.VSSetShader(&pipeline.composite_vs, None);
+                context.PSSetShader(&pipeline.composite_ps, None);
+                context.PSSetShaderResources(0, Some(&[level1.srv.clone(), targets.snapshot_srv.clone()]));
+                for blur in members {
+                    update_buffer(
+                        context,
+                        params_buf,
+                        &[BackdropBlurParams {
+                            viewport_size: [vw, vh],
+                            texel_size: [1.0 / level1.width as f32, 1.0 / level1.height as f32],
+                            offset: plan.offset,
+                            _pad: [0; 3],
+                            bounds_origin: [blur.bounds.origin.x.0, blur.bounds.origin.y.0],
+                            bounds_size: [blur.bounds.size.width.0, blur.bounds.size.height.0],
+                            corner_radii: [
+                                blur.corner_radii.top_left.0,
+                                blur.corner_radii.top_right.0,
+                                blur.corner_radii.bottom_right.0,
+                                blur.corner_radii.bottom_left.0,
+                            ],
+                            mask_origin: [
+                                blur.content_mask.bounds.origin.x.0,
+                                blur.content_mask.bounds.origin.y.0,
+                            ],
+                            mask_size: [
+                                blur.content_mask.bounds.size.width.0,
+                                blur.content_mask.bounds.size.height.0,
+                            ],
+                        }],
+                    )?;
+                    context.Draw(4, 0);
+                }
+            }
+            unbind_inputs();
+        }
+        Ok(())
+}
+
 impl DirectXRenderPipelines {
     pub fn new(device: &ID3D11Device) -> Result<Self> {
         let shadow_pipeline = PipelineState::new(
@@ -1538,7 +1498,6 @@ impl BackdropBlurPipeline {
             composite_ps,
             params: create_constant_buffer::<BackdropBlurParams>(device)?,
             clamp_sampler,
-            blend_state: create_blend_state(device)?,
         })
     }
 }
@@ -1549,12 +1508,10 @@ impl BackdropBlurTargets {
         unsafe { render_target.GetDesc(&mut base_desc) };
         let width = base_desc.Width.max(1);
         let height = base_desc.Height.max(1);
-        let half_width = (width / 2).max(1);
-        let half_height = (height / 2).max(1);
-        let quarter_width = (width / 4).max(1);
-        let quarter_height = (height / 4).max(1);
 
-        let scene_desc = D3D11_TEXTURE2D_DESC {
+        // CopyResource needs the snapshot to match the target's format and
+        // sample count; the target is never multisampled.
+        let snapshot_desc = D3D11_TEXTURE2D_DESC {
             Width: width,
             Height: height,
             MipLevels: 1,
@@ -1569,52 +1526,33 @@ impl BackdropBlurTargets {
             MiscFlags: 0,
             ..base_desc
         };
-        let mut scene = None;
-        unsafe { device.CreateTexture2D(&scene_desc, None, Some(&mut scene))? };
-        let scene = scene.context("creating backdrop blur scene snapshot texture")?;
-        let mut scene_srv = None;
-        unsafe { device.CreateShaderResourceView(&scene, None, Some(&mut scene_srv))? };
+        let mut snapshot = None;
+        unsafe { device.CreateTexture2D(&snapshot_desc, None, Some(&mut snapshot))? };
+        let snapshot = snapshot.context("creating backdrop blur snapshot texture")?;
+        let mut snapshot_srv = None;
+        unsafe { device.CreateShaderResourceView(&snapshot, None, Some(&mut snapshot_srv))? };
 
-        let make_rt = |w: u32, h: u32| -> Result<(
-            ID3D11Texture2D,
-            Option<ID3D11RenderTargetView>,
-            Option<ID3D11ShaderResourceView>,
-        )> {
-            let desc = D3D11_TEXTURE2D_DESC {
-                Width: w,
-                Height: h,
-                BindFlags: (D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE).0 as u32,
-                ..scene_desc
-            };
-            let mut tex = None;
-            unsafe { device.CreateTexture2D(&desc, None, Some(&mut tex))? };
-            let tex = tex.context("creating backdrop blur mip texture")?;
-            let mut rtv = None;
-            unsafe { device.CreateRenderTargetView(&tex, None, Some(&mut rtv))? };
-            let mut srv = None;
-            unsafe { device.CreateShaderResourceView(&tex, None, Some(&mut srv))? };
-            Ok((tex, rtv, srv))
-        };
+        let levels = (1..=gpui::backdrop_blur::MAX_BLUR_LEVELS)
+            .map(|level| -> Result<BlurLevel> {
+                let (w, h) = gpui::backdrop_blur::level_size(width, height, level);
+                let desc = D3D11_TEXTURE2D_DESC {
+                    Width: w,
+                    Height: h,
+                    BindFlags: (D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE).0 as u32,
+                    ..snapshot_desc
+                };
+                let mut texture = None;
+                unsafe { device.CreateTexture2D(&desc, None, Some(&mut texture))? };
+                let texture = texture.context("creating backdrop blur level texture")?;
+                let mut rtv = None;
+                unsafe { device.CreateRenderTargetView(&texture, None, Some(&mut rtv))? };
+                let mut srv = None;
+                unsafe { device.CreateShaderResourceView(&texture, None, Some(&mut srv))? };
+                Ok(BlurLevel { _texture: texture, rtv, srv, width: w, height: h })
+            })
+            .collect::<Result<Vec<_>>>()?;
 
-        let (half, half_rtv, half_srv) = make_rt(half_width, half_height)?;
-        let (quarter, quarter_rtv, quarter_srv) = make_rt(quarter_width, quarter_height)?;
-
-        Ok(Self {
-            width,
-            height,
-            half_width,
-            half_height,
-            quarter_width,
-            quarter_height,
-            scene,
-            scene_srv,
-            _half: half,
-            half_rtv,
-            half_srv,
-            _quarter: quarter,
-            quarter_rtv,
-            quarter_srv,
-        })
+        Ok(Self { width, height, snapshot, snapshot_srv, levels })
     }
 }
 
@@ -2751,3 +2689,147 @@ mod dxgi {
         ))
     }
 }
+
+/// The blur passes and composite on a real Direct3D device (WARP), against
+/// `gpui::backdrop_blur::reference`. Run in release: debug builds compile
+/// the shaders from source at run time.
+#[cfg(all(test, not(debug_assertions)))]
+mod backdrop_blur_tests {
+    use super::*;
+    use gpui::backdrop_blur::{BlurPlan, reference};
+    use gpui::{Bounds, ContentMask, Corners, ScaledPixels, point, size};
+    use windows::Win32::Foundation::HMODULE;
+    use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_WARP;
+
+    const W: u32 = 96;
+    const H: u32 = 96;
+
+    fn warp() -> (ID3D11Device, ID3D11DeviceContext) {
+        let mut device = None;
+        let mut context = None;
+        unsafe {
+            D3D11CreateDevice(
+                None,
+                D3D_DRIVER_TYPE_WARP,
+                HMODULE::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                None,
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                Some(&mut context),
+            )
+            .unwrap();
+        }
+        (device.unwrap(), context.unwrap())
+    }
+
+    /// White and red vertical stripes, 8 pixels wide, as BGRA bytes.
+    fn stripes() -> Vec<u8> {
+        let mut px = Vec::with_capacity((W * H * 4) as usize);
+        for _ in 0..H {
+            for x in 0..W {
+                px.extend_from_slice(if (x / 8) % 2 == 0 { &[255, 255, 255, 255] } else { &[0, 0, 255, 255] });
+            }
+        }
+        px
+    }
+
+    fn read_back(device: &ID3D11Device, context: &ID3D11DeviceContext, texture: &ID3D11Texture2D) -> Vec<u8> {
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        unsafe { texture.GetDesc(&mut desc) };
+        let staging_desc = D3D11_TEXTURE2D_DESC {
+            Usage: D3D11_USAGE_STAGING,
+            BindFlags: 0,
+            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+            MiscFlags: 0,
+            ..desc
+        };
+        let mut staging = None;
+        unsafe { device.CreateTexture2D(&staging_desc, None, Some(&mut staging)).unwrap() };
+        let staging = staging.unwrap();
+        let mut out = vec![0u8; (W * H * 4) as usize];
+        unsafe {
+            context.CopyResource(&staging, texture);
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            context.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)).unwrap();
+            for row in 0..H as usize {
+                let src = (mapped.pData as *const u8).add(row * mapped.RowPitch as usize);
+                std::ptr::copy_nonoverlapping(src, out.as_mut_ptr().add(row * W as usize * 4), W as usize * 4);
+            }
+            context.Unmap(&staging, 0);
+        }
+        out
+    }
+
+    fn check(radius: f32) {
+        let (device, context) = warp();
+        let initial = stripes();
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: W,
+            Height: H,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: (D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE).0 as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let data = D3D11_SUBRESOURCE_DATA { pSysMem: initial.as_ptr().cast(), SysMemPitch: W * 4, SysMemSlicePitch: 0 };
+        let mut target = None;
+        unsafe { device.CreateTexture2D(&desc, Some(&data), Some(&mut target)).unwrap() };
+        let target = target.unwrap();
+        let mut rtv = None;
+        unsafe { device.CreateRenderTargetView(&target, None, Some(&mut rtv)).unwrap() };
+        let viewport = D3D11_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: W as f32, Height: H as f32, MinDepth: 0.0, MaxDepth: 1.0 };
+        let pipeline = BackdropBlurPipeline::new(&device).unwrap();
+        let mut targets = None;
+        let rect = |x: f32, y: f32, w: f32, h: f32| Bounds { origin: point(ScaledPixels(x), ScaledPixels(y)), size: size(ScaledPixels(w), ScaledPixels(h)) };
+        let blur = BackdropBlur {
+            order: 0,
+            blur_radius: ScaledPixels(radius),
+            bounds: rect(16.0, 20.0, 64.0, 56.0),
+            corner_radii: Corners {
+                top_left: ScaledPixels(10.0),
+                top_right: ScaledPixels(4.0),
+                bottom_right: ScaledPixels(10.0),
+                bottom_left: ScaledPixels(0.0),
+            },
+            content_mask: ContentMask { bounds: rect(0.0, 0.0, W as f32, H as f32) },
+        };
+        draw_blur_batch(&device, &context, &pipeline, &mut targets, &target, &rtv, &viewport, &[blur]).unwrap();
+        let actual = read_back(&device, &context, &target);
+
+        // The reference works in RGBA; the target is BGRA.
+        let rgba = |p: &[u8]| [p[2], p[1], p[0], p[3]].map(|c| c as f32 / 255.0);
+        let snapshot = reference::Image { width: W, height: H, pixels: initial.chunks_exact(4).map(rgba).collect() };
+        let plan = BlurPlan::for_radius(radius).unwrap();
+        let expected = reference::composite(&snapshot, plan, [16.0, 20.0], [64.0, 56.0], [10.0, 4.0, 10.0, 0.0]);
+        let (mut worst, mut total) = (0u8, 0u64);
+        for (i, px) in actual.chunks_exact(4).enumerate() {
+            let want = expected.pixels[i].map(|c| (c * 255.0).round().clamp(0.0, 255.0) as u8);
+            let got = [px[2], px[1], px[0], px[3]];
+            for c in 0..4 {
+                let d = got[c].abs_diff(want[c]);
+                worst = worst.max(d);
+                total += d as u64;
+            }
+        }
+        let mean = total as f64 / (W * H * 4) as f64;
+        assert!(worst <= 8 && mean < 1.0, "radius {radius} ({plan:?}): worst channel difference {worst}, mean {mean:.2}");
+        let at = |x: u32, y: u32, img: &[u8]| img[((y * W + x) * 4) as usize..][..4].to_vec();
+        assert_ne!(at(48, 48, &actual), at(48, 48, &initial), "the inside is blurred");
+        assert_eq!(at(4, 4, &actual), at(4, 4, &initial), "the outside is untouched");
+    }
+
+    // `#[test]` alone is gpui's test macro here (the module imports gpui's).
+    #[core::prelude::v1::test]
+    fn backdrop_blur_matches_the_reference() {
+        for radius in [2.0, 5.0, 9.0, 16.0] {
+            check(radius);
+        }
+    }
+}
+

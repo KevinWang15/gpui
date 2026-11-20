@@ -1417,16 +1417,18 @@ float4 view_transition_fragment(float4 position: SV_Position): SV_Target {
 
 /*
 **
-**              Backdrop blur (Dual-Kawase)
+**              Backdrop blur (gpui::backdrop_blur)
 **
 */
 
+// The dual-Kawase passes and the composite, as `gpui::backdrop_blur`
+// defines them (the WGSL in gpui_wgpu is the same). The target holds
+// premultiplied alpha.
 cbuffer BackdropBlurParams: register(b2) {
-    float2 blur_viewport_size;
-    float2 blur_texel_size;
-    float blur_radius;
-    float blur_kawase_offset;
-    uint2 blur_pad;
+    float2 blur_viewport_size;   // composite: the target's size in pixels
+    float2 blur_texel_size;      // the source level's texel size, in UV
+    float blur_offset;           // the plan's sample offset, in source texels
+    uint3 blur_pad;
     float2 blur_bounds_origin;
     float2 blur_bounds_size;
     float4 blur_corner_radii; // (top_left, top_right, bottom_right, bottom_left)
@@ -1435,6 +1437,8 @@ cbuffer BackdropBlurParams: register(b2) {
 };
 
 Texture2D<float4> t_blur_src: register(t0);
+// The copy of the target taken for this blur batch (level 0), for the composite.
+Texture2D<float4> t_blur_snapshot: register(t1);
 SamplerState s_blur: register(s0);
 
 struct BlurFullscreenInput {
@@ -1454,35 +1458,40 @@ BlurFullscreenInput kawase_downsample_vertex(uint vertex_id: SV_VertexID) {
     return blur_fullscreen_vertex_impl(vertex_id);
 }
 
-// 5-tap Dual-Kawase downsample (2x resolution reduction per pass).
+// The 5-tap downsample.
 float4 kawase_downsample_fragment(BlurFullscreenInput input): SV_Target {
-    float2 hp = blur_texel_size * blur_kawase_offset;
+    float2 d = blur_texel_size * blur_offset;
     float4 sum = t_blur_src.Sample(s_blur, input.uv) * 4.0;
-    sum += t_blur_src.Sample(s_blur, input.uv + float2(-hp.x, -hp.y));
-    sum += t_blur_src.Sample(s_blur, input.uv + float2(hp.x, -hp.y));
-    sum += t_blur_src.Sample(s_blur, input.uv + float2(-hp.x, hp.y));
-    sum += t_blur_src.Sample(s_blur, input.uv + float2(hp.x, hp.y));
+    sum += t_blur_src.Sample(s_blur, input.uv + float2(-d.x, -d.y));
+    sum += t_blur_src.Sample(s_blur, input.uv + float2(d.x, -d.y));
+    sum += t_blur_src.Sample(s_blur, input.uv + float2(-d.x, d.y));
+    sum += t_blur_src.Sample(s_blur, input.uv + float2(d.x, d.y));
     return sum / 8.0;
+}
+
+// The 8-tap tent upsample.
+float4 blur_tent(float2 uv) {
+    float2 d = blur_texel_size * blur_offset;
+    float4 sum = t_blur_src.Sample(s_blur, uv + float2(-d.x * 2.0, 0.0));
+    sum += t_blur_src.Sample(s_blur, uv + float2(-d.x, d.y)) * 2.0;
+    sum += t_blur_src.Sample(s_blur, uv + float2(0.0, d.y * 2.0));
+    sum += t_blur_src.Sample(s_blur, uv + float2(d.x, d.y)) * 2.0;
+    sum += t_blur_src.Sample(s_blur, uv + float2(d.x * 2.0, 0.0));
+    sum += t_blur_src.Sample(s_blur, uv + float2(d.x, -d.y)) * 2.0;
+    sum += t_blur_src.Sample(s_blur, uv + float2(0.0, -d.y * 2.0));
+    sum += t_blur_src.Sample(s_blur, uv + float2(-d.x, -d.y)) * 2.0;
+    return sum / 12.0;
 }
 
 BlurFullscreenInput kawase_upsample_vertex(uint vertex_id: SV_VertexID) {
     return blur_fullscreen_vertex_impl(vertex_id);
 }
 
-// 8-tap Dual-Kawase tent-filter upsample.
 float4 kawase_upsample_fragment(BlurFullscreenInput input): SV_Target {
-    float2 hp = blur_texel_size * blur_kawase_offset;
-    float4 sum = t_blur_src.Sample(s_blur, input.uv + float2(-hp.x * 2.0, 0.0));
-    sum += t_blur_src.Sample(s_blur, input.uv + float2(-hp.x, hp.y)) * 2.0;
-    sum += t_blur_src.Sample(s_blur, input.uv + float2(0.0, hp.y * 2.0));
-    sum += t_blur_src.Sample(s_blur, input.uv + float2(hp.x, hp.y)) * 2.0;
-    sum += t_blur_src.Sample(s_blur, input.uv + float2(hp.x * 2.0, 0.0));
-    sum += t_blur_src.Sample(s_blur, input.uv + float2(hp.x, -hp.y)) * 2.0;
-    sum += t_blur_src.Sample(s_blur, input.uv + float2(0.0, -hp.y * 2.0));
-    sum += t_blur_src.Sample(s_blur, input.uv + float2(-hp.x, -hp.y)) * 2.0;
-    return sum / 12.0;
+    return blur_tent(input.uv);
 }
 
+// One quad over the blur's bounds within its content mask.
 BlurFullscreenInput backdrop_blur_vertex(uint vertex_id: SV_VertexID) {
     float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
     float2 clip_min = max(blur_bounds_origin, blur_mask_origin);
@@ -1499,31 +1508,31 @@ BlurFullscreenInput backdrop_blur_vertex(uint vertex_id: SV_VertexID) {
     return output;
 }
 
-float pick_blur_corner_radius(float2 pos, float4 radii) {
-    if (pos.x < 0.0) {
-        return pos.y < 0.0 ? radii.x : radii.w;
-    } else {
-        return pos.y < 0.0 ? radii.y : radii.z;
+// `gpui::backdrop_blur::rounded_rect_coverage`.
+float blur_coverage(float2 pixel) {
+    float2 half_size = blur_bounds_size * 0.5;
+    float2 rel = pixel - (blur_bounds_origin + half_size);
+    float corner = blur_corner_radii.w; // bottom_left
+    if (rel.x < 0.0 && rel.y < 0.0) {
+        corner = blur_corner_radii.x;
+    } else if (rel.x >= 0.0 && rel.y < 0.0) {
+        corner = blur_corner_radii.y;
+    } else if (rel.x >= 0.0 && rel.y >= 0.0) {
+        corner = blur_corner_radii.z;
     }
+    float r = min(corner, min(half_size.x, half_size.y));
+    float2 q = abs(rel) - (half_size - float2(r, r));
+    float dist = length(max(q, float2(0.0, 0.0))) + min(max(q.x, q.y), 0.0) - r;
+    return saturate(0.5 - dist);
 }
 
+// lerp(snapshot, blurred, coverage), written with blending off.
 float4 backdrop_blur_fragment(BlurFullscreenInput input): SV_Target {
-    float2 frag_px = input.position.xy;
-    float2 half_size = blur_bounds_size * 0.5;
-    float2 center = blur_bounds_origin + half_size;
-    float2 rel = frag_px - center;
-    float radius = min(pick_blur_corner_radius(rel, blur_corner_radii), min(half_size.x, half_size.y));
-
-    float2 q = abs(rel) - (half_size - float2(radius, radius));
-    float dist = length(max(q, float2(0.0, 0.0))) + min(max(q.x, q.y), 0.0) - radius;
-
-    float edge_alpha = saturate(0.5 - dist);
-    float strength = saturate(blur_radius / 3.0);
-    float alpha = edge_alpha * strength;
-    if (alpha <= 0.001) {
+    float4 blurred = blur_tent(input.uv);
+    float4 snapshot = t_blur_snapshot.Load(int3(int2(input.position.xy), 0));
+    float cov = blur_coverage(input.position.xy);
+    if (cov <= 0.0) {
         discard;
     }
-
-    float4 blurred = t_blur_src.Sample(s_blur, saturate(input.uv));
-    return float4(blurred.rgb, alpha);
+    return lerp(snapshot, blurred, cov);
 }

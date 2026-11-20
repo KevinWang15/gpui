@@ -1330,3 +1330,130 @@ bool has_border(Edges_ScaledPixels border_widths) {
 bool is_shaped(Quad quad) {
   return has_rounded_corners(quad.corner_radii) || has_border(quad.border_widths);
 }
+
+/*
+**
+**              Backdrop blur (gpui::backdrop_blur)
+**
+*/
+
+// The dual-Kawase passes, the composite and the final blit, as
+// `gpui::backdrop_blur` defines them (the WGSL in gpui_wgpu and the HLSL in
+// gpui_windows are the same). The target holds premultiplied alpha.
+// Scalar padding keeps this layout equal to the Rust `BlurParams` (80 bytes).
+struct BlurParams {
+  float2 viewport_size; // composite: the target's size in pixels
+  float2 texel_size;    // the source level's texel size, in UV
+  float offset;         // the plan's sample offset, in source texels
+  uint pad0;
+  uint pad1;
+  uint pad2;
+  float2 bounds_origin;
+  float2 bounds_size;
+  float4 corner_radii; // (top_left, top_right, bottom_right, bottom_left)
+  float2 mask_origin;
+  float2 mask_size;
+};
+
+struct BlurVarying {
+  float4 position [[position]];
+  float2 uv;
+};
+
+constexpr sampler blur_sampler(mag_filter::linear, min_filter::linear,
+                               address::clamp_to_edge);
+
+vertex BlurVarying blur_fullscreen_vertex(uint vertex_id [[vertex_id]]) {
+  float2 p = float2(float((vertex_id << 1) & 2u), float(vertex_id & 2u));
+  BlurVarying out;
+  out.position = float4(p.x * 2.0 - 1.0, 1.0 - p.y * 2.0, 0.0, 1.0);
+  out.uv = p;
+  return out;
+}
+
+// The 5-tap downsample.
+fragment float4 kawase_downsample_fragment(BlurVarying in [[stage_in]],
+                                           constant BlurParams &params [[buffer(0)]],
+                                           texture2d<float> src [[texture(0)]]) {
+  float2 d = params.texel_size * params.offset;
+  float4 sum = src.sample(blur_sampler, in.uv) * 4.0;
+  sum += src.sample(blur_sampler, in.uv + float2(-d.x, -d.y));
+  sum += src.sample(blur_sampler, in.uv + float2(d.x, -d.y));
+  sum += src.sample(blur_sampler, in.uv + float2(-d.x, d.y));
+  sum += src.sample(blur_sampler, in.uv + float2(d.x, d.y));
+  return sum / 8.0;
+}
+
+// The 8-tap tent upsample.
+float4 blur_tent(texture2d<float> src, constant BlurParams &params, float2 uv) {
+  float2 d = params.texel_size * params.offset;
+  float4 sum = src.sample(blur_sampler, uv + float2(-d.x * 2.0, 0.0));
+  sum += src.sample(blur_sampler, uv + float2(-d.x, d.y)) * 2.0;
+  sum += src.sample(blur_sampler, uv + float2(0.0, d.y * 2.0));
+  sum += src.sample(blur_sampler, uv + float2(d.x, d.y)) * 2.0;
+  sum += src.sample(blur_sampler, uv + float2(d.x * 2.0, 0.0));
+  sum += src.sample(blur_sampler, uv + float2(d.x, -d.y)) * 2.0;
+  sum += src.sample(blur_sampler, uv + float2(0.0, -d.y * 2.0));
+  sum += src.sample(blur_sampler, uv + float2(-d.x, -d.y)) * 2.0;
+  return sum / 12.0;
+}
+
+fragment float4 kawase_upsample_fragment(BlurVarying in [[stage_in]],
+                                         constant BlurParams &params [[buffer(0)]],
+                                         texture2d<float> src [[texture(0)]]) {
+  return blur_tent(src, params, in.uv);
+}
+
+// One quad over the blur's bounds within its content mask.
+vertex BlurVarying backdrop_blur_vertex(uint vertex_id [[vertex_id]],
+                                        constant BlurParams &params [[buffer(0)]]) {
+  float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+  float2 clip_min = max(params.bounds_origin, params.mask_origin);
+  float2 clip_max = min(params.bounds_origin + params.bounds_size,
+                        params.mask_origin + params.mask_size);
+  float2 clipped_size = max(clip_max - clip_min, float2(0.0, 0.0));
+  float2 px_pos = clip_min + unit_vertex * clipped_size;
+  BlurVarying out;
+  out.position = float4((px_pos.x / params.viewport_size.x) * 2.0 - 1.0,
+                        1.0 - (px_pos.y / params.viewport_size.y) * 2.0, 0.0, 1.0);
+  out.uv = px_pos / params.viewport_size;
+  return out;
+}
+
+// `gpui::backdrop_blur::rounded_rect_coverage`.
+float blur_coverage(constant BlurParams &params, float2 pixel) {
+  float2 half_size = params.bounds_size * 0.5;
+  float2 rel = pixel - (params.bounds_origin + half_size);
+  float corner = params.corner_radii.w; // bottom_left
+  if (rel.x < 0.0 && rel.y < 0.0) {
+    corner = params.corner_radii.x;
+  } else if (rel.x >= 0.0 && rel.y < 0.0) {
+    corner = params.corner_radii.y;
+  } else if (rel.x >= 0.0 && rel.y >= 0.0) {
+    corner = params.corner_radii.z;
+  }
+  float r = min(corner, min(half_size.x, half_size.y));
+  float2 q = abs(rel) - (half_size - float2(r, r));
+  float dist = length(max(q, float2(0.0, 0.0))) + min(max(q.x, q.y), 0.0) - r;
+  return saturate(0.5 - dist);
+}
+
+// mix(snapshot, blurred, coverage), written with blending off.
+fragment float4 backdrop_blur_fragment(BlurVarying in [[stage_in]],
+                                       constant BlurParams &params [[buffer(0)]],
+                                       texture2d<float> level1 [[texture(0)]],
+                                       texture2d<float> snapshot [[texture(1)]]) {
+  float4 blurred = blur_tent(level1, params, in.uv);
+  float4 backdrop = snapshot.read(uint2(in.position.xy));
+  float cov = blur_coverage(params, in.position.xy);
+  if (cov <= 0.0) {
+    discard_fragment();
+  }
+  return mix(backdrop, blurred, cov);
+}
+
+// Exact copy of the offscreen frame to the drawable.
+fragment float4 blur_blit_fragment(BlurVarying in [[stage_in]],
+                                   texture2d<float> src [[texture(0)]]) {
+  return src.read(uint2(in.position.xy));
+}

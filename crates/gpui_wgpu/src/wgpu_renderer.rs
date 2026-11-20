@@ -113,9 +113,9 @@ impl From<SceneTransition> for ViewTransitionParams {
 struct BackdropBlurParams {
     viewport_size: [f32; 2],
     texel_size: [f32; 2],
-    blur_radius: f32,
-    kawase_offset: f32,
-    premultiplied_alpha: u32,
+    offset: f32,
+    straight_alpha: u32,
+    from_snapshot: u32,
     _pad: u32,
     bounds_origin: [f32; 2],
     bounds_size: [f32; 2],
@@ -124,16 +124,22 @@ struct BackdropBlurParams {
     mask_size: [f32; 2],
 }
 
+/// The frame is drawn into `scene` while it has blurs; each blur batch copies
+/// it into `snapshot` (level 0) and runs its passes through `levels`
+/// (`levels[k - 1]` is level `k`). See `gpui::backdrop_blur`.
 struct BackdropBlurTargets {
     size: Size<DevicePixels>,
     buffer_generation: u64,
     scene: TransitionTexture,
-    half: TransitionTexture,
-    quarter: TransitionTexture,
+    snapshot: TransitionTexture,
+    levels: Vec<TransitionTexture>,
     depth: DepthTexture,
+    /// For the final blit (reads `scene`).
     scene_bind_group: wgpu::BindGroup,
-    half_bind_group: wgpu::BindGroup,
-    quarter_bind_group: wgpu::BindGroup,
+    /// For passes reading level 0.
+    snapshot_bind_group: wgpu::BindGroup,
+    /// For passes reading level `k`, `k >= 1`.
+    level_bind_groups: Vec<wgpu::BindGroup>,
 }
 
 #[derive(Clone)]
@@ -836,6 +842,17 @@ impl WgpuRendererCore {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                // The snapshot, for the composite.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -1260,7 +1277,8 @@ impl WgpuRendererCore {
             "vs_backdrop_blur",
             "fs_backdrop_blur",
             wgpu::PrimitiveTopology::TriangleStrip,
-            Some(blend_mode),
+            // The composite writes mix(snapshot, blurred, coverage) itself.
+            None,
         );
         let backdrop_blit = create_backdrop_pipeline(
             "backdrop_blit",
@@ -1705,7 +1723,9 @@ impl WgpuRendererCore {
                 dimension: wgpu::TextureDimension::D2,
                 format: self.target_format,
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC
+                    | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -2127,17 +2147,17 @@ impl WgpuRendererCore {
             return;
         }
 
-        let half_size = Size {
-            width: DevicePixels((size.width.0 / 2).max(1)),
-            height: DevicePixels((size.height.0 / 2).max(1)),
-        };
-        let quarter_size = Size {
-            width: DevicePixels((size.width.0 / 4).max(1)),
-            height: DevicePixels((size.height.0 / 4).max(1)),
-        };
         let scene_tex = self.create_transition_texture("backdrop_blur_scene", size);
-        let half_tex = self.create_transition_texture("backdrop_blur_half", half_size);
-        let quarter_tex = self.create_transition_texture("backdrop_blur_quarter", quarter_size);
+        let snapshot_tex = self.create_transition_texture("backdrop_blur_snapshot", size);
+        let levels: Vec<TransitionTexture> = (1..=gpui::backdrop_blur::MAX_BLUR_LEVELS)
+            .map(|level| {
+                let (w, h) = gpui::backdrop_blur::level_size(size.width.0 as u32, size.height.0 as u32, level);
+                self.create_transition_texture(
+                    "backdrop_blur_level",
+                    Size { width: DevicePixels(w as i32), height: DevicePixels(h as i32) },
+                )
+            })
+            .collect();
 
         let depth_tex = self
             .resources
@@ -2185,27 +2205,31 @@ impl WgpuRendererCore {
                                 &self.resources.atlas_sampler,
                             ),
                         },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::TextureView(&snapshot_tex.view),
+                        },
                     ],
                 })
         };
 
         let scene_bind_group = make_bg("backdrop_blur_scene_bg", &scene_tex.view);
-        let half_bind_group = make_bg("backdrop_blur_half_bg", &half_tex.view);
-        let quarter_bind_group = make_bg("backdrop_blur_quarter_bg", &quarter_tex.view);
+        let snapshot_bind_group = make_bg("backdrop_blur_snapshot_bg", &snapshot_tex.view);
+        let level_bind_groups = levels.iter().map(|level| make_bg("backdrop_blur_level_bg", &level.view)).collect();
 
         self.backdrop_blur_targets = Some(BackdropBlurTargets {
             size,
             buffer_generation: buf_gen,
             scene: scene_tex,
-            half: half_tex,
-            quarter: quarter_tex,
+            snapshot: snapshot_tex,
+            levels,
             depth: DepthTexture {
                 texture: depth_tex,
                 view: depth_view,
             },
             scene_bind_group,
-            half_bind_group,
-            quarter_bind_group,
+            snapshot_bind_group,
+            level_bind_groups,
         });
     }
 
@@ -2219,25 +2243,21 @@ impl WgpuRendererCore {
         depth_scale: f32,
     ) -> Result<wgpu::SubmissionIndex> {
         let batches: Vec<PrimitiveBatch> = scene.batches().collect();
-        let mut blur_batch_count = 0usize;
-        let mut total_blurs = 0usize;
+        // Slot 0 = final blit; each plan of each blur batch uses a slot per
+        // pass, and each blur one for its composite.
+        let mut required_slots = 1usize;
         for batch in &batches {
             if let PrimitiveBatch::BackdropBlurs(range) = batch {
-                blur_batch_count += 1;
-                total_blurs += range.len();
+                for (plan, blurs) in gpui::backdrop_blur::group_by_plan(&scene.backdrop_blurs[range.clone()]) {
+                    required_slots += plan.passes().count() + blurs.len();
+                }
             }
         }
-        // Slot 0 = final blit; each blur batch uses 3 Kawase slots + `range.len()` composite slots.
-        let required_slots = 1 + blur_batch_count * 3 + total_blurs;
         self.ensure_backdrop_blur_targets(size, required_slots);
 
         let viewport_width = size.width.0 as f32;
         let viewport_height = size.height.0 as f32;
-        let half_w = (size.width.0 / 2).max(1) as f32;
-        let half_h = (size.height.0 / 2).max(1) as f32;
-        let quarter_w = (size.width.0 / 4).max(1) as f32;
-        let quarter_h = (size.height.0 / 4).max(1) as f32;
-        let premultiplied_alpha = self.resources.pipelines.premultiplied_alpha as u32;
+        let straight_alpha = !self.resources.pipelines.premultiplied_alpha as u32;
         let stride = self.backdrop_blur_stride;
 
         // Write slot 0 (bit-exact final blit params).
@@ -2341,34 +2361,7 @@ impl WgpuRendererCore {
                     self.draw_batch(
                         scene,
                         instance_bindings,
-                        match b {
-                            PrimitiveBatch::BackdropBlurs(r) => {
-                                PrimitiveBatch::BackdropBlurs(r.clone())
-                            }
-                            PrimitiveBatch::Shadows(r) => PrimitiveBatch::Shadows(r.clone()),
-                            PrimitiveBatch::Quads(r) => PrimitiveBatch::Quads(r.clone()),
-                            PrimitiveBatch::Paths(r) => PrimitiveBatch::Paths(r.clone()),
-                            PrimitiveBatch::Underlines(r) => PrimitiveBatch::Underlines(r.clone()),
-                            PrimitiveBatch::MonochromeSprites { texture_id, range } => {
-                                PrimitiveBatch::MonochromeSprites {
-                                    texture_id: *texture_id,
-                                    range: range.clone(),
-                                }
-                            }
-                            PrimitiveBatch::SubpixelSprites { texture_id, range } => {
-                                PrimitiveBatch::SubpixelSprites {
-                                    texture_id: *texture_id,
-                                    range: range.clone(),
-                                }
-                            }
-                            PrimitiveBatch::PolychromeSprites { texture_id, range } => {
-                                PrimitiveBatch::PolychromeSprites {
-                                    texture_id: *texture_id,
-                                    range: range.clone(),
-                                }
-                            }
-                            PrimitiveBatch::Surfaces(r) => PrimitiveBatch::Surfaces(r.clone()),
-                        },
+                        b.clone(),
                         &mut quad_cursor,
                         &mut path_tile_cursor,
                         viewport_width,
@@ -2385,113 +2378,65 @@ impl WgpuRendererCore {
                 let blur_range = blur_range.clone();
                 batch_idx += 1;
 
-                let max_radius = scene.backdrop_blurs[blur_range.clone()]
-                    .iter()
-                    .map(|b| b.blur_radius.0)
-                    .fold(0.0f32, f32::max);
-                let kawase_offset = (max_radius / 5.0).clamp(0.75, 4.0);
-
-                // Downsample 1: full -> half
-                let d1_slot = next_slot;
-                next_slot += 1;
-                let d1_params = BackdropBlurParams {
-                    texel_size: [1.0 / viewport_width, 1.0 / viewport_height],
-                    kawase_offset,
-                    ..zero_params
-                };
-                self.resources.queue.write_buffer(
-                    &self.resources.backdrop_blur_buffer,
-                    u64::from(d1_slot) * stride,
-                    bytemuck::bytes_of(&d1_params),
+                // Level 0: what's drawn so far (gpui::backdrop_blur).
+                encoder.copy_texture_to_texture(
+                    targets.scene.texture.as_image_copy(),
+                    targets.snapshot.texture.as_image_copy(),
+                    wgpu::Extent3d {
+                        width: size.width.0 as u32,
+                        height: size.height.0 as u32,
+                        depth_or_array_layers: 1,
+                    },
                 );
-                {
-                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("kawase_downsample_half"),
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: &targets.half.view,
-                            resolve_target: None,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                                store: wgpu::StoreOp::Store,
-                            },
-                            depth_slice: None,
-                        })],
-                        depth_stencil_attachment: None,
-                        ..Default::default()
-                    });
-                    pass.set_pipeline(&self.resources.pipelines.kawase_downsample);
-                    pass.set_bind_group(0, &targets.scene_bind_group, &[slot_offset(d1_slot)]);
-                    pass.draw(0..3, 0..1);
-                }
+                let (full_w, full_h) = (size.width.0 as u32, size.height.0 as u32);
+                for (plan, blurs) in gpui::backdrop_blur::group_by_plan(&scene.backdrop_blurs[blur_range]) {
+                    for blur_pass in plan.passes() {
+                        let slot = next_slot;
+                        next_slot += 1;
+                        let (sw, sh) = gpui::backdrop_blur::level_size(full_w, full_h, blur_pass.source);
+                        let params = BackdropBlurParams {
+                            texel_size: [1.0 / sw as f32, 1.0 / sh as f32],
+                            offset: plan.offset,
+                            straight_alpha,
+                            from_snapshot: (blur_pass.source == 0) as u32,
+                            ..zero_params
+                        };
+                        self.resources.queue.write_buffer(
+                            &self.resources.backdrop_blur_buffer,
+                            u64::from(slot) * stride,
+                            bytemuck::bytes_of(&params),
+                        );
+                        let source_group = if blur_pass.source == 0 {
+                            &targets.snapshot_bind_group
+                        } else {
+                            &targets.level_bind_groups[blur_pass.source as usize - 1]
+                        };
+                        let pipeline = match blur_pass.kind {
+                            gpui::backdrop_blur::BlurPassKind::Downsample => &self.resources.pipelines.kawase_downsample,
+                            gpui::backdrop_blur::BlurPassKind::Upsample => &self.resources.pipelines.kawase_upsample,
+                        };
+                        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("backdrop_blur_level_pass"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: &targets.levels[blur_pass.target as usize - 1].view,
+                                resolve_target: None,
+                                ops: wgpu::Operations {
+                                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                    store: wgpu::StoreOp::Store,
+                                },
+                                depth_slice: None,
+                            })],
+                            depth_stencil_attachment: None,
+                            ..Default::default()
+                        });
+                        pass.set_pipeline(pipeline);
+                        pass.set_bind_group(0, source_group, &[slot_offset(slot)]);
+                        pass.draw(0..3, 0..1);
+                    }
 
-                // Downsample 2: half -> quarter
-                let d2_slot = next_slot;
-                next_slot += 1;
-                let d2_params = BackdropBlurParams {
-                    texel_size: [1.0 / half_w, 1.0 / half_h],
-                    kawase_offset,
-                    ..zero_params
-                };
-                self.resources.queue.write_buffer(
-                    &self.resources.backdrop_blur_buffer,
-                    u64::from(d2_slot) * stride,
-                    bytemuck::bytes_of(&d2_params),
-                );
-                {
-                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("kawase_downsample_quarter"),
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: &targets.quarter.view,
-                            resolve_target: None,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                                store: wgpu::StoreOp::Store,
-                            },
-                            depth_slice: None,
-                        })],
-                        depth_stencil_attachment: None,
-                        ..Default::default()
-                    });
-                    pass.set_pipeline(&self.resources.pipelines.kawase_downsample);
-                    pass.set_bind_group(0, &targets.half_bind_group, &[slot_offset(d2_slot)]);
-                    pass.draw(0..3, 0..1);
-                }
-
-                // Upsample: quarter -> half
-                let u1_slot = next_slot;
-                next_slot += 1;
-                let u1_params = BackdropBlurParams {
-                    texel_size: [1.0 / quarter_w, 1.0 / quarter_h],
-                    kawase_offset,
-                    ..zero_params
-                };
-                self.resources.queue.write_buffer(
-                    &self.resources.backdrop_blur_buffer,
-                    u64::from(u1_slot) * stride,
-                    bytemuck::bytes_of(&u1_params),
-                );
-                {
-                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("kawase_upsample_half"),
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: &targets.half.view,
-                            resolve_target: None,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                                store: wgpu::StoreOp::Store,
-                            },
-                            depth_slice: None,
-                        })],
-                        depth_stencil_attachment: None,
-                        ..Default::default()
-                    });
-                    pass.set_pipeline(&self.resources.pipelines.kawase_upsample);
-                    pass.set_bind_group(0, &targets.quarter_bind_group, &[slot_offset(u1_slot)]);
-                    pass.draw(0..3, 0..1);
-                }
-
-                // Composite each rounded BackdropBlur region onto targets.scene
-                {
+                    // Composite: the last upsample, from level 1, mixed into
+                    // the scene by each blur's coverage.
+                    let (l1w, l1h) = gpui::backdrop_blur::level_size(full_w, full_h, 1);
                     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("backdrop_blur_composite_pass"),
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -2507,15 +2452,15 @@ impl WgpuRendererCore {
                         ..Default::default()
                     });
                     pass.set_pipeline(&self.resources.pipelines.backdrop_blur_composite);
-                    for blur in &scene.backdrop_blurs[blur_range] {
-                        let c_slot = next_slot;
+                    for blur in blurs {
+                        let slot = next_slot;
                         next_slot += 1;
-                        let comp_params = BackdropBlurParams {
+                        let params = BackdropBlurParams {
                             viewport_size: [viewport_width, viewport_height],
-                            texel_size: [1.0 / half_w, 1.0 / half_h],
-                            blur_radius: blur.blur_radius.0,
-                            kawase_offset,
-                            premultiplied_alpha,
+                            texel_size: [1.0 / l1w as f32, 1.0 / l1h as f32],
+                            offset: plan.offset,
+                            straight_alpha,
+                            from_snapshot: 0,
                             _pad: 0,
                             bounds_origin: [blur.bounds.origin.x.0, blur.bounds.origin.y.0],
                             bounds_size: [blur.bounds.size.width.0, blur.bounds.size.height.0],
@@ -2536,10 +2481,10 @@ impl WgpuRendererCore {
                         };
                         self.resources.queue.write_buffer(
                             &self.resources.backdrop_blur_buffer,
-                            u64::from(c_slot) * stride,
-                            bytemuck::bytes_of(&comp_params),
+                            u64::from(slot) * stride,
+                            bytemuck::bytes_of(&params),
                         );
-                        pass.set_bind_group(0, &targets.half_bind_group, &[slot_offset(c_slot)]);
+                        pass.set_bind_group(0, &targets.level_bind_groups[0], &[slot_offset(slot)]);
                         pass.draw(0..4, 0..1);
                     }
                 }
@@ -3890,6 +3835,71 @@ mod tests {
     fn webgl_shader_is_valid_wgsl_without_storage_buffers() {
         assert!(!WEBGL_SHADERS.contains("var<storage"));
         validate_wgsl(WEBGL_SHADERS, naga::valid::Capabilities::empty());
+    }
+
+    /// Renders stripes, then the same with a backdrop blur over them, and
+    /// checks the blur against `gpui::backdrop_blur::reference` run on the
+    /// first image: the GPU passes must match the definition, up to the
+    /// rounding of 8-bit intermediate levels.
+    #[cfg(target_os = "linux")]
+    fn check_blur_against_reference(radius: f32) -> anyhow::Result<()> {
+        use gpui::backdrop_blur::{BlurPlan, reference};
+        let (w, h) = (96, 96);
+        let stripes = |scene: &mut Scene| {
+            for i in 0..12 {
+                let color = if i % 2 == 0 { gpui::white() } else { gpui::red() };
+                scene.insert_primitive(solid_quad(i as f32 * 8.0, 0.0, 8.0, 96.0, color));
+            }
+        };
+        let region = Bounds { origin: Point { x: 16.0.into(), y: 20.0.into() }, size: Size { width: 64.0.into(), height: 56.0.into() } };
+        let mut renderer = WgpuHeadlessRenderer::new()?;
+        let mut plain = Scene::default();
+        stripes(&mut plain);
+        plain.finish();
+        let backdrop = renderer.render_scene_to_image(&plain, device_size(w, h))?;
+        let mut blurred = Scene::default();
+        stripes(&mut blurred);
+        blurred.insert_primitive(gpui::BackdropBlur {
+            order: 0,
+            blur_radius: radius.into(),
+            bounds: region,
+            corner_radii: Corners { top_left: 10.0.into(), top_right: 4.0.into(), bottom_right: 10.0.into(), bottom_left: 0.0.into() },
+            content_mask: ContentMask { bounds: Bounds { origin: Point::default(), size: Size { width: 96.0.into(), height: 96.0.into() } } },
+        });
+        blurred.finish();
+        let actual = renderer.render_scene_to_image(&blurred, device_size(w, h))?;
+
+        let snapshot = reference::Image {
+            width: w as u32,
+            height: h as u32,
+            pixels: backdrop.pixels().map(|p| p.0.map(|c| c as f32 / 255.0)).collect(),
+        };
+        let plan = BlurPlan::for_radius(radius).unwrap();
+        let expected = reference::composite(&snapshot, plan, [16.0, 20.0], [64.0, 56.0], [10.0, 4.0, 10.0, 0.0]);
+        let (mut worst, mut total) = (0u8, 0u64);
+        for (i, px) in actual.pixels().enumerate() {
+            let want = expected.pixels[i].map(|c| (c * 255.0).round().clamp(0.0, 255.0) as u8);
+            for c in 0..4 {
+                let d = px.0[c].abs_diff(want[c]);
+                worst = worst.max(d);
+                total += d as u64;
+            }
+        }
+        let mean = total as f64 / (w * h * 4) as f64;
+        assert!(worst <= 8 && mean < 1.0, "radius {radius} ({plan:?}): worst channel difference {worst}, mean {mean:.2}");
+        // The blur actually changed the stripes inside, and nothing outside.
+        assert_ne!(actual.get_pixel(48, 48), backdrop.get_pixel(48, 48));
+        assert_eq!(actual.get_pixel(4, 4), backdrop.get_pixel(4, 4));
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn headless_backdrop_blur_matches_the_reference() -> anyhow::Result<()> {
+        for radius in [2.0, 5.0, 9.0, 16.0] {
+            check_blur_against_reference(radius)?;
+        }
+        Ok(())
     }
 
     #[test]

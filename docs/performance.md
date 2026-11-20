@@ -106,7 +106,7 @@ Measured in `--release` on Linux (x86_64, Rust 1.99, Lavapipe Vulkan ICD for WGP
   - Separated `Scene::base_generation()` (structural) from `Scene::generation()` (content) and tracked `animated_quad_range()` / `animated_monochrome_sprite_range()`.
   - `WgpuRendererCore::prepare_instances` caches all 7 `wgpu::BindGroup`s per `base_generation` and uploads only the tiny mutated animated slice (`~128 B` instead of re-uploading hundreds of kilobytes of static quads, shadows, paths, and text sprites), reducing `prepare_instances` from `242.2 µs` to `4.4 µs` (**55.4× faster**, `0` BindGroup allocations/frame).
 - **Multi-Pass Dual-Kawase GPU Frosted-Glass `BackdropBlur` (`shaders_backdrop_blur.wgsl`)**:
-  - Added `Styled::backdrop_blur(Pixels)` and `Primitive::BackdropBlur`, backed on `gpui_wgpu` by a single-command-encoder Dual-Kawase pyramid (`full → half → quarter → half`) + rounded-rectangle SDF composite + bit-exact blit pass.
+  - Added `Styled::backdrop_blur(Pixels)` and `Primitive::BackdropBlur`. What a blur is, for every renderer (DirectX, Metal, WGPU), is in `crates/gpui/src/backdrop_blur.rs`: a dual-Kawase pyramid whose depth and sample offset come from the radius (a standard deviation), composited as `mix(backdrop, blurred, coverage)` so translucent windows stay correct, with a CPU reference the renderers' tests compare against.
   - Zero overhead on frames without backdrop blur; enabled by default on in-window `Dialog` backdrops (`10 px`) and demonstrated live in `gpui_playground`.
 
 ---

@@ -34,6 +34,7 @@ mod app;
 mod arena;
 mod asset_cache;
 mod assets;
+pub mod backdrop_blur;
 mod bounds_tree;
 mod color;
 mod element;

@@ -78,3 +78,6 @@ windows-registry.workspace = true
 
 [package.metadata.cargo-shear]
 ignored = ["scap"]
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }

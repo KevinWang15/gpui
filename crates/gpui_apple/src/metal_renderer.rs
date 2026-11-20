@@ -2,7 +2,7 @@ use crate::metal_atlas::MetalAtlas;
 use anyhow::{Context as _, Result};
 use block2::RcBlock;
 use gpui::{
-    AtlasTextureId, Bounds, ContentMask, DevicePixels, PaintSurface, PaintedPath, PrimitiveBatch,
+    AtlasTextureId, BackdropBlur, Bounds, ContentMask, DevicePixels, PaintSurface, PaintedPath, PrimitiveBatch,
     ScaledPixels, Scene, Size, quad_depth, quad_depth_scale, size,
 };
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
@@ -27,8 +27,9 @@ use objc2_metal::{
     MTLResourceOptions, MTLStorageMode, MTLStoreAction, MTLTexture, MTLTextureDescriptor,
     MTLTextureUsage, MTLViewport,
 };
+use objc2_metal::MTLBlitCommandEncoder;
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
-use objc2_metal::{MTLBlitCommandEncoder, MTLOrigin, MTLRegion, MTLSize};
+use objc2_metal::{MTLOrigin, MTLRegion, MTLSize};
 use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
 use parking_lot::Mutex;
 
@@ -148,6 +149,42 @@ pub struct MetalRenderer {
     /// rendering headlessly without reading pixels back.
     #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
     headless_render_target: Option<Retained<ProtocolObject<dyn MTLTexture>>>,
+    blur_pipelines: BlurPipelines,
+    blur_targets: Option<BlurTargets>,
+}
+
+/// The backdrop blur's pipelines (`gpui::backdrop_blur`): color only, no
+/// blending, no depth.
+struct BlurPipelines {
+    downsample: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+    upsample: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+    composite: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+    blit: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+}
+
+/// A frame with blurs is drawn into `scene`; each blur batch copies it into
+/// `snapshot` (level 0); `levels[k - 1]` is level `k`.
+#[derive(Clone)]
+struct BlurTargets {
+    scene: Retained<ProtocolObject<dyn MTLTexture>>,
+    snapshot: Retained<ProtocolObject<dyn MTLTexture>>,
+    depth: Retained<ProtocolObject<dyn MTLTexture>>,
+    levels: Vec<Retained<ProtocolObject<dyn MTLTexture>>>,
+}
+
+/// `BlurParams` in shaders.metal (80 bytes).
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+struct BlurParams {
+    viewport_size: [f32; 2],
+    texel_size: [f32; 2],
+    offset: f32,
+    pad: [u32; 3],
+    bounds_origin: [f32; 2],
+    bounds_size: [f32; 2],
+    corner_radii: [f32; 4],
+    mask_origin: [f32; 2],
+    mask_size: [f32; 2],
 }
 
 impl MetalRenderer {
@@ -309,6 +346,15 @@ impl MetalRenderer {
             MTLPixelFormat::BGRA8Unorm,
             true,
         )?;
+        let blur_pipeline = |label: &str, vertex: &str, fragment: &str| {
+            build_blur_pipeline_state(&device, &library, label, vertex, fragment)
+        };
+        let blur_pipelines = BlurPipelines {
+            downsample: blur_pipeline("kawase_downsample", "blur_fullscreen_vertex", "kawase_downsample_fragment")?,
+            upsample: blur_pipeline("kawase_upsample", "blur_fullscreen_vertex", "kawase_upsample_fragment")?,
+            composite: blur_pipeline("backdrop_blur", "backdrop_blur_vertex", "backdrop_blur_fragment")?,
+            blit: blur_pipeline("backdrop_blur_blit", "blur_fullscreen_vertex", "blur_blit_fragment")?,
+        };
         let opaque_quads_pipeline_state = build_pipeline_state(
             &device,
             &library,
@@ -403,6 +449,8 @@ impl MetalRenderer {
             core_video_texture_cache,
             #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
             headless_render_target: None,
+            blur_pipelines,
+            blur_targets: None,
         })
     }
 
@@ -747,6 +795,19 @@ impl MetalRenderer {
             .commandBuffer()
             .context("creating command buffer")?;
         let alpha = if self.opaque { 1. } else { 0. };
+        let clear_color = MTLClearColor { red: 0., green: 0., blue: 0., alpha };
+        if !scene.backdrop_blurs.is_empty() {
+            self.draw_with_backdrop_blurs(
+                scene,
+                instance_bindings,
+                texture,
+                viewport_size,
+                surface_textures,
+                &command_buffer,
+                clear_color,
+            )?;
+            return Ok(command_buffer);
+        }
         let depth_texture = self.depth_texture_matching(texture)?;
 
         let command_encoder = new_command_encoder_for_texture(
@@ -754,41 +815,58 @@ impl MetalRenderer {
             texture,
             &depth_texture,
             viewport_size,
-            MTLClearColor {
-                red: 0.,
-                green: 0.,
-                blue: 0.,
-                alpha,
-            },
+            clear_color,
         )?;
         let depth_scale = quad_depth_scale(scene.quads.len());
-        // SAFETY: Metal copies both values, which match every vertex shader's
-        // `GlobalInputIndex_ViewportSize` and `GlobalInputIndex_DepthScale` arguments.
-        unsafe {
-            command_encoder.setVertexBytes_length_atIndex(
-                ptr::NonNull::from(&viewport_size).cast(),
-                mem::size_of_val(&viewport_size),
-                GlobalInputIndex::ViewportSize as usize,
-            );
-            command_encoder.setVertexBytes_length_atIndex(
-                ptr::NonNull::from(&depth_scale).cast(),
-                mem::size_of_val(&depth_scale),
-                GlobalInputIndex::DepthScale as usize,
-            );
-        }
+        set_frame_bytes(&command_encoder, viewport_size, depth_scale);
 
-        self.draw_opaque_quads(scene.quads.len(), instance_bindings, &command_encoder);
+        self.draw_opaque_quads(scene.quads.len(), 0..scene.quads.len(), instance_bindings, &command_encoder);
         command_encoder.setDepthStencilState(Some(&self.depth_test_state));
 
         let mut quad_cursor: u32 = 0;
         let mut path_tile_cursor = 0;
         for batch in scene.batches() {
+            if let Err(error) = self.encode_batch(
+                scene,
+                batch,
+                &mut quad_cursor,
+                &mut path_tile_cursor,
+                depth_scale,
+                viewport_size,
+                instance_bindings,
+                &command_encoder,
+                surface_textures,
+            ) {
+                command_encoder.endEncoding();
+                return Err(error);
+            }
+        }
+
+        command_encoder.endEncoding();
+
+        Ok(command_buffer)
+    }
+
+    /// Encodes one batch (other than blurs) into `command_encoder`.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_batch(
+        &mut self,
+        scene: &Scene,
+        batch: PrimitiveBatch,
+        quad_cursor: &mut u32,
+        path_tile_cursor: &mut usize,
+        depth_scale: f32,
+        viewport_size: Size<DevicePixels>,
+        instance_bindings: &InstanceBindings,
+        command_encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
+        surface_textures: &mut Vec<CFRetained<CVMetalTexture>>,
+    ) -> Result<()> {
             // Quad shaders assign each quad its own depth.
             // In every other batch type, the depth is fixed to the position of the quad cursor.
             let (znear, zfar) = if matches!(&batch, PrimitiveBatch::Quads(_)) {
                 (0.0, 1.0)
             } else {
-                let depth = quad_depth(quad_cursor, depth_scale) as f64;
+                let depth = quad_depth(*quad_cursor, depth_scale) as f64;
                 (depth, depth)
             };
             command_encoder.setViewport(MTLViewport {
@@ -801,62 +879,289 @@ impl MetalRenderer {
             });
 
             match batch {
+                // Drawn by `draw_with_backdrop_blurs` between segments.
                 PrimitiveBatch::BackdropBlurs(_) => {}
                 PrimitiveBatch::Shadows(range) => {
-                    self.draw_shadows(range, instance_bindings, &command_encoder)
+                    self.draw_shadows(range, instance_bindings, command_encoder)
                 }
                 PrimitiveBatch::Quads(range) => {
-                    quad_cursor += range.len() as u32;
-                    self.draw_quads(range, instance_bindings, &command_encoder)
+                    *quad_cursor += range.len() as u32;
+                    self.draw_quads(range, instance_bindings, command_encoder)
                 }
                 PrimitiveBatch::Paths(range) => {
-                    let tiles_start = path_tile_cursor;
-                    path_tile_cursor += scene.paths[range]
+                    let tiles_start = *path_tile_cursor;
+                    *path_tile_cursor += scene.paths[range]
                         .iter()
                         .map(PaintedPath::tile_count)
                         .sum::<usize>();
                     self.draw_path_tiles(
-                        tiles_start..path_tile_cursor,
+                        tiles_start..*path_tile_cursor,
                         instance_bindings,
-                        &command_encoder,
+                        command_encoder,
                     )
                 }
                 PrimitiveBatch::Underlines(range) => {
-                    self.draw_underlines(range, instance_bindings, &command_encoder)
+                    self.draw_underlines(range, instance_bindings, command_encoder)
                 }
                 PrimitiveBatch::MonochromeSprites { texture_id, range } => self
                     .draw_monochrome_sprites(
                         texture_id,
                         range,
                         instance_bindings,
-                        &command_encoder,
+                        command_encoder,
                     ),
                 PrimitiveBatch::PolychromeSprites { texture_id, range } => self
                     .draw_polychrome_sprites(
                         texture_id,
                         range,
                         instance_bindings,
-                        &command_encoder,
+                        command_encoder,
                     ),
                 PrimitiveBatch::Surfaces(range) => {
-                    if let Err(error) = self.draw_surfaces(
+                    self.draw_surfaces(
                         &scene.surfaces[range.clone()],
                         range.start,
                         instance_bindings,
-                        &command_encoder,
+                        command_encoder,
                         surface_textures,
-                    ) {
-                        command_encoder.endEncoding();
-                        return Err(error);
-                    }
+                    )?;
                 }
                 PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
             }
+        Ok(())
+    }
+
+    /// Draws a frame that has backdrop blurs, as `gpui::backdrop_blur`
+    /// defines them. The frame goes to an offscreen texture (the drawable is
+    /// framebuffer-only, so it can't be copied from), in segments between
+    /// blur batches; each blur batch copies it (level 0), runs its passes and
+    /// composites; at the end the frame is copied to `texture`. The depth
+    /// buffer is kept across segments.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_with_backdrop_blurs(
+        &mut self,
+        scene: &Scene,
+        instance_bindings: &InstanceBindings,
+        texture: &ProtocolObject<dyn MTLTexture>,
+        viewport_size: Size<DevicePixels>,
+        surface_textures: &mut Vec<CFRetained<CVMetalTexture>>,
+        command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
+        clear_color: MTLClearColor,
+    ) -> Result<()> {
+        let targets = self.blur_targets_matching(texture)?;
+        let batches: Vec<PrimitiveBatch> = scene.batches().collect();
+        let depth_scale = quad_depth_scale(scene.quads.len());
+        let total_quads = scene.quads.len();
+        let mut quad_cursor: u32 = 0;
+        let mut path_tile_cursor = 0usize;
+        let mut first = true;
+        let mut index = 0;
+        loop {
+            // The batches up to the next blur batch, and their quads.
+            let start = index;
+            let mut segment_quads = 0usize;
+            while index < batches.len() && !matches!(batches[index], PrimitiveBatch::BackdropBlurs(_)) {
+                if let PrimitiveBatch::Quads(range) = &batches[index] {
+                    segment_quads += range.len();
+                }
+                index += 1;
+            }
+            let encoder = new_blur_frame_encoder(
+                command_buffer,
+                &targets.scene,
+                &targets.depth,
+                first.then_some(clear_color),
+            )?;
+            first = false;
+            set_frame_bytes(&encoder, viewport_size, depth_scale);
+            let quad_start = quad_cursor as usize;
+            self.draw_opaque_quads(total_quads, quad_start..quad_start + segment_quads, instance_bindings, &encoder);
+            encoder.setDepthStencilState(Some(&self.depth_test_state));
+            for batch in &batches[start..index] {
+                if let Err(error) = self.encode_batch(
+                    scene,
+                    batch.clone(),
+                    &mut quad_cursor,
+                    &mut path_tile_cursor,
+                    depth_scale,
+                    viewport_size,
+                    instance_bindings,
+                    &encoder,
+                    surface_textures,
+                ) {
+                    encoder.endEncoding();
+                    return Err(error);
+                }
+            }
+            encoder.endEncoding();
+            match batches.get(index) {
+                Some(PrimitiveBatch::BackdropBlurs(range)) => {
+                    self.encode_blur_batch(command_buffer, &scene.backdrop_blurs[range.clone()], &targets)?;
+                    index += 1;
+                }
+                _ => break,
+            }
         }
 
-        command_encoder.endEncoding();
+        // The frame to the drawable.
+        let encoder = new_color_encoder(command_buffer, texture, MTLLoadAction::DontCare)?;
+        encoder.setRenderPipelineState(&self.blur_pipelines.blit);
+        // SAFETY: The texture matches the blit shader's `texture(0)`.
+        unsafe {
+            encoder.setFragmentTexture_atIndex(Some(&targets.scene), 0);
+            encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3);
+        }
+        encoder.endEncoding();
+        Ok(())
+    }
 
-        Ok(command_buffer)
+    /// One blur batch: copy the frame (level 0), run each plan's passes, and
+    /// composite each blur into the frame with blending off.
+    fn encode_blur_batch(
+        &self,
+        command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
+        blurs: &[BackdropBlur],
+        targets: &BlurTargets,
+    ) -> Result<()> {
+        use gpui::backdrop_blur::{BlurPassKind, group_by_plan, level_size};
+        let groups = group_by_plan(blurs);
+        if groups.is_empty() {
+            return Ok(());
+        }
+        let blit = command_buffer
+            .blitCommandEncoder()
+            .context("creating blit command encoder")?;
+        // SAFETY: Both textures are 2D, one mip level, the same size and
+        // format, and not in use by an encoder.
+        unsafe { blit.copyFromTexture_toTexture(&targets.scene, &targets.snapshot) };
+        blit.endEncoding();
+
+        let (width, height) = (targets.scene.width() as u32, targets.scene.height() as u32);
+        let pipelines = &self.blur_pipelines;
+        for (plan, members) in groups {
+            for pass in plan.passes() {
+                let (sw, sh) = level_size(width, height, pass.source);
+                let params = BlurParams {
+                    texel_size: [1.0 / sw as f32, 1.0 / sh as f32],
+                    offset: plan.offset,
+                    ..BlurParams::default()
+                };
+                let source = if pass.source == 0 {
+                    &targets.snapshot
+                } else {
+                    &targets.levels[pass.source as usize - 1]
+                };
+                let encoder = new_color_encoder(
+                    command_buffer,
+                    &targets.levels[pass.target as usize - 1],
+                    MTLLoadAction::DontCare,
+                )?;
+                encoder.setRenderPipelineState(match pass.kind {
+                    BlurPassKind::Downsample => &pipelines.downsample,
+                    BlurPassKind::Upsample => &pipelines.upsample,
+                });
+                // SAFETY: The bytes are `BlurParams`, which matches the
+                // shader's `buffer(0)`; the texture matches `texture(0)`.
+                unsafe {
+                    encoder.setFragmentBytes_length_atIndex(
+                        ptr::NonNull::from(&params).cast(),
+                        mem::size_of::<BlurParams>(),
+                        0,
+                    );
+                    encoder.setFragmentTexture_atIndex(Some(source), 0);
+                    encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3);
+                }
+                encoder.endEncoding();
+            }
+
+            // Composite: the last upsample, from level 1, mixed into the
+            // frame by each blur's coverage.
+            let (l1w, l1h) = level_size(width, height, 1);
+            let encoder = new_color_encoder(command_buffer, &targets.scene, MTLLoadAction::Load)?;
+            encoder.setRenderPipelineState(&pipelines.composite);
+            // SAFETY: The textures match the shader's `texture(0)` and `texture(1)`.
+            unsafe {
+                encoder.setFragmentTexture_atIndex(Some(&targets.levels[0]), 0);
+                encoder.setFragmentTexture_atIndex(Some(&targets.snapshot), 1);
+            }
+            for blur in members {
+                let params = BlurParams {
+                    viewport_size: [width as f32, height as f32],
+                    texel_size: [1.0 / l1w as f32, 1.0 / l1h as f32],
+                    offset: plan.offset,
+                    pad: [0; 3],
+                    bounds_origin: [blur.bounds.origin.x.0, blur.bounds.origin.y.0],
+                    bounds_size: [blur.bounds.size.width.0, blur.bounds.size.height.0],
+                    corner_radii: [
+                        blur.corner_radii.top_left.0,
+                        blur.corner_radii.top_right.0,
+                        blur.corner_radii.bottom_right.0,
+                        blur.corner_radii.bottom_left.0,
+                    ],
+                    mask_origin: [blur.content_mask.bounds.origin.x.0, blur.content_mask.bounds.origin.y.0],
+                    mask_size: [blur.content_mask.bounds.size.width.0, blur.content_mask.bounds.size.height.0],
+                };
+                // SAFETY: The bytes are `BlurParams`, which matches the
+                // vertex and fragment shaders' `buffer(0)`.
+                unsafe {
+                    encoder.setVertexBytes_length_atIndex(
+                        ptr::NonNull::from(&params).cast(),
+                        mem::size_of::<BlurParams>(),
+                        0,
+                    );
+                    encoder.setFragmentBytes_length_atIndex(
+                        ptr::NonNull::from(&params).cast(),
+                        mem::size_of::<BlurParams>(),
+                        0,
+                    );
+                    encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::TriangleStrip, 0, 4);
+                }
+            }
+            encoder.endEncoding();
+        }
+        Ok(())
+    }
+
+    /// The offscreen frame, its copy, its depth buffer and the blur levels,
+    /// for `texture`'s size; made again when the size changes.
+    fn blur_targets_matching(&mut self, texture: &ProtocolObject<dyn MTLTexture>) -> Result<BlurTargets> {
+        if let Some(targets) = &self.blur_targets
+            && targets.scene.width() == texture.width()
+            && targets.scene.height() == texture.height()
+        {
+            return Ok(targets.clone());
+        }
+        let (width, height) = (texture.width(), texture.height());
+        let make = |w: usize, h: usize, format: MTLPixelFormat, usage: MTLTextureUsage, label: &str| -> Result<Retained<ProtocolObject<dyn MTLTexture>>> {
+            let descriptor = MTLTextureDescriptor::new();
+            // SAFETY: The sizes are at least 1 and at most the target's.
+            unsafe {
+                descriptor.setWidth(w.max(1));
+                descriptor.setHeight(h.max(1));
+            }
+            descriptor.setPixelFormat(format);
+            descriptor.setUsage(usage);
+            descriptor.setStorageMode(MTLStorageMode::Private);
+            self.device
+                .newTextureWithDescriptor(&descriptor)
+                .with_context(|| format!("allocating backdrop blur {label}"))
+        };
+        let color = MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead;
+        let levels = (1..=gpui::backdrop_blur::MAX_BLUR_LEVELS)
+            .map(|level| {
+                let (w, h) = gpui::backdrop_blur::level_size(width as u32, height as u32, level);
+                make(w as usize, h as usize, MTLPixelFormat::BGRA8Unorm, color, "level")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let targets = BlurTargets {
+            scene: make(width, height, MTLPixelFormat::BGRA8Unorm, color, "frame")?,
+            snapshot: make(width, height, MTLPixelFormat::BGRA8Unorm, MTLTextureUsage::ShaderRead, "snapshot")?,
+            // Kept between segments, so not memoryless.
+            depth: make(width, height, MTLPixelFormat::Depth32Float, MTLTextureUsage::RenderTarget, "depth")?,
+            levels,
+        };
+        self.blur_targets = Some(targets.clone());
+        Ok(targets)
     }
 
     fn depth_texture_matching(
@@ -892,13 +1197,16 @@ impl MetalRenderer {
         Ok(depth_texture)
     }
 
+    /// Draws the opaque quads among `quads` (indices into the scene's
+    /// `quad_count` quads), front to back.
     fn draw_opaque_quads(
         &self,
         quad_count: usize,
+        quads: Range<usize>,
         instance_bindings: &InstanceBindings,
         command_encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
     ) {
-        if quad_count == 0 {
+        if quads.is_empty() {
             return;
         }
         let quad_count_value = quad_count as u32;
@@ -918,12 +1226,13 @@ impl MetalRenderer {
                 mem::size_of_val(&quad_count_value),
                 QuadInputIndex::QuadCount as usize,
             );
+            // The shader draws quad `quad_count - 1 - instance_id`.
             command_encoder.drawPrimitives_vertexStart_vertexCount_instanceCount_baseInstance(
                 MTLPrimitiveType::TriangleStrip,
                 0,
                 4,
-                quad_count,
-                0,
+                quads.len(),
+                quad_count - quads.end,
             );
         }
     }
@@ -1394,6 +1703,113 @@ fn build_pipeline_state(
         .with_context(|| format!("creating {label} render pipeline"))
 }
 
+/// A pipeline for the blur passes: BGRA color only, no blending, no depth.
+fn build_blur_pipeline_state(
+    device: &ProtocolObject<dyn MTLDevice>,
+    library: &ProtocolObject<dyn MTLLibrary>,
+    label: &str,
+    vertex_fn_name: &str,
+    fragment_fn_name: &str,
+) -> Result<Retained<ProtocolObject<dyn MTLRenderPipelineState>>> {
+    let vertex_fn = library
+        .newFunctionWithName(&NSString::from_str(vertex_fn_name))
+        .with_context(|| format!("locating vertex function {vertex_fn_name}"))?;
+    let fragment_fn = library
+        .newFunctionWithName(&NSString::from_str(fragment_fn_name))
+        .with_context(|| format!("locating fragment function {fragment_fn_name}"))?;
+    let descriptor = MTLRenderPipelineDescriptor::new();
+    descriptor.setLabel(Some(&NSString::from_str(label)));
+    descriptor.setVertexFunction(Some(vertex_fn.as_ref()));
+    descriptor.setFragmentFunction(Some(fragment_fn.as_ref()));
+    // SAFETY: Index zero is within the pipeline's color attachment array.
+    let color_attachment = unsafe { descriptor.colorAttachments().objectAtIndexedSubscript(0) };
+    color_attachment.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
+    color_attachment.setBlendingEnabled(false);
+    device
+        .newRenderPipelineStateWithDescriptor_error(&descriptor)
+        .with_context(|| format!("creating {label} render pipeline"))
+}
+
+/// The viewport size and depth scale every scene vertex shader reads.
+fn set_frame_bytes(
+    command_encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
+    viewport_size: Size<DevicePixels>,
+    depth_scale: f32,
+) {
+    // SAFETY: Metal copies both values, which match every vertex shader's
+    // `GlobalInputIndex_ViewportSize` and `GlobalInputIndex_DepthScale` arguments.
+    unsafe {
+        command_encoder.setVertexBytes_length_atIndex(
+            ptr::NonNull::from(&viewport_size).cast(),
+            mem::size_of_val(&viewport_size),
+            GlobalInputIndex::ViewportSize as usize,
+        );
+        command_encoder.setVertexBytes_length_atIndex(
+            ptr::NonNull::from(&depth_scale).cast(),
+            mem::size_of_val(&depth_scale),
+            GlobalInputIndex::DepthScale as usize,
+        );
+    }
+}
+
+/// A segment of a frame with blurs: color and depth kept (stored) between
+/// segments; the first one clears both.
+fn new_blur_frame_encoder(
+    command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
+    texture: &ProtocolObject<dyn MTLTexture>,
+    depth_texture: &ProtocolObject<dyn MTLTexture>,
+    clear: Option<MTLClearColor>,
+) -> Result<Retained<ProtocolObject<dyn MTLRenderCommandEncoder>>> {
+    let render_pass_descriptor = MTLRenderPassDescriptor::new();
+    // SAFETY: Index zero is within the render pass's color attachment array.
+    let color_attachment = unsafe {
+        render_pass_descriptor
+            .colorAttachments()
+            .objectAtIndexedSubscript(0)
+    };
+    color_attachment.setTexture(Some(texture));
+    color_attachment.setStoreAction(MTLStoreAction::Store);
+    let depth_attachment = render_pass_descriptor.depthAttachment();
+    depth_attachment.setTexture(Some(depth_texture));
+    depth_attachment.setStoreAction(MTLStoreAction::Store);
+    match clear {
+        Some(color) => {
+            color_attachment.setLoadAction(MTLLoadAction::Clear);
+            color_attachment.setClearColor(color);
+            depth_attachment.setLoadAction(MTLLoadAction::Clear);
+            depth_attachment.setClearDepth(0.0);
+        }
+        None => {
+            color_attachment.setLoadAction(MTLLoadAction::Load);
+            depth_attachment.setLoadAction(MTLLoadAction::Load);
+        }
+    }
+    command_buffer
+        .renderCommandEncoderWithDescriptor(&render_pass_descriptor)
+        .context("creating render command encoder")
+}
+
+/// A color-only pass over all of `texture` (the blur passes).
+fn new_color_encoder(
+    command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
+    texture: &ProtocolObject<dyn MTLTexture>,
+    load: MTLLoadAction,
+) -> Result<Retained<ProtocolObject<dyn MTLRenderCommandEncoder>>> {
+    let render_pass_descriptor = MTLRenderPassDescriptor::new();
+    // SAFETY: Index zero is within the render pass's color attachment array.
+    let color_attachment = unsafe {
+        render_pass_descriptor
+            .colorAttachments()
+            .objectAtIndexedSubscript(0)
+    };
+    color_attachment.setTexture(Some(texture));
+    color_attachment.setLoadAction(load);
+    color_attachment.setStoreAction(MTLStoreAction::Store);
+    command_buffer
+        .renderCommandEncoderWithDescriptor(&render_pass_descriptor)
+        .context("creating render command encoder")
+}
+
 fn build_depth_stencil_state(
     device: &ProtocolObject<dyn MTLDevice>,
     write_depth: bool,
@@ -1681,6 +2097,84 @@ mod tests {
         CVPixelBufferUnlockBaseAddress, kCVPixelBufferIOSurfacePropertiesKey,
     };
     use objc2_metal::MTLCommandBufferStatus;
+
+    /// Renders stripes, then the same with a backdrop blur over them, and
+    /// checks the blur against `gpui::backdrop_blur::reference` run on the
+    /// first image, up to the rounding of 8-bit intermediate levels.
+    /// `cargo test -p gpui_apple --features test-support backdrop_blur`.
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn backdrop_blur_matches_the_reference() -> Result<()> {
+        use gpui::backdrop_blur::{BlurPlan, reference};
+        use gpui::{BorderStyle, Corners, Edges, Quad};
+        let (w, h) = (96i32, 96i32);
+        let rect = |x: f32, y: f32, width: f32, height: f32| Bounds {
+            origin: Point { x: ScaledPixels(x), y: ScaledPixels(y) },
+            size: size(ScaledPixels(width), ScaledPixels(height)),
+        };
+        let everything = ContentMask { bounds: rect(0.0, 0.0, w as f32, h as f32) };
+        let stripes = |scene: &mut Scene| {
+            for i in 0..12 {
+                let color = if i % 2 == 0 { gpui::white() } else { gpui::red() };
+                let bounds = rect(i as f32 * 8.0, 0.0, 8.0, 96.0);
+                scene.insert_primitive(Quad {
+                    order: 0,
+                    border_style: BorderStyle::Solid,
+                    bounds,
+                    content_mask: ContentMask { bounds },
+                    background: color.into(),
+                    border_color: color,
+                    corner_radii: Corners::default(),
+                    border_widths: Edges::default(),
+                });
+            }
+        };
+        let mut renderer = MetalRenderer::new_headless(Default::default())?;
+        for radius in [2.0f32, 5.0, 9.0, 16.0] {
+            let mut plain = Scene::default();
+            stripes(&mut plain);
+            plain.finish();
+            let backdrop = renderer.render_scene_to_image(&plain, size(DevicePixels(w), DevicePixels(h)))?;
+            let mut blurred = Scene::default();
+            stripes(&mut blurred);
+            blurred.insert_primitive(BackdropBlur {
+                order: 0,
+                blur_radius: ScaledPixels(radius),
+                bounds: rect(16.0, 20.0, 64.0, 56.0),
+                corner_radii: Corners {
+                    top_left: ScaledPixels(10.0),
+                    top_right: ScaledPixels(4.0),
+                    bottom_right: ScaledPixels(10.0),
+                    bottom_left: ScaledPixels(0.0),
+                },
+                content_mask: everything.clone(),
+            });
+            blurred.finish();
+            let actual = renderer.render_scene_to_image(&blurred, size(DevicePixels(w), DevicePixels(h)))?;
+
+            let snapshot = reference::Image {
+                width: w as u32,
+                height: h as u32,
+                pixels: backdrop.pixels().map(|p| p.0.map(|c| c as f32 / 255.0)).collect(),
+            };
+            let plan = BlurPlan::for_radius(radius).unwrap();
+            let expected = reference::composite(&snapshot, plan, [16.0, 20.0], [64.0, 56.0], [10.0, 4.0, 10.0, 0.0]);
+            let (mut worst, mut total) = (0u8, 0u64);
+            for (i, px) in actual.pixels().enumerate() {
+                let want = expected.pixels[i].map(|c| (c * 255.0).round().clamp(0.0, 255.0) as u8);
+                for c in 0..4 {
+                    let d = px.0[c].abs_diff(want[c]);
+                    worst = worst.max(d);
+                    total += d as u64;
+                }
+            }
+            let mean = total as f64 / (w * h * 4) as f64;
+            assert!(worst <= 8 && mean < 1.0, "radius {radius} ({plan:?}): worst channel difference {worst}, mean {mean:.2}");
+            assert_ne!(actual.get_pixel(48, 48), backdrop.get_pixel(48, 48), "the inside is blurred");
+            assert_eq!(actual.get_pixel(4, 4), backdrop.get_pixel(4, 4), "the outside is untouched");
+        }
+        Ok(())
+    }
 
     #[test]
     fn render_to_image_rejects_zero_sized_layer() -> Result<()> {
