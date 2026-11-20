@@ -16,6 +16,7 @@ pub fn code_snippet(
     cx: &App,
 ) -> impl IntoElement {
     let theme = cx.theme();
+    let id = id.into();
     let copy_text = code.clone();
     let is_dark = theme.mode == ThemeMode::Dark;
     let code_bg = if is_dark {
@@ -63,7 +64,7 @@ pub fn code_snippet(
                 )
                 .child(
                     div()
-                        .id(id)
+                        .id(id.clone())
                         .flex()
                         .flex_row()
                         .items_center()
@@ -90,11 +91,14 @@ pub fn code_snippet(
                 ),
         )
         .child(
+            // Code keeps its lines: long ones scroll sideways.
             div()
+                .id((id, "body"))
                 .flex()
                 .flex_col()
                 .gap(px(2.))
                 .w_full()
+                .overflow_x_scroll()
                 .p(px(14.))
                 .bg(code_bg)
                 .font_family("Lilex")
@@ -102,7 +106,7 @@ pub fn code_snippet(
                 .line_height(px(19.))
                 .text_color(palette::SLATE_100)
                 .children(code.lines().map(|line| {
-                    div().w_full().child(if line.is_empty() {
+                    div().whitespace_nowrap().child(if line.is_empty() {
                         SharedString::new_static(" ")
                     } else {
                         SharedString::from(line.to_owned())

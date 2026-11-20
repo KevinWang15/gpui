@@ -229,7 +229,9 @@ impl RenderOnce for Stack {
         let theme = cx.theme();
         let mut el = div().flex().gap(self.gap);
         el = match self.direction {
-            StackDirection::Vertical => el.flex_col().flex_shrink_0(),
+            // Shrinkable in a row, down to its content's min-content width (its
+            // automatic minimum size also keeps a column from squeezing it).
+            StackDirection::Vertical => el.flex_col(),
             StackDirection::Horizontal => el.flex_row(),
         };
         crate::Refineable::refine(el.style(), &self.style);

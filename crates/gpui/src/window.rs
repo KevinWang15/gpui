@@ -4269,7 +4269,12 @@ impl Window {
         } else if let Some(active_drag) = cx.active_drag.take() {
             let mut element = active_drag.view.clone().into_any_element();
             let offset = self.mouse_position() - active_drag.cursor_offset;
-            element.prepaint_as_root(offset, AvailableSpace::min_size(), self, cx);
+            element.prepaint_as_root(
+                offset,
+                size(AvailableSpace::MaxContent, AvailableSpace::MaxContent),
+                self,
+                cx,
+            );
             active_drag_element = Some(element);
             cx.active_drag = Some(active_drag);
         } else {
@@ -4350,7 +4355,11 @@ impl Window {
             };
             let mut element = tooltip_request.tooltip.view.clone().into_any_element();
             let mouse_position = tooltip_request.tooltip.mouse_position;
-            let tooltip_size = element.layout_as_root(AvailableSpace::min_size(), self, cx);
+            let tooltip_size = element.layout_as_root(
+                size(AvailableSpace::MaxContent, AvailableSpace::MaxContent),
+                self,
+                cx,
+            );
 
             let mut tooltip_bounds =
                 Bounds::new(mouse_position + point(px(1.), px(1.)), tooltip_size);

@@ -3258,3 +3258,76 @@ fn audit_regression_edge_cases_and_soak(cx: &mut TestAppContext) {
         cx.run_until_parked();
     }
 }
+
+struct MinContentProbe(Rc<dyn Fn() -> crate::AnyElement>);
+
+impl Render for MinContentProbe {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        crate::div().size_full().child((self.0)())
+    }
+}
+
+/// The bounds of the element marked `probe` in what `f` renders.
+fn probe_bounds(
+    cx: &mut TestAppContext,
+    f: impl Fn() -> crate::AnyElement + 'static,
+) -> crate::Bounds<crate::Pixels> {
+    cx.update(init_components);
+    let (_, cx) = cx.add_window_view(|_, _| MinContentProbe(Rc::new(f)));
+    cx.run_until_parked();
+    cx.debug_bounds("probe").unwrap()
+}
+
+const SENTENCE: &str = "Drag files from your desktop or click to open the native file dialog.";
+
+/// Text's min-content width is its widest word, as in CSS: next to a
+/// fixed-width sibling in a row that is short of room, it wraps.
+#[gpui::test]
+fn text_in_a_short_row_wraps_instead_of_pushing_siblings_out(cx: &mut TestAppContext) {
+    let row = probe_bounds(cx, || {
+        crate::div()
+            .w(px(300.))
+            .child(
+                h_stack()
+                    .child(
+                        crate::div()
+                            .debug_selector(|| "probe".into())
+                            .child(SENTENCE),
+                    )
+                    .child(crate::div().flex_shrink_0().w(px(120.)).h(px(10.))),
+            )
+            .into_any_element()
+    });
+    assert!(row.size.width.0 <= 300. - 120. - 12. + 0.5, "{row:?}");
+    assert!(row.size.height.0 > 30., "the sentence should wrap: {row:?}");
+}
+
+/// A row sized in a min-content pass, then for real: the text gets its
+/// single-line width, not the width it was wrapped to in the first pass.
+#[gpui::test]
+fn text_keeps_its_full_width_after_a_min_content_pass(cx: &mut TestAppContext) {
+    let alone = probe_bounds(cx, || {
+        crate::div()
+            .debug_selector(|| "probe".into())
+            .absolute()
+            .child("GPUI Playground")
+            .into_any_element()
+    });
+    let mut other = TestAppContext::single();
+    let nested = probe_bounds(&mut other, || {
+        crate::div()
+            .flex()
+            .flex_row()
+            .child(
+                crate::div().w(px(252.)).child(
+                    h_stack().child(
+                        crate::div()
+                            .debug_selector(|| "probe".into())
+                            .child(v_stack().child(crate::div().child("GPUI Playground"))),
+                    ),
+                ),
+            )
+            .into_any_element()
+    });
+    assert_eq!(nested.size.width, alone.size.width);
+}

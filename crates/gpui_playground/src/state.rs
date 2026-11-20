@@ -1268,6 +1268,8 @@ impl PlaygroundApp {
                         .child(gpui::icons::Icon::new(icon).size(IconSize::TwoXl))
                         .child(
                             gpui::div()
+                                .px(gpui::px(10.))
+                                .text_center()
                                 .text_size(gpui::px(14.))
                                 .font_weight(gpui::FontWeight::BOLD)
                                 .child(label),

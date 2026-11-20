@@ -18,7 +18,7 @@ use crate::{
 
 use super::input::{Input, InputEvent, InputState};
 use super::interactive::copy_button;
-use super::palette as tw;
+use super::palette;
 use super::theme::{
     ANIM_FAST, ActiveTheme, ComponentSize, ThemeMode, focus_ring_shadow, tabular_numerals,
 };
@@ -184,26 +184,26 @@ pub fn parse_hex_color(input: &str) -> Option<Rgba> {
 
 fn default_presets() -> Vec<Hsla> {
     vec![
-        tw::SLATE_900.into(),
-        tw::SLATE_500.into(),
-        tw::RED_500.into(),
-        tw::ORANGE_500.into(),
-        tw::AMBER_500.into(),
-        tw::EMERALD_500.into(),
-        tw::TEAL_500.into(),
-        tw::SKY_500.into(),
-        tw::BLUE_600.into(),
-        tw::INDIGO_600.into(),
-        tw::VIOLET_600.into(),
-        tw::ROSE_500.into(),
+        palette::SLATE_900.into(),
+        palette::SLATE_500.into(),
+        palette::RED_500.into(),
+        palette::ORANGE_500.into(),
+        palette::AMBER_500.into(),
+        palette::EMERALD_500.into(),
+        palette::TEAL_500.into(),
+        palette::SKY_500.into(),
+        palette::BLUE_600.into(),
+        palette::INDIGO_600.into(),
+        palette::VIOLET_600.into(),
+        palette::ROSE_500.into(),
     ]
 }
 
 fn paint_checkerboard(bounds: Bounds<Pixels>, sq: f32, is_dark: bool, window: &mut Window) {
     let (light, dark): (Hsla, Hsla) = if is_dark {
-        (tw::SLATE_700.into(), tw::SLATE_800.into())
+        (palette::SLATE_700.into(), palette::SLATE_800.into())
     } else {
-        (tw::SLATE_100.into(), tw::SLATE_300.into())
+        (palette::SLATE_100.into(), palette::SLATE_300.into())
     };
     window.paint_quad(fill(bounds, light));
     let cols = (bounds.size.width.0 / sq).ceil().max(0.0) as usize;
@@ -261,7 +261,7 @@ impl Focusable for ColorPickerState {
 impl ColorPickerState {
     /// Creates a new [`ColorPickerState`] defaulting to Indigo 600 (`#4F46E5`).
     pub fn new(cx: &mut Context<Self>) -> Self {
-        let initial: Hsla = tw::INDIGO_600.into();
+        let initial: Hsla = palette::INDIGO_600.into();
         let initial_rgba: Rgba = initial.into();
         let (h, s, v, a) = rgba_to_hsva(initial_rgba);
         let initial_hex = format_hex(initial_rgba, true);
@@ -603,7 +603,7 @@ impl ColorPickerState {
                     .h(px(14.))
                     .rounded_full()
                     .border_2()
-                    .border_color(tw::WHITE)
+                    .border_color(palette::WHITE)
                     .bg(current_hsla.opacity(1.0))
                     .shadow_md()
                     .child(
@@ -694,7 +694,7 @@ impl ColorPickerState {
                     .rounded_full()
                     .bg(pure_hue)
                     .border_2()
-                    .border_color(tw::WHITE)
+                    .border_color(palette::WHITE)
                     .shadow_sm()
                     .child(
                         div()
@@ -769,7 +769,7 @@ impl ColorPickerState {
                         .rounded_full()
                         .bg(current_hsla)
                         .border_2()
-                        .border_color(tw::WHITE)
+                        .border_color(palette::WHITE)
                         .shadow_sm()
                         .child(
                             div()
@@ -786,6 +786,7 @@ impl ColorPickerState {
         let b8 = (current_rgba.b * 255.0).round() as u8;
         let a_pct = (current_rgba.a * 100.0).round() as u8;
 
+        let current_hex = format_hex(self.color().into(), true);
         let presets_row = (!self.presets.is_empty()).then(|| {
             div()
                 .flex()
@@ -794,6 +795,9 @@ impl ColorPickerState {
                 .gap(px(6.))
                 .pt(px(2.))
                 .children(self.presets.iter().enumerate().map(|(idx, &preset)| {
+                    // The stronger border keeps swatches near the surface's
+                    // color visible; the current color's swatch gets the ring.
+                    let selected = format_hex(preset.into(), true) == current_hex;
                     div()
                         .id(("cp-preset", idx))
                         .w(px(20.))
@@ -801,7 +805,8 @@ impl ColorPickerState {
                         .rounded(theme.radius_sm)
                         .bg(preset)
                         .border_1()
-                        .border_color(theme.border)
+                        .border_color(theme.input_border_hover)
+                        .when(selected, |el| el.border_2().border_color(theme.ring))
                         .when(!disabled, |el| {
                             el.cursor_pointer()
                                 .hover(|s| s.border_color(theme.foreground))

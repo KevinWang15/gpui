@@ -598,6 +598,54 @@ struct TextLayoutInner {
     bounds: Option<Bounds<Pixels>>,
 }
 
+/// Text's CSS min-content size: as wide as its widest piece between line
+/// break opportunities (trailing spaces hang), and as tall as it is wrapped
+/// to that width.
+fn min_content_size(
+    text: &SharedString,
+    font_size: Pixels,
+    runs: &[TextRun],
+    line_height: Pixels,
+    window: &mut Window,
+) -> Option<Size<Pixels>> {
+    let lines = window
+        .text_system()
+        .shape_text(text.clone(), font_size, runs, None, None)
+        .log_err()?;
+    let mut width = Pixels::ZERO;
+    for line in &lines {
+        width = width.max(widest_piece(line));
+    }
+    let width = width.ceil();
+    let wrapped = window
+        .text_system()
+        .shape_text(text.clone(), font_size, runs, Some(width), None)
+        .log_err()?;
+    let height = wrapped
+        .iter()
+        .map(|line| line.size(line_height).height)
+        .fold(Pixels::ZERO, |a, b| a + b);
+    Some(Size { width, height })
+}
+
+/// The widest piece of `line` between break opportunities, without the
+/// spaces that end it.
+fn widest_piece(line: &WrappedLine) -> Pixels {
+    let layout = &line.unwrapped_layout;
+    let text = line.text.as_ref();
+    let mut start = 0;
+    let mut widest = Pixels::ZERO;
+    for end in crate::LineWrapper::break_indices(text) {
+        if end <= start {
+            continue;
+        }
+        let trimmed = start + text[start..end].trim_end().len();
+        widest = widest.max(layout.x_for_index(trimmed) - layout.x_for_index(start));
+        start = end;
+    }
+    widest
+}
+
 impl TextLayout {
     fn layout(
         &self,
@@ -623,6 +671,19 @@ impl TextLayout {
             let element_state = self.clone();
 
             move |known_dimensions, available_space, window, cx| {
+                // The min-content probe (a flex or grid item's smallest size):
+                // the widest unbreakable piece, as in CSS, so text in a row
+                // that is short of room wraps instead of pushing its siblings
+                // out. Answered without touching the layout that gets painted.
+                if text_style.white_space == WhiteSpace::Normal
+                    && text_style.text_overflow.is_none()
+                    && known_dimensions.width.is_none()
+                    && available_space.width == crate::AvailableSpace::MinContent
+                {
+                    return min_content_size(&text, font_size, &runs, line_height, window)
+                        .unwrap_or_default();
+                }
+
                 let wrap_width = if text_style.white_space == WhiteSpace::Normal {
                     known_dimensions.width.or(match available_space.width {
                         crate::AvailableSpace::Definite(x) => Some(x),
@@ -653,7 +714,9 @@ impl TextLayout {
 
                 // Only use cached layout if:
                 // 1. We have a cached size
-                // 2. wrap_width matches (or both are None)
+                // 2. wrap_width matches, or this probe is unconstrained and the
+                //    cached layout didn't wrap (a layout wrapped to some
+                //    narrower width would answer it with that width)
                 // 3. truncate_width is None (if truncate_width is Some, we need to re-layout
                 //    because the previous layout may have been computed without truncation)
                 // 4. the cached layout was not truncated (a truncated layout answers an
@@ -661,7 +724,12 @@ impl TextLayout {
                 //    sizing with whatever width some earlier measure pass happened to use)
                 if let Some(text_layout) = element_state.0.borrow().as_ref()
                     && let Some(size) = text_layout.size
-                    && (wrap_width.is_none() || wrap_width == text_layout.wrap_width)
+                    && (wrap_width == text_layout.wrap_width
+                        || (wrap_width.is_none()
+                            && text_layout
+                                .lines
+                                .iter()
+                                .all(|line| line.wrap_boundaries.is_empty())))
                     && truncate_width.is_none()
                     && text_layout.truncate_width.is_none()
                 {
