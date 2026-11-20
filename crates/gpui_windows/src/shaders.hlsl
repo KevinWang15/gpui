@@ -1499,22 +1499,22 @@ float vt_noise2d(float2 p) {
     return lerp(lerp(a, b, u.x), lerp(c, d, u.x), u.y);
 }
 
-float vt_fbm(float2 p) {
-    float val = 0.0;
-    float amp = 0.5;
-    [unroll]
-    for (int i = 0; i < 4; i++) {
-        val += amp * vt_noise2d(p);
-        p = float2(p.x * 1.60 - p.y * 1.24, p.x * 1.24 + p.y * 1.60) + float2(13.7, 7.3);
-        amp *= 0.5;
-    }
-    return val / 0.9375;
+float vt_smooth_noise2(float2 p) {
+    float a = vt_noise2d(p);
+    float b = vt_noise2d(float2(p.x * 1.72 - p.y * 1.18, p.x * 1.18 + p.y * 1.72) + float2(7.4, 13.1));
+    return a * 0.68 + b * 0.32;
 }
 
-float vt_warped_fbm(float2 q) {
-    float wx = vt_fbm(q + float2(5.2, 1.3));
-    float wy = vt_fbm(q + float2(1.7, 9.2));
-    return vt_fbm(q + float2(wx - 0.5, wy - 0.5) * 1.35);
+float vt_smin(float a, float b, float k) {
+    float h = saturate(0.5 + 0.5 * (b - a) / k);
+    return lerp(b, a, h) - k * h * (1.0 - h);
+}
+
+float2 vt_hash22(float2 p) {
+    return float2(
+        vt_hash21(p + float2(1.7, 9.2)),
+        vt_hash21(p + float2(8.3, 2.8))
+    );
 }
 
 float4 vt_shockwave(float2 frag_pos, float2 dims) {
@@ -1685,6 +1685,32 @@ float4 vt_page_curl(float2 frag_pos, float2 dims) {
     return float4(new_raw.rgb * trail_shadow, new_raw.a);
 }
 
+float vt_liquid_field(float2 pos, float2 origin, float max_r, float cell, float p) {
+    float norm_dist = length(pos - origin) / max_r;
+    float swirl = vt_smooth_noise2(pos / (cell * 1.55) + float2(p * 0.24, -p * 0.18));
+    float field = norm_dist * 0.78 + (swirl - 0.5) * 0.24;
+
+    float drop_cell = cell * 0.96;
+    float2 g = pos / drop_cell;
+    float2 id = floor(g);
+    [unroll]
+    for (int dy = -1; dy <= 1; dy++) {
+        [unroll]
+        for (int dx = -1; dx <= 1; dx++) {
+            float2 cid = id + float2(float(dx), float(dy));
+            float2 rnd = vt_hash22(cid);
+            float2 center_g = cid + float2(0.22, 0.22) + rnd * 0.56;
+            float2 d_vec = g - center_g;
+            float d_cell = sqrt(dot(d_vec, d_vec) + 0.022) - 0.14832397;
+            float center_dist = length(center_g * drop_cell - origin) / max_r;
+            float lead = (vt_hash21(cid + float2(4.9, 6.1)) - 0.5) * 0.14;
+            float drop_f = center_dist * 0.78 + lead + d_cell * 0.36 - 0.082;
+            field = vt_smin(field, drop_f, 0.09);
+        }
+    }
+    return field;
+}
+
 float4 vt_liquid_dissolve(float2 frag_pos, float2 dims) {
     float scale = max(vt_feather, 1.0);
     float p = saturate(vt_progress);
@@ -1695,49 +1721,86 @@ float4 vt_liquid_dissolve(float2 frag_pos, float2 dims) {
         return vt_load_new(frag_pos);
     }
 
-    float cell = clamp(min(dims.x, dims.y) * 0.22, 36.0 * scale, 120.0 * scale);
-    float disp_scale = cell / (120.0 * scale);
-    float2 q = frag_pos / cell;
-    float norm_dist = saturate(length(frag_pos - vt_origin) / max(vt_radius, 1.0));
-    float n = vt_warped_fbm(q);
-    float field = norm_dist * 0.66 + n * 0.34;
-    float threshold = lerp(-0.11, 1.11, p);
-    float diff = field - threshold;
-    float time_env = smoothstep(0.0, 0.07, p) * (1.0 - smoothstep(0.88, 1.0, p));
+    float cell = clamp(min(dims.x, dims.y) * 0.22, 42.0 * scale, 132.0 * scale);
+    float disp_scale = clamp(cell / (120.0 * scale), 0.38, 1.0);
+    float max_r = max(vt_radius, 1.0);
+    float threshold = lerp(-0.24, 1.02, p);
+    float time_env = smoothstep(0.0, 0.05, p) * (1.0 - smoothstep(0.90, 1.0, p));
 
-    if (abs(diff) > 0.095 || time_env <= 0.0005) {
+    float f0 = vt_liquid_field(frag_pos, vt_origin, max_r, cell, p);
+    float diff = f0 - threshold;
+
+    if (abs(diff) > 0.30 || time_env <= 0.0005) {
         return diff < 0.0 ? vt_load_new(frag_pos) : vt_load_old(frag_pos);
     }
 
-    float eps = 0.045;
-    float nx = vt_warped_fbm(q + float2(eps, 0.0)) - vt_warped_fbm(q - float2(eps, 0.0));
-    float ny = vt_warped_fbm(q + float2(0.0, eps)) - vt_warped_fbm(q - float2(0.0, eps));
-    float2 grad = float2(nx, ny) / (2.0 * eps);
+    float eps_px = 1.5 * scale;
+    float fx = vt_liquid_field(frag_pos + float2(eps_px, 0.0), vt_origin, max_r, cell, p);
+    float fxm = vt_liquid_field(frag_pos - float2(eps_px, 0.0), vt_origin, max_r, cell, p);
+    float fy = vt_liquid_field(frag_pos + float2(0.0, eps_px), vt_origin, max_r, cell, p);
+    float fym = vt_liquid_field(frag_pos - float2(0.0, eps_px), vt_origin, max_r, cell, p);
+    float2 grad_px = float2(fx - fxm, fy - fym) / (2.0 * eps_px);
+    float grad_len = length(grad_px);
+    float2 n2 = grad_px / max(grad_len, 0.00025);
+
+    float h = threshold - f0;
+    float signed_px = h / max(grad_len, 0.00025);
+    float shadow_w = 18.0 * scale * disp_scale;
+
+    if (h > 0.26) {
+        return vt_load_new(frag_pos);
+    }
+    if (signed_px < -(shadow_w + 2.0 * scale) && h < -0.02) {
+        return vt_load_old(frag_pos);
+    }
+
+    float4 old_raw = vt_load_old(frag_pos);
+    float shadow_d = max(-signed_px, 0.0);
+    float2 light_2d = normalize(float2(0.48, 0.78));
+    float shadow_bias = 0.45 + 0.55 * max(dot(n2, light_2d), 0.0);
+    float contact_shadow = exp(-shadow_d / max(shadow_w * 0.34, 1.0))
+        * (1.0 - smoothstep(0.0, shadow_w, shadow_d))
+        * shadow_bias * 0.24 * time_env;
+    float4 old_lit = float4(old_raw.rgb * (1.0 - contact_shadow), old_raw.a);
+
+    float h_pos = max(h, 0.0);
+    float rim_fade = exp(-h_pos / 0.052) * (1.0 - smoothstep(0.16, 0.25, h_pos));
+    float2 slope_vec = grad_px * (240.0 * scale * disp_scale) * rim_fade;
+    float3 n3 = normalize(float3(slope_vec, 1.0));
+    float slope_mag = clamp(length(slope_vec), 0.0, 1.25);
 
     float border_dist = min(min(frag_pos.x, dims.x - frag_pos.x), min(frag_pos.y, dims.y - frag_pos.y));
-    float edge_damp = smoothstep(0.0, 20.0 * scale * disp_scale, border_dist);
+    float edge_damp = smoothstep(0.0, 18.0 * scale * disp_scale, border_dist);
 
-    float meniscus = exp(-(diff * diff) / (2.0 * 0.028 * 0.028)) * time_env;
-    float2 disp_px = grad * meniscus * (18.0 * scale * disp_scale) * edge_damp;
-
-    float2 uv_r = (frag_pos + disp_px * 0.80) / dims;
-    float2 uv_g = (frag_pos + disp_px * 1.00) / dims;
-    float2 uv_b = (frag_pos + disp_px * 1.22) / dims;
-
-    float4 old_g = vt_sample_old(uv_g);
-    float4 old_col = float4(vt_sample_old(uv_r).r, old_g.g, vt_sample_old(uv_b).b, old_g.a);
+    float2 refract_px = slope_vec * (11.0 * scale * disp_scale * time_env * edge_damp);
+    float2 uv_r = (frag_pos - refract_px * 0.86) / dims;
+    float2 uv_g = (frag_pos - refract_px * 1.00) / dims;
+    float2 uv_b = (frag_pos - refract_px * 1.16) / dims;
     float4 new_g = vt_sample_new(uv_g);
-    float4 new_col = float4(vt_sample_new(uv_r).r, new_g.g, vt_sample_new(uv_b).b, new_g.a);
+    float4 new_refracted = float4(vt_sample_new(uv_r).r, new_g.g, vt_sample_new(uv_b).b, new_g.a);
 
-    float show_old = smoothstep(-0.018, 0.018, diff);
-    float4 color = lerp(new_col, old_col, show_old);
+    float3 view_dir = float3(0.0, 0.0, 1.0);
+    float3 key_l = normalize(float3(-0.48, -0.68, 0.55));
+    float3 key_h = normalize(key_l + view_dir);
+    float spec_sharp = pow(max(dot(n3, key_h), 0.0), 48.0) * 0.82 * rim_fade;
+    float spec_broad = pow(max(dot(n3, key_h), 0.0), 10.0) * 0.16 * rim_fade * smoothstep(0.0, 0.35, slope_mag);
 
-    float rim = exp(-(diff * diff) / (2.0 * 0.009 * 0.009)) * time_env;
-    float3 rim_tint = lerp(float3(0.72, 0.90, 1.0), float3(0.96, 0.78, 1.0), n);
-    float inner_d = diff + 0.018;
-    float inner_shade = exp(-(inner_d * inner_d) / (2.0 * 0.014 * 0.014)) * time_env * 0.10;
-    float3 lit_rgb = color.rgb * (1.0 - inner_shade) + rim_tint * (rim * 0.34 * color.a);
-    return float4(saturate(lit_rgb), color.a);
+    float3 fill_l = normalize(float3(0.50, 0.62, 0.60));
+    float3 fill_h = normalize(fill_l + view_dir);
+    float spec_fill = pow(max(dot(n3, fill_h), 0.0), 26.0) * 0.28 * rim_fade * smoothstep(0.0, 0.35, slope_mag);
+
+    float fresnel = pow(max(1.0 - n3.z, 0.0), 2.1) * 0.38 * rim_fade;
+    float bevel_shade = max(dot(n2, light_2d), 0.0) * min(slope_mag, 1.0) * 0.12 * rim_fade * time_env;
+
+    float3 highlight = (float3(1.0, 1.0, 1.0) * spec_sharp
+        + float3(0.84, 0.95, 1.0) * (spec_broad + fresnel)
+        + float3(0.70, 0.88, 1.0) * spec_fill) * time_env * new_refracted.a;
+    float3 liquid_rgb = saturate(new_refracted.rgb * (1.0 - bevel_shade) + highlight);
+    float4 liquid_col = float4(liquid_rgb, new_refracted.a);
+
+    float aa = max(0.95 * scale, 0.75);
+    float inside = smoothstep(-aa, aa, signed_px);
+    return lerp(old_lit, liquid_col, inside);
 }
 
 float2 vt_mirror_uv(float2 uv) {
@@ -2016,12 +2079,6 @@ float4 vt_glitch(float2 frag_pos, float2 dims) {
         rgb = lerp(rgb, tint * col.a, 0.32 * glitch_amt);
     }
     return float4(saturate(rgb), col.a);
-}
-
-float vt_smooth_noise2(float2 p) {
-    float a = vt_noise2d(p);
-    float b = vt_noise2d(float2(p.x * 1.72 - p.y * 1.18, p.x * 1.18 + p.y * 1.72) + float2(7.4, 13.1));
-    return a * 0.68 + b * 0.32;
 }
 
 float4 vt_prismatic_blob(float2 frag_pos, float2 dims) {

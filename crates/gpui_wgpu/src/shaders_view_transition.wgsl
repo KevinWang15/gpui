@@ -120,23 +120,23 @@ fn vt_noise2d(p: vec2<f32>) -> f32 {
     return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
 }
 
-fn vt_fbm(p_in: vec2<f32>) -> f32 {
-    var p = p_in;
-    var val = 0.0;
-    var amp = 0.5;
-    for (var i = 0; i < 4; i += 1) {
-        val += amp * vt_noise2d(p);
-        // Mild rotation + lacunarity 2.02 eliminates axis-aligned grid artifacts.
-        p = vec2<f32>(p.x * 1.60 - p.y * 1.24, p.x * 1.24 + p.y * 1.60) + vec2<f32>(13.7, 7.3);
-        amp *= 0.5;
-    }
-    return val / 0.9375;
+// Smooth 2-octave value noise (silky organic curves without high-frequency crinkles).
+fn vt_smooth_noise2(p: vec2<f32>) -> f32 {
+    let a = vt_noise2d(p);
+    let b = vt_noise2d(vec2<f32>(p.x * 1.72 - p.y * 1.18, p.x * 1.18 + p.y * 1.72) + vec2<f32>(7.4, 13.1));
+    return a * 0.68 + b * 0.32;
 }
 
-fn vt_warped_fbm(q: vec2<f32>) -> f32 {
-    let wx = vt_fbm(q + vec2<f32>(5.2, 1.3));
-    let wy = vt_fbm(q + vec2<f32>(1.7, 9.2));
-    return vt_fbm(q + vec2<f32>(wx - 0.5, wy - 0.5) * 1.35);
+fn vt_smin(a: f32, b: f32, k: f32) -> f32 {
+    let h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
+    return mix(b, a, h) - k * h * (1.0 - h);
+}
+
+fn vt_hash22(p: vec2<f32>) -> vec2<f32> {
+    return vec2<f32>(
+        vt_hash21(p + vec2<f32>(1.7, 9.2)),
+        vt_hash21(p + vec2<f32>(8.3, 2.8)),
+    );
 }
 
 fn vt_shockwave(frag_pos: vec2<f32>, dims: vec2<f32>, dims_i: vec2<i32>) -> vec4<f32> {
@@ -324,6 +324,37 @@ fn vt_page_curl(frag_pos: vec2<f32>, dims: vec2<f32>, dims_i: vec2<i32>) -> vec4
     return vec4<f32>(new_raw.rgb * trail_shadow, new_raw.a);
 }
 
+// Smooth C2 metaball liquid field: combines an organic undulating main wave with circular
+// surface-tension droplets that nucleate just ahead of the frontier and coalesce smoothly via smin.
+fn vt_liquid_field(pos: vec2<f32>, origin: vec2<f32>, max_r: f32, cell: f32, p: f32) -> f32 {
+    let norm_dist = length(pos - origin) / max_r;
+    let swirl = vt_smooth_noise2(pos / (cell * 1.55) + vec2<f32>(p * 0.24, -p * 0.18));
+    var field = norm_dist * 0.78 + (swirl - 0.5) * 0.24;
+
+    // Cellular glossy droplet beads coalescing into the advancing liquid sheet.
+    let drop_cell = cell * 0.96;
+    let g = pos / drop_cell;
+    let id = floor(g);
+    for (var dy = -1; dy <= 1; dy += 1) {
+        for (var dx = -1; dx <= 1; dx += 1) {
+            let cid = id + vec2<f32>(f32(dx), f32(dy));
+            let rnd = vt_hash22(cid);
+            let center_g = cid + vec2<f32>(0.22) + rnd * 0.56;
+            let d_vec = g - center_g;
+            // Smooth hyperboloid cone tip so gradient is C-infinity smooth at droplet centers (zero pinprick).
+            let d_cell = sqrt(dot(d_vec, d_vec) + 0.022) - 0.14832397;
+            let center_dist = length(center_g * drop_cell - origin) / max_r;
+            let lead = (vt_hash21(cid + vec2<f32>(4.9, 6.1)) - 0.5) * 0.14;
+            let drop_f = center_dist * 0.78 + lead + d_cell * 0.36 - 0.082;
+            field = vt_smin(field, drop_f, 0.09);
+        }
+    }
+    return field;
+}
+
+// Glossy 3D liquid-droplet dissolve: crystal-clear metaball droplets nucleate and coalesce
+// smoothly from origin with convex glass-meniscus refraction, Blinn-Phong wet specular glints,
+// Fresnel rim light, and a soft directional contact shadow on the old view underneath.
 fn vt_liquid_dissolve(frag_pos: vec2<f32>, dims: vec2<f32>, dims_i: vec2<i32>) -> vec4<f32> {
     let scale = max(params.feather_px, 1.0);
     let p = clamp(params.progress, 0.0, 1.0);
@@ -334,56 +365,104 @@ fn vt_liquid_dissolve(frag_pos: vec2<f32>, dims: vec2<f32>, dims_i: vec2<i32>) -
         return vt_load_new(frag_pos, dims_i);
     }
 
-    let cell = clamp(min(dims.x, dims.y) * 0.22, 36.0 * scale, 120.0 * scale);
-    let disp_scale = cell / (120.0 * scale);
-    let q = frag_pos / cell;
-    let norm_dist = clamp(length(frag_pos - params.origin_px) / max(params.radius_px, 1.0), 0.0, 1.0);
-    let n = vt_warped_fbm(q);
-    let field = norm_dist * 0.66 + n * 0.34;
-    let threshold = mix(-0.11, 1.11, p);
-    let diff = field - threshold;
-    let time_env = smoothstep(0.0, 0.07, p) * (1.0 - smoothstep(0.88, 1.0, p));
+    let cell = clamp(min(dims.x, dims.y) * 0.22, 42.0 * scale, 132.0 * scale);
+    let disp_scale = clamp(cell / (120.0 * scale), 0.38, 1.0);
+    let max_r = max(params.radius_px, 1.0);
+    let threshold = mix(-0.24, 1.02, p);
+    let time_env = smoothstep(0.0, 0.05, p) * (1.0 - smoothstep(0.90, 1.0, p));
 
-    // Fast exact path for ~92% of pixels away from the active liquid frontier.
-    if (abs(diff) > 0.095 || time_env <= 0.0005) {
+    let f0 = vt_liquid_field(frag_pos, params.origin_px, max_r, cell, p);
+    let diff = f0 - threshold;
+
+    // Wide conservative early-reject so the entire 3D meniscus dome & contact shadow never clip.
+    if (abs(diff) > 0.30 || time_env <= 0.0005) {
         if (diff < 0.0) {
             return vt_load_new(frag_pos, dims_i);
         }
         return vt_load_old(frag_pos, dims_i);
     }
 
-    // Surface-tension refraction tightly localized on the organic liquid tendrils.
-    let eps = 0.045;
-    let nx = vt_warped_fbm(q + vec2<f32>(eps, 0.0)) - vt_warped_fbm(q - vec2<f32>(eps, 0.0));
-    let ny = vt_warped_fbm(q + vec2<f32>(0.0, eps)) - vt_warped_fbm(q - vec2<f32>(0.0, eps));
-    let grad = vec2<f32>(nx, ny) / (2.0 * eps);
+    // Smooth C-infinity heightfield gradient via central differences (zero pinprick, zero donut holes).
+    let eps_px = 1.5 * scale;
+    let fx = vt_liquid_field(frag_pos + vec2<f32>(eps_px, 0.0), params.origin_px, max_r, cell, p);
+    let fxm = vt_liquid_field(frag_pos - vec2<f32>(eps_px, 0.0), params.origin_px, max_r, cell, p);
+    let fy = vt_liquid_field(frag_pos + vec2<f32>(0.0, eps_px), params.origin_px, max_r, cell, p);
+    let fym = vt_liquid_field(frag_pos - vec2<f32>(0.0, eps_px), params.origin_px, max_r, cell, p);
+    let grad_px = vec2<f32>(fx - fxm, fy - fym) / (2.0 * eps_px);
+    let grad_len = length(grad_px);
+    let n2 = grad_px / max(grad_len, 0.00025);
+
+    // `h > 0` inside the advancing liquid (new view), `h < 0` on the dry old view outside.
+    let h = threshold - f0;
+    let signed_px = h / max(grad_len, 0.00025);
+    let shadow_w = 18.0 * scale * disp_scale;
+
+    if (h > 0.26) {
+        return vt_load_new(frag_pos, dims_i);
+    }
+    if (signed_px < -(shadow_w + 2.0 * scale) && h < -0.02) {
+        return vt_load_old(frag_pos, dims_i);
+    }
+
+    // Outside the liquid: crisp old view with a soft directional contact shadow cast by the raised liquid rim.
+    let old_raw = vt_load_old(frag_pos, dims_i);
+    let shadow_d = max(-signed_px, 0.0);
+    let light_2d = normalize(vec2<f32>(0.48, 0.78));
+    let shadow_bias = 0.45 + 0.55 * max(dot(n2, light_2d), 0.0);
+    let contact_shadow = exp(-shadow_d / max(shadow_w * 0.34, 1.0))
+        * (1.0 - smoothstep(0.0, shadow_w, shadow_d))
+        * shadow_bias * 0.24 * time_env;
+    let old_lit = vec4<f32>(old_raw.rgb * (1.0 - contact_shadow), old_raw.a);
+
+    // Inside the liquid: true physical heightfield surface normal!
+    // Exponential depth decay keeps small droplets 100% smoothly domed like real raindrops while
+    // melting the main pool's curved meniscus seamlessly to 0.000000 with zero cutoff seam.
+    let h_pos = max(h, 0.0);
+    let rim_fade = exp(-h_pos / 0.052) * (1.0 - smoothstep(0.16, 0.25, h_pos));
+    let slope_vec = grad_px * (240.0 * scale * disp_scale) * rim_fade;
+    let n3 = normalize(vec3<f32>(slope_vec, 1.0));
+    let slope_mag = clamp(length(slope_vec), 0.0, 1.25);
 
     let border_dist = min(min(frag_pos.x, dims.x - frag_pos.x), min(frag_pos.y, dims.y - frag_pos.y));
-    let edge_damp = smoothstep(0.0, 20.0 * scale * disp_scale, border_dist);
+    let edge_damp = smoothstep(0.0, 18.0 * scale * disp_scale, border_dist);
 
-    let meniscus = exp(-(diff * diff) / (2.0 * 0.028 * 0.028)) * time_env;
-    let disp_px = grad * meniscus * (18.0 * scale * disp_scale) * edge_damp;
-
-    let uv_r = (frag_pos + disp_px * 0.80) / dims;
-    let uv_g = (frag_pos + disp_px * 1.00) / dims;
-    let uv_b = (frag_pos + disp_px * 1.22) / dims;
-
-    let old_g = vt_sample_old(uv_g);
-    let old_col = vec4<f32>(vt_sample_old(uv_r).r, old_g.g, vt_sample_old(uv_b).b, old_g.a);
+    // Convex glass-lens refraction curving gently inward along the wet meniscus with crystal RGB caustics.
+    let refract_px = slope_vec * (11.0 * scale * disp_scale * time_env * edge_damp);
+    let uv_r = (frag_pos - refract_px * 0.86) / dims;
+    let uv_g = (frag_pos - refract_px * 1.00) / dims;
+    let uv_b = (frag_pos - refract_px * 1.16) / dims;
     let new_g = vt_sample_new(uv_g);
-    let new_col = vec4<f32>(vt_sample_new(uv_r).r, new_g.g, vt_sample_new(uv_b).b, new_g.a);
+    let new_refracted = vec4<f32>(vt_sample_new(uv_r).r, new_g.g, vt_sample_new(uv_b).b, new_g.a);
 
-    let show_old = smoothstep(-0.018, 0.018, diff);
-    var color = mix(new_col, old_col, show_old);
+    // 3D studio key-light Blinn-Phong specular glint + secondary crystal rim bounce + Fresnel edge.
+    // Every lighting term is modulated by `rim_fade` so flat interior pixels stay 100% untouched.
+    let view_dir = vec3<f32>(0.0, 0.0, 1.0);
+    let key_l = normalize(vec3<f32>(-0.48, -0.68, 0.55));
+    let key_h = normalize(key_l + view_dir);
+    let spec_sharp = pow(max(dot(n3, key_h), 0.0), 48.0) * 0.82 * rim_fade;
+    let spec_broad = pow(max(dot(n3, key_h), 0.0), 10.0) * 0.16 * rim_fade * smoothstep(0.0, 0.35, slope_mag);
 
-    // Iridescent glossy liquid meniscus rim + delicate inner shadow.
-    let rim = exp(-(diff * diff) / (2.0 * 0.009 * 0.009)) * time_env;
-    let rim_tint = mix(vec3<f32>(0.72, 0.90, 1.0), vec3<f32>(0.96, 0.78, 1.0), n);
-    let inner_d = diff + 0.018;
-    let inner_shade = exp(-(inner_d * inner_d) / (2.0 * 0.014 * 0.014)) * time_env * 0.10;
-    let lit_rgb = color.rgb * (1.0 - inner_shade) + rim_tint * (rim * 0.34 * color.a);
-    color = vec4<f32>(clamp(lit_rgb, vec3<f32>(0.0), vec3<f32>(1.0)), color.a);
-    return color;
+    let fill_l = normalize(vec3<f32>(0.50, 0.62, 0.60));
+    let fill_h = normalize(fill_l + view_dir);
+    let spec_fill = pow(max(dot(n3, fill_h), 0.0), 26.0) * 0.28 * rim_fade * smoothstep(0.0, 0.35, slope_mag);
+
+    let fresnel = pow(max(1.0 - n3.z, 0.0), 2.1) * 0.38 * rim_fade;
+    let bevel_shade = max(dot(n2, light_2d), 0.0) * min(slope_mag, 1.0) * 0.12 * rim_fade * time_env;
+
+    let highlight = (vec3<f32>(1.0, 1.0, 1.0) * spec_sharp
+        + vec3<f32>(0.84, 0.95, 1.0) * (spec_broad + fresnel)
+        + vec3<f32>(0.70, 0.88, 1.0) * spec_fill) * time_env * new_refracted.a;
+    let liquid_rgb = clamp(
+        new_refracted.rgb * (1.0 - bevel_shade) + highlight,
+        vec3<f32>(0.0),
+        vec3<f32>(1.0),
+    );
+    let liquid_col = vec4<f32>(liquid_rgb, new_refracted.a);
+
+    // Razor-crisp, silky ~1.7px anti-aliased surface-tension boundary.
+    let aa = max(0.95 * scale, 0.75);
+    let inside = smoothstep(-aa, aa, signed_px);
+    return mix(old_lit, liquid_col, inside);
 }
 
 fn vt_mirror_uv(uv: vec2<f32>) -> vec2<f32> {
@@ -713,13 +792,6 @@ fn vt_glitch(frag_pos: vec2<f32>, dims: vec2<f32>, dims_i: vec2<i32>) -> vec4<f3
         rgb = mix(rgb, tint * col.a, 0.32 * glitch_amt);
     }
     return vec4<f32>(clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0)), col.a);
-}
-
-// Smooth 2-octave value noise (silky organic curves without high-frequency crinkles).
-fn vt_smooth_noise2(p: vec2<f32>) -> f32 {
-    let a = vt_noise2d(p);
-    let b = vt_noise2d(vec2<f32>(p.x * 1.72 - p.y * 1.18, p.x * 1.18 + p.y * 1.72) + vec2<f32>(7.4, 13.1));
-    return a * 0.68 + b * 0.32;
 }
 
 // Organic double-blob radial reveal: two independent smooth random blobs (outer & inner)
