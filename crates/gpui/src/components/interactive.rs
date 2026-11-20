@@ -110,10 +110,7 @@ impl Rating {
     }
 
     /// Registers a callback invoked with the newly selected rating (`0..=max`).
-    pub fn on_change(
-        mut self,
-        handler: impl Fn(&usize, &mut Window, &mut App) + 'static,
-    ) -> Self {
+    pub fn on_change(mut self, handler: impl Fn(&usize, &mut Window, &mut App) + 'static) -> Self {
         self.on_change = Some(Rc::new(handler));
         self
     }
@@ -128,11 +125,9 @@ impl Styled for Rating {
 impl RenderOnce for Rating {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
-        let hover_state = window.use_keyed_state(
-            (self.id.clone(), "rating-hover"),
-            cx,
-            |_, _| RatingHoverState::default(),
-        );
+        let hover_state = window.use_keyed_state((self.id.clone(), "rating-hover"), cx, |_, _| {
+            RatingHoverState::default()
+        });
         // Clear any stale hover state if toggled into `read_only`.
         if self.read_only && hover_state.read(cx).hovered.is_some() {
             hover_state.update(cx, |st, _| st.hovered = None);
@@ -157,23 +152,24 @@ impl RenderOnce for Rating {
         };
 
         let hs_row_leave = hover_state.clone();
-        let mut row = div()
-            .id(self.id)
-            .flex()
-            .flex_row()
-            .items_center()
-            .when(!self.read_only, |el| {
-                // Clear hover only when leaving the whole star group, eliminating flicker between stars.
-                el.on_hover(move |is_hovered, _, cx| {
-                    if !*is_hovered {
-                        hs_row_leave.update(cx, |st, cx| {
-                            if st.hovered.take().is_some() {
-                                cx.notify();
-                            }
-                        });
-                    }
-                })
-            });
+        let mut row =
+            div()
+                .id(self.id)
+                .flex()
+                .flex_row()
+                .items_center()
+                .when(!self.read_only, |el| {
+                    // Clear hover only when leaving the whole star group, eliminating flicker between stars.
+                    el.on_hover(move |is_hovered, _, cx| {
+                        if !*is_hovered {
+                            hs_row_leave.update(cx, |st, cx| {
+                                if st.hovered.take().is_some() {
+                                    cx.notify();
+                                }
+                            });
+                        }
+                    })
+                });
 
         for idx in 1..=self.max {
             let filled = idx <= display_val;
@@ -205,7 +201,11 @@ impl RenderOnce for Rating {
                             }
                         })
                         .on_click(move |_, window, cx| {
-                            let next = if allow_clear && current == idx { 0 } else { idx };
+                            let next = if allow_clear && current == idx {
+                                0
+                            } else {
+                                idx
+                            };
                             // Reset hover preview on click so clearing to 0 updates immediately under cursor.
                             hs_click.update(cx, |st, cx| {
                                 st.hovered = None;
@@ -359,15 +359,13 @@ impl Styled for CopyButton {
 impl RenderOnce for CopyButton {
     fn render(mut self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
-        let state = window.use_keyed_state(
-            (self.id.clone(), "copy-btn-state"),
-            cx,
-            |_, cx| CopyButtonState {
+        let state = window.use_keyed_state((self.id.clone(), "copy-btn-state"), cx, |_, cx| {
+            CopyButtonState {
                 copied: false,
                 focus_handle: cx.focus_handle(),
                 _reset_task: None,
-            },
-        );
+            }
+        });
         let (copied, focus_handle) = {
             let s = state.read(cx);
             (s.copied, s.focus_handle.clone())
@@ -449,7 +447,12 @@ impl RenderOnce for CopyButton {
 
         // Respect caller `.text_color(...)` for both icon and idle text while keeping copied confirmation green.
         let custom_fg = self.style.text.color;
-        if copied && !matches!(self.variant, ButtonVariant::Primary | ButtonVariant::Destructive) {
+        if copied
+            && !matches!(
+                self.variant,
+                ButtonVariant::Primary | ButtonVariant::Destructive
+            )
+        {
             self.style.text.color = None;
         }
         let idle_fg = custom_fg.unwrap_or(default_fg);
@@ -710,13 +713,13 @@ impl PinInputState {
         }
         // When pasting a full OTP code (or more chars than fit from active_index), replace from slot 0
         // so pasting a fresh 6-digit code over an expired one never truncates or corrupts it.
-        let mut cursor = if valid.len() >= self.length || valid.len() > self.length - self.active_index
-        {
-            self.chars.fill(None);
-            0
-        } else {
-            self.active_index
-        };
+        let mut cursor =
+            if valid.len() >= self.length || valid.len() > self.length - self.active_index {
+                self.chars.fill(None);
+                0
+            } else {
+                self.active_index
+            };
         for ch in valid {
             if cursor >= self.length {
                 break;
@@ -909,13 +912,7 @@ impl Render for PinInputState {
             root = root.child(cell);
 
             if split_gap_after == Some(idx) {
-                root = root.child(
-                    div()
-                        .w(px(8.))
-                        .h(px(2.))
-                        .rounded_full()
-                        .bg(theme.border),
-                );
+                root = root.child(div().w(px(8.)).h(px(2.)).rounded_full().bg(theme.border));
             }
         }
 

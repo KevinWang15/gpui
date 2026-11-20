@@ -45,15 +45,14 @@ pub fn render_icons(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> imp
     let total_pages = total_matches.div_ceil(PAGE_SIZE).max(1);
     let current_page = app.icon_page.clamp(1, total_pages);
     let start = (current_page - 1) * PAGE_SIZE;
-    let page_icons: Vec<LucideIcon> = matching
-        .into_iter()
-        .skip(start)
-        .take(PAGE_SIZE)
-        .collect();
+    let page_icons: Vec<LucideIcon> = matching.into_iter().skip(start).take(PAGE_SIZE).collect();
 
     let selected = app.selected_icon;
     let snippet = {
-        let mut s = format!("Icon::new(LucideIcon::{selected:?})\n    .size(IconSize::{:?})", app.icon_size);
+        let mut s = format!(
+            "Icon::new(LucideIcon::{selected:?})\n    .size(IconSize::{:?})",
+            app.icon_size
+        );
         if (app.icon_stroke - 2.0).abs() > 0.01 {
             s.push_str(&format!("\n    .stroke_width({:.1})", app.icon_stroke));
         }

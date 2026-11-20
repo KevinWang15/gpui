@@ -409,11 +409,14 @@ impl PlaygroundApp {
             .default_value("design")
             .clearable(true)
         });
-        cx.subscribe(&role_select, |this, _, ev: &SelectEvent<&'static str>, cx| {
-            if let SelectEvent::Change(val) = ev {
-                this.log_event("Select(Role)", format!("selected -> {:?}", val), cx);
-            }
-        })
+        cx.subscribe(
+            &role_select,
+            |this, _, ev: &SelectEvent<&'static str>, cx| {
+                if let SelectEvent::Change(val) = ev {
+                    this.log_event("Select(Role)", format!("selected -> {:?}", val), cx);
+                }
+            },
+        )
         .detach();
 
         let country_select = cx.new(|cx| {
@@ -480,11 +483,9 @@ impl PlaygroundApp {
             ComboBoxState::new(
                 vec![
                     ComboBoxOption::new("rust".to_string(), "Rust").icon(LucideIcon::Flame),
-                    ComboBoxOption::new("taffy".to_string(), "Taffy")
-                        .icon(LucideIcon::Wind),
+                    ComboBoxOption::new("taffy".to_string(), "Taffy").icon(LucideIcon::Wind),
                     ComboBoxOption::new("lucide".to_string(), "Lucide").icon(LucideIcon::Shapes),
-                    ComboBoxOption::new("gpu".to_string(), "GPU Rendering")
-                        .icon(LucideIcon::Cpu),
+                    ComboBoxOption::new("gpu".to_string(), "GPU Rendering").icon(LucideIcon::Cpu),
                     ComboBoxOption::new("a11y".to_string(), "Keyboard Nav")
                         .icon(LucideIcon::Keyboard),
                     ComboBoxOption::new("dark-mode".to_string(), "Dark Mode")
@@ -497,8 +498,9 @@ impl PlaygroundApp {
             .placeholder("Add or create tags...")
             .default_values(vec!["rust".to_string(), "taffy".to_string()])
         });
-        cx.subscribe(&multi_combo, |this, combo, ev: &ComboBoxEvent<String>, cx| {
-            match ev {
+        cx.subscribe(
+            &multi_combo,
+            |this, combo, ev: &ComboBoxEvent<String>, cx| match ev {
                 ComboBoxEvent::Change(vals) => {
                     this.log_event("ComboBox(Tags)", format!("tags -> {:?}", vals), cx);
                 }
@@ -516,13 +518,15 @@ impl PlaygroundApp {
                         cx,
                     );
                 }
-            }
-        })
+            },
+        )
         .detach();
 
         let icon_search = cx.new(|cx| {
             InputState::new(cx)
-                .placeholder("Search all 2,092 Lucide icons (e.g. arrow, check, cloud, git, sun)...")
+                .placeholder(
+                    "Search all 2,092 Lucide icons (e.g. arrow, check, cloud, git, sun)...",
+                )
                 .leading_icon(LucideIcon::Search)
                 .clearable(true)
         });
@@ -552,7 +556,8 @@ impl PlaygroundApp {
         let analytics_filter = cx.new(|cx| {
             FilterBarState::new(
                 vec![
-                    FilterFieldDef::new("provider", "Provider").hint("openai, anthropic, local, cursor"),
+                    FilterFieldDef::new("provider", "Provider")
+                        .hint("openai, anthropic, local, cursor"),
                     FilterFieldDef::new("model", "Model").hint("claude-sonnet-5-5, gpt-6.2, ..."),
                     FilterFieldDef::new("key", "Key").hint("prod-api, dev-local, ide-agent"),
                 ],
@@ -824,7 +829,8 @@ impl PlaygroundApp {
         cx.subscribe(&ring_slider, |this, _, ev: &SliderEvent, cx| {
             let SliderEvent::Change(v) = ev;
             this.loading_demo_progress = *v;
-            this.num_budget.update(cx, |n, cx| n.set_value(*v as f64, cx));
+            this.num_budget
+                .update(cx, |n, cx| n.set_value(*v as f64, cx));
             cx.notify();
         })
         .detach();
@@ -835,34 +841,32 @@ impl PlaygroundApp {
                 .icon(LucideIcon::Boxes)
                 .badge("3")
                 .children([
-                    TreeNode::new("crates", "crates")
-                        .children([
-                            TreeNode::new("gpui", "gpui")
-                                .children([
-                                    TreeNode::new("components", "src/components")
-                                        .children([
-                                            TreeNode::new("tree-rs", "tree.rs").icon(LucideIcon::FileCode),
-                                            TreeNode::new("color-rs", "color_picker.rs").icon(LucideIcon::FileCode),
-                                            TreeNode::new("blur-rs", "loading_overlay.rs").icon(LucideIcon::FileCode),
-                                        ]),
-                                    TreeNode::new("scene-rs", "src/scene.rs").icon(LucideIcon::FileCode),
-                                ]),
-                            TreeNode::new("gpui-wgpu", "gpui_wgpu")
-                                .children([
-                                    TreeNode::new("wgpu-rs", "wgpu_renderer.rs").icon(LucideIcon::FileCode),
-                                    TreeNode::new("wgsl", "shaders_backdrop_blur.wgsl").icon(LucideIcon::Sparkles),
-                                ]),
-                            TreeNode::new("gpui-win", "gpui_windows")
-                                .children([
-                                    TreeNode::new("dx-rs", "directx_renderer.rs").icon(LucideIcon::FileCode),
-                                    TreeNode::new("hlsl", "shaders.hlsl").icon(LucideIcon::Sparkles),
-                                ]),
+                    TreeNode::new("crates", "crates").children([
+                        TreeNode::new("gpui", "gpui").children([
+                            TreeNode::new("components", "src/components").children([
+                                TreeNode::new("tree-rs", "tree.rs").icon(LucideIcon::FileCode),
+                                TreeNode::new("color-rs", "color_picker.rs")
+                                    .icon(LucideIcon::FileCode),
+                                TreeNode::new("blur-rs", "loading_overlay.rs")
+                                    .icon(LucideIcon::FileCode),
+                            ]),
+                            TreeNode::new("scene-rs", "src/scene.rs").icon(LucideIcon::FileCode),
                         ]),
-                    TreeNode::new("docs", "docs")
-                        .children([
-                            TreeNode::new("doc-perf", "performance.md").icon(LucideIcon::FileText),
-                            TreeNode::new("doc-theme", "theming.md").icon(LucideIcon::FileText),
+                        TreeNode::new("gpui-wgpu", "gpui_wgpu").children([
+                            TreeNode::new("wgpu-rs", "wgpu_renderer.rs").icon(LucideIcon::FileCode),
+                            TreeNode::new("wgsl", "shaders_backdrop_blur.wgsl")
+                                .icon(LucideIcon::Sparkles),
                         ]),
+                        TreeNode::new("gpui-win", "gpui_windows").children([
+                            TreeNode::new("dx-rs", "directx_renderer.rs")
+                                .icon(LucideIcon::FileCode),
+                            TreeNode::new("hlsl", "shaders.hlsl").icon(LucideIcon::Sparkles),
+                        ]),
+                    ]),
+                    TreeNode::new("docs", "docs").children([
+                        TreeNode::new("doc-perf", "performance.md").icon(LucideIcon::FileText),
+                        TreeNode::new("doc-theme", "theming.md").icon(LucideIcon::FileText),
+                    ]),
                     TreeNode::new("readme", "README.md").icon(LucideIcon::BookOpen),
                 ]),
         ];
@@ -891,10 +895,13 @@ impl PlaygroundApp {
                 .default_color(gpui::components::palette::INDIGO_600, cx)
                 .inline(true)
         });
-        cx.subscribe(&inline_color_picker, |this, ent, _: &ColorPickerEvent, cx| {
-            let hex = ent.read(cx).hex();
-            this.log_event("ColorPicker(Inline)", hex, cx);
-        })
+        cx.subscribe(
+            &inline_color_picker,
+            |this, ent, _: &ColorPickerEvent, cx| {
+                let hex = ent.read(cx).hex();
+                this.log_event("ColorPicker(Inline)", hex, cx);
+            },
+        )
         .detach();
 
         let popover_color_picker = cx.new(|cx| {
@@ -902,38 +909,66 @@ impl PlaygroundApp {
                 .default_color(gpui::components::palette::EMERALD_500, cx)
                 .inline(false)
         });
-        cx.subscribe(&popover_color_picker, |this, ent, _: &ColorPickerEvent, cx| {
-            let hex = ent.read(cx).hex();
-            this.log_event("ColorPicker(Popover)", hex, cx);
-        })
+        cx.subscribe(
+            &popover_color_picker,
+            |this, ent, _: &ColorPickerEvent, cx| {
+                let hex = ent.read(cx).hex();
+                this.log_event("ColorPicker(Popover)", hex, cx);
+            },
+        )
         .detach();
 
         let demo_dropzone = cx.new(|cx| {
             FileDropzoneState::new(cx)
                 .accept(&["png", "jpg", "svg", "pdf", "json", "rs", "md"])
                 .default_files(vec![
-                    FileEntry::synthetic(1, "release-notes.md", 18_420, FileStatus::Done, Some(100.0)),
-                    FileEntry::synthetic(2, "architecture-diagram.png", 1_480_200, FileStatus::Uploading, Some(64.0)),
-                    FileEntry::synthetic(3, "telemetry-export.json", 420_110, FileStatus::Ready, None),
+                    FileEntry::synthetic(
+                        1,
+                        "release-notes.md",
+                        18_420,
+                        FileStatus::Done,
+                        Some(100.0),
+                    ),
+                    FileEntry::synthetic(
+                        2,
+                        "architecture-diagram.png",
+                        1_480_200,
+                        FileStatus::Uploading,
+                        Some(64.0),
+                    ),
+                    FileEntry::synthetic(
+                        3,
+                        "telemetry-export.json",
+                        420_110,
+                        FileStatus::Ready,
+                        None,
+                    ),
                 ])
         });
-        cx.subscribe(&demo_dropzone, |this, _, ev: &FileDropzoneEvent, cx| match ev {
-            FileDropzoneEvent::FilesAdded(list) => {
-                this.log_event("FileDropzone", format!("added {} file(s)", list.len()), cx)
-            }
-            FileDropzoneEvent::FileRemoved(id) => {
-                this.log_event("FileDropzone", format!("removed #{id}"), cx)
-            }
-            FileDropzoneEvent::Rejected(msg) => {
-                this.log_event("FileDropzone", format!("rejected: {msg}"), cx);
-                this.push_toast(ToastVariant::Warning, "File rejected", Some(msg.as_ref()), cx);
-            }
-        })
+        cx.subscribe(
+            &demo_dropzone,
+            |this, _, ev: &FileDropzoneEvent, cx| match ev {
+                FileDropzoneEvent::FilesAdded(list) => {
+                    this.log_event("FileDropzone", format!("added {} file(s)", list.len()), cx)
+                }
+                FileDropzoneEvent::FileRemoved(id) => {
+                    this.log_event("FileDropzone", format!("removed #{id}"), cx)
+                }
+                FileDropzoneEvent::Rejected(msg) => {
+                    this.log_event("FileDropzone", format!("rejected: {msg}"), cx);
+                    this.push_toast(
+                        ToastVariant::Warning,
+                        "File rejected",
+                        Some(msg.as_ref()),
+                        cx,
+                    );
+                }
+            },
+        )
         .detach();
 
-        let demo_date_picker = cx.new(|cx| {
-            DatePickerState::new(cx).default_date(CalendarDate::today_utc())
-        });
+        let demo_date_picker =
+            cx.new(|cx| DatePickerState::new(cx).default_date(CalendarDate::today_utc()));
         cx.subscribe(&demo_date_picker, |this, _, ev: &DatePickerEvent, cx| {
             let DatePickerEvent::Change(d) = ev;
             this.log_event("DatePicker", format!("{d:?}"), cx);
@@ -997,10 +1032,8 @@ impl PlaygroundApp {
                 ])
         });
 
-        let demo_tree_select = cx.new(|cx| {
-            TreeSelectState::new(sample_tree_nodes, cx)
-                .default_selected("blur-rs", cx)
-        });
+        let demo_tree_select = cx
+            .new(|cx| TreeSelectState::new(sample_tree_nodes, cx).default_selected("blur-rs", cx));
         cx.subscribe(&demo_tree_select, |this, _, ev: &TreeSelectEvent, cx| {
             let TreeSelectEvent::Change(sel) = ev;
             this.log_event("TreeSelect", format!("{sel:?}"), cx);
@@ -1026,17 +1059,14 @@ impl PlaygroundApp {
                             CascaderOption::new("fra", "Frankfurt"),
                             CascaderOption::new("ber", "Berlin"),
                         ]),
-                        CascaderOption::new("uk", "United Kingdom").children([
-                            CascaderOption::new("lon", "London"),
-                        ]),
+                        CascaderOption::new("uk", "United Kingdom")
+                            .children([CascaderOption::new("lon", "London")]),
                     ]),
                     CascaderOption::new("apac", "Asia-Pacific").children([
-                        CascaderOption::new("jp", "Japan").children([
-                            CascaderOption::new("tyo", "Tokyo"),
-                        ]),
-                        CascaderOption::new("sg", "Singapore").children([
-                            CascaderOption::new("sin", "Singapore"),
-                        ]),
+                        CascaderOption::new("jp", "Japan")
+                            .children([CascaderOption::new("tyo", "Tokyo")]),
+                        CascaderOption::new("sg", "Singapore")
+                            .children([CascaderOption::new("sin", "Singapore")]),
                     ]),
                 ],
                 cx,
@@ -1052,12 +1082,18 @@ impl PlaygroundApp {
         let demo_transfer = cx.new(|cx| {
             TransferState::new(
                 vec![
-                    TransferItem::new("read-metrics", "Read Metrics").description("Query time-series & charts"),
-                    TransferItem::new("write-alerts", "Manage Alerts").description("Create & mute rules"),
-                    TransferItem::new("deploy-prod", "Deploy Production").description("Trigger canary releases"),
-                    TransferItem::new("rotate-keys", "Rotate API Keys").description("Generate signing tokens"),
-                    TransferItem::new("audit-export", "Export Audit Logs").description("Download CSV / JSON"),
-                    TransferItem::new("billing-admin", "Billing Admin").description("Invoices & quotas"),
+                    TransferItem::new("read-metrics", "Read Metrics")
+                        .description("Query time-series & charts"),
+                    TransferItem::new("write-alerts", "Manage Alerts")
+                        .description("Create & mute rules"),
+                    TransferItem::new("deploy-prod", "Deploy Production")
+                        .description("Trigger canary releases"),
+                    TransferItem::new("rotate-keys", "Rotate API Keys")
+                        .description("Generate signing tokens"),
+                    TransferItem::new("audit-export", "Export Audit Logs")
+                        .description("Download CSV / JSON"),
+                    TransferItem::new("billing-admin", "Billing Admin")
+                        .description("Invoices & quotas"),
                 ],
                 ["read-metrics", "write-alerts"],
                 cx,
@@ -1115,7 +1151,11 @@ impl PlaygroundApp {
                 ],
             );
 
-        let vf_name = cx.new(|cx| InputState::new(cx).placeholder("Ada Lovelace").leading_icon(LucideIcon::User));
+        let vf_name = cx.new(|cx| {
+            InputState::new(cx)
+                .placeholder("Ada Lovelace")
+                .leading_icon(LucideIcon::User)
+        });
         cx.subscribe(&vf_name, |this, inp, ev: &InputEvent, cx| {
             if let InputEvent::Change(val) = ev {
                 this.validated_form.set_value("name", val.clone());
@@ -1125,7 +1165,11 @@ impl PlaygroundApp {
             }
         })
         .detach();
-        let vf_email = cx.new(|cx| InputState::new(cx).placeholder("ada@company.dev").leading_icon(LucideIcon::Mail));
+        let vf_email = cx.new(|cx| {
+            InputState::new(cx)
+                .placeholder("ada@company.dev")
+                .leading_icon(LucideIcon::Mail)
+        });
         cx.subscribe(&vf_email, |this, inp, ev: &InputEvent, cx| {
             if let InputEvent::Change(val) = ev {
                 this.validated_form.set_value("email", val.clone());
@@ -1135,7 +1179,12 @@ impl PlaygroundApp {
             }
         })
         .detach();
-        let vf_password = cx.new(|cx| InputState::new(cx).placeholder("Minimum 8 characters").masked(true).leading_icon(LucideIcon::Lock));
+        let vf_password = cx.new(|cx| {
+            InputState::new(cx)
+                .placeholder("Minimum 8 characters")
+                .masked(true)
+                .leading_icon(LucideIcon::Lock)
+        });
         cx.subscribe(&vf_password, |this, inp, ev: &InputEvent, cx| {
             if let InputEvent::Change(val) = ev {
                 this.validated_form.set_value("password", val.clone());
@@ -1147,7 +1196,12 @@ impl PlaygroundApp {
             }
         })
         .detach();
-        let vf_confirm = cx.new(|cx| InputState::new(cx).placeholder("Repeat password").masked(true).leading_icon(LucideIcon::ShieldCheck));
+        let vf_confirm = cx.new(|cx| {
+            InputState::new(cx)
+                .placeholder("Repeat password")
+                .masked(true)
+                .leading_icon(LucideIcon::ShieldCheck)
+        });
         cx.subscribe(&vf_confirm, |this, inp, ev: &InputEvent, cx| {
             if let InputEvent::Change(val) = ev {
                 this.validated_form.set_value("confirm", val.clone());
@@ -1188,7 +1242,12 @@ impl PlaygroundApp {
             TourEvent::StepChange(i) => this.log_event("Tour", format!("step #{}", i + 1), cx),
             TourEvent::Finish => {
                 this.log_event("Tour", "finished!", cx);
-                this.push_toast(ToastVariant::Success, "Tour completed", Some("You explored all highlighted features."), cx);
+                this.push_toast(
+                    ToastVariant::Success,
+                    "Tour completed",
+                    Some("You explored all highlighted features."),
+                    cx,
+                );
             }
             TourEvent::Close => this.log_event("Tour", "dismissed", cx),
         })
@@ -1237,7 +1296,9 @@ impl PlaygroundApp {
                 "infra",
                 "Infrastructure",
                 [
-                    MenuNode::item("clusters", "Clusters").icon(LucideIcon::Server).badge("4"),
+                    MenuNode::item("clusters", "Clusters")
+                        .icon(LucideIcon::Server)
+                        .badge("4"),
                     MenuNode::item("workers", "Worker Nodes").icon(LucideIcon::Cpu),
                     MenuNode::submenu(
                         "net",
@@ -1297,11 +1358,14 @@ impl PlaygroundApp {
                 .font_size(gpui::px(18.))
                 .font_weight(gpui::FontWeight::BOLD)
         });
-        cx.subscribe(&demo_editable_title, |this, _, ev: &EditableTextEvent, cx| {
-            if let EditableTextEvent::Commit(val) = ev {
-                this.log_event("EditableText", format!("Commit(\"{val}\")"), cx);
-            }
-        })
+        cx.subscribe(
+            &demo_editable_title,
+            |this, _, ev: &EditableTextEvent, cx| {
+                if let EditableTextEvent::Commit(val) = ev {
+                    this.log_event("EditableText", format!("Commit(\"{val}\")"), cx);
+                }
+            },
+        )
         .detach();
 
         let demo_qr_input = cx.new(|cx| {
@@ -1637,10 +1701,18 @@ impl PlaygroundApp {
         });
         cx.subscribe(&entity, |this, _, ev: &TextBoxEvent, cx| match ev {
             TextBoxEvent::Change(val) => {
-                this.log_event("TextBox", format!("Change({} chars)", val.chars().count()), cx);
+                this.log_event(
+                    "TextBox",
+                    format!("Change({} chars)", val.chars().count()),
+                    cx,
+                );
             }
             TextBoxEvent::Submit(val) => {
-                this.log_event("TextBox", format!("Submit({} chars)", val.chars().count()), cx);
+                this.log_event(
+                    "TextBox",
+                    format!("Submit({} chars)", val.chars().count()),
+                    cx,
+                );
                 this.push_toast(
                     ToastVariant::Success,
                     "TextBox submitted (Cmd/Ctrl+Enter)",
@@ -1700,12 +1772,7 @@ impl PlaygroundApp {
         self.native_toasts.dismiss_all(cx);
     }
 
-    pub fn open_dialog(
-        &mut self,
-        destructive: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn open_dialog(&mut self, destructive: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.dialog_destructive = destructive;
         let kind_label = if destructive {
             "destructive"

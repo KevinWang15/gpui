@@ -1,11 +1,11 @@
 //! [`Badge`] / pill tag component with semantic colors, variants,
 //! status dot, leading icon, and optional remove button.
 
+use crate::icons::{Icon, IconSize, LucideIcon};
 use crate::{
     App, ClickEvent, ElementId, FontWeight, Hsla, IntoElement, RenderOnce, SharedString,
     StyleRefinement, Styled, Window, div, prelude::*, px,
 };
-use crate::icons::{Icon, IconSize, LucideIcon};
 
 use super::palette as tw;
 use super::theme::{ActiveTheme, Theme, ThemeMode};

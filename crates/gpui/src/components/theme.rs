@@ -324,7 +324,11 @@ impl ThemeTransitionStyle {
     }
 
     /// Converts this style and optional click coordinate into a GPU [`ViewTransition`].
-    pub fn to_view_transition(self, origin: Option<Point<Pixels>>, window: &Window) -> ViewTransition {
+    pub fn to_view_transition(
+        self,
+        origin: Option<Point<Pixels>>,
+        window: &Window,
+    ) -> ViewTransition {
         let fallback_origin = || {
             let vp = window.viewport_size();
             crate::point(vp.width * 0.5, vp.height * 0.5)
@@ -658,12 +662,7 @@ impl Theme {
     }
 
     /// Customizes [`Toggle`](super::Toggle) track and thumb colors.
-    pub fn with_toggle_colors(
-        mut self,
-        track_off: Hsla,
-        track_on: Hsla,
-        thumb: Hsla,
-    ) -> Self {
+    pub fn with_toggle_colors(mut self, track_off: Hsla, track_on: Hsla, thumb: Hsla) -> Self {
         self.toggle_track_off = track_off;
         self.toggle_track_on = track_on;
         self.toggle_thumb = thumb;

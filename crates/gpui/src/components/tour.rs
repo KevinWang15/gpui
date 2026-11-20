@@ -33,10 +33,7 @@ pub struct TourStep {
 
 impl TourStep {
     /// Creates a centered tour step with no specific spotlight target.
-    pub fn centered(
-        title: impl Into<SharedString>,
-        description: impl Into<SharedString>,
-    ) -> Self {
+    pub fn centered(title: impl Into<SharedString>, description: impl Into<SharedString>) -> Self {
         Self {
             target_key: None,
             title: title.into(),
@@ -311,31 +308,28 @@ impl RenderOnce for TourTarget {
             (st.targets.clone(), st.frame_gen.clone(), st.is_open())
         };
         let key = self.key;
-        let mut wrapper = div()
-            .relative()
-            .child(self.child)
-            .child(
-                canvas(
-                    move |bounds, window, _| {
-                        let generation = frame_gen.get();
-                        let mut map = targets.borrow_mut();
-                        let changed = map
-                            .get(&key)
-                            .map(|(_, prev)| *prev != bounds)
-                            .unwrap_or(true);
-                        map.insert(key.clone(), (generation, bounds));
-                        // If a live target moves (resize/scroll/first mount) while tour is open,
-                        // refresh immediately so the spotlight tracks with zero stale offset.
-                        if is_open && changed {
-                            window.refresh();
-                        }
-                    },
-                    |_, _, _, _| {},
-                )
-                .absolute()
-                .inset_0()
-                .size_full(),
-            );
+        let mut wrapper = div().relative().child(self.child).child(
+            canvas(
+                move |bounds, window, _| {
+                    let generation = frame_gen.get();
+                    let mut map = targets.borrow_mut();
+                    let changed = map
+                        .get(&key)
+                        .map(|(_, prev)| *prev != bounds)
+                        .unwrap_or(true);
+                    map.insert(key.clone(), (generation, bounds));
+                    // If a live target moves (resize/scroll/first mount) while tour is open,
+                    // refresh immediately so the spotlight tracks with zero stale offset.
+                    if is_open && changed {
+                        window.refresh();
+                    }
+                },
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .inset_0()
+            .size_full(),
+        );
         crate::Refineable::refine(wrapper.style(), &self.style);
         wrapper
     }
@@ -527,9 +521,9 @@ impl Render for TourState {
                                     .primary()
                                     .size(ComponentSize::Xs)
                                     .label(if is_last { "Finish" } else { "Next" })
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.next_in(window, cx)
-                                    })),
+                                    .on_click(
+                                        cx.listener(|this, _, window, cx| this.next_in(window, cx)),
+                                    ),
                             ),
                     ),
             );
@@ -578,7 +572,13 @@ impl Render for TourState {
                 .w(vp.width)
                 .h(vp.height)
                 // 4 surrounding darkened scrim slabs forming a crisp cutout window
-                .child(scrim_slab("tour-scrim-t").top_0().left_0().w_full().h(px(y1)))
+                .child(
+                    scrim_slab("tour-scrim-t")
+                        .top_0()
+                        .left_0()
+                        .w_full()
+                        .h(px(y1)),
+                )
                 .child(
                     scrim_slab("tour-scrim-b")
                         .top(px(y2))
@@ -642,13 +642,9 @@ impl Render for TourState {
                 .child(card_el)
         };
 
-        deferred(
-            anchored()
-                .position(point(px(0.), px(0.)))
-                .child(overlay),
-        )
-        .priority(58)
-        .into_any_element()
+        deferred(anchored().position(point(px(0.), px(0.))).child(overlay))
+            .priority(58)
+            .into_any_element()
     }
 }
 

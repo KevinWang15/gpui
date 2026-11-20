@@ -8,27 +8,25 @@ use crate::subscription::SingleSubscriberSet;
 use crate::taffy::TaffyLayoutEngine;
 use crate::{
     Action, ActiveViewTransition, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App,
-    AppContext, Arena, Asset,
-    AsyncWindowContext, AtlasTile, AvailableSpace, BackdropBlur, Background, BorderStyle, Bounds,
-    BoxShadow,
-    Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
-    DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
-    EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
-    Hsla, InputHandler, InputPreference, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
-    Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
-    MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, PaintedPath, Path,
-    Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow,
-    Point, PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, QuadAnimation,
-    QuadAnimationMode, Render, RenderGlyphParams,
-    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
+    AppContext, Arena, Asset, AsyncWindowContext, AtlasTile, AvailableSpace, BackdropBlur,
+    Background, BorderStyle, Bounds, BoxShadow, Capslock, Context, Corners, CursorHideMode,
+    CursorStyle, Decorations, DevicePixels, DispatchActionListener, DispatchNodeId, DispatchTree,
+    DisplayId, Edges, Effect, Entity, EntityId, EventEmitter, FileDropEvent, FontId, Global,
+    GlobalElementId, GlyphId, GpuSpecs, Hsla, InputHandler, InputPreference, IsZero, KeyBinding,
+    KeyContext, KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex,
+    Modifiers, ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent,
+    MouseUpEvent, PaintedPath, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
+    PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, Priority, PromptButton,
+    PromptLevel, Quad, QuadAnimation, QuadAnimationMode, Render, RenderGlyphParams, RenderImage,
+    RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
     SpriteAnimation, SpriteAnimationId, StrikethroughStyle, Style, SubpixelSprite, Subscription,
     SystemWindowTab, SystemWindowTabController, TabStopMap, Task, TextInputConfiguration,
     TextInputStateChange, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
     TransformationMatrix, Underline, UnderlineStyle, ViewTransition, WindowAppearance,
-    WindowBackgroundAppearance,
-    WindowBounds, WindowControls, WindowDecorations, WindowInsets, WindowOptions, WindowParams,
-    WindowTextSystem, WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
+    WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations, WindowInsets,
+    WindowOptions, WindowParams, WindowTextSystem, WindowVisibility, point, prelude::*, px, rems,
+    size, transparent_black,
 };
 
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
@@ -6120,7 +6118,11 @@ impl Window {
 
     /// The scroll container that takes `event` (see
     /// [`Self::with_scroll_container`]), latching the gesture to it.
-    fn resolve_scroll_target(&mut self, event: &crate::ScrollEvent, now: Instant) -> Option<HitboxId> {
+    fn resolve_scroll_target(
+        &mut self,
+        event: &crate::ScrollEvent,
+        now: Instant,
+    ) -> Option<HitboxId> {
         let delta = event.delta.pixel_delta(self.line_height());
         let frame = &self.rendered_frame;
         if let Some(latch) = &mut self.scroll_latch {
@@ -6155,10 +6157,18 @@ impl Window {
                 if let Some(container) = frame.scroll_containers.iter().find(|c| c.hitbox == id)
                     && (container.can_scroll)(delta)
                 {
-                    self.scroll_latch = Some(ScrollLatch { key: container.key, last_event: now, position: event.position });
+                    self.scroll_latch = Some(ScrollLatch {
+                        key: container.key,
+                        last_event: now,
+                        position: event.position,
+                    });
                     return Some(id);
                 }
-                current = frame.hitboxes.iter().find(|h| h.id == id).and_then(|h| h.scroll_parent);
+                current = frame
+                    .hitboxes
+                    .iter()
+                    .find(|h| h.id == id)
+                    .and_then(|h| h.scroll_parent);
             }
         }
         None

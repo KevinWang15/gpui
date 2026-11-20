@@ -102,13 +102,11 @@ pub fn code_snippet(
                 .line_height(px(19.))
                 .text_color(palette::SLATE_100)
                 .children(code.lines().map(|line| {
-                    div()
-                        .w_full()
-                        .child(if line.is_empty() {
-                            SharedString::new_static(" ")
-                        } else {
-                            SharedString::from(line.to_owned())
-                        })
+                    div().w_full().child(if line.is_empty() {
+                        SharedString::new_static(" ")
+                    } else {
+                        SharedString::from(line.to_owned())
+                    })
                 })),
         )
 }

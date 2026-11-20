@@ -3,11 +3,11 @@
 
 use smallvec::SmallVec;
 
+use crate::icons::{Icon, LucideIcon};
 use crate::{
     AnyElement, App, FontWeight, Hsla, IntoElement, ParentElement, Pixels, RenderOnce,
     SharedString, StyleRefinement, Styled, Window, div, prelude::*, px,
 };
-use crate::icons::{Icon, LucideIcon};
 
 use super::palette as tw;
 use super::theme::{ActiveTheme, ComponentSize};
@@ -225,11 +225,7 @@ impl RenderOnce for AvatarGroup {
         let theme = cx.theme();
         let mut row = div().flex().flex_row().items_center();
         for (idx, child) in self.children.into_iter().enumerate() {
-            row = row.child(
-                div()
-                    .when(idx > 0, |el| el.ml(px(-8.)))
-                    .child(child),
-            );
+            row = row.child(div().when(idx > 0, |el| el.ml(px(-8.))).child(child));
         }
         if let Some(extra) = self.overflow_count {
             row = row.child(

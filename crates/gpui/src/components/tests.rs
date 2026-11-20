@@ -6,8 +6,8 @@ use std::rc::Rc;
 use crate::components::*;
 use crate::icons::{Icon, IconSize, LucideIcon};
 use crate::{
-    Context, Entity, EntityInputHandler, Focusable, IntoElement, Keystroke, Render,
-    SharedString, TestAppContext, Window, prelude::*, px, size,
+    Context, Entity, EntityInputHandler, Focusable, IntoElement, Keystroke, Render, SharedString,
+    TestAppContext, Window, prelude::*, px, size,
 };
 
 #[gpui::test]
@@ -66,15 +66,24 @@ fn input_typing_selection_undo_redo_and_submit(cx: &mut TestAppContext) {
     // Test keyboard actions: undo, redo, submit
     cx.dispatch_action(input::input_actions::Undo);
     cx.run_until_parked();
-    assert_eq!(input_entity.read_with(cx, |i, _| i.value().to_owned()), "hello world");
+    assert_eq!(
+        input_entity.read_with(cx, |i, _| i.value().to_owned()),
+        "hello world"
+    );
 
     cx.dispatch_action(input::input_actions::Redo);
     cx.run_until_parked();
-    assert_eq!(input_entity.read_with(cx, |i, _| i.value().to_owned()), "hello gpui");
+    assert_eq!(
+        input_entity.read_with(cx, |i, _| i.value().to_owned()),
+        "hello gpui"
+    );
 
     cx.dispatch_action(input::input_actions::Submit);
     cx.run_until_parked();
-    assert_eq!(submitted.borrow().as_slice(), &[SharedString::from("hello gpui")]);
+    assert_eq!(
+        submitted.borrow().as_slice(),
+        &[SharedString::from("hello gpui")]
+    );
 
     // Test max_length enforcement & clear
     input_entity.update_in(cx, |input, window, cx| {
@@ -352,20 +361,22 @@ impl Render for FullComponentShowcaseView {
                     v_stack()
                         .spacing(px(16.))
                         .py(px(16.))
-                        .child(
-                            breadcrumb(
-                                "crumbs",
-                                vec![
-                                    BreadcrumbItem::link("Home", |_, _, _| {})
-                                        .icon(LucideIcon::House),
-                                    BreadcrumbItem::current("Components"),
-                                ],
-                            ),
-                        )
+                        .child(breadcrumb(
+                            "crumbs",
+                            vec![
+                                BreadcrumbItem::link("Home", |_, _, _| {}).icon(LucideIcon::House),
+                                BreadcrumbItem::current("Components"),
+                            ],
+                        ))
                         .child(
                             page_header("Component Library")
                                 .description("GPUI components + Lucide icons")
-                                .action(button("cta").primary().label("Create").leading_icon(LucideIcon::Plus)),
+                                .action(
+                                    button("cta")
+                                        .primary()
+                                        .label("Create")
+                                        .leading_icon(LucideIcon::Plus),
+                                ),
                         )
                         .child(
                             tabs(
@@ -377,10 +388,12 @@ impl Render for FullComponentShowcaseView {
                                 ],
                             )
                             .selected_index(self.active_tab)
-                            .on_change(cx.listener(|this, idx, _, cx| {
-                                this.active_tab = *idx;
-                                cx.notify();
-                            })),
+                            .on_change(cx.listener(
+                                |this, idx, _, cx| {
+                                    this.active_tab = *idx;
+                                    cx.notify();
+                                },
+                            )),
                         )
                         .child(
                             grid(2)
@@ -390,7 +403,9 @@ impl Render for FullComponentShowcaseView {
                                             card_header()
                                                 .bordered()
                                                 .child(card_title("Form Controls"))
-                                                .child(card_description("Inputs, selects, toggles")),
+                                                .child(card_description(
+                                                    "Inputs, selects, toggles",
+                                                )),
                                         )
                                         .child(
                                             card_content()
@@ -413,18 +428,23 @@ impl Render for FullComponentShowcaseView {
                                                         .with_icons(true)
                                                         .label("Notifications")
                                                         .description("Receive weekly digest")
-                                                        .on_change(cx.listener(|this, val, _, cx| {
-                                                            this.toggled = *val;
-                                                            cx.notify();
-                                                        })),
+                                                        .on_change(cx.listener(
+                                                            |this, val, _, cx| {
+                                                                this.toggled = *val;
+                                                                cx.notify();
+                                                            },
+                                                        )),
                                                 )
                                                 .child(
                                                     checkbox("chk", self.checked)
                                                         .label("Accept terms")
-                                                        .on_change(cx.listener(|this, val, _, cx| {
-                                                            this.checked = CheckState::from(*val);
-                                                            cx.notify();
-                                                        })),
+                                                        .on_change(cx.listener(
+                                                            |this, val, _, cx| {
+                                                                this.checked =
+                                                                    CheckState::from(*val);
+                                                                cx.notify();
+                                                            },
+                                                        )),
                                                 )
                                                 .child(
                                                     radio_group(
@@ -461,7 +481,12 @@ impl Render for FullComponentShowcaseView {
                                         )
                                         .child(
                                             h_stack()
-                                                .child(badge("Active").color(BadgeColor::Green).dot(true).pill(true))
+                                                .child(
+                                                    badge("Active")
+                                                        .color(BadgeColor::Green)
+                                                        .dot(true)
+                                                        .pill(true),
+                                                )
                                                 .child(badge("Beta").color(BadgeColor::Indigo))
                                                 .child(kbd("⌘K"))
                                                 .child(spinner().label("Syncing")),
@@ -469,46 +494,62 @@ impl Render for FullComponentShowcaseView {
                                         .child(
                                             avatar_group()
                                                 .overflow(4)
-                                                .child(avatar("Ada Lovelace").status(AvatarStatus::Online))
-                                                .child(avatar("Alan Turing").status(AvatarStatus::Away)),
+                                                .child(
+                                                    avatar("Ada Lovelace")
+                                                        .status(AvatarStatus::Online),
+                                                )
+                                                .child(
+                                                    avatar("Alan Turing")
+                                                        .status(AvatarStatus::Away),
+                                                ),
                                         )
-                                        .child(progress_bar(72.0).label("Upload").show_percentage(true))
+                                        .child(
+                                            progress_bar(72.0)
+                                                .label("Upload")
+                                                .show_percentage(true),
+                                        )
                                         .child(skeleton().h(px(16.)))
                                         .child(divider().label("OR"))
                                         .child(
                                             accordion().child(
-                                                disclosure("faq-1", "What is GPUI?", self.disclosure_open)
-                                                    .borderless()
-                                                    .on_toggle(cx.listener(|this, open, _, cx| {
-                                                        this.disclosure_open = *open;
-                                                        cx.notify();
-                                                    }))
-                                                    .child("Zed's GPU-accelerated Rust UI framework."),
+                                                disclosure(
+                                                    "faq-1",
+                                                    "What is GPUI?",
+                                                    self.disclosure_open,
+                                                )
+                                                .borderless()
+                                                .on_toggle(cx.listener(|this, open, _, cx| {
+                                                    this.disclosure_open = *open;
+                                                    cx.notify();
+                                                }))
+                                                .child("Zed's GPU-accelerated Rust UI framework."),
                                             ),
                                         )
                                         .child(
                                             table(
                                                 "users",
                                                 vec![
-                                                    TableColumn::new("Name").sortable(Some(SortDirection::Ascending)),
-                                                    TableColumn::new("Role").align(TableAlign::Right),
+                                                    TableColumn::new("Name")
+                                                        .sortable(Some(SortDirection::Ascending)),
+                                                    TableColumn::new("Role")
+                                                        .align(TableAlign::Right),
                                                 ],
                                             )
                                             .striped(true)
                                             .row(TableRow::new().text("Ada").text("Admin"))
                                             .row(TableRow::new().text("Grace").text("Maintainer")),
                                         )
-                                        .child(
-                                            pagination("pager", self.page, 12).on_page_change(
-                                                cx.listener(|this, p, _, cx| {
-                                                    this.page = *p;
-                                                    cx.notify();
-                                                }),
-                                            ),
-                                        )
+                                        .child(pagination("pager", self.page, 12).on_page_change(
+                                            cx.listener(|this, p, _, cx| {
+                                                this.page = *p;
+                                                cx.notify();
+                                            }),
+                                        ))
                                         .child(
                                             dropdown_menu("dd", self.dropdown_open)
-                                                .trigger(button("dd-btn").outline().label("Actions"))
+                                                .trigger(
+                                                    button("dd-btn").outline().label("Actions"),
+                                                )
                                                 .entry(MenuEntry::Label("Account".into()))
                                                 .entry(MenuEntry::item_with_icon(
                                                     "Settings",
@@ -556,8 +597,7 @@ fn full_component_suite_renders_cleanly_in_light_and_dark_mode(cx: &mut TestAppC
         let input = cx.new(|cx| InputState::new(cx).placeholder("you@example.com"));
         let textbox = cx.new(|cx| TextBoxState::new(cx).placeholder("Tell us about yourself"));
         let select = cx.new(|cx| {
-            SelectState::new(vec![SelectOption::new("eng", "Engineering")], cx)
-                .default_value("eng")
+            SelectState::new(vec![SelectOption::new("eng", "Engineering")], cx).default_value("eng")
         });
         let combobox = cx.new(|cx| {
             ComboBoxState::new(vec![ComboBoxOption::new("rust", "Rust")], cx)
@@ -943,7 +983,11 @@ fn view_transition_physical_shader_modes_evaluate_cleanly() {
         assert!(mid.progress > 0.4 && mid.progress < 0.95);
         assert!(mid.radius.0 > 1000.0);
 
-        assert!(active.evaluate(now + transition.duration, vp, 2.0).is_none());
+        assert!(
+            active
+                .evaluate(now + transition.duration, vp, 2.0)
+                .is_none()
+        );
     }
 }
 
@@ -963,12 +1007,10 @@ impl Render for AdvancedAnalyticsTestView {
                     .spacing(px(8.))
                     .child(time_range_picker("test-tr", &self.time_range))
                     .child(theme_switcher("test-theme-sw"))
-                    .child(
-                        segmented_control("test-seg", self.metric.clone()).items([
-                            SegmentedItem::new("cost", "Cost"),
-                            SegmentedItem::new("tokens", "Tokens"),
-                        ]),
-                    ),
+                    .child(segmented_control("test-seg", self.metric.clone()).items([
+                        SegmentedItem::new("cost", "Cost"),
+                        SegmentedItem::new("tokens", "Tokens"),
+                    ])),
             )
             .child(filter_bar("test-fb", &self.filter))
             .child(stat_group("test-stats").items([
@@ -988,7 +1030,10 @@ impl Render for AdvancedAnalyticsTestView {
                     .subtitle("30 days")
                     .content(
                         stacked_bar_chart("test-bars")
-                            .series([StackedBarSeries::new("sonnet"), StackedBarSeries::new("gpt")])
+                            .series([
+                                StackedBarSeries::new("sonnet"),
+                                StackedBarSeries::new("gpt"),
+                            ])
                             .points([
                                 StackedBarPoint::new("Oct 21", vec![18.0, 9.0]),
                                 StackedBarPoint::new("Today", vec![22.0, 14.0]),
@@ -1006,17 +1051,18 @@ impl Render for AdvancedAnalyticsTestView {
                                 .endpoint_callout("Today"),
                         )
                         .add_series(
-                            LineSeries::new("Baseline", vec![(0.0, 0.0), (12.0, 24.0), (24.0, 48.0)])
-                                .line_style(LineStyle::Dashed),
+                            LineSeries::new(
+                                "Baseline",
+                                vec![(0.0, 0.0), (12.0, 24.0), (24.0, 48.0)],
+                            )
+                            .line_style(LineStyle::Dashed),
                         ),
                 ),
             )
-            .child(
-                breakdown_list("test-bd").items([
-                    BreakdownItem::new("claude-sonnet-5-5", 520.20),
-                    BreakdownItem::new("gpt-6.2", 269.07),
-                ]),
-            )
+            .child(breakdown_list("test-bd").items([
+                BreakdownItem::new("claude-sonnet-5-5", 520.20),
+                BreakdownItem::new("gpt-6.2", 269.07),
+            ]))
     }
 }
 
@@ -1053,13 +1099,19 @@ fn advanced_analytics_components_render_and_filter_narrow(cx: &mut TestAppContex
     // Test programmatic narrow + toggle off on FilterBarState
     window
         .update(cx, |view, _, cx| {
-            view.filter
-                .update(cx, |s, cx| s.toggle_narrow("model", "claude-sonnet-5-5", cx));
-            assert!(view.filter.read(cx).is_narrowed_to("model", "claude-sonnet-5-5"));
+            view.filter.update(cx, |s, cx| {
+                s.toggle_narrow("model", "claude-sonnet-5-5", cx)
+            });
+            assert!(
+                view.filter
+                    .read(cx)
+                    .is_narrowed_to("model", "claude-sonnet-5-5")
+            );
             assert_eq!(view.filter.read(cx).clauses().len(), 1);
 
-            view.filter
-                .update(cx, |s, cx| s.toggle_narrow("model", "claude-sonnet-5-5", cx));
+            view.filter.update(cx, |s, cx| {
+                s.toggle_narrow("model", "claude-sonnet-5-5", cx)
+            });
             assert!(view.filter.read(cx).clauses().is_empty());
 
             // Test TimeRangePickerState preset + stepping
@@ -1227,8 +1279,16 @@ fn custom_theme_tokens_and_direct_styled_passthrough_render_cleanly(cx: &mut Tes
 
     cx.update(|cx| Theme::set_global(custom, cx));
     let _window = cx.open_window(size(px(1000.), px(720.)), |_, cx| {
-        let search = cx.new(|cx| InputState::new(cx).placeholder("Filter...").size(ComponentSize::Sm));
-        let count_input = cx.new(|cx| InputState::new(cx).default_value("5").size(ComponentSize::Sm));
+        let search = cx.new(|cx| {
+            InputState::new(cx)
+                .placeholder("Filter...")
+                .size(ComponentSize::Sm)
+        });
+        let count_input = cx.new(|cx| {
+            InputState::new(cx)
+                .default_value("5")
+                .size(ComponentSize::Sm)
+        });
         CustomStyledSettingsView {
             search,
             count_input,
@@ -1603,8 +1663,18 @@ fn gpu_offload_quad_animations_and_backdrop_blur(cx: &mut TestAppContext) {
         origin: crate::point(crate::ScaledPixels(110.0), crate::ScaledPixels(10.0)),
         size: size(crate::ScaledPixels(20.0), crate::ScaledPixels(20.0)),
     };
-    let c0 = crate::Hsla { h: 0.0, s: 0.0, l: 0.5, a: 1.0 };
-    let c1 = crate::Hsla { h: 0.6, s: 0.8, l: 0.5, a: 1.0 };
+    let c0 = crate::Hsla {
+        h: 0.0,
+        s: 0.0,
+        l: 0.5,
+        a: 1.0,
+    };
+    let c1 = crate::Hsla {
+        h: 0.6,
+        s: 0.8,
+        l: 0.5,
+        a: 1.0,
+    };
     let t0 = std::time::Instant::now();
     scene.insert_animated_quad(
         crate::Quad {
@@ -1681,12 +1751,10 @@ fn gpu_offload_quad_animations_and_backdrop_blur(cx: &mut TestAppContext) {
                         .bg(crate::Hsla::from(palette::SLATE_900).opacity(0.45)),
                 )
                 .child(toggle("gpu-tog", self.checked).label("GPU Toggle"))
-                .child(
-                    segmented_control("gpu-seg", self.tab.clone()).items([
-                        SegmentedItem::new("a", "Alpha"),
-                        SegmentedItem::new("b", "Beta"),
-                    ]),
-                )
+                .child(segmented_control("gpu-seg", self.tab.clone()).items([
+                    SegmentedItem::new("a", "Alpha"),
+                    SegmentedItem::new("b", "Beta"),
+                ]))
                 .child(progress_bar(self.progress).animated("gpu-prog"))
                 .child(Skeleton::line(px(12.)))
         }
@@ -1744,7 +1812,12 @@ fn blur_container_loading_overlay_spinners_and_progress_ring(cx: &mut TestAppCon
         origin: crate::point(crate::ScaledPixels(10.0), crate::ScaledPixels(10.0)),
         size: size(crate::ScaledPixels(6.0), crate::ScaledPixels(30.0)),
     };
-    let base_color = crate::Hsla { h: 0.65, s: 0.8, l: 0.55, a: 1.0 };
+    let base_color = crate::Hsla {
+        h: 0.65,
+        s: 0.8,
+        l: 0.55,
+        a: 1.0,
+    };
     scene.insert_animated_quad(
         crate::Quad {
             order: 0,
@@ -1873,7 +1946,9 @@ fn command_palette_fuzzy_search_and_execution(cx: &mut TestAppContext) {
     }
     impl Render for PaletteHost {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            crate::div().size_full().child(command_palette(&self.palette))
+            crate::div()
+                .size_full()
+                .child(command_palette(&self.palette))
         }
     }
 
@@ -1907,7 +1982,10 @@ fn command_palette_fuzzy_search_and_execution(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
     assert!(palette.read_with(cx, |p, _| p.is_open()));
-    assert_eq!(palette.read_with(cx, |p, cx| p.filtered_indices(cx).len()), 3);
+    assert_eq!(
+        palette.read_with(cx, |p, cx| p.filtered_indices(cx).len()),
+        3
+    );
 
     // Close cleanly
     cx.update(|_, cx| {
@@ -2051,7 +2129,8 @@ fn split_pane_number_input_pin_input_rating_and_copy_button(cx: &mut TestAppCont
                 .suffix("USD")
         });
         let pin = cx.new(|cx| PinInputState::new(6, cx));
-        let completed_pin: Rc<std::cell::RefCell<Option<SharedString>>> = Rc::new(Default::default());
+        let completed_pin: Rc<std::cell::RefCell<Option<SharedString>>> =
+            Rc::new(Default::default());
         let pin_ref = completed_pin.clone();
         cx.subscribe(&pin, move |_, _, ev: &PinInputEvent, _| {
             if let PinInputEvent::Complete(code) = ev {
@@ -2104,10 +2183,7 @@ fn split_pane_number_input_pin_input_rating_and_copy_button(cx: &mut TestAppCont
     });
     assert_eq!(pin.read_with(cx, |p, _| p.value()), "123456");
     assert!(pin.read_with(cx, |p, _| p.is_complete()));
-    assert_eq!(
-        completed_pin.borrow().as_deref(),
-        Some("123456")
-    );
+    assert_eq!(completed_pin.borrow().as_deref(), Some("123456"));
     cx.update(|_, cx| {
         pin.update(cx, |p, cx| p.clear(cx));
     });
@@ -2194,10 +2270,10 @@ fn tier1_tree_popconfirm_color_picker_dropzone_descriptions_timeline_and_table(
     }
 
     let (view, cx) = cx.add_window_view(|_, cx| {
-        let nodes = vec![TreeNode::new("root", "Root").children([
-            TreeNode::new("a", "Alpha"),
-            TreeNode::new("b", "Beta"),
-        ])];
+        let nodes = vec![
+            TreeNode::new("root", "Root")
+                .children([TreeNode::new("a", "Alpha"), TreeNode::new("b", "Beta")]),
+        ];
         let tree_st = cx.new(|cx| {
             TreeState::new(nodes, cx)
                 .checkable(true)
@@ -2205,7 +2281,11 @@ fn tier1_tree_popconfirm_color_picker_dropzone_descriptions_timeline_and_table(
                 .default_expanded(["root"])
         });
         let color_st = cx.new(|cx| ColorPickerState::new(cx).inline(true));
-        let dz_st = cx.new(|cx| FileDropzoneState::new(cx).accept(&["rs", "md"]).max_files(2));
+        let dz_st = cx.new(|cx| {
+            FileDropzoneState::new(cx)
+                .accept(&["rs", "md"])
+                .max_files(2)
+        });
         Tier1View {
             tree_st,
             color_st,
@@ -2220,7 +2300,10 @@ fn tier1_tree_popconfirm_color_picker_dropzone_descriptions_timeline_and_table(
 
     // Tree tri-state checkbox cascade
     cx.update(|_, cx| tree_st.update(cx, |t, cx| t.toggle_check("a", cx)));
-    assert_eq!(tree_st.read_with(cx, |t, _| t.checked_ids()), vec![SharedString::from("a")]);
+    assert_eq!(
+        tree_st.read_with(cx, |t, _| t.checked_ids()),
+        vec![SharedString::from("a")]
+    );
     cx.update(|_, cx| tree_st.update(cx, |t, cx| t.toggle_check("root", cx)));
     assert_eq!(
         tree_st.read_with(cx, |t, _| t.checked_ids()),
@@ -2283,13 +2366,13 @@ fn tier2_range_slider_date_time_list_typography_result_transfer_and_tag_input(
                 .child(slider(&self.marked_sl))
                 .child(date_picker(&self.dp))
                 .child(time_picker(&self.tp))
-                .child(
-                    list("t2-list")
-                        .item(ListItem::new("Row 1").subtitle("Sub").selected(true)),
-                )
+                .child(list("t2-list").item(ListItem::new("Row 1").subtitle("Sub").selected(true)))
                 .child(
                     virtual_list("t2-vlist", 500, |i, _, _| {
-                        crate::div().h(px(28.)).child(format!("Item {i}")).into_any_element()
+                        crate::div()
+                            .h(px(28.))
+                            .child(format!("Item {i}"))
+                            .into_any_element()
                     })
                     .viewport_height(px(100.)),
                 )
@@ -2320,7 +2403,8 @@ fn tier2_range_slider_date_time_list_typography_result_transfer_and_tag_input(
             SliderState::new(cx)
                 .marks([SliderMark::new(0.0, "Low"), SliderMark::new(100.0, "High")])
         });
-        let dp = cx.new(|cx| DatePickerState::new(cx).default_date(CalendarDate::new(2026, 11, 20)));
+        let dp =
+            cx.new(|cx| DatePickerState::new(cx).default_date(CalendarDate::new(2026, 11, 20)));
         let tp = cx.new(|cx| TimePickerState::new(cx).use_12h(true));
         let editable = cx.new(|cx| EditableTextState::new("Initial", cx));
         let xfer = cx.new(|cx| {
@@ -2379,7 +2463,10 @@ fn tier3_image_preview_tree_select_cascader_tour_menu_carousel_extras_and_form(
     assert_eq!(qr_short.size, 21);
     assert!(qr_short.get(0, 0) && qr_short.get(6, 0) && qr_short.get(0, 6));
     assert!(qr_short.get(3, 3), "finder center must be dark");
-    assert!(qr_short.get(8, qr_short.size - 8), "dark module must be set");
+    assert!(
+        qr_short.get(8, qr_short.size - 8),
+        "dark module must be set"
+    );
     let qr_url = QrMatrix::encode(b"https://github.com/KevinWang15/gpui");
     assert!(qr_url.size >= 25);
 
@@ -2393,16 +2480,8 @@ fn tier3_image_preview_tree_select_cascader_tour_menu_carousel_extras_and_form(
                 FormRule::email("Invalid email"),
             ],
         )
-        .field(
-            "pw",
-            "",
-            vec![FormRule::min_length(6, "Too short")],
-        )
-        .field(
-            "confirm",
-            "",
-            vec![FormRule::matches("pw", "Mismatch")],
-        )
+        .field("pw", "", vec![FormRule::min_length(6, "Too short")])
+        .field("confirm", "", vec![FormRule::matches("pw", "Mismatch")])
         .field(
             "age",
             "25",
@@ -2442,7 +2521,11 @@ fn tier3_image_preview_tree_select_cascader_tour_menu_carousel_extras_and_form(
                     v_stack()
                         .p(px(12.))
                         .spacing(px(10.))
-                        .child(tour_target(&self.tour_st, "step1", image_preview(&self.img_prev)))
+                        .child(tour_target(
+                            &self.tour_st,
+                            "step1",
+                            image_preview(&self.img_prev),
+                        ))
                         .child(tree_select(&self.ts))
                         .child(cascader(&self.casc))
                         .child(nav_menu(&self.hmenu))
@@ -2453,9 +2536,10 @@ fn tier3_image_preview_tree_select_cascader_tour_menu_carousel_extras_and_form(
                                 .slide(crate::div().child("Slide B")),
                         )
                         .child(
-                            watermark("CONFIDENTIAL")
-                                .subtext("2026")
-                                .child(qr_code("https://github.com/KevinWang15/gpui").icon(LucideIcon::Sparkles)),
+                            watermark("CONFIDENTIAL").subtext("2026").child(
+                                qr_code("https://github.com/KevinWang15/gpui")
+                                    .icon(LucideIcon::Sparkles),
+                            ),
                         ),
                 )
                 .child(
@@ -2476,14 +2560,13 @@ fn tier3_image_preview_tree_select_cascader_tour_menu_carousel_extras_and_form(
                 cx,
             )
         });
-        let ts = cx.new(|cx| {
-            TreeSelectState::new(vec![TreeNode::new("n1", "Node 1")], cx)
-        });
+        let ts = cx.new(|cx| TreeSelectState::new(vec![TreeNode::new("n1", "Node 1")], cx));
         let casc = cx.new(|cx| {
             CascaderState::new(
-                vec![CascaderOption::new("us", "United States").children([
-                    CascaderOption::new("sf", "San Francisco"),
-                ])],
+                vec![
+                    CascaderOption::new("us", "United States")
+                        .children([CascaderOption::new("sf", "San Francisco")]),
+                ],
                 cx,
             )
             .default_path(["us", "sf"])
@@ -2518,13 +2601,21 @@ fn tier3_image_preview_tree_select_cascader_tour_menu_carousel_extras_and_form(
     cx.run_until_parked();
 
     let (img_prev, casc, tour_st, car) = view.read_with(cx, |v, _| {
-        (v.img_prev.clone(), v.casc.clone(), v.tour_st.clone(), v.car.clone())
+        (
+            v.img_prev.clone(),
+            v.casc.clone(),
+            v.tour_st.clone(),
+            v.car.clone(),
+        )
     });
 
     // Cascader label path resolution
     assert_eq!(
         casc.read_with(cx, |c, _| c.selected_labels()),
-        vec![SharedString::from("United States"), SharedString::from("San Francisco")]
+        vec![
+            SharedString::from("United States"),
+            SharedString::from("San Francisco")
+        ]
     );
 
     // ImagePreview lightbox zoom/rotate/next/close
@@ -2563,7 +2654,17 @@ fn audit_regression_edge_cases_and_soak(cx: &mut TestAppContext) {
     cx.update(init_components);
 
     // 1. parse_hex_color: multibyte UTF-8 never panics; valid 3/4/6/8-digit hex parses cleanly
-    for bad in ["红", "🚀", "颜色", "🎨🚀", "#红红红", "#gg0000", "", "#12", "#1234567"] {
+    for bad in [
+        "红",
+        "🚀",
+        "颜色",
+        "🎨🚀",
+        "#红红红",
+        "#gg0000",
+        "",
+        "#12",
+        "#1234567",
+    ] {
         assert!(parse_hex_color(bad).is_none(), "expected None for {bad:?}");
     }
     assert!(parse_hex_color("#f0a").is_some());
@@ -2589,28 +2690,35 @@ fn audit_regression_edge_cases_and_soak(cx: &mut TestAppContext) {
 
     // 3. FormState: strict email, optional empty skipping, live is_valid(), transitive Matches
     let mut form = FormState::new()
-        .field(
-            "email",
-            "",
-            vec![FormRule::email("Invalid email")],
-        )
+        .field("email", "", vec![FormRule::email("Invalid email")])
         .field(
             "age",
             "",
             vec![FormRule::numeric_range(10.0, 2.0, "Out of range")],
         )
-        .field(
-            "bio",
-            "",
-            vec![FormRule::min_length(5, "Too short")],
-        )
+        .field("bio", "", vec![FormRule::min_length(5, "Too short")])
         .field("pw", "secret123", vec![FormRule::required("Required")])
-        .field("pw2", "secret123", vec![FormRule::matches("pw", "Mismatch")])
-        .field("pw3", "secret123", vec![FormRule::matches("pw2", "Mismatch")]);
+        .field(
+            "pw2",
+            "secret123",
+            vec![FormRule::matches("pw", "Mismatch")],
+        )
+        .field(
+            "pw3",
+            "secret123",
+            vec![FormRule::matches("pw2", "Mismatch")],
+        );
 
     // Optional fields pass when empty, live is_valid() works before validate_all()
     assert!(form.is_valid());
-    for bad_email in ["a@b@c.com", "a b@c.com", "a@b..c", ".a@b.c", "a@.b.c", "a@b.c."] {
+    for bad_email in [
+        "a@b@c.com",
+        "a b@c.com",
+        "a@b..c",
+        ".a@b.c",
+        "a@.b.c",
+        "a@b.c.",
+    ] {
         form.set_value("email", bad_email);
         assert!(!form.validate_field("email"), "should reject {bad_email}");
         assert!(!form.is_valid());
@@ -2704,13 +2812,11 @@ fn audit_regression_edge_cases_and_soak(cx: &mut TestAppContext) {
                         .child(tag_input(&self.tags))
                         .child(transfer(&self.xfer))
                         .child(carousel("reg-car", &self.car_zero))
-                        .child(
-                            tour_target(
-                                &self.tour_st,
-                                "t1",
-                                image_preview(&self.img_prev),
-                            ),
-                        ),
+                        .child(tour_target(
+                            &self.tour_st,
+                            "t1",
+                            image_preview(&self.img_prev),
+                        )),
                 )
                 .child(command_palette(&self.palette))
                 .child(tour(&self.tour_st))
@@ -2737,10 +2843,8 @@ fn audit_regression_edge_cases_and_soak(cx: &mut TestAppContext) {
     let pe = pal_exec.clone();
 
     let (view, cx) = cx.add_window_view(|_, cx| {
-        let picker = cx.new(|cx| {
-            ColorPickerState::new(cx)
-                .default_color(crate::rgba(0x3b82f6ff), cx)
-        });
+        let picker =
+            cx.new(|cx| ColorPickerState::new(cx).default_color(crate::rgba(0x3b82f6ff), cx));
         cx.subscribe(&picker, move |_, _, ev: &ColorPickerEvent, _| {
             if matches!(ev, ColorPickerEvent::Change(_)) {
                 cc.set(cc.get() + 1);
@@ -2773,11 +2877,7 @@ fn audit_regression_edge_cases_and_soak(cx: &mut TestAppContext) {
                 .clamp_range(0.05, 0.95)
         });
 
-        let num_frac = cx.new(|cx| {
-            NumberInputState::new(cx)
-                .step(0.1)
-                .default_value(0.0, cx)
-        });
+        let num_frac = cx.new(|cx| NumberInputState::new(cx).step(0.1).default_value(0.0, cx));
         cx.subscribe(&num_frac, move |_, _, ev: &NumberInputEvent, _| {
             if matches!(ev, NumberInputEvent::Change(_)) {
                 nc.set(nc.get() + 1);
@@ -2824,9 +2924,7 @@ fn audit_regression_edge_cases_and_soak(cx: &mut TestAppContext) {
 
         let casc = cx.new(|cx| {
             CascaderState::new(
-                vec![CascaderOption::new("us", "US").children([
-                    CascaderOption::new("sf", "SF"),
-                ])],
+                vec![CascaderOption::new("us", "US").children([CascaderOption::new("sf", "SF")])],
                 cx,
             )
             .default_path(["us", "sf"])
@@ -2991,7 +3089,10 @@ fn audit_regression_edge_cases_and_soak(cx: &mut TestAppContext) {
     cx.update(|_, cx| tree_sel.update(cx, |t, cx| t.set_selected(Some("n1".into()), cx)));
     cx.run_until_parked();
     assert_eq!(ts_changes.get(), 3);
-    assert_eq!(tree_sel.read_with(cx, |t, _| t.selected().cloned()), Some("n1".into()));
+    assert_eq!(
+        tree_sel.read_with(cx, |t, _| t.selected().cloned()),
+        Some("n1".into())
+    );
 
     // Verify Cascader: re-clicking already-selected leaf still closes popover
     let casc = view.read_with(cx, |v, _| v.casc.clone());

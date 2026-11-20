@@ -44,9 +44,21 @@ pub(crate) fn hsva_to_rgba(h: f32, s: f32, v: f32, a: f32) -> Rgba {
     } else {
         0.0
     };
-    let s = if s.is_finite() { s.clamp(0.0, 1.0) } else { 0.0 };
-    let v = if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.0 };
-    let a = if a.is_finite() { a.clamp(0.0, 1.0) } else { 1.0 };
+    let s = if s.is_finite() {
+        s.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let v = if v.is_finite() {
+        v.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let a = if a.is_finite() {
+        a.clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
     let c = v * s;
     let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
     let m = v - c;
@@ -106,7 +118,12 @@ pub(crate) fn rgba_to_hsva(rgba: Rgba) -> (f32, f32, f32, f32) {
         60.0 * (((r - g) / delta) + 4.0)
     };
     let s = if max < 1e-6 { 0.0 } else { delta / max };
-    (h.rem_euclid(360.0), s.clamp(0.0, 1.0), max.clamp(0.0, 1.0), a)
+    (
+        h.rem_euclid(360.0),
+        s.clamp(0.0, 1.0),
+        max.clamp(0.0, 1.0),
+        a,
+    )
 }
 
 /// Formats an [`Rgba`] color as `#RRGGBB` (when opaque) or `#RRGGBBAA`.
@@ -430,8 +447,8 @@ impl ColorPickerState {
             DragTarget::Spectrum => {
                 if let Some(b) = self.spectrum_bounds.get() {
                     let s = ((pos.x.0 - b.origin.x.0) / b.size.width.0.max(1.0)).clamp(0.0, 1.0);
-                    let v = 1.0
-                        - ((pos.y.0 - b.origin.y.0) / b.size.height.0.max(1.0)).clamp(0.0, 1.0);
+                    let v =
+                        1.0 - ((pos.y.0 - b.origin.y.0) / b.size.height.0.max(1.0)).clamp(0.0, 1.0);
                     self.sat = s;
                     self.val = v;
                 }
@@ -928,12 +945,10 @@ impl Render for ColorPickerState {
         }
 
         if self.inline {
-            let mut panel = self
-                .render_panel(cx)
-                .when(!self.disabled, |el| {
-                    el.track_focus(&self.focus_handle)
-                        .on_key_down(cx.listener(Self::on_key_down))
-                });
+            let mut panel = self.render_panel(cx).when(!self.disabled, |el| {
+                el.track_focus(&self.focus_handle)
+                    .on_key_down(cx.listener(Self::on_key_down))
+            });
             crate::Refineable::refine(panel.style(), &self.frame_style);
             return panel.into_any_element();
         }

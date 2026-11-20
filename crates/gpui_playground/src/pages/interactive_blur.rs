@@ -147,55 +147,52 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
                 ),
         )
         .child(
-            card()
-                .flat()
-                .padded()
-                .child(
-                    v_stack()
-                        .spacing(px(10.))
-                        .child(
-                            h_stack()
-                                .justify_between()
-                                .child(card_title("Production Signing Key"))
-                                .child(
-                                    button("relock-secret-btn")
-                                        .ghost()
-                                        .size(ComponentSize::Xs)
-                                        .leading_icon(LucideIcon::EyeOff)
-                                        .label("Blur Again")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.privacy_blurred = true;
-                                            this.log_event("BlurContainer", "re-blurred", cx);
-                                        })),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .p(px(10.))
-                                .rounded(theme.radius_md)
-                                .bg(theme.surface_muted)
-                                .font_family("Lilex")
-                                .text_size(px(12.5))
-                                .child("sk_live_gpui_98f2c4a1d77b0e394f0192b8e"),
-                        )
-                        .child(
-                            h_stack()
-                                .justify_between()
-                                .child(
-                                    div()
-                                        .text_size(px(12.))
-                                        .text_color(theme.muted_foreground)
-                                        .child("Rotated 2 hours ago · Scope: read/write"),
+            card().flat().padded().child(
+                v_stack()
+                    .spacing(px(10.))
+                    .child(
+                        h_stack()
+                            .justify_between()
+                            .child(card_title("Production Signing Key"))
+                            .child(
+                                button("relock-secret-btn")
+                                    .ghost()
+                                    .size(ComponentSize::Xs)
+                                    .leading_icon(LucideIcon::EyeOff)
+                                    .label("Blur Again")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.privacy_blurred = true;
+                                        this.log_event("BlurContainer", "re-blurred", cx);
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .p(px(10.))
+                            .rounded(theme.radius_md)
+                            .bg(theme.surface_muted)
+                            .font_family("Lilex")
+                            .text_size(px(12.5))
+                            .child("sk_live_gpui_98f2c4a1d77b0e394f0192b8e"),
+                    )
+                    .child(
+                        h_stack()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(theme.muted_foreground)
+                                    .child("Rotated 2 hours ago · Scope: read/write"),
+                            )
+                            .child(
+                                copy_button(
+                                    "copy-secret-key",
+                                    "sk_live_gpui_98f2c4a1d77b0e394f0192b8e",
                                 )
-                                .child(
-                                    copy_button(
-                                        "copy-secret-key",
-                                        "sk_live_gpui_98f2c4a1d77b0e394f0192b8e",
-                                    )
-                                    .size(ComponentSize::Xs),
-                                ),
-                        ),
-                ),
+                                .size(ComponentSize::Xs),
+                            ),
+                    ),
+            ),
         );
 
     let blur_loading_section = card()
@@ -540,8 +537,7 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
             "Open Command Palette",
             LucideIcon::Search,
             cx.listener(|this, _, window, cx| {
-                this.command_palette
-                    .update(cx, |p, cx| p.open(window, cx));
+                this.command_palette.update(cx, |p, cx| p.open(window, cx));
             }),
         )
         .with_shortcut("⌘K"),
@@ -560,7 +556,11 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
             app.ctx_pin_enabled,
             cx.listener(|this, _, _, cx| {
                 this.ctx_pin_enabled = !this.ctx_pin_enabled;
-                this.log_event("ContextMenu", format!("pin -> {}", this.ctx_pin_enabled), cx);
+                this.log_event(
+                    "ContextMenu",
+                    format!("pin -> {}", this.ctx_pin_enabled),
+                    cx,
+                );
             }),
         ),
         MenuEntry::checkbox_item(
@@ -824,8 +824,9 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
         StepItem::new("Promote Live").description("100% production rollout"),
     ];
     if app.stepper_error && app.stepper_active < deploy_steps.len() {
-        deploy_steps[app.stepper_active] =
-            deploy_steps[app.stepper_active].clone().status(StepStatus::Error);
+        deploy_steps[app.stepper_active] = deploy_steps[app.stepper_active]
+            .clone()
+            .status(StepStatus::Error);
     }
 
     let stepper_section = card()

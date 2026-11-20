@@ -133,11 +133,8 @@ impl Styled for FloatButton {
 impl RenderOnce for FloatButton {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
-        let fh_state = window.use_keyed_state(
-            (self.id.clone(), "fab-fh"),
-            cx,
-            |_, cx| cx.focus_handle(),
-        );
+        let fh_state =
+            window.use_keyed_state((self.id.clone(), "fab-fh"), cx, |_, cx| cx.focus_handle());
         let focus_handle = fh_state.read(cx).clone();
         let focused = focus_handle.is_focused(window);
 
@@ -149,7 +146,12 @@ impl RenderOnce for FloatButton {
                 transparent_black(),
             )
         } else {
-            (theme.surface, theme.surface_hover, theme.foreground, theme.border)
+            (
+                theme.surface,
+                theme.surface_hover,
+                theme.foreground,
+                theme.border,
+            )
         };
 
         let icon_size = if self.size.0 <= 32.0 {
@@ -200,7 +202,11 @@ impl RenderOnce for FloatButton {
                         .rounded_full()
                         .bg(theme.destructive)
                         .border_2()
-                        .border_color(if self.primary { theme.primary } else { theme.surface }),
+                        .border_color(if self.primary {
+                            theme.primary
+                        } else {
+                            theme.surface
+                        }),
                 )
             });
 
@@ -283,14 +289,12 @@ impl Styled for FloatButtonGroup {
 impl RenderOnce for FloatButtonGroup {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let reduce_motion = cx.reduce_motion();
-        let state = window.use_keyed_state(
-            (self.id.clone(), "fab-group-open"),
-            cx,
-            |_, cx| FabGroupOpen {
+        let state = window.use_keyed_state((self.id.clone(), "fab-group-open"), cx, |_, cx| {
+            FabGroupOpen {
                 open: false,
                 focus_handle: cx.focus_handle(),
-            },
-        );
+            }
+        });
         let (open, focus_handle) = {
             let s = state.read(cx);
             (s.open, s.focus_handle.clone())
@@ -321,11 +325,7 @@ impl RenderOnce for FloatButtonGroup {
 
         let auto_close = self.auto_close;
         let actions_col = open.then(|| {
-            let mut col = div()
-                .flex()
-                .flex_col()
-                .items_center()
-                .gap(px(10.));
+            let mut col = div().flex().flex_col().items_center().gap(px(10.));
             for mut act in self.actions {
                 if auto_close {
                     let prev_cb = act.on_click.take();
@@ -512,9 +512,12 @@ impl RenderOnce for Watermark {
                     strikethrough: None,
                 };
                 let primary_size = px(14.);
-                let primary_line = window
-                    .text_system()
-                    .shape_line(text.clone(), primary_size, &[primary_run], None);
+                let primary_line = window.text_system().shape_line(
+                    text.clone(),
+                    primary_size,
+                    &[primary_run],
+                    None,
+                );
 
                 let sub_size = px(11.);
                 let sub_line = subtext.as_ref().filter(|s| !s.is_empty()).map(|sub| {
@@ -536,8 +539,8 @@ impl RenderOnce for Watermark {
                     .0
                     .max(sub_line.as_ref().map(|l| l.width.0).unwrap_or(0.0));
                 let step_x = (tile_w + gap_x * 0.55).max(80.0);
-                let step_y = (if sub_line.is_some() { 34.0 } else { 20.0 } + gap_y * 0.55)
-                    .max(48.0);
+                let step_y =
+                    (if sub_line.is_some() { 34.0 } else { 20.0 } + gap_y * 0.55).max(48.0);
 
                 let start_x = bounds.origin.x.0 + 16.0;
                 let start_y = bounds.origin.y.0 + 16.0;
@@ -642,39 +645,255 @@ struct VersionSpec {
 }
 
 const SPECS_L: &[VersionSpec] = &[
-    VersionSpec { ver: 1, total_data_cw: 19, ec_cw: 7, g1_blocks: 1, g1_data_cw: 19, g2_blocks: 0, g2_data_cw: 0, align_center: None },
-    VersionSpec { ver: 2, total_data_cw: 34, ec_cw: 10, g1_blocks: 1, g1_data_cw: 34, g2_blocks: 0, g2_data_cw: 0, align_center: Some(18) },
-    VersionSpec { ver: 3, total_data_cw: 55, ec_cw: 15, g1_blocks: 1, g1_data_cw: 55, g2_blocks: 0, g2_data_cw: 0, align_center: Some(22) },
-    VersionSpec { ver: 4, total_data_cw: 80, ec_cw: 20, g1_blocks: 1, g1_data_cw: 80, g2_blocks: 0, g2_data_cw: 0, align_center: Some(26) },
-    VersionSpec { ver: 5, total_data_cw: 108, ec_cw: 26, g1_blocks: 1, g1_data_cw: 108, g2_blocks: 0, g2_data_cw: 0, align_center: Some(30) },
-    VersionSpec { ver: 6, total_data_cw: 136, ec_cw: 18, g1_blocks: 2, g1_data_cw: 68, g2_blocks: 0, g2_data_cw: 0, align_center: Some(34) },
+    VersionSpec {
+        ver: 1,
+        total_data_cw: 19,
+        ec_cw: 7,
+        g1_blocks: 1,
+        g1_data_cw: 19,
+        g2_blocks: 0,
+        g2_data_cw: 0,
+        align_center: None,
+    },
+    VersionSpec {
+        ver: 2,
+        total_data_cw: 34,
+        ec_cw: 10,
+        g1_blocks: 1,
+        g1_data_cw: 34,
+        g2_blocks: 0,
+        g2_data_cw: 0,
+        align_center: Some(18),
+    },
+    VersionSpec {
+        ver: 3,
+        total_data_cw: 55,
+        ec_cw: 15,
+        g1_blocks: 1,
+        g1_data_cw: 55,
+        g2_blocks: 0,
+        g2_data_cw: 0,
+        align_center: Some(22),
+    },
+    VersionSpec {
+        ver: 4,
+        total_data_cw: 80,
+        ec_cw: 20,
+        g1_blocks: 1,
+        g1_data_cw: 80,
+        g2_blocks: 0,
+        g2_data_cw: 0,
+        align_center: Some(26),
+    },
+    VersionSpec {
+        ver: 5,
+        total_data_cw: 108,
+        ec_cw: 26,
+        g1_blocks: 1,
+        g1_data_cw: 108,
+        g2_blocks: 0,
+        g2_data_cw: 0,
+        align_center: Some(30),
+    },
+    VersionSpec {
+        ver: 6,
+        total_data_cw: 136,
+        ec_cw: 18,
+        g1_blocks: 2,
+        g1_data_cw: 68,
+        g2_blocks: 0,
+        g2_data_cw: 0,
+        align_center: Some(34),
+    },
 ];
 
 const SPECS_M: &[VersionSpec] = &[
-    VersionSpec { ver: 1, total_data_cw: 16, ec_cw: 10, g1_blocks: 1, g1_data_cw: 16, g2_blocks: 0, g2_data_cw: 0, align_center: None },
-    VersionSpec { ver: 2, total_data_cw: 28, ec_cw: 16, g1_blocks: 1, g1_data_cw: 28, g2_blocks: 0, g2_data_cw: 0, align_center: Some(18) },
-    VersionSpec { ver: 3, total_data_cw: 44, ec_cw: 26, g1_blocks: 1, g1_data_cw: 44, g2_blocks: 0, g2_data_cw: 0, align_center: Some(22) },
-    VersionSpec { ver: 4, total_data_cw: 64, ec_cw: 18, g1_blocks: 2, g1_data_cw: 32, g2_blocks: 0, g2_data_cw: 0, align_center: Some(26) },
-    VersionSpec { ver: 5, total_data_cw: 86, ec_cw: 24, g1_blocks: 2, g1_data_cw: 43, g2_blocks: 0, g2_data_cw: 0, align_center: Some(30) },
-    VersionSpec { ver: 6, total_data_cw: 108, ec_cw: 16, g1_blocks: 4, g1_data_cw: 27, g2_blocks: 0, g2_data_cw: 0, align_center: Some(34) },
+    VersionSpec {
+        ver: 1,
+        total_data_cw: 16,
+        ec_cw: 10,
+        g1_blocks: 1,
+        g1_data_cw: 16,
+        g2_blocks: 0,
+        g2_data_cw: 0,
+        align_center: None,
+    },
+    VersionSpec {
+        ver: 2,
+        total_data_cw: 28,
+        ec_cw: 16,
+        g1_blocks: 1,
+        g1_data_cw: 28,
+        g2_blocks: 0,
+        g2_data_cw: 0,
+        align_center: Some(18),
+    },
+    VersionSpec {
+        ver: 3,
+        total_data_cw: 44,
+        ec_cw: 26,
+        g1_blocks: 1,
+        g1_data_cw: 44,
+        g2_blocks: 0,
+        g2_data_cw: 0,
+        align_center: Some(22),
+    },
+    VersionSpec {
+        ver: 4,
+        total_data_cw: 64,
+        ec_cw: 18,
+        g1_blocks: 2,
+        g1_data_cw: 32,
+        g2_blocks: 0,
+        g2_data_cw: 0,
+        align_center: Some(26),
+    },
+    VersionSpec {
+        ver: 5,
+        total_data_cw: 86,
+        ec_cw: 24,
+        g1_blocks: 2,
+        g1_data_cw: 43,
+        g2_blocks: 0,
+        g2_data_cw: 0,
+        align_center: Some(30),
+    },
+    VersionSpec {
+        ver: 6,
+        total_data_cw: 108,
+        ec_cw: 16,
+        g1_blocks: 4,
+        g1_data_cw: 27,
+        g2_blocks: 0,
+        g2_data_cw: 0,
+        align_center: Some(34),
+    },
 ];
 
 const SPECS_Q: &[VersionSpec] = &[
-    VersionSpec { ver: 1, total_data_cw: 13, ec_cw: 13, g1_blocks: 1, g1_data_cw: 13, g2_blocks: 0, g2_data_cw: 0, align_center: None },
-    VersionSpec { ver: 2, total_data_cw: 22, ec_cw: 22, g1_blocks: 1, g1_data_cw: 22, g2_blocks: 0, g2_data_cw: 0, align_center: Some(18) },
-    VersionSpec { ver: 3, total_data_cw: 34, ec_cw: 18, g1_blocks: 2, g1_data_cw: 17, g2_blocks: 0, g2_data_cw: 0, align_center: Some(22) },
-    VersionSpec { ver: 4, total_data_cw: 48, ec_cw: 26, g1_blocks: 2, g1_data_cw: 24, g2_blocks: 0, g2_data_cw: 0, align_center: Some(26) },
-    VersionSpec { ver: 5, total_data_cw: 62, ec_cw: 18, g1_blocks: 2, g1_data_cw: 15, g2_blocks: 2, g2_data_cw: 16, align_center: Some(30) },
-    VersionSpec { ver: 6, total_data_cw: 76, ec_cw: 24, g1_blocks: 4, g1_data_cw: 19, g2_blocks: 0, g2_data_cw: 0, align_center: Some(34) },
+    VersionSpec {
+        ver: 1,
+        total_data_cw: 13,
+        ec_cw: 13,
+        g1_blocks: 1,
+        g1_data_cw: 13,
+        g2_blocks: 0,
+        g2_data_cw: 0,
+        align_center: None,
+    },
+    VersionSpec {
+        ver: 2,
+        total_data_cw: 22,
+        ec_cw: 22,
+        g1_blocks: 1,
+        g1_data_cw: 22,
+        g2_blocks: 0,
+        g2_data_cw: 0,
+        align_center: Some(18),
+    },
+    VersionSpec {
+        ver: 3,
+        total_data_cw: 34,
+        ec_cw: 18,
+        g1_blocks: 2,
+        g1_data_cw: 17,
+        g2_blocks: 0,
+        g2_data_cw: 0,
+        align_center: Some(22),
+    },
+    VersionSpec {
+        ver: 4,
+        total_data_cw: 48,
+        ec_cw: 26,
+        g1_blocks: 2,
+        g1_data_cw: 24,
+        g2_blocks: 0,
+        g2_data_cw: 0,
+        align_center: Some(26),
+    },
+    VersionSpec {
+        ver: 5,
+        total_data_cw: 62,
+        ec_cw: 18,
+        g1_blocks: 2,
+        g1_data_cw: 15,
+        g2_blocks: 2,
+        g2_data_cw: 16,
+        align_center: Some(30),
+    },
+    VersionSpec {
+        ver: 6,
+        total_data_cw: 76,
+        ec_cw: 24,
+        g1_blocks: 4,
+        g1_data_cw: 19,
+        g2_blocks: 0,
+        g2_data_cw: 0,
+        align_center: Some(34),
+    },
 ];
 
 const SPECS_H: &[VersionSpec] = &[
-    VersionSpec { ver: 1, total_data_cw: 9, ec_cw: 17, g1_blocks: 1, g1_data_cw: 9, g2_blocks: 0, g2_data_cw: 0, align_center: None },
-    VersionSpec { ver: 2, total_data_cw: 16, ec_cw: 28, g1_blocks: 1, g1_data_cw: 16, g2_blocks: 0, g2_data_cw: 0, align_center: Some(18) },
-    VersionSpec { ver: 3, total_data_cw: 26, ec_cw: 22, g1_blocks: 2, g1_data_cw: 13, g2_blocks: 0, g2_data_cw: 0, align_center: Some(22) },
-    VersionSpec { ver: 4, total_data_cw: 36, ec_cw: 16, g1_blocks: 4, g1_data_cw: 9, g2_blocks: 0, g2_data_cw: 0, align_center: Some(26) },
-    VersionSpec { ver: 5, total_data_cw: 46, ec_cw: 22, g1_blocks: 2, g1_data_cw: 11, g2_blocks: 2, g2_data_cw: 12, align_center: Some(30) },
-    VersionSpec { ver: 6, total_data_cw: 60, ec_cw: 28, g1_blocks: 4, g1_data_cw: 15, g2_blocks: 0, g2_data_cw: 0, align_center: Some(34) },
+    VersionSpec {
+        ver: 1,
+        total_data_cw: 9,
+        ec_cw: 17,
+        g1_blocks: 1,
+        g1_data_cw: 9,
+        g2_blocks: 0,
+        g2_data_cw: 0,
+        align_center: None,
+    },
+    VersionSpec {
+        ver: 2,
+        total_data_cw: 16,
+        ec_cw: 28,
+        g1_blocks: 1,
+        g1_data_cw: 16,
+        g2_blocks: 0,
+        g2_data_cw: 0,
+        align_center: Some(18),
+    },
+    VersionSpec {
+        ver: 3,
+        total_data_cw: 26,
+        ec_cw: 22,
+        g1_blocks: 2,
+        g1_data_cw: 13,
+        g2_blocks: 0,
+        g2_data_cw: 0,
+        align_center: Some(22),
+    },
+    VersionSpec {
+        ver: 4,
+        total_data_cw: 36,
+        ec_cw: 16,
+        g1_blocks: 4,
+        g1_data_cw: 9,
+        g2_blocks: 0,
+        g2_data_cw: 0,
+        align_center: Some(26),
+    },
+    VersionSpec {
+        ver: 5,
+        total_data_cw: 46,
+        ec_cw: 22,
+        g1_blocks: 2,
+        g1_data_cw: 11,
+        g2_blocks: 2,
+        g2_data_cw: 12,
+        align_center: Some(30),
+    },
+    VersionSpec {
+        ver: 6,
+        total_data_cw: 60,
+        ec_cw: 28,
+        g1_blocks: 4,
+        g1_data_cw: 15,
+        g2_blocks: 0,
+        g2_data_cw: 0,
+        align_center: Some(34),
+    },
 ];
 
 /// Encoded boolean module matrix for a QR code (`size × size`).
@@ -1077,10 +1296,7 @@ thread_local! {
 fn cached_qr_matrix(value: &SharedString, ecc: QrEccLevel) -> Arc<QrMatrix> {
     QR_CACHE.with(|cache| {
         let mut entries = cache.borrow_mut();
-        if let Some(pos) = entries
-            .iter()
-            .position(|(v, e, _)| v == value && *e == ecc)
-        {
+        if let Some(pos) = entries.iter().position(|(v, e, _)| v == value && *e == ecc) {
             let entry = entries.remove(pos);
             let mat = Arc::clone(&entry.2);
             entries.push(entry);
@@ -1226,8 +1442,7 @@ impl RenderOnce for QRCode {
                         let cell = (side / (dim + 8) as f32).floor().max(1.0);
                         let total = cell * dim as f32;
                         let ox = (bounds.origin.x.0 + (bounds.size.width.0 - total) * 0.5).floor();
-                        let oy =
-                            (bounds.origin.y.0 + (bounds.size.height.0 - total) * 0.5).floor();
+                        let oy = (bounds.origin.y.0 + (bounds.size.height.0 - total) * 0.5).floor();
                         for &(y, x_start, run_len) in &matrix.runs {
                             window.paint_quad(quad(
                                 Bounds {

@@ -4,11 +4,11 @@
 
 use smallvec::SmallVec;
 
+use crate::icons::{Icon, IconSize, LucideIcon};
 use crate::{
     AnyElement, App, ClickEvent, ElementId, FontWeight, IntoElement, ParentElement, Pixels,
     RenderOnce, SharedString, StyleRefinement, Styled, Window, div, prelude::*, px,
 };
-use crate::icons::{Icon, IconSize, LucideIcon};
 
 use super::theme::{ActiveTheme, Theme};
 
@@ -241,7 +241,9 @@ impl RenderOnce for Stack {
                 if index + 1 < count {
                     let sep = match self.direction {
                         StackDirection::Vertical => div().w_full().h(px(1.)).bg(theme.border),
-                        StackDirection::Horizontal => div().w(px(1.)).self_stretch().bg(theme.border),
+                        StackDirection::Horizontal => {
+                            div().w(px(1.)).self_stretch().bg(theme.border)
+                        }
                     };
                     el = el.child(sep);
                 }
@@ -381,7 +383,9 @@ impl RenderOnce for Card {
             .border_color(theme.border)
             .rounded(theme.radius_xl)
             .overflow_hidden()
-            .when(self.elevated && theme.elevation_shadows, |el| el.shadow_sm())
+            .when(self.elevated && theme.elevation_shadows, |el| {
+                el.shadow_sm()
+            })
             .when(self.padded, |el| el.p(px(20.)))
             .children(self.children);
         crate::Refineable::refine(el.style(), &self.style);
@@ -446,7 +450,9 @@ impl RenderOnce for CardHeader {
             .gap(px(4.))
             .px(px(20.))
             .py(px(16.))
-            .when(self.bordered, |el| el.border_b_1().border_color(theme.border))
+            .when(self.bordered, |el| {
+                el.border_b_1().border_color(theme.border)
+            })
             .children(self.children);
         crate::Refineable::refine(el.style(), &self.style);
         el
@@ -756,7 +762,9 @@ impl RenderOnce for PageHeader {
             .gap(px(16.))
             .w_full()
             .pb(px(16.))
-            .when(self.bordered, |el| el.border_b_1().border_color(theme.border))
+            .when(self.bordered, |el| {
+                el.border_b_1().border_color(theme.border)
+            })
             .child(
                 div()
                     .flex()
@@ -878,7 +886,9 @@ impl RenderOnce for Navbar {
             .h(self.height)
             .px(px(20.))
             .bg(theme.surface)
-            .when(self.bordered, |el| el.border_b_1().border_color(theme.border))
+            .when(self.bordered, |el| {
+                el.border_b_1().border_color(theme.border)
+            })
             .child(
                 div()
                     .flex()
@@ -1338,13 +1348,7 @@ impl RenderOnce for AppShell {
                             .flex_1()
                             .min_h_0()
                             .overflow_y_scroll()
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .w_full()
-                                    .children(self.content),
-                            ),
+                            .child(div().flex().flex_col().w_full().children(self.content)),
                     ),
             );
         crate::Refineable::refine(el.style(), &self.style);
@@ -1414,8 +1418,12 @@ impl RenderOnce for ScrollArea {
         let mut el = div()
             .id(self.id)
             .when(self.vertical && self.horizontal, |el| el.overflow_scroll())
-            .when(self.vertical && !self.horizontal, |el| el.overflow_y_scroll())
-            .when(!self.vertical && self.horizontal, |el| el.overflow_x_scroll())
+            .when(self.vertical && !self.horizontal, |el| {
+                el.overflow_y_scroll()
+            })
+            .when(!self.vertical && self.horizontal, |el| {
+                el.overflow_x_scroll()
+            })
             .children(self.children);
         crate::Refineable::refine(el.style(), &self.style);
         el

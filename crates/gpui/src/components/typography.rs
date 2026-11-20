@@ -8,18 +8,16 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::icons::{Icon, IconSize, LucideIcon};
 use crate::{
-    App, Context, ElementId, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
-    IntoElement, KeyDownEvent, Pixels, Render, RenderOnce, SharedString, StyleRefinement, Styled,
-    Window, div, prelude::*, px, uniform_list,
+    App, Context, ElementId, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, IntoElement,
+    KeyDownEvent, Pixels, Render, RenderOnce, SharedString, StyleRefinement, Styled, Window, div,
+    prelude::*, px, uniform_list,
 };
 
 use super::button::{ButtonVariant, button};
 use super::input::{Input, InputEvent, InputState};
 use super::interactive::copy_button;
 use super::palette as tw;
-use super::theme::{
-    ActiveTheme, ComponentSize, ThemeMode, focus_ring_shadow, tabular_numerals,
-};
+use super::theme::{ActiveTheme, ComponentSize, ThemeMode, focus_ring_shadow, tabular_numerals};
 
 // ============================================================================
 // Heading
@@ -638,11 +636,9 @@ impl Styled for TruncatedText {
 impl RenderOnce for TruncatedText {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
-        let state = window.use_keyed_state(
-            (self.id.clone(), "trunc-state"),
-            cx,
-            |_, _| TruncateExpandState::default(),
-        );
+        let state = window.use_keyed_state((self.id.clone(), "trunc-state"), cx, |_, _| {
+            TruncateExpandState::default()
+        });
         let expanded = state.read(cx).expanded;
 
         // Single-pass O(max_chars) grapheme-safe cutoff without scanning the tail of huge strings!
@@ -779,7 +775,11 @@ impl RenderOnce for CodeBlock {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
         let is_dark = theme.mode == ThemeMode::Dark;
-        let bg = if is_dark { tw::SLATE_950 } else { tw::SLATE_900 };
+        let bg = if is_dark {
+            tw::SLATE_950
+        } else {
+            tw::SLATE_900
+        };
         let header_bg = tw::SLATE_800;
         let code_copy = self.code.clone();
         let ranges = Rc::new(line_byte_ranges(self.code.as_ref()));

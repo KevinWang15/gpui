@@ -297,12 +297,7 @@ impl Render for ImagePreviewState {
         let tw_w = self.thumb_width;
         let tw_h = self.thumb_height;
 
-        let mut thumbs = div()
-            .flex()
-            .flex_row()
-            .flex_wrap()
-            .gap(px(10.))
-            .w_full();
+        let mut thumbs = div().flex().flex_row().flex_wrap().gap(px(10.)).w_full();
 
         if self.items.is_empty() {
             thumbs = thumbs.child(
@@ -415,211 +410,210 @@ impl Render for ImagePreviewState {
             };
 
             let scrim = crate::Hsla::from(tw::SLATE_950).opacity(0.72);
-            let overlay = div()
-                .id(("img-lightbox-backdrop", entity_id))
-                .track_focus(&self.focus_handle)
-                .on_key_down(cx.listener(Self::on_key_down))
-                .w(vp.width)
-                .h(vp.height)
-                .bg(scrim)
-                .occlude()
-                .flex()
-                .flex_col()
-                .justify_between()
-                .p(px(20.))
-                // Use mouse-down rather than on_click so Space/Enter keyboard events never dismiss!
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, window, cx| this.close_in(window, cx)),
-                )
-                // Top caption bar
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .justify_between()
-                        .gap(px(12.))
-                        .px(px(14.))
-                        .py(px(10.))
-                        .rounded(theme.radius_xl)
-                        .bg(crate::Hsla::from(tw::SLATE_900).opacity(0.78))
-                        .border_1()
-                        .border_color(crate::Hsla::from(tw::WHITE).opacity(0.12))
-                        .on_any_mouse_down(cx.listener(|this, _, window, cx| {
-                            window.focus(&this.focus_handle, cx);
-                            cx.stop_propagation();
-                        }))
-                        .child(
-                            div()
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .gap(px(10.))
-                                .flex_1()
-                                .min_w_0()
-                                .child(
-                                    div()
-                                        .flex_shrink_0()
-                                        .px(px(8.))
-                                        .py(px(2.))
-                                        .rounded_full()
-                                        .bg(crate::Hsla::from(tw::WHITE).opacity(0.14))
-                                        .text_size(px(12.))
-                                        .font_features(tabular_numerals())
-                                        .text_color(tw::SLATE_100)
-                                        .child(format!("{} / {total}", idx + 1)),
-                                )
-                                .child(
-                                    div()
-                                        .min_w_0()
-                                        .truncate()
-                                        .text_size(px(14.))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(tw::WHITE)
-                                        .child(title),
-                                )
-                                .when_some(subtitle, |el, sub| {
-                                    el.child(
-                                        div()
-                                            .min_w_0()
-                                            .truncate()
-                                            .text_size(px(12.5))
-                                            .text_color(tw::SLATE_300)
-                                            .child(sub),
-                                    )
-                                }),
-                        )
-                        .child(toolbar_btn("lb-close", LucideIcon::X, false).on_click(
-                            cx.listener(|this, _, window, cx| this.close_in(window, cx)),
-                        )),
-                )
-                // Center stage
-                .child(
-                    div()
-                        .flex_1()
-                        .min_h_0()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .justify_between()
-                        .gap(px(16.))
-                        .child(div().flex_shrink_0().w(px(40.)).when(total > 1, |el| {
-                            el.on_any_mouse_down(|_, _, cx| cx.stop_propagation()).child(
-                                toolbar_btn("lb-prev", LucideIcon::ChevronLeft, false)
-                                    .w(px(40.))
-                                    .h(px(40.))
-                                    .bg(crate::Hsla::from(tw::SLATE_900).opacity(0.75))
-                                    .on_click(cx.listener(|this, _, _, cx| this.prev(cx))),
-                            )
-                        }))
-                        .child(
-                            div()
-                                .id(("lb-stage-scroll", entity_id))
-                                .max_w(px(max_stage_w))
-                                .max_h(px(max_stage_h))
-                                .overflow_scroll()
-                                .rounded(theme.radius_xl)
-                                .border_1()
-                                .border_color(crate::Hsla::from(tw::WHITE).opacity(0.18))
-                                .shadow_2xl()
-                                .on_any_mouse_down(cx.listener(|this, _, window, cx| {
-                                    window.focus(&this.focus_handle, cx);
-                                    cx.stop_propagation();
-                                }))
-                                .child(
-                                    div()
-                                        .w(stage_w)
-                                        .h(stage_h)
-                                        .flex_shrink_0()
-                                        .child(media_el),
-                                ),
-                        )
-                        .child(div().flex_shrink_0().w(px(40.)).when(total > 1, |el| {
-                            el.on_any_mouse_down(|_, _, cx| cx.stop_propagation()).child(
-                                toolbar_btn("lb-next", LucideIcon::ChevronRight, false)
-                                    .w(px(40.))
-                                    .h(px(40.))
-                                    .bg(crate::Hsla::from(tw::SLATE_900).opacity(0.75))
-                                    .on_click(cx.listener(|this, _, _, cx| this.next(cx))),
-                            )
-                        })),
-                )
-                // Bottom frosted toolbar
-                .child(
-                    div().flex().justify_center().child(
+            let overlay =
+                div()
+                    .id(("img-lightbox-backdrop", entity_id))
+                    .track_focus(&self.focus_handle)
+                    .on_key_down(cx.listener(Self::on_key_down))
+                    .w(vp.width)
+                    .h(vp.height)
+                    .bg(scrim)
+                    .occlude()
+                    .flex()
+                    .flex_col()
+                    .justify_between()
+                    .p(px(20.))
+                    // Use mouse-down rather than on_click so Space/Enter keyboard events never dismiss!
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, window, cx| this.close_in(window, cx)),
+                    )
+                    // Top caption bar
+                    .child(
                         div()
                             .flex()
                             .flex_row()
                             .items_center()
-                            .gap(px(6.))
-                            .px(px(12.))
-                            .py(px(6.))
-                            .rounded_full()
-                            .bg(crate::Hsla::from(tw::SLATE_900).opacity(0.84))
+                            .justify_between()
+                            .gap(px(12.))
+                            .px(px(14.))
+                            .py(px(10.))
+                            .rounded(theme.radius_xl)
+                            .bg(crate::Hsla::from(tw::SLATE_900).opacity(0.78))
                             .border_1()
-                            .border_color(crate::Hsla::from(tw::WHITE).opacity(0.14))
+                            .border_color(crate::Hsla::from(tw::WHITE).opacity(0.12))
                             .on_any_mouse_down(cx.listener(|this, _, window, cx| {
                                 window.focus(&this.focus_handle, cx);
                                 cx.stop_propagation();
                             }))
                             .child(
-                                toolbar_btn("lb-zoom-out", LucideIcon::ZoomOut, at_min_zoom).when(
-                                    !at_min_zoom,
-                                    |el| {
-                                        el.on_click(cx.listener(|this, _, _, cx| {
-                                            this.adjust_zoom(-0.25, cx)
-                                        }))
-                                    },
-                                ),
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(10.))
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .px(px(8.))
+                                            .py(px(2.))
+                                            .rounded_full()
+                                            .bg(crate::Hsla::from(tw::WHITE).opacity(0.14))
+                                            .text_size(px(12.))
+                                            .font_features(tabular_numerals())
+                                            .text_color(tw::SLATE_100)
+                                            .child(format!("{} / {total}", idx + 1)),
+                                    )
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .truncate()
+                                            .text_size(px(14.))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(tw::WHITE)
+                                            .child(title),
+                                    )
+                                    .when_some(subtitle, |el, sub| {
+                                        el.child(
+                                            div()
+                                                .min_w_0()
+                                                .truncate()
+                                                .text_size(px(12.5))
+                                                .text_color(tw::SLATE_300)
+                                                .child(sub),
+                                        )
+                                    }),
                             )
+                            .child(toolbar_btn("lb-close", LucideIcon::X, false).on_click(
+                                cx.listener(|this, _, window, cx| this.close_in(window, cx)),
+                            )),
+                    )
+                    // Center stage
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(16.))
+                            .child(div().flex_shrink_0().w(px(40.)).when(total > 1, |el| {
+                                el.on_any_mouse_down(|_, _, cx| cx.stop_propagation())
+                                    .child(
+                                        toolbar_btn("lb-prev", LucideIcon::ChevronLeft, false)
+                                            .w(px(40.))
+                                            .h(px(40.))
+                                            .bg(crate::Hsla::from(tw::SLATE_900).opacity(0.75))
+                                            .on_click(cx.listener(|this, _, _, cx| this.prev(cx))),
+                                    )
+                            }))
                             .child(
                                 div()
-                                    .w(px(48.))
-                                    .text_center()
-                                    .text_size(px(12.))
-                                    .font_features(tabular_numerals())
-                                    .text_color(tw::SLATE_100)
-                                    .child(format!("{zoom_pct}%")),
+                                    .id(("lb-stage-scroll", entity_id))
+                                    .max_w(px(max_stage_w))
+                                    .max_h(px(max_stage_h))
+                                    .overflow_scroll()
+                                    .rounded(theme.radius_xl)
+                                    .border_1()
+                                    .border_color(crate::Hsla::from(tw::WHITE).opacity(0.18))
+                                    .shadow_2xl()
+                                    .on_any_mouse_down(cx.listener(|this, _, window, cx| {
+                                        window.focus(&this.focus_handle, cx);
+                                        cx.stop_propagation();
+                                    }))
+                                    .child(
+                                        div().w(stage_w).h(stage_h).flex_shrink_0().child(media_el),
+                                    ),
                             )
-                            .child(
-                                toolbar_btn("lb-zoom-in", LucideIcon::ZoomIn, at_max_zoom).when(
-                                    !at_max_zoom,
-                                    |el| {
-                                        el.on_click(cx.listener(|this, _, _, cx| {
-                                            this.adjust_zoom(0.25, cx)
-                                        }))
-                                    },
+                            .child(div().flex_shrink_0().w(px(40.)).when(total > 1, |el| {
+                                el.on_any_mouse_down(|_, _, cx| cx.stop_propagation())
+                                    .child(
+                                        toolbar_btn("lb-next", LucideIcon::ChevronRight, false)
+                                            .w(px(40.))
+                                            .h(px(40.))
+                                            .bg(crate::Hsla::from(tw::SLATE_900).opacity(0.75))
+                                            .on_click(cx.listener(|this, _, _, cx| this.next(cx))),
+                                    )
+                            })),
+                    )
+                    // Bottom frosted toolbar
+                    .child(
+                        div().flex().justify_center().child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(6.))
+                                .px(px(12.))
+                                .py(px(6.))
+                                .rounded_full()
+                                .bg(crate::Hsla::from(tw::SLATE_900).opacity(0.84))
+                                .border_1()
+                                .border_color(crate::Hsla::from(tw::WHITE).opacity(0.14))
+                                .on_any_mouse_down(cx.listener(|this, _, window, cx| {
+                                    window.focus(&this.focus_handle, cx);
+                                    cx.stop_propagation();
+                                }))
+                                .child(
+                                    toolbar_btn("lb-zoom-out", LucideIcon::ZoomOut, at_min_zoom)
+                                        .when(!at_min_zoom, |el| {
+                                            el.on_click(cx.listener(|this, _, _, cx| {
+                                                this.adjust_zoom(-0.25, cx)
+                                            }))
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .w(px(48.))
+                                        .text_center()
+                                        .text_size(px(12.))
+                                        .font_features(tabular_numerals())
+                                        .text_color(tw::SLATE_100)
+                                        .child(format!("{zoom_pct}%")),
+                                )
+                                .child(
+                                    toolbar_btn("lb-zoom-in", LucideIcon::ZoomIn, at_max_zoom)
+                                        .when(!at_max_zoom, |el| {
+                                            el.on_click(cx.listener(|this, _, _, cx| {
+                                                this.adjust_zoom(0.25, cx)
+                                            }))
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .w(px(1.))
+                                        .h(px(18.))
+                                        .mx(px(4.))
+                                        .bg(crate::Hsla::from(tw::WHITE).opacity(0.18)),
+                                )
+                                .child(
+                                    toolbar_btn("lb-rot-l", LucideIcon::RotateCcw, false).on_click(
+                                        cx.listener(|this, _, _, cx| this.rotate(-90, cx)),
+                                    ),
+                                )
+                                .child(
+                                    toolbar_btn("lb-rot-r", LucideIcon::RotateCw, false).on_click(
+                                        cx.listener(|this, _, _, cx| this.rotate(90, cx)),
+                                    ),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(11.5))
+                                        .font_features(tabular_numerals())
+                                        .text_color(tw::SLATE_300)
+                                        .px(px(4.))
+                                        .child(format!("{}°", self.rotation_deg)),
+                                )
+                                .child(
+                                    toolbar_btn("lb-reset", LucideIcon::RefreshCw, false).on_click(
+                                        cx.listener(|this, _, _, cx| this.reset_view(cx)),
+                                    ),
                                 ),
-                            )
-                            .child(
-                                div()
-                                    .w(px(1.))
-                                    .h(px(18.))
-                                    .mx(px(4.))
-                                    .bg(crate::Hsla::from(tw::WHITE).opacity(0.18)),
-                            )
-                            .child(toolbar_btn("lb-rot-l", LucideIcon::RotateCcw, false).on_click(
-                                cx.listener(|this, _, _, cx| this.rotate(-90, cx)),
-                            ))
-                            .child(toolbar_btn("lb-rot-r", LucideIcon::RotateCw, false).on_click(
-                                cx.listener(|this, _, _, cx| this.rotate(90, cx)),
-                            ))
-                            .child(
-                                div()
-                                    .text_size(px(11.5))
-                                    .font_features(tabular_numerals())
-                                    .text_color(tw::SLATE_300)
-                                    .px(px(4.))
-                                    .child(format!("{}°", self.rotation_deg)),
-                            )
-                            .child(
-                                toolbar_btn("lb-reset", LucideIcon::RefreshCw, false).on_click(
-                                    cx.listener(|this, _, _, cx| this.reset_view(cx)),
-                                ),
-                            ),
-                    ),
-                );
+                        ),
+                    );
 
             let final_lb = if reduce_motion {
                 overlay
@@ -631,22 +625,14 @@ impl Render for ImagePreviewState {
                         ("lb-enter", entity_id),
                         Animation::new(ANIM_FAST).with_easing(ease_out_quint()),
                         move |el, delta| {
-                            el.opacity(delta).when(blur_r > px(0.), |el| {
-                                el.backdrop_blur(px(blur_r.0 * delta))
-                            })
+                            el.opacity(delta)
+                                .when(blur_r > px(0.), |el| el.backdrop_blur(px(blur_r.0 * delta)))
                         },
                     )
                     .into_any_element()
             };
 
-            Some(
-                deferred(
-                    anchored()
-                        .position(point(px(0.), px(0.)))
-                        .child(final_lb),
-                )
-                .priority(60),
-            )
+            Some(deferred(anchored().position(point(px(0.), px(0.))).child(final_lb)).priority(60))
         });
 
         let mut root = div()

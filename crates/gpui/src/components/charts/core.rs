@@ -3,12 +3,12 @@
 
 use std::rc::Rc;
 
+use crate::icons::{Icon, IconSize, LucideIcon};
 use crate::{
     AnyElement, App, BorderStyle, Bounds, ClickEvent, Corners, Edges, ElementId, FontWeight, Hsla,
     IntoElement, ParentElement, Pixels, Point, RenderOnce, SharedString, StyleRefinement, Styled,
     TextAlign, TextRun, Window, div, fill, point, prelude::*, px, quad, size,
 };
-use crate::icons::{Icon, IconSize, LucideIcon};
 
 use crate::components::palette as tw;
 use crate::components::theme::{ActiveTheme, Theme, ThemeMode, tabular_numerals};
@@ -414,7 +414,10 @@ pub(crate) fn paint_brush_band(
     let sel_w = (sel_right - sel_left).max(2.0);
     let sel_h = plot.height();
     window.paint_quad(fill(
-        Bounds::new(point(px(sel_left), px(plot.top)), size(px(sel_w), px(sel_h))),
+        Bounds::new(
+            point(px(sel_left), px(plot.top)),
+            size(px(sel_w), px(sel_h)),
+        ),
         accent.opacity(if is_live_brushing { 0.16 } else { 0.11 }),
     ));
     window.paint_quad(fill(
