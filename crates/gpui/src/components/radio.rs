@@ -204,7 +204,7 @@ impl<T: Clone + PartialEq + 'static> RenderOnce for RadioGroup<T> {
             let on_change = self.on_change.clone();
             let focus = (!item_disabled)
                 .then(|| super::focus::choice_item_handle(&handles, index, tab_item));
-            let ring = super::focus::focus_visible_ring(&handles[index], window, &theme);
+            let focus_outline = super::focus::focus_visible_outline(&handles[index], window, &theme);
 
             let row = match self.variant {
                 RadioVariant::List => {
@@ -237,7 +237,7 @@ impl<T: Clone + PartialEq + 'static> RenderOnce for RadioGroup<T> {
                         .mt(px(1.))
                         .rounded_full()
                         .border_1()
-                        .when_some(ring, |el, ring| el.shadow(ring))
+                        .when_some(focus_outline, |el, outline| el.outline(outline))
                         .child(dot)
                         .with_spring(
                             circle_id,
@@ -300,7 +300,7 @@ impl<T: Clone + PartialEq + 'static> RenderOnce for RadioGroup<T> {
                         .rounded(theme.radius_lg)
                         .border_1()
                         .shadow_2xs()
-                        .when_some(ring, |el, ring| el.shadow(ring))
+                        .when_some(focus_outline, |el, outline| el.outline(outline))
                         .when(!item_disabled, |el| {
                             el.cursor_pointer().hover(|s| {
                                 if is_selected {

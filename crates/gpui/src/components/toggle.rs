@@ -169,9 +169,9 @@ impl RenderOnce for Toggle {
                 .read(cx)
                 .clone()
         });
-        let ring = focus
+        let focus_outline = focus
             .as_ref()
-            .and_then(|handle| super::focus::focus_visible_ring(handle, window, &theme));
+            .and_then(|handle| super::focus::focus_visible_outline(handle, window, &theme));
 
         let track = if !with_icons {
             // Zero-relayout GPU scene-animated track color + sliding thumb.
@@ -226,7 +226,7 @@ impl RenderOnce for Toggle {
                 .h(track_h)
                 // The canvas paints the pill; the rounding shapes the ring.
                 .rounded_full()
-                .when_some(ring, |el, ring| el.shadow(ring))
+                .when_some(focus_outline, |el, outline| el.outline(outline))
                 .child(
                     canvas(
                         |_, _, _| {},
@@ -330,7 +330,7 @@ impl RenderOnce for Toggle {
                 .w(track_w)
                 .h(track_h)
                 .rounded_full()
-                .when_some(ring, |el, ring| el.shadow(ring))
+                .when_some(focus_outline, |el, outline| el.outline(outline))
                 .child(thumb)
                 .with_spring(
                     track_id,

@@ -445,6 +445,12 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Sets a non-layout-affecting [`OutlineStyle`](crate::OutlineStyle) around (or inset within) the element.
+    fn outline(mut self, outline: crate::OutlineStyle) -> Self {
+        self.style().outline = Some(outline);
+        self
+    }
+
     /// Returns a mutable reference to the text style that has been configured on this element.
     fn text_style(&mut self) -> &mut TextStyleRefinement {
         let style: &mut StyleRefinement = self.style();

@@ -29,12 +29,33 @@
 //! - **A click** focuses the focusable element it's in, and a click outside
 //!   every focusable element blurs (gpui's mouse down default).
 
-use crate::{App, ElementId, FocusHandle, StatefulInteractiveElement, Styled, Window};
+use crate::{
+    App, ElementId, FocusHandle, OutlineStyle, StatefulInteractiveElement, Styled, Window, px,
+};
 
-use super::layout::focus_ring_shadow;
 use super::theme::Theme;
 
-/// Makes `el` (which needs an id) a tab stop, with the theme's focus ring
+/// Subtle dashed outline drawn around keyboard-focused (`:focus-visible`) controls.
+///
+/// Respects [`Theme::focus_ring_width`]: returns `None` when `<= 0px`. Never adds a background
+/// fill or shifts layout.
+pub(crate) fn focus_outline(theme: &Theme) -> Option<OutlineStyle> {
+    if theme.focus_ring_width <= px(0.) {
+        return None;
+    }
+    Some(OutlineStyle::dashed(px(1.), theme.ring.opacity(0.65)).offset(px(2.)))
+}
+
+/// Inset variant of [`focus_outline`] for controls flush against an `overflow_hidden()` parent
+/// (accordion headers, table cells, list rows, time-picker wheel items).
+pub(crate) fn focus_outline_inset(theme: &Theme) -> Option<OutlineStyle> {
+    if theme.focus_ring_width <= px(0.) {
+        return None;
+    }
+    Some(OutlineStyle::dashed(px(1.), theme.ring.opacity(0.65)).offset(px(-2.)))
+}
+
+/// Makes `el` (which needs an id) a tab stop, with a subtle dashed outline
 /// when focus comes by keyboard; or, when `enabled` is false, leaves it out
 /// of the tab order.
 pub(crate) fn tab_stop<E: StatefulInteractiveElement + Styled>(
@@ -45,15 +66,17 @@ pub(crate) fn tab_stop<E: StatefulInteractiveElement + Styled>(
     if !enabled {
         return el;
     }
-    let ring = focus_ring_shadow(theme, false);
-    el.focusable()
-        .tab_stop(true)
-        .focus_visible(move |style| style.shadow(ring))
+    let el = el.focusable().tab_stop(true);
+    if let Some(outline) = focus_outline(theme) {
+        el.focus_visible(move |style| style.outline(outline))
+    } else {
+        el
+    }
 }
 
-/// [`tab_stop`] with the ring drawn inside the element, for a
+/// [`tab_stop`] with the dashed outline drawn inset inside the element, for a
 /// control flush against the edge of a parent that clips its children (an
-/// accordion's header, a table's header cells), where an outside ring would
+/// accordion's header, a table's header cells), where an outside outline would
 /// be cut off.
 pub(crate) fn tab_stop_inset<E: StatefulInteractiveElement + Styled>(
     el: E,
@@ -63,23 +86,37 @@ pub(crate) fn tab_stop_inset<E: StatefulInteractiveElement + Styled>(
     if !enabled {
         return el;
     }
-    let ring: Vec<_> = focus_ring_shadow(theme, false)
-        .into_iter()
-        .map(|shadow| shadow.inset())
-        .collect();
-    tab_stop(el, true, theme).focus_visible(move |style| style.shadow(ring))
+    let el = el.focusable().tab_stop(true);
+    if let Some(outline) = focus_outline_inset(theme) {
+        el.focus_visible(move |style| style.outline(outline))
+    } else {
+        el
+    }
 }
 
-/// The keyboard-focus ring for an element that tracks its own handle: the
-/// ring when `handle` has keyboard focus, else nothing.
-pub(crate) fn focus_visible_ring(
+/// The keyboard-focus dashed outline for an element that tracks its own handle:
+/// returns `Some(OutlineStyle)` when `handle` has keyboard focus, else `None`.
+pub(crate) fn focus_visible_outline(
     handle: &FocusHandle,
     window: &Window,
     theme: &Theme,
-) -> Option<Vec<crate::BoxShadow>> {
+) -> Option<OutlineStyle> {
     handle
         .is_focus_visible(window)
-        .then(|| focus_ring_shadow(theme, false))
+        .then(|| focus_outline(theme))
+        .flatten()
+}
+
+/// Inset variant of [`focus_visible_outline`] for items inside clipped containers.
+pub(crate) fn focus_visible_outline_inset(
+    handle: &FocusHandle,
+    window: &Window,
+    theme: &Theme,
+) -> Option<OutlineStyle> {
+    handle
+        .is_focus_visible(window)
+        .then(|| focus_outline_inset(theme))
+        .flatten()
 }
 
 /// What a modal overlay remembers between frames: its focus handle, whether

@@ -1368,6 +1368,10 @@ fn custom_theme_tokens_and_direct_styled_passthrough_render_cleanly(cx: &mut Tes
         custom.chart_colors[0]
     );
     assert!(layout::focus_ring_shadow(&custom, false).is_empty());
+    assert!(super::focus::focus_outline(&custom).is_none());
+    let default_outline = super::focus::focus_outline(&Theme::light()).expect("default focus outline");
+    assert_eq!(default_outline.style, crate::BorderStyle::Dashed);
+    assert_eq!(default_outline.width, px(1.));
 
     cx.update(|cx| Theme::set_global(custom, cx));
     let _window = cx.open_window(size(px(1000.), px(720.)), |_, cx| {

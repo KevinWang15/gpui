@@ -14,7 +14,7 @@ use crate::{
 };
 
 use super::button::button;
-use super::theme::{ANIM_FAST, ActiveTheme, ComponentSize, focus_ring_shadow, tabular_numerals};
+use super::theme::{ANIM_FAST, ActiveTheme, ComponentSize, tabular_numerals};
 use super::time_range::{CalendarDate, CalendarGrid};
 
 const TWO_DIGIT: [&str; 60] = [
@@ -449,9 +449,11 @@ impl Render for DatePickerState {
             } else {
                 theme.input_border
             })
-            // Ring for keyboard focus only (`focus` module docs).
-            .when((self.open || focus_visible) && !self.disabled, |el| {
-                el.shadow(focus_ring_shadow(&theme))
+            // Dashed outline for keyboard focus only (`focus` module docs).
+            .when(focus_visible && !self.disabled, |el| {
+                el.when_some(super::focus::focus_outline(&theme), |el, outline| {
+                    el.outline(outline)
+                })
             })
             .bg(if self.disabled {
                 theme.disabled_bg
@@ -896,13 +898,13 @@ impl Render for TimePickerState {
             let handle = hour_keys[hour_index.min(hour_count - 1)].clone();
             window.defer(cx, move |window, cx| window.focus(&handle, cx));
         }
-        let ring_for = |handle: &FocusHandle, window: &Window| {
-            super::focus::focus_visible_ring(handle, window, &theme)
+        let outline_for = |handle: &FocusHandle, window: &Window| {
+            super::focus::focus_visible_outline_inset(handle, window, &theme)
         };
-        let hour_rings: Vec<_> = hour_keys.iter().map(|h| ring_for(h, window)).collect();
-        let min_rings: Vec<_> = min_keys.iter().map(|h| ring_for(h, window)).collect();
-        let sec_rings: Vec<_> = sec_keys.iter().map(|h| ring_for(h, window)).collect();
-        let ampm_rings: Vec<_> = ampm_keys.iter().map(|h| ring_for(h, window)).collect();
+        let hour_rings: Vec<_> = hour_keys.iter().map(|h| outline_for(h, window)).collect();
+        let min_rings: Vec<_> = min_keys.iter().map(|h| outline_for(h, window)).collect();
+        let sec_rings: Vec<_> = sec_keys.iter().map(|h| outline_for(h, window)).collect();
+        let ampm_rings: Vec<_> = ampm_keys.iter().map(|h| outline_for(h, window)).collect();
 
         let popover = (self.open && !self.disabled).then(|| {
             let cur_h_display = if use_12h {
@@ -948,7 +950,7 @@ impl Render for TimePickerState {
                             div()
                                 .id(("tp-h", h as usize))
                                 .track_focus(&super::focus::choice_item_handle(&hour_keys, i, Some(hour_index)))
-                                .when_some(hour_rings[i].clone(), |el, ring| el.shadow(ring))
+                                .when_some(hour_rings[i], |el, outline| el.outline(outline))
                                 .flex()
                                 .items_center()
                                 .justify_center()
@@ -1023,7 +1025,7 @@ impl Render for TimePickerState {
                             div()
                                 .id(("tp-m", m))
                                 .track_focus(&super::focus::choice_item_handle(&min_keys, i, tab_item))
-                                .when_some(min_rings[i].clone(), |el, ring| el.shadow(ring))
+                                .when_some(min_rings[i], |el, outline| el.outline(outline))
                                 .flex()
                                 .items_center()
                                 .justify_center()
@@ -1089,7 +1091,7 @@ impl Render for TimePickerState {
                                 div()
                                     .id(("tp-s", s))
                                     .track_focus(&super::focus::choice_item_handle(&sec_keys, i, tab_item))
-                                    .when_some(sec_rings[i].clone(), |el, ring| el.shadow(ring))
+                                    .when_some(sec_rings[i], |el, outline| el.outline(outline))
                                     .flex()
                                     .items_center()
                                     .justify_center()
@@ -1146,7 +1148,7 @@ impl Render for TimePickerState {
                         div()
                             .id(("tp-ap", usize::from(pm)))
                             .track_focus(&super::focus::choice_item_handle(&ampm_keys, i, Some(usize::from(is_pm))))
-                            .when_some(ampm_rings[i].clone(), |el, ring| el.shadow(ring))
+                            .when_some(ampm_rings[i], |el, outline| el.outline(outline))
                             .flex()
                             .items_center()
                             .justify_center()
@@ -1295,9 +1297,11 @@ impl Render for TimePickerState {
             } else {
                 theme.input_border
             })
-            // Ring for keyboard focus only (`focus` module docs).
-            .when((self.open || focus_visible) && !self.disabled, |el| {
-                el.shadow(focus_ring_shadow(&theme))
+            // Dashed outline for keyboard focus only (`focus` module docs).
+            .when(focus_visible && !self.disabled, |el| {
+                el.when_some(super::focus::focus_outline(&theme), |el, outline| {
+                    el.outline(outline)
+                })
             })
             .bg(if self.disabled {
                 theme.disabled_bg

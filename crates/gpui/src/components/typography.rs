@@ -440,7 +440,7 @@ impl Render for EditableTextState {
         let theme = cx.theme();
         let hover_bg = theme.surface_hover;
         let entity_id = cx.entity_id();
-        let ring = super::focus::focus_visible_ring(&self.focus_handle, window, &theme);
+        let focus_outline = super::focus::focus_visible_outline(&self.focus_handle, window, &theme);
 
         let mut root = if self.editing {
             div()
@@ -501,7 +501,7 @@ impl Render for EditableTextState {
                         }))
                 })
                 .when(self.disabled, |el| el.opacity(0.55).cursor_not_allowed())
-                .when(!self.disabled, |el| el.when_some(ring, |el, ring| el.shadow(ring)))
+                .when(!self.disabled, |el| el.when_some(focus_outline, |el, outline| el.outline(outline)))
                 .flex()
                 .flex_row()
                 .items_center()

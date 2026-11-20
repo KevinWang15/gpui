@@ -17,7 +17,7 @@ use crate::{
 use super::badge::{BadgeColor, badge};
 use super::checkbox::CheckState;
 use super::input::{Input, InputEvent, InputState};
-use super::theme::{ActiveTheme, ComponentSize, focus_ring_shadow};
+use super::theme::{ActiveTheme, ComponentSize};
 
 const TREE_ROW_HEIGHT: f32 = 30.0;
 const TREE_INDENT_STEP: f32 = 18.0;
@@ -1108,7 +1108,11 @@ impl Render for TreeState {
             .on_key_down(cx.listener(Self::on_key_down))
             .w_full()
             .rounded(theme.radius_md)
-            .when(is_focused, |el| el.shadow(focus_ring_shadow(&theme)))
+            .when(is_focused, |el| {
+                el.when_some(super::focus::focus_outline(&theme), |el, outline| {
+                    el.outline(outline)
+                })
+            })
             .child(list_body);
 
         let mut root = div()

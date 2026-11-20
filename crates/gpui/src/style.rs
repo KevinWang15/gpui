@@ -174,6 +174,58 @@ pub struct GridTemplate {
     pub min_size: GridTemplateMinSize,
 }
 
+/// Non-layout-affecting stroke painted around (or inset within) an element's bounds,
+/// analogous to CSS `outline` and `outline-offset`.
+///
+/// Unlike [`BoxShadow`], an outline never fills the element's interior background; unlike
+/// borders, it never affects Taffy layout or overwrites existing borders.
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct OutlineStyle {
+    /// Stroke thickness.
+    pub width: Pixels,
+    /// Stroke color.
+    pub color: Hsla,
+    /// Line style (`BorderStyle::Solid` or `BorderStyle::Dashed`).
+    pub style: BorderStyle,
+    /// Outward offset from the element's bounds (`> 0` draws outside with a gap;
+    /// `< 0` draws inset inside the element for clipped containers).
+    pub offset: Pixels,
+}
+
+impl OutlineStyle {
+    /// Creates a solid outline with `width` and `color` flush with the element's outer edge.
+    pub fn new(width: Pixels, color: impl Into<Hsla>) -> Self {
+        Self {
+            width,
+            color: color.into(),
+            style: BorderStyle::Solid,
+            offset: px(0.),
+        }
+    }
+
+    /// Creates a dashed outline with `width` and `color`.
+    pub fn dashed(width: Pixels, color: impl Into<Hsla>) -> Self {
+        Self {
+            width,
+            color: color.into(),
+            style: BorderStyle::Dashed,
+            offset: px(0.),
+        }
+    }
+
+    /// Sets the outward offset from the element's bounds (negative values draw inset).
+    pub fn offset(mut self, offset: Pixels) -> Self {
+        self.offset = offset;
+        self
+    }
+
+    /// Overrides the stroke [`BorderStyle`].
+    pub fn style(mut self, style: BorderStyle) -> Self {
+        self.style = style;
+        self
+    }
+}
+
 /// The CSS styling that can be applied to an element via the `Styled` trait
 #[derive(Clone, Refineable, Debug)]
 #[refineable(Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -290,6 +342,9 @@ pub struct Style {
 
     /// Box shadow of the element
     pub box_shadow: Vec<BoxShadow>,
+
+    /// Non-layout-affecting outline painted around (or inset within) the element
+    pub outline: Option<OutlineStyle>,
 
     /// The text style of this element
     #[refineable]
@@ -764,6 +819,40 @@ impl Style {
             ));
         }
 
+        if let Some(outline) = self.outline
+            && outline.width > px(0.)
+            && !outline.color.is_transparent()
+        {
+            let expand = outline.offset + outline.width;
+            let outline_w = (bounds.size.width + expand * 2.).max(px(0.));
+            let outline_h = (bounds.size.height + expand * 2.).max(px(0.));
+            if outline_w > px(0.) && outline_h > px(0.) {
+                let outline_bounds = Bounds {
+                    origin: point(bounds.origin.x - expand, bounds.origin.y - expand),
+                    size: size(outline_w, outline_h),
+                };
+                let outline_radii = corner_radii
+                    .map(|r| {
+                        if *r > px(0.) {
+                            (*r + expand).max(px(0.))
+                        } else {
+                            px(0.)
+                        }
+                    })
+                    .clamp_radii_for_quad_size(outline_bounds.size);
+                let mut bg = outline.color;
+                bg.a = 0.;
+                window.paint_quad(quad(
+                    outline_bounds,
+                    outline_radii,
+                    bg,
+                    Edges::all(outline.width),
+                    outline.color,
+                    outline.style,
+                ));
+            }
+        }
+
         #[cfg(debug_assertions)]
         if self.debug_below {
             cx.remove_global::<DebugBelow>();
@@ -815,6 +904,7 @@ impl Default for Style {
             border_style: BorderStyle::default(),
             corner_radii: Corners::default(),
             box_shadow: Default::default(),
+            outline: None,
             text: TextStyleRefinement::default(),
             mouse_cursor: None,
             opacity: None,

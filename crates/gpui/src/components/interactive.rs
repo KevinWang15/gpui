@@ -213,7 +213,7 @@ impl RenderOnce for Rating {
             let current = self.value;
             let allow_clear = self.allow_clear;
 
-            let ring = super::focus::focus_visible_ring(&handles[idx - 1], window, &theme);
+            let focus_outline = super::focus::focus_visible_outline(&handles[idx - 1], window, &theme);
             let star = div()
                 .id(("star", idx))
                 .when(!self.read_only, |el| {
@@ -223,7 +223,7 @@ impl RenderOnce for Rating {
                         tab_item,
                     ))
                 })
-                .when_some(ring, |el, ring| el.shadow(ring))
+                .when_some(focus_outline, |el, outline| el.outline(outline))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -412,8 +412,8 @@ impl RenderOnce for CopyButton {
             let s = state.read(cx);
             (s.copied, s.focus_handle.clone())
         };
-        let ring = (!self.disabled)
-            .then(|| super::focus::focus_visible_ring(&focus_handle, window, &theme))
+        let focus_outline = (!self.disabled)
+            .then(|| super::focus::focus_visible_outline(&focus_handle, window, &theme))
             .flatten();
         let value = self.value;
         let reset_after = self.reset_after;
@@ -551,7 +551,7 @@ impl RenderOnce for CopyButton {
             .text_size(font_size)
             .font_weight(FontWeight::MEDIUM)
             .text_color(active_fg)
-            .when_some(ring, |el, ring| el.shadow(ring))
+            .when_some(focus_outline, |el, outline| el.outline(outline))
             .when(!self.disabled, |el| {
                 el.cursor_pointer()
                     .hover(move |s| s.bg(hover_bg))

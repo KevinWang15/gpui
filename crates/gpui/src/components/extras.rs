@@ -137,8 +137,8 @@ impl RenderOnce for FloatButton {
             cx.focus_handle().tab_stop(true)
         });
         let focus_handle = fh_state.read(cx).clone();
-        let ring = (!self.disabled)
-            .then(|| super::focus::focus_visible_ring(&focus_handle, window, &theme))
+        let focus_outline = (!self.disabled)
+            .then(|| super::focus::focus_visible_outline(&focus_handle, window, &theme))
             .flatten();
 
         let (bg, hover_bg, fg, border_color) = if self.primary {
@@ -179,7 +179,7 @@ impl RenderOnce for FloatButton {
             .border_1()
             .border_color(border_color)
             .when(theme.elevation_shadows, |el| el.shadow_lg())
-            .when_some(ring, |el, ring| el.shadow(ring))
+            .when_some(focus_outline, |el, outline| el.outline(outline))
             .when(!self.disabled, |el| {
                 el.cursor_pointer()
                     .hover(move |s| s.bg(hover_bg))

@@ -275,7 +275,7 @@ impl RenderOnce for Carousel {
         };
         // Clicking the arrows or dots focuses the carousel too; the ring is for
         // keyboard focus only.
-        let ring = super::focus::focus_visible_ring(&focus_handle, window, &theme);
+        let focus_outline = super::focus::focus_visible_outline(&focus_handle, window, &theme);
         let can_prev = slide_count > 1 && (looping || active_idx > 0);
         let can_next = slide_count > 1 && (looping || active_idx + 1 < slide_count);
 
@@ -343,8 +343,8 @@ impl RenderOnce for Carousel {
             .min_h(px(180.))
             .rounded(theme.radius_xl)
             .border_1()
-            .border_color(if ring.is_some() { theme.ring } else { theme.border })
-            .when_some(ring, |el, ring| el.shadow(ring))
+            .border_color(theme.border)
+            .when_some(focus_outline, |el, outline| el.outline(outline))
             .bg(theme.surface)
             .overflow_hidden()
             .child(animated_slide)

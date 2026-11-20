@@ -439,8 +439,9 @@ impl Render for SliderState {
                             .border_color(theme.slider_fill)
                             .when(theme.elevation_shadows, |el| el.shadow_sm())
                             .when(focused && !disabled, |el| {
-                                let ring = super::layout::focus_ring_shadow(&theme, false);
-                                el.when(!ring.is_empty(), |el| el.shadow(ring))
+                                el.when_some(super::focus::focus_outline(&theme), |el, outline| {
+                                    el.outline(outline)
+                                })
                             }),
                     ),
             )
@@ -871,8 +872,9 @@ impl Render for RangeSliderState {
                 .border_color(theme.slider_fill)
                 .when(theme.elevation_shadows, |el| el.shadow_sm())
                 .when(focused && !disabled && is_active, |el| {
-                    let ring = super::layout::focus_ring_shadow(&theme, false);
-                    el.when(!ring.is_empty(), |el| el.shadow(ring))
+                    el.when_some(super::focus::focus_outline(&theme), |el, outline| {
+                        el.outline(outline)
+                    })
                 })
         };
 

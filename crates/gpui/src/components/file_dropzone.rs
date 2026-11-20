@@ -14,7 +14,7 @@ use crate::{
 
 use super::badge::{BadgeColor, badge};
 use super::feedback::ProgressBar;
-use super::theme::{ActiveTheme, ComponentSize, focus_ring_shadow, tabular_numerals};
+use super::theme::{ActiveTheme, ComponentSize, tabular_numerals};
 
 /// Processing / upload status for a [`FileEntry`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -484,9 +484,11 @@ impl Render for FileDropzoneState {
             } else {
                 theme.input_border
             })
-            // Ring for keyboard focus only (`focus` module docs).
+            // Dashed outline for keyboard focus only (`focus` module docs).
             .when(is_focus_visible && !disabled, |el| {
-                el.shadow(focus_ring_shadow(&theme))
+                el.when_some(super::focus::focus_outline(&theme), |el, outline| {
+                    el.outline(outline)
+                })
             })
             .bg(theme.surface_muted.opacity(0.35))
             .when(!disabled, |el| {

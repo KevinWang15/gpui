@@ -13,7 +13,6 @@ use crate::{
 use crate::icons::{Icon, IconSize, LucideIcon};
 
 use super::focus::{is_list_nav_key, list_step};
-use super::layout::focus_ring_shadow;
 use super::theme::{ANIM_FAST, ActiveTheme, ComponentSize};
 
 /// A selectable option inside a [`Select`] control.
@@ -419,9 +418,10 @@ impl<T: Clone + PartialEq + 'static> Render for SelectState<T> {
                 el.cursor_pointer()
                     .when(theme.elevation_shadows, |el| el.shadow_2xs())
             })
-            .when((focus_visible || self.open) && !self.disabled, |el| {
-                let ring = focus_ring_shadow(&theme, self.invalid);
-                el.when(!ring.is_empty(), |el| el.shadow(ring))
+            .when(focus_visible && !self.disabled, |el| {
+                el.when_some(super::focus::focus_outline(&theme), |el, outline| {
+                    el.outline(outline)
+                })
             })
             .when(!focused && !self.open && !self.disabled, |el| {
                 let hover_border = if self.invalid {

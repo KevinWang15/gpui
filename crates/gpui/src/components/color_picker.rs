@@ -20,7 +20,7 @@ use super::input::{Input, InputEvent, InputState};
 use super::interactive::copy_button;
 use super::palette;
 use super::theme::{
-    ANIM_FAST, ActiveTheme, ComponentSize, ThemeMode, focus_ring_shadow, tabular_numerals,
+    ANIM_FAST, ActiveTheme, ComponentSize, ThemeMode, tabular_numerals,
 };
 
 /// Events emitted by [`ColorPickerState`].
@@ -811,9 +811,9 @@ impl ColorPickerState {
             .position(|p| format_hex((*p).into(), true) == current_hex)
             .or(Some(0))
             .filter(|_| !disabled);
-        let preset_rings: Vec<_> = preset_keys
+        let preset_outlines: Vec<_> = preset_keys
             .iter()
-            .map(|h| super::focus::focus_visible_ring(h, window, &theme))
+            .map(|h| super::focus::focus_visible_outline(h, window, &theme))
             .collect();
         let presets_row = (!self.presets.is_empty()).then(|| {
             div()
@@ -830,7 +830,7 @@ impl ColorPickerState {
                     div()
                         .id(("cp-preset", idx))
                         .track_focus(&super::focus::choice_item_handle(&preset_keys, idx, preset_tab))
-                        .when_some(preset_rings[idx].clone(), |el, ring| el.shadow(ring))
+                        .when_some(preset_outlines[idx], |el, outline| el.outline(outline))
                         .w(px(20.))
                         .h(px(20.))
                         .rounded(theme.radius_sm)
@@ -1062,9 +1062,11 @@ impl Render for ColorPickerState {
             } else {
                 theme.input_border
             })
-            // Ring for keyboard focus only (`focus` module docs).
+            // Dashed outline for keyboard focus only (`focus` module docs).
             .when(focus_visible && !self.disabled, |el| {
-                el.shadow(focus_ring_shadow(&theme))
+                el.when_some(super::focus::focus_outline(&theme), |el, outline| {
+                    el.outline(outline)
+                })
             })
             .bg(theme.input_bg)
             .text_size(px(13.))

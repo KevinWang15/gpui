@@ -361,11 +361,11 @@ impl RenderOnce for SegmentedControl {
                 theme.muted_foreground
             };
 
-            let ring = super::focus::focus_visible_ring(&handles[index], window, &theme);
+            let focus_outline = super::focus::focus_visible_outline(&handles[index], window, &theme);
             let mut seg = div()
                 .id(("seg", index))
                 .track_focus(&super::focus::choice_item_handle(&handles, index, tab_item))
-                .when_some(ring, |el, ring| el.shadow(ring))
+                .when_some(focus_outline, |el, outline| el.outline(outline))
                 .relative()
                 .flex()
                 .items_center()

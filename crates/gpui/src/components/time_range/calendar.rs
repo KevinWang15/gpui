@@ -367,11 +367,11 @@ impl RenderOnce for CalendarGrid {
 
                 let day_label = DAY_LABELS[(date.day.clamp(1, 31) - 1) as usize];
                 let handle = &cells[offset as usize];
-                let ring = super::super::focus::focus_visible_ring(handle, window, &theme);
+                let focus_outline = super::super::focus::focus_visible_outline(handle, window, &theme);
                 let cell = div()
                     .id(("day", offset as usize))
                     .track_focus(&handle.clone().tab_stop(date == active && !is_disabled))
-                    .when_some(ring, |el, ring| el.shadow(ring))
+                    .when_some(focus_outline, |el, outline| el.outline(outline))
                     .w(px(34.))
                     .h(px(32.))
                     .flex()

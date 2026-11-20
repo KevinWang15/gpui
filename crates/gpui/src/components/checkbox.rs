@@ -130,9 +130,9 @@ impl RenderOnce for Checkbox {
                 .read(cx)
                 .clone()
         });
-        let ring = focus
+        let focus_outline = focus
             .as_ref()
-            .and_then(|handle| super::focus::focus_visible_ring(handle, window, &theme));
+            .and_then(|handle| super::focus::focus_visible_outline(handle, window, &theme));
         let active = !matches!(self.state, CheckState::Unchecked);
         let off_bg = if self.disabled {
             theme.disabled_bg
@@ -170,7 +170,7 @@ impl RenderOnce for Checkbox {
             .rounded(theme.radius_sm)
             .border_1()
             .when(!active && !self.disabled, |el| el.shadow_2xs())
-            .when_some(ring, |el, ring| el.shadow(ring))
+            .when_some(focus_outline, |el, outline| el.outline(outline))
             .when_some(icon_opt, |el, icon| {
                 el.child(
                     div()

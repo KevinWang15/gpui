@@ -276,10 +276,10 @@ impl RenderOnce for Tabs {
             if item.disabled {
                 tab = tab.opacity(0.45).cursor_not_allowed();
             } else {
-                let ring = super::focus::focus_visible_ring(&handles[index], window, &theme);
+                let focus_outline = super::focus::focus_visible_outline(&handles[index], window, &theme);
                 tab = tab
                     .track_focus(&super::focus::choice_item_handle(&handles, index, tab_item))
-                    .when_some(ring, |el, ring| el.shadow(ring))
+                    .when_some(focus_outline, |el, outline| el.outline(outline))
                     .cursor_pointer().when(!active, |el| {
                     el.hover(|s| match self.variant {
                         TabsVariant::Underline => s.text_color(theme.foreground),

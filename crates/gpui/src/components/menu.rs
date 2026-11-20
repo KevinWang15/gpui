@@ -630,12 +630,12 @@ impl Render for MenuState {
                             top_index += 1;
                             let handle =
                                 super::focus::choice_item_handle(&handles, index, tab_item);
-                            let ring = super::focus::focus_visible_ring(&handle, window, &theme);
+                            let focus_outline = super::focus::focus_visible_outline(&handle, window, &theme);
                             bar = bar.child(
                                 div()
                                     .id((ElementId::from("hmenu-item"), key.clone()))
                                     .when(!*disabled, |el| el.track_focus(&handle))
-                                    .when_some(ring, |el, ring| el.shadow(ring))
+                                    .when_some(focus_outline, |el, outline| el.outline(outline))
                                     .flex()
                                     .flex_row()
                                     .items_center()
@@ -692,7 +692,7 @@ impl Render for MenuState {
                             top_index += 1;
                             let handle =
                                 super::focus::choice_item_handle(&handles, index, tab_item);
-                            let ring = super::focus::focus_visible_ring(&handle, window, &theme);
+                            let focus_outline = super::focus::focus_visible_outline(&handle, window, &theme);
                             let trigger_click = handle.clone();
                             let trigger_down = handle.clone();
                             let trigger_tab = handle.clone();
@@ -829,7 +829,7 @@ impl Render for MenuState {
                                                     },
                                                 )
                                             })
-                                            .when_some(ring, |el, ring| el.shadow(ring))
+                                            .when_some(focus_outline, |el, outline| el.outline(outline))
                                             .relative()
                                             .flex()
                                             .flex_row()

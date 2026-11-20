@@ -13,7 +13,7 @@ use crate::{
     deferred, div, ease_out_quint, point, prelude::*, px,
 };
 
-use super::theme::{ANIM_FAST, ActiveTheme, ComponentSize, focus_ring_shadow};
+use super::theme::{ANIM_FAST, ActiveTheme, ComponentSize};
 use super::tree::{Tree, TreeEvent, TreeNode, TreeState};
 
 // ============================================================================
@@ -364,9 +364,11 @@ impl Render for TreeSelectState {
             } else {
                 theme.input_border
             })
-            // Ring for keyboard focus only (`focus` module docs).
-            .when((self.open || focus_visible) && !self.disabled, |el| {
-                el.shadow(focus_ring_shadow(&theme))
+            // Dashed outline for keyboard focus only (`focus` module docs).
+            .when(focus_visible && !self.disabled, |el| {
+                el.when_some(super::focus::focus_outline(&theme), |el, outline| {
+                    el.outline(outline)
+                })
             })
             .bg(if self.disabled {
                 theme.disabled_bg
@@ -953,9 +955,11 @@ impl Render for CascaderState {
             } else {
                 theme.input_border
             })
-            // Ring for keyboard focus only (`focus` module docs).
-            .when((self.open || focus_visible) && !self.disabled, |el| {
-                el.shadow(focus_ring_shadow(&theme))
+            // Dashed outline for keyboard focus only (`focus` module docs).
+            .when(focus_visible && !self.disabled, |el| {
+                el.when_some(super::focus::focus_outline(&theme), |el, outline| {
+                    el.outline(outline)
+                })
             })
             .bg(if self.disabled {
                 theme.disabled_bg
