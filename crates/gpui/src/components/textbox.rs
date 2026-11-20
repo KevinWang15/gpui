@@ -142,9 +142,13 @@ pub struct TextBoxState {
     last_line_height: Pixels,
     scroll_x: Pixels,
     scroll_y: Pixels,
+    /// Last `(cursor_offset, content.len())` for which scroll auto-followed the caret,
+    /// allowing manual mouse-wheel and scrollbar dragging without snapping back.
+    last_cursor_scroll_sync: Option<(usize, usize)>,
     /// The scroll position and its largest value, for the window's scroll
     /// routing (`custom_scroll`), which asks between frames.
     scroll_extent: std::rc::Rc<std::cell::Cell<(Pixels, Pixels)>>,
+    scrollbar_state: std::rc::Rc<std::cell::RefCell<crate::OverlayScrollbarState>>,
     is_selecting: bool,
     rows: usize,
     disabled: bool,
@@ -183,7 +187,11 @@ impl TextBoxState {
             last_line_height: px(20.),
             scroll_x: px(0.),
             scroll_y: px(0.),
+            last_cursor_scroll_sync: None,
             scroll_extent: Default::default(),
+            scrollbar_state: std::rc::Rc::new(std::cell::RefCell::new(
+                crate::OverlayScrollbarState::default(),
+            )),
             is_selecting: false,
             rows: 4,
             disabled: false,
@@ -740,7 +748,7 @@ impl TextBoxState {
     fn on_scroll_wheel(
         &mut self,
         event: &ScrollEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let delta = event.delta.pixel_delta(self.last_line_height);
@@ -750,8 +758,19 @@ impl TextBoxState {
             .map(|b| b.size.height)
             .unwrap_or(self.last_line_height * self.rows as f32);
         let max_scroll = (content_height - view_height).max(px(0.));
+        let old_scroll_y = self.scroll_y;
         self.scroll_y = (self.scroll_y - delta.y).clamp(px(0.), max_scroll);
         self.scroll_extent.set((self.scroll_y, max_scroll));
+        if self.scroll_y != old_scroll_y {
+            crate::OverlayScrollbarState::note_scroll(
+                &self.scrollbar_state,
+                true,
+                false,
+                cx.entity_id(),
+                window,
+                cx,
+            );
+        }
         cx.notify();
     }
 }
@@ -966,6 +985,10 @@ struct MultiLinePrepaint {
     line_height: Pixels,
     scroll_x: Pixels,
     scroll_y: Pixels,
+    max_scroll_y: Pixels,
+    cursor_scroll_sync: (usize, usize),
+    container_hitbox: crate::Hitbox,
+    scrollbar_prepaint: Option<Box<crate::OverlayScrollbarPrepaint>>,
 }
 
 impl Element for MultiLineTextElement {
@@ -1097,11 +1120,18 @@ impl Element for MultiLineTextElement {
 
         let cursor_line = state.line_index_for_offset(cursor_offset);
         let cursor_top_abs = line_height * cursor_line as f32;
-        if cursor_top_abs - scroll_y + line_height > bounds.size.height {
-            scroll_y = (cursor_top_abs + line_height - bounds.size.height).max(px(0.));
-        } else if cursor_top_abs < scroll_y {
-            scroll_y = cursor_top_abs.max(px(0.));
+        let content_height = line_height * lines.len() as f32;
+        let max_scroll_y = (content_height - bounds.size.height).max(px(0.));
+        let cursor_scroll_sync = (cursor_offset, state.content.len());
+        let follow_cursor = state.last_cursor_scroll_sync != Some(cursor_scroll_sync);
+        if follow_cursor {
+            if cursor_top_abs - scroll_y + line_height > bounds.size.height {
+                scroll_y = (cursor_top_abs + line_height - bounds.size.height).max(px(0.));
+            } else if cursor_top_abs < scroll_y {
+                scroll_y = cursor_top_abs.max(px(0.));
+            }
         }
+        scroll_y = scroll_y.clamp(px(0.), max_scroll_y);
 
         let visible_width = bounds.size.width.max(px(1.));
         let max_line_width = lines
@@ -1171,6 +1201,17 @@ impl Element for MultiLineTextElement {
             }
         }
 
+        let container_hitbox = window.insert_hitbox(bounds, crate::HitboxBehavior::Normal);
+        let scrollbar_prepaint = crate::prepaint_overlay_scrollbars(
+            bounds,
+            crate::Edges::default(),
+            point(crate::Overflow::Visible, crate::Overflow::Scroll),
+            point(px(0.), max_scroll_y),
+            crate::ScrollbarVisibility::Auto,
+            window,
+            cx,
+        );
+
         MultiLinePrepaint {
             lines,
             placeholder_line,
@@ -1179,6 +1220,10 @@ impl Element for MultiLineTextElement {
             line_height,
             scroll_x,
             scroll_y,
+            max_scroll_y,
+            cursor_scroll_sync,
+            container_hitbox,
+            scrollbar_prepaint,
         }
     }
 
@@ -1192,12 +1237,14 @@ impl Element for MultiLineTextElement {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let (focus_handle, disabled, cursor_visible) = {
+        let (focus_handle, disabled, cursor_visible, scrollbar_state, scroll_extent) = {
             let state = self.state.read(cx);
             (
                 state.focus_handle.clone(),
                 state.disabled,
                 state.blink.is_visible(),
+                state.scrollbar_state.clone(),
+                state.scroll_extent.clone(),
             )
         };
         let focused = !disabled && focus_handle.is_focused(window);
@@ -1251,12 +1298,60 @@ impl Element for MultiLineTextElement {
         let line_height = prepaint.line_height;
         let scroll_x = prepaint.scroll_x;
         let scroll_y = prepaint.scroll_y;
+        let max_scroll_y = prepaint.max_scroll_y;
+        let cursor_scroll_sync = prepaint.cursor_scroll_sync;
         self.state.update(cx, |state, _cx| {
             state.last_lines = lines;
             state.last_bounds = Some(bounds);
             state.last_line_height = line_height;
             state.scroll_x = scroll_x;
             state.scroll_y = scroll_y;
+            state.last_cursor_scroll_sync = Some(cursor_scroll_sync);
+            state.scroll_extent.set((scroll_y, max_scroll_y));
+        });
+
+        if let Some(scrollbar_prepaint) = prepaint.scrollbar_prepaint.as_ref() {
+            let controller = TextBoxScrollbarController {
+                state: self.state.clone(),
+                scroll_extent,
+            };
+            crate::paint_overlay_scrollbars(
+                scrollbar_prepaint,
+                &prepaint.container_hitbox,
+                crate::ScrollbarVisibility::Auto,
+                None,
+                scrollbar_state,
+                controller,
+                window,
+                cx,
+            );
+        }
+    }
+}
+
+#[derive(Clone)]
+struct TextBoxScrollbarController {
+    state: Entity<TextBoxState>,
+    scroll_extent: std::rc::Rc<std::cell::Cell<(Pixels, Pixels)>>,
+}
+
+impl crate::ScrollbarController for TextBoxScrollbarController {
+    fn offset(&self) -> Point<Pixels> {
+        let (y, _) = self.scroll_extent.get();
+        point(px(0.), -y)
+    }
+
+    fn max_offset(&self) -> Point<Pixels> {
+        let (_, max) = self.scroll_extent.get();
+        point(px(0.), max)
+    }
+
+    fn set_offset(&self, offset: Point<Pixels>, _window: &mut Window, cx: &mut App) {
+        self.state.update(cx, |state, cx| {
+            let (_, max) = state.scroll_extent.get();
+            state.scroll_y = (-offset.y).clamp(px(0.), max);
+            state.scroll_extent.set((state.scroll_y, max));
+            cx.notify();
         });
     }
 }

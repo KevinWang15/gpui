@@ -66,6 +66,33 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Controls overlay scrollbar visibility on scrollable elements (`Overflow::Scroll`).
+    ///
+    /// Defaults to [`ScrollbarVisibility::Auto`] (slim overlay scrollbar hidden by default,
+    /// revealing at 50% opacity when cursor approaches and 80% on direct hover/drag).
+    fn scrollbar_visibility(mut self, visibility: crate::ScrollbarVisibility) -> Self {
+        self.style().scrollbar_visibility = Some(visibility);
+        self
+    }
+
+    /// Hides the built-in overlay scrollbar on this scrollable element.
+    fn hide_scrollbar(mut self) -> Self {
+        self.style().scrollbar_visibility = Some(crate::ScrollbarVisibility::Hidden);
+        self
+    }
+
+    /// Keeps the slim overlay scrollbar always visible whenever this element's content overflows.
+    fn show_scrollbar_always(mut self) -> Self {
+        self.style().scrollbar_visibility = Some(crate::ScrollbarVisibility::Always);
+        self
+    }
+
+    /// Overrides the overlay scrollbar thumb base color for this element.
+    fn scrollbar_color(mut self, color: impl Into<Hsla>) -> Self {
+        self.style().scrollbar_color = Some(color.into());
+        self
+    }
+
     /// Sets the whitespace of the element to `normal`.
     fn whitespace_normal(mut self) -> Self {
         self.text_style().white_space = Some(WhiteSpace::Normal);

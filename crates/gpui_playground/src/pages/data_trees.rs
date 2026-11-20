@@ -249,6 +249,7 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
                                     .flex_row()
                                     .items_center()
                                     .justify_between()
+                                    .gap(px(8.))
                                     .h(px(34.))
                                     .px(px(12.))
                                     .border_b_1()
@@ -257,15 +258,22 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
                                     .child(
                                         h_stack()
                                             .spacing(px(8.))
+                                            .flex_1()
+                                            .min_w_0()
                                             .child(
                                                 Icon::new(LucideIcon::Terminal)
                                                     .size(IconSize::Xs)
                                                     .color(theme.primary),
                                             )
-                                            .child(format!("Virtual log entry #{:04}", idx + 1)),
+                                            .child(
+                                                div()
+                                                    .truncate()
+                                                    .child(format!("Virtual log entry #{:04}", idx + 1)),
+                                            ),
                                     )
                                     .child(
                                         div()
+                                            .flex_shrink_0()
                                             .font_features(tabular_numerals())
                                             .text_color(theme.muted_foreground)
                                             .child(format!("shard-{}", idx % 16)),

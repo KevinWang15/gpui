@@ -242,6 +242,10 @@ pub struct Style {
     pub overflow: Point<Overflow>,
     /// How much space (in points) should be reserved for the scrollbars of `Overflow::Scroll` and `Overflow::Auto` nodes.
     pub scrollbar_width: AbsoluteLength,
+    /// Controls overlay scrollbar visibility on scrollable elements (`Overflow::Scroll`).
+    pub scrollbar_visibility: crate::ScrollbarVisibility,
+    /// Optional override for the overlay scrollbar thumb base color (alpha is animated by state).
+    pub scrollbar_color: Option<Hsla>,
     /// Whether both x and y axis should be scrollable at the same time.
     pub allow_concurrent_scroll: bool,
     /// Whether scrolling should be restricted to the input gesture's axis.
@@ -878,6 +882,8 @@ impl Default for Style {
             allow_concurrent_scroll: false,
             restrict_scroll_to_axis: false,
             scrollbar_width: AbsoluteLength::default(),
+            scrollbar_visibility: crate::ScrollbarVisibility::Auto,
+            scrollbar_color: None,
             position: Position::Relative,
             inset: Edges::auto(),
             margin: Edges::<Length>::zero(),

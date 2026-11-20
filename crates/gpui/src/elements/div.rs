@@ -2313,6 +2313,7 @@ pub struct Interactivity {
     /// A scroll container that scrolls itself: its key and `can_scroll`.
     pub(crate) custom_scroll: Option<(usize, Rc<dyn Fn(Point<Pixels>) -> bool>)>,
     pub(crate) ongoing_scroll: Option<Rc<RefCell<OngoingScroll>>>,
+    pub(crate) scrollbar_prepaint: Option<Box<crate::OverlayScrollbarPrepaint>>,
     pub(crate) group: Option<SharedString>,
     /// The base style of the element, before any modifications are applied
     /// by focus, active, etc.
@@ -2609,6 +2610,23 @@ impl Interactivity {
                                     _ => f(&style, scroll_offset, hitbox, window, cx),
                                 }
                             });
+                            self.scrollbar_prepaint = if self.scroll_offset.is_some()
+                                && style.display != Display::None
+                                && style.visibility != Visibility::Hidden
+                            {
+                                let border = style.border_widths.to_pixels(window.rem_size());
+                                crate::prepaint_overlay_scrollbars(
+                                    bounds,
+                                    border,
+                                    style.overflow,
+                                    scroll_max,
+                                    style.scrollbar_visibility,
+                                    window,
+                                    cx,
+                                )
+                            } else {
+                                None
+                            };
                             (result, element_state)
                         },
                     )
@@ -2774,6 +2792,28 @@ impl Interactivity {
                                         if let Some(focus_handle) = &self.tracked_focus_handle {
                                             window.next_frame.tab_stops.insert(focus_handle);
                                         }
+                                        let scrollbar_state = if self.scrollbar_prepaint.is_some() {
+                                            if let Some(element_state) = element_state.as_mut() {
+                                                Some(
+                                                    element_state
+                                                        .scrollbar_state
+                                                        .get_or_insert_with(Default::default)
+                                                        .clone(),
+                                                )
+                                            } else {
+                                                self.tracked_scroll_handle.as_ref().map(|handle| {
+                                                    handle.0.borrow().scrollbar_state.clone()
+                                                })
+                                            }
+                                        } else {
+                                            None
+                                        };
+                                        let scrollbar_max = self
+                                            .scrollbar_prepaint
+                                            .as_ref()
+                                            .map(|sp| sp.max_offset)
+                                            .unwrap_or_default();
+
                                         if let Some(hitbox) = hitbox {
                                             #[cfg(debug_assertions)]
                                             self.paint_debug_info(
@@ -2807,7 +2847,14 @@ impl Interactivity {
                                                 window,
                                                 cx,
                                             );
-                                            self.paint_scroll_listener(hitbox, &style, window, cx);
+                                            self.paint_scroll_listener(
+                                                hitbox,
+                                                &style,
+                                                scrollbar_state.clone(),
+                                                scrollbar_max,
+                                                window,
+                                                cx,
+                                            );
                                         }
 
                                         self.paint_keyboard_listeners(window, cx);
@@ -2828,6 +2875,34 @@ impl Interactivity {
                                         }
 
                                         f(&style, window, cx);
+
+                                        if let (
+                                            Some(hitbox),
+                                            Some(scrollbar_prepaint),
+                                            Some(scroll_offset),
+                                            Some(scrollbar_state),
+                                        ) = (
+                                            hitbox,
+                                            self.scrollbar_prepaint.as_ref(),
+                                            self.scroll_offset.clone(),
+                                            scrollbar_state,
+                                        ) {
+                                            let controller = DivScrollbarController {
+                                                scroll_offset,
+                                                max_offset: scrollbar_prepaint.max_offset,
+                                                current_view: window.current_view(),
+                                            };
+                                            crate::paint_overlay_scrollbars(
+                                                scrollbar_prepaint,
+                                                hitbox,
+                                                style.scrollbar_visibility,
+                                                style.scrollbar_color,
+                                                scrollbar_state,
+                                                controller,
+                                                window,
+                                                cx,
+                                            );
+                                        }
 
                                         if let Some(_hitbox) = hitbox {
                                             #[cfg(any(feature = "inspector", debug_assertions))]
@@ -3584,6 +3659,8 @@ impl Interactivity {
         &self,
         hitbox: &Hitbox,
         style: &Style,
+        scrollbar_state: Option<Rc<RefCell<crate::OverlayScrollbarState>>>,
+        scroll_max: Point<Pixels>,
         window: &mut Window,
         _cx: &mut App,
     ) {
@@ -3612,9 +3689,30 @@ impl Interactivity {
 
                     let Point { x: delta_x, y: delta_y } =
                         scroll_axes_delta(delta, overflow, restrict_scroll_to_axis, allow_concurrent_scroll);
+                    let old_clamped = point(
+                        old_scroll_offset.x.clamp(-scroll_max.x, px(0.)),
+                        old_scroll_offset.y.clamp(-scroll_max.y, px(0.)),
+                    );
                     scroll_offset.y += delta_y;
                     scroll_offset.x += delta_x;
                     if *scroll_offset != old_scroll_offset {
+                        let new_clamped = point(
+                            scroll_offset.x.clamp(-scroll_max.x, px(0.)),
+                            scroll_offset.y.clamp(-scroll_max.y, px(0.)),
+                        );
+                        let v_moved = new_clamped.y != old_clamped.y;
+                        let h_moved = new_clamped.x != old_clamped.x;
+                        drop(scroll_offset);
+                        if let Some(scrollbar_state) = &scrollbar_state {
+                            crate::OverlayScrollbarState::note_scroll(
+                                scrollbar_state,
+                                v_moved,
+                                h_moved,
+                                current_view,
+                                window,
+                                cx,
+                            );
+                        }
                         cx.notify(current_view);
                     }
                 }
@@ -3857,6 +3955,7 @@ pub struct InteractiveElementState {
     pub(crate) pending_keyboard_down: Option<Rc<RefCell<Option<u64>>>>,
     pub(crate) scroll_offset: Option<Rc<RefCell<Point<Pixels>>>>,
     ongoing_scroll: Option<Rc<RefCell<OngoingScroll>>>,
+    pub(crate) scrollbar_state: Option<Rc<RefCell<crate::OverlayScrollbarState>>>,
     pub(crate) active_tooltip: Option<Rc<RefCell<Option<ActiveTooltip>>>>,
     long_press_tooltip_active: Option<Rc<Cell<bool>>>,
 }
@@ -4441,10 +4540,36 @@ impl ScrollAnchor {
     }
 }
 
+#[derive(Clone)]
+struct DivScrollbarController {
+    scroll_offset: Rc<RefCell<Point<Pixels>>>,
+    max_offset: Point<Pixels>,
+    current_view: EntityId,
+}
+
+impl crate::ScrollbarController for DivScrollbarController {
+    fn offset(&self) -> Point<Pixels> {
+        *self.scroll_offset.borrow()
+    }
+
+    fn max_offset(&self) -> Point<Pixels> {
+        self.max_offset
+    }
+
+    fn set_offset(&self, offset: Point<Pixels>, _window: &mut Window, cx: &mut App) {
+        *self.scroll_offset.borrow_mut() = point(
+            offset.x.clamp(-self.max_offset.x, px(0.)),
+            offset.y.clamp(-self.max_offset.y, px(0.)),
+        );
+        cx.notify(self.current_view);
+    }
+}
+
 #[derive(Default, Debug)]
 struct ScrollHandleState {
     offset: Rc<RefCell<Point<Pixels>>>,
     ongoing_scroll: Rc<RefCell<OngoingScroll>>,
+    scrollbar_state: Rc<RefCell<crate::OverlayScrollbarState>>,
     bounds: Bounds<Pixels>,
     max_offset: Point<Pixels>,
     child_bounds: Vec<Bounds<Pixels>>,

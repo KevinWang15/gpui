@@ -73,6 +73,7 @@ struct StateInner {
     measuring_behavior: ListMeasuringBehavior,
     item_measurement_ready: Option<Box<dyn Fn(usize, &App) -> bool>>,
     follow_state: FollowState,
+    scrollbar_state: Rc<RefCell<crate::OverlayScrollbarState>>,
 }
 
 #[derive(Clone, Copy)]
@@ -225,6 +226,9 @@ struct ItemLayout {
 pub struct ListPrepaintState {
     hitbox: Hitbox,
     layout: LayoutItemsResponse,
+    scrollbar_prepaint: Option<Box<crate::OverlayScrollbarPrepaint>>,
+    scrollbar_visibility: crate::ScrollbarVisibility,
+    scrollbar_color: Option<crate::Hsla>,
 }
 
 #[derive(Clone)]
@@ -325,6 +329,7 @@ impl ListState {
             measuring_behavior: ListMeasuringBehavior::default(),
             item_measurement_ready: None,
             follow_state: FollowState::default(),
+            scrollbar_state: Rc::new(RefCell::new(crate::OverlayScrollbarState::default())),
         })));
         state.splice(0..0, item_count);
         state
@@ -1571,9 +1576,17 @@ impl Element for List {
         if last_item_width
             .is_none_or(|width| width != bounds.size.width - padding.along(Axis::Horizontal))
         {
+            let first_layout = last_item_width.is_none();
             let new_items = SumTree::from_iter(
                 state.items.iter().map(|item| ListItem::Unmeasured {
-                    size_hint: None,
+                    size_hint: if first_layout {
+                        match item {
+                            ListItem::Unmeasured { size_hint, .. } => *size_hint,
+                            ListItem::Measured { .. } => None,
+                        }
+                    } else {
+                        None
+                    },
                     focus_handle: item.focus_handle(),
                 }),
                 (),
@@ -1634,7 +1647,28 @@ impl Element for List {
                 || layout.item_layouts.back().is_some_and(|last| last.index + 1 >= count) && shown <= room + px(0.5);
             extent.set((up, !at_end));
         }
-        ListPrepaintState { hitbox, layout }
+
+        let max_scroll_y = state.max_scroll_offset();
+        let border = style.border_widths.to_pixels(window.rem_size());
+        let scrollbar_prepaint = window.with_content_mask(Some(ContentMask { bounds }), |window| {
+            crate::prepaint_overlay_scrollbars(
+                bounds,
+                border,
+                point(Overflow::Visible, Overflow::Scroll),
+                point(px(0.), max_scroll_y),
+                style.scrollbar_visibility,
+                window,
+                cx,
+            )
+        });
+
+        ListPrepaintState {
+            hitbox,
+            layout,
+            scrollbar_prepaint,
+            scrollbar_visibility: style.scrollbar_visibility,
+            scrollbar_color: style.scrollbar_color,
+        }
     }
 
     fn paint(
@@ -1648,6 +1682,7 @@ impl Element for List {
         cx: &mut App,
     ) {
         let current_view = window.current_view();
+        let scrollbar_state = self.state.0.borrow().scrollbar_state.clone();
 
         // Register the scroll listener before painting children so that, in
         // the bubble phase (which runs in reverse registration order),
@@ -1659,18 +1694,32 @@ impl Element for List {
         let scroll_top = prepaint.layout.scroll_top;
         let hitbox_id = prepaint.hitbox.id;
         let mut accumulated_scroll_delta = ScrollDelta::default();
-        window.on_mouse_event(move |event: &ScrollEvent, phase, window, cx| {
-            if phase == DispatchPhase::Bubble && hitbox_id.is_scroll_target(window) {
-                accumulated_scroll_delta = accumulated_scroll_delta.coalesce(event.delta);
-                let pixel_delta = accumulated_scroll_delta.pixel_delta(px(20.));
-                list_state.0.borrow_mut().scroll(
-                    &scroll_top,
-                    height,
-                    pixel_delta,
-                    current_view,
-                    window,
-                    cx,
-                )
+        window.on_mouse_event({
+            let scrollbar_state = scrollbar_state.clone();
+            move |event: &ScrollEvent, phase, window, cx| {
+                if phase == DispatchPhase::Bubble && hitbox_id.is_scroll_target(window) {
+                    accumulated_scroll_delta = accumulated_scroll_delta.coalesce(event.delta);
+                    let pixel_delta = accumulated_scroll_delta.pixel_delta(px(20.));
+                    let before_top = list_state.logical_scroll_top();
+                    list_state.0.borrow_mut().scroll(
+                        &scroll_top,
+                        height,
+                        pixel_delta,
+                        current_view,
+                        window,
+                        cx,
+                    );
+                    if list_state.logical_scroll_top() != before_top {
+                        crate::OverlayScrollbarState::note_scroll(
+                            &scrollbar_state,
+                            true,
+                            false,
+                            current_view,
+                            window,
+                            cx,
+                        );
+                    }
+                }
             }
         });
 
@@ -1678,7 +1727,53 @@ impl Element for List {
             for item in &mut prepaint.layout.item_layouts {
                 item.element.paint(window, cx);
             }
+
+            if let Some(scrollbar_prepaint) = prepaint.scrollbar_prepaint.as_ref() {
+                let controller = ListScrollbarController {
+                    list_state: self.state.clone(),
+                    current_view,
+                };
+                crate::paint_overlay_scrollbars(
+                    scrollbar_prepaint,
+                    &prepaint.hitbox,
+                    prepaint.scrollbar_visibility,
+                    prepaint.scrollbar_color,
+                    scrollbar_state,
+                    controller,
+                    window,
+                    cx,
+                );
+            }
         });
+    }
+}
+
+#[derive(Clone)]
+struct ListScrollbarController {
+    list_state: ListState,
+    current_view: EntityId,
+}
+
+impl crate::ScrollbarController for ListScrollbarController {
+    fn offset(&self) -> Point<Pixels> {
+        self.list_state.scroll_px_offset_for_scrollbar()
+    }
+
+    fn max_offset(&self) -> Point<Pixels> {
+        self.list_state.max_offset_for_scrollbar()
+    }
+
+    fn set_offset(&self, offset: Point<Pixels>, _window: &mut Window, cx: &mut App) {
+        self.list_state.set_offset_from_scrollbar(offset);
+        cx.notify(self.current_view);
+    }
+
+    fn drag_started(&self) {
+        self.list_state.scrollbar_drag_started();
+    }
+
+    fn drag_ended(&self) {
+        self.list_state.scrollbar_drag_ended();
     }
 }
 
