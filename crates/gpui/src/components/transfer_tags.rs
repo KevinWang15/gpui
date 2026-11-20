@@ -788,6 +788,7 @@ impl TagInputState {
             InputState::new(cx)
                 .placeholder("Type tag and press Enter...")
                 .size(ComponentSize::Sm)
+                .content_px(px(2.))
         });
         cx.subscribe(&input, |this, inp, ev: &InputEvent, cx| match ev {
             InputEvent::Submit(text) => {

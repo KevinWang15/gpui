@@ -1333,7 +1333,7 @@ mod tests {
 
     use super::*;
     use crate::components::button::button;
-    use crate::components::combobox::{ComboBoxOption, ComboBoxState, combo_box};
+    use crate::components::combobox::{ComboBoxEvent, ComboBoxOption, ComboBoxState, combo_box};
     use crate::components::input::{Input, InputEvent, InputState, input};
     use crate::components::keyboard_tests::keys;
     use crate::components::layout::v_stack;
@@ -1957,5 +1957,115 @@ mod tests {
         // ComboBox: Tab -> Down opens at 0 -> PageDown jumps to 6 -> PageUp back to 0 -> PageDown -> Enter selects 6.
         keys(cx, "tab down pagedown pageup pagedown enter");
         assert_eq!(cmb.read_with(cx, |c, _| c.selected_value().copied()), Some(6));
+    }
+
+    #[crate::test]
+    fn combobox_types_inline_in_original_box_for_single_and_multi_select(cx: &mut TestAppContext) {
+        cx.update(init_components);
+
+        let created = Rc::new(RefCell::new(Vec::<SharedString>::new()));
+        let created_ref = created.clone();
+
+        struct ComboHost {
+            single: Entity<ComboBoxState<&'static str>>,
+            multi: Entity<ComboBoxState<String>>,
+        }
+
+        impl Render for ComboHost {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                v_stack()
+                    .w(px(360.))
+                    .child(combo_box(&self.single))
+                    .child(combo_box(&self.multi))
+            }
+        }
+
+        let (view, cx) = cx.add_window_view(move |_, cx| {
+            let single = cx.new(|cx| {
+                ComboBoxState::new(
+                    vec![
+                        ComboBoxOption::new("gpui", "GPUI").keywords(["zed", "ui"]),
+                        ComboBoxOption::new("wgpu", "wgpu").keywords(["vulkan", "metal"]),
+                        ComboBoxOption::new("taffy", "Taffy").keywords(["flexbox", "css"]),
+                    ],
+                    cx,
+                )
+                .default_values(vec!["gpui"])
+            });
+            let multi = cx.new(|cx| {
+                ComboBoxState::new(
+                    vec![
+                        ComboBoxOption::new("rust".to_string(), "Rust"),
+                        ComboBoxOption::new("taffy".to_string(), "Taffy"),
+                        ComboBoxOption::new("dark".to_string(), "Dark Mode"),
+                    ],
+                    cx,
+                )
+                .multiple(true)
+                .allow_custom(true)
+                .default_values(vec!["rust".to_string()])
+            });
+            let log = created_ref.clone();
+            cx.subscribe(&multi, move |_, _, ev: &ComboBoxEvent<String>, _| {
+                if let ComboBoxEvent::Create(label) = ev {
+                    log.borrow_mut().push(label.clone());
+                }
+            })
+            .detach();
+            ComboHost { single, multi }
+        });
+        cx.run_until_parked();
+
+        let (single, multi) = view.read_with(cx, |h, _| (h.single.clone(), h.multi.clone()));
+
+        // Tabbing onto single-select focuses its inline input directly; typing opens & filters live!
+        keys(cx, "tab");
+        assert!(focused(cx, &single));
+        cx.simulate_input("vulkan");
+        cx.run_until_parked();
+        assert!(single.read_with(cx, |c, _| c.is_open()));
+        assert_eq!(single.read_with(cx, |c, cx| c.query(cx).to_owned()), "vulkan");
+        // Escape closes, clears the inline filter, keeps previous selection & focus.
+        keys(cx, "escape");
+        assert!(!single.read_with(cx, |c, _| c.is_open()));
+        assert_eq!(single.read_with(cx, |c, _| c.selected_value().copied()), Some("gpui"));
+        assert_eq!(single.read_with(cx, |c, cx| c.query(cx).to_owned()), "");
+        assert!(focused(cx, &single));
+
+        // Typing "css" + Enter selects "taffy" directly from inline typing.
+        cx.simulate_input("css");
+        cx.run_until_parked();
+        keys(cx, "enter");
+        assert_eq!(single.read_with(cx, |c, _| c.selected_value().copied()), Some("taffy"));
+        assert!(!single.read_with(cx, |c, _| c.is_open()));
+
+        // Tab moves cleanly to multi-select inline input.
+        keys(cx, "tab");
+        assert!(focused(cx, &multi));
+        cx.simulate_input("da");
+        cx.run_until_parked();
+        assert!(multi.read_with(cx, |c, _| c.is_open()));
+        // Enter selects "Dark Mode", clears inline query, keeps popover open.
+        keys(cx, "enter");
+        assert_eq!(
+            multi.read_with(cx, |c, _| c.selected_values().to_vec()),
+            vec!["rust".to_string(), "dark".to_string()]
+        );
+        assert_eq!(multi.read_with(cx, |c, cx| c.query(cx).to_owned()), "");
+        assert!(multi.read_with(cx, |c, _| c.is_open()));
+
+        // Backspace on empty inline query pops the last chip ("dark").
+        keys(cx, "backspace");
+        assert_eq!(
+            multi.read_with(cx, |c, _| c.selected_values().to_vec()),
+            vec!["rust".to_string()]
+        );
+
+        // Typing unmatched text + Enter emits ComboBoxEvent::Create.
+        cx.simulate_input("wayland");
+        cx.run_until_parked();
+        keys(cx, "enter");
+        assert_eq!(*created.borrow(), vec![SharedString::from("wayland")]);
+        assert!(!multi.read_with(cx, |c, _| c.is_open()));
     }
 }

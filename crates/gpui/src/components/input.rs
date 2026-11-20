@@ -171,6 +171,7 @@ pub struct InputState {
     redo_stack: Vec<UndoEntry>,
     was_focused: bool,
     tab_stop: bool,
+    content_px: Option<Pixels>,
     blink: CursorBlink,
     completions: Option<CompletionController>,
     pending_completion_config: Option<Box<CompletionConfig>>,
@@ -213,6 +214,7 @@ impl InputState {
             redo_stack: Vec::new(),
             was_focused: false,
             tab_stop: true,
+            content_px: None,
             blink: CursorBlink::new(),
             completions: None,
             pending_completion_config: None,
@@ -234,8 +236,17 @@ impl InputState {
 
     /// Leaves the input out of the tab order, for a composite control whose
     /// tab stop is another handle (see the `focus` module docs).
+    #[allow(dead_code)]
     pub(crate) fn tab_stop(mut self, tab_stop: bool) -> Self {
         self.tab_stop = tab_stop;
+        self
+    }
+
+    /// Overrides the inner horizontal padding for borderless inputs embedded
+    /// inside composite controls like [`super::combobox::ComboBox`] and
+    /// [`super::transfer_tags::TagInput`].
+    pub(crate) fn content_px(mut self, px_x: Pixels) -> Self {
+        self.content_px = Some(px_x);
         self
     }
 
@@ -583,6 +594,22 @@ impl InputState {
     ) {
         self.placeholder = placeholder.into();
         cx.notify();
+    }
+
+    pub(crate) fn placeholder_text(&self) -> &SharedString {
+        &self.placeholder
+    }
+
+    pub(crate) fn set_placeholder_silent(&mut self, placeholder: impl Into<SharedString>) {
+        self.placeholder = placeholder.into();
+    }
+
+    pub(crate) fn size_value(&self) -> ComponentSize {
+        self.size
+    }
+
+    pub(crate) fn set_size_silent(&mut self, size: ComponentSize) {
+        self.size = size;
     }
 
     fn is_effectively_masked(&self) -> bool {
@@ -1698,7 +1725,7 @@ impl Render for InputState {
             .flex_1()
             .min_w_0()
             .h_full()
-            .px(self.size.px_x())
+            .px(self.content_px.unwrap_or_else(|| self.size.px_x()))
             .gap(px(8.))
             .key_context("GpuiInput")
             // One tab stop, unless disabled or a composite owns the stop.

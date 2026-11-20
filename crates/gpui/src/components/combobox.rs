@@ -1,20 +1,22 @@
 //! Searchable [`ComboBox`] / [`ComboBoxState`] supporting both single-select
-//! and multi-select (with removable tag chips), live filtering, keyboard navigation, and optional
-//! custom-entry creation.
+//! and multi-select (with removable tag chips), inline typing directly inside the main input
+//! frame, live fuzzy filtering, keyboard navigation, and optional custom-entry creation.
 
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
+use crate::icons::{Icon, IconSize, LucideIcon};
 use crate::{
     Anchor, Animation, AnimationExt, App, Bounds, Context, Entity, EventEmitter, FocusHandle,
-    Focusable, FontWeight, IntoElement, KeyDownEvent, MouseButton, Pixels, Render, RenderOnce,
-    ScrollHandle, SharedString, StyleRefinement, Styled, Subscription, Window, anchored, canvas,
-    deferred, div, ease_out_quint, point, prelude::*, px,
+    Focusable, FontWeight, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Render,
+    RenderOnce, ScrollHandle, SharedString, StyleRefinement, Styled, Subscription, Window,
+    anchored, canvas, deferred, div, ease_out_quint, point, prelude::*, px, transparent_black,
 };
-use crate::icons::{Icon, IconSize, LucideIcon};
 
+use super::completion::fuzzy_match_score_lower;
 use super::focus::{is_list_nav_key, list_step};
-use super::input::{InputEvent, InputState};
+use super::input::{Input, InputEvent, InputState, input_actions};
 use super::layout::focus_ring_shadow;
 use super::theme::{ANIM_FAST, ActiveTheme, ComponentSize};
 
@@ -81,21 +83,32 @@ impl<T> ComboBoxOption<T> {
         self
     }
 
-    fn matches(&self, query_lower: &str) -> bool {
+    fn fuzzy_score(&self, query_lower: &str) -> Option<i32> {
         if query_lower.is_empty() {
-            return true;
+            return Some(0);
         }
-        if self.label.to_lowercase().contains(query_lower) {
-            return true;
-        }
-        if let Some(desc) = &self.description
-            && desc.to_lowercase().contains(query_lower)
-        {
-            return true;
-        }
-        self.keywords
+        let label_score = fuzzy_match_score_lower(query_lower, &self.label.to_lowercase());
+        let desc_score = self
+            .description
+            .as_deref()
+            .and_then(|d| fuzzy_match_score_lower(query_lower, &d.to_lowercase()))
+            .map(|s| s - 15);
+        let kw_score = self
+            .keywords
             .iter()
-            .any(|kw| kw.to_lowercase().contains(query_lower))
+            .filter_map(|kw| fuzzy_match_score_lower(query_lower, &kw.to_lowercase()))
+            .max()
+            .map(|s| s - 20);
+        let grp_score = self
+            .group
+            .as_deref()
+            .and_then(|g| fuzzy_match_score_lower(query_lower, &g.to_lowercase()))
+            .map(|s| s - 25);
+
+        [label_score, desc_score, kw_score, grp_score]
+            .into_iter()
+            .flatten()
+            .max()
     }
 }
 
@@ -109,6 +122,9 @@ pub enum ComboBoxEvent<T> {
 }
 
 /// Entity state backing a searchable [`ComboBox`] (single or multi-select).
+///
+/// Users type directly inside the main control (alongside selected chips in multi-select mode);
+/// the anchored popover displays only the filtered suggestion list.
 pub struct ComboBoxState<T: Clone + PartialEq + 'static> {
     focus_handle: FocusHandle,
     search_input: Entity<InputState>,
@@ -135,8 +151,12 @@ pub struct ComboBoxState<T: Clone + PartialEq + 'static> {
 impl<T: Clone + PartialEq + 'static> EventEmitter<ComboBoxEvent<T>> for ComboBoxState<T> {}
 
 impl<T: Clone + PartialEq + 'static> Focusable for ComboBoxState<T> {
-    fn focus_handle(&self, _cx: &App) -> FocusHandle {
-        self.focus_handle.clone()
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        if !self.disabled {
+            self.search_input.read(cx).focus_handle(cx)
+        } else {
+            self.focus_handle.clone()
+        }
     }
 }
 
@@ -145,14 +165,14 @@ impl<T: Clone + PartialEq + 'static> ComboBoxState<T> {
     pub fn new(options: Vec<ComboBoxOption<T>>, cx: &mut Context<Self>) -> Self {
         let search_input = cx.new(|cx| {
             InputState::new(cx)
-                .placeholder("Search...")
-                .size(ComponentSize::Sm)
-                .leading_icon(LucideIcon::Search)
-                .clearable(true)
-                // The trigger is the combobox's one tab stop.
-                .tab_stop(false)
+                .placeholder("Select or search...")
+                .size(ComponentSize::Md)
+                .content_px(px(0.))
         });
         let sub = cx.subscribe(&search_input, |this, _input, event: &InputEvent, cx| {
+            if this.disabled {
+                return;
+            }
             match event {
                 InputEvent::Change(query) => {
                     this.open = true;
@@ -160,9 +180,16 @@ impl<T: Clone + PartialEq + 'static> ComboBoxState<T> {
                     this.highlighted_filtered_pos = filtered
                         .iter()
                         .position(|&idx| !this.options[idx].disabled);
+                    this.scroll_handle.scroll_to_item(0);
                     cx.notify();
                 }
                 InputEvent::Submit(query) => {
+                    if !this.open {
+                        this.open = true;
+                        this.highlighted_filtered_pos = this.first_enabled_filtered_pos_with_app(cx);
+                        cx.notify();
+                        return;
+                    }
                     let filtered = this.filtered_indices_for_query(query);
                     if let Some(pos) = this.highlighted_filtered_pos
                         && let Some(&opt_idx) = filtered.get(pos)
@@ -174,7 +201,14 @@ impl<T: Clone + PartialEq + 'static> ComboBoxState<T> {
                         this.close_menu(cx);
                     }
                 }
-                InputEvent::Focus | InputEvent::Blur | InputEvent::AcceptSuggestion(_) => {}
+                InputEvent::Focus => {
+                    cx.notify();
+                }
+                InputEvent::Blur => {
+                    this.close_menu(cx);
+                    cx.notify();
+                }
+                InputEvent::AcceptSuggestion(_) => {}
             }
         });
 
@@ -220,20 +254,12 @@ impl<T: Clone + PartialEq + 'static> ComboBoxState<T> {
         self
     }
 
-    /// Sets placeholder text inside the search input.
+    /// Sets inline filter placeholder text shown while typing alongside selected chips.
     pub fn search_placeholder(mut self, placeholder: impl Into<SharedString>, cx: &mut App) -> Self {
         let placeholder: SharedString = placeholder.into();
         self.search_placeholder = placeholder.clone();
         self.search_input.update(cx, |input, cx| {
-            // Re-initialize placeholder via setter-friendly replacement
-            let value = input.value().to_owned();
-            *input = InputState::new(cx)
-                .default_value(value)
-                .placeholder(placeholder)
-                .size(ComponentSize::Sm)
-                .leading_icon(LucideIcon::Search)
-                .clearable(true)
-                .tab_stop(false);
+            input.set_placeholder(placeholder, cx);
         });
         self
     }
@@ -284,7 +310,7 @@ impl<T: Clone + PartialEq + 'static> ComboBoxState<T> {
         self.selected.first()
     }
 
-    /// Returns the underlying search [`InputState`] entity.
+    /// Returns the underlying inline search [`InputState`] entity.
     pub fn search_input(&self) -> &Entity<InputState> {
         &self.search_input
     }
@@ -309,14 +335,43 @@ impl<T: Clone + PartialEq + 'static> ComboBoxState<T> {
         self.open
     }
 
-    /// Returns the filtered option indices matching `query`.
+    /// Returns the filtered option indices matching `query` in exact visual display order.
     pub fn filtered_indices_for_query(&self, query: &str) -> Vec<usize> {
-        let query = query.trim().to_lowercase();
-        self.options
+        let q = query.trim().to_lowercase();
+        let scored_indices: Vec<usize> = if q.is_empty() {
+            (0..self.options.len()).collect()
+        } else {
+            let mut scored: Vec<(i32, usize)> = self
+                .options
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, opt)| opt.fuzzy_score(&q).map(|score| (score, idx)))
+                .collect();
+            scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+            scored.into_iter().map(|(_, idx)| idx).collect()
+        };
+
+        // Keep grouped items clustered in first-seen group order so Up/Down matches visual rows.
+        if scored_indices
             .iter()
-            .enumerate()
-            .filter_map(|(idx, opt)| opt.matches(&query).then_some(idx))
-            .collect()
+            .any(|&idx| self.options[idx].group.is_some())
+        {
+            let mut group_map: HashMap<Option<SharedString>, usize> = HashMap::new();
+            let mut grouped: Vec<Vec<usize>> = Vec::new();
+            for idx in scored_indices {
+                let key = self.options[idx].group.clone();
+                if let Some(&pos) = group_map.get(&key) {
+                    grouped[pos].push(idx);
+                } else {
+                    let pos = grouped.len();
+                    group_map.insert(key, pos);
+                    grouped.push(vec![idx]);
+                }
+            }
+            grouped.into_iter().flatten().collect()
+        } else {
+            scored_indices
+        }
     }
 
     /// Returns the filtered option indices matching the current search input.
@@ -329,27 +384,32 @@ impl<T: Clone + PartialEq + 'static> ComboBoxState<T> {
         indices.iter().position(|&idx| !self.options[idx].disabled)
     }
 
-    /// Opens the combobox dropdown and focuses its search input.
+    /// Opens the combobox dropdown and focuses its inline search input.
     pub fn open_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.disabled {
             return;
         }
         self.open = true;
         self.highlighted_filtered_pos = self.first_enabled_filtered_pos_with_app(cx);
+        self.scroll_handle.scroll_to_item(0);
         let search_focus = self.search_input.focus_handle(cx);
         window.focus(&search_focus, cx);
         cx.notify();
     }
 
-    /// Closes the combobox dropdown and clears the filter query.
+    /// Closes the combobox dropdown and clears the filter query silently.
     pub fn close_menu(&mut self, cx: &mut Context<Self>) {
         if !self.open {
+            if !self.search_input.read(cx).value().is_empty() {
+                self.search_input
+                    .update(cx, |input, cx| input.set_value_silent(String::new(), cx));
+            }
             return;
         }
         self.open = false;
         self.search_input.update(cx, |input, cx| {
             if !input.value().is_empty() {
-                input.set_value(String::new(), cx);
+                input.set_value_silent(String::new(), cx);
             }
         });
         cx.notify();
@@ -374,7 +434,7 @@ impl<T: Clone + PartialEq + 'static> ComboBoxState<T> {
             }
         } else {
             self.selected = vec![value];
-            self.open = false;
+            self.close_menu(cx);
         }
         cx.emit(ComboBoxEvent::Change(self.selected.clone()));
         cx.notify();
@@ -390,9 +450,17 @@ impl<T: Clone + PartialEq + 'static> ComboBoxState<T> {
         }
     }
 
-    /// Clears all selected values.
+    /// Clears all selected values (and any active filter query).
     pub fn clear(&mut self, cx: &mut Context<Self>) {
+        let had_query = !self.search_input.read(cx).value().is_empty();
+        if had_query {
+            self.search_input
+                .update(cx, |input, cx| input.set_value_silent(String::new(), cx));
+        }
         if self.selected.is_empty() {
+            if had_query {
+                cx.notify();
+            }
             return;
         }
         self.selected.clear();
@@ -415,12 +483,29 @@ impl<T: Clone + PartialEq + 'static> ComboBoxState<T> {
             } else {
                 self.selected.push(value);
             }
+            if !self.search_input.read(cx).value().is_empty() {
+                self.search_input
+                    .update(cx, |input, cx| input.set_value_silent(String::new(), cx));
+                self.highlighted_filtered_pos = self.first_enabled_filtered_pos_with_app(cx);
+            }
         } else {
             self.selected = vec![value];
             self.close_menu(cx);
         }
         cx.emit(ComboBoxEvent::Change(self.selected.clone()));
         cx.notify();
+    }
+
+    fn pop_last_if_query_empty(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.disabled || !self.multiple || !self.search_input.read(cx).value().is_empty() {
+            return false;
+        }
+        if self.selected.pop().is_some() {
+            cx.emit(ComboBoxEvent::Change(self.selected.clone()));
+            cx.notify();
+            return true;
+        }
+        false
     }
 
     fn child_index_for_filtered_pos(&self, filtered: &[usize], target_pos: usize) -> usize {
@@ -480,6 +565,7 @@ impl<T: Clone + PartialEq + 'static> ComboBoxState<T> {
             return;
         }
         match key {
+            // Fallback when input keybindings aren't installed.
             "enter" => {
                 if !self.open {
                     self.open_menu(window, cx);
@@ -501,20 +587,14 @@ impl<T: Clone + PartialEq + 'static> ComboBoxState<T> {
             }
             "escape" if self.open => {
                 self.close_menu(cx);
-                window.focus(&self.focus_handle, cx);
                 cx.stop_propagation();
             }
-            // As a browser's select: Tab closes the menu and moves on from
-            // the trigger (the popup comes last in the tab order).
+            // As a browser's select: Tab closes the menu and moves focus on naturally.
             "tab" if self.open => {
                 self.close_menu(cx);
-                window.focus(&self.focus_handle, cx);
             }
-            "backspace" if self.multiple && self.search_input.read(cx).value().is_empty() => {
-                if self.selected.pop().is_some() {
-                    cx.emit(ComboBoxEvent::Change(self.selected.clone()));
-                    cx.notify();
-                }
+            "backspace" if self.pop_last_if_query_empty(cx) => {
+                cx.stop_propagation();
             }
             _ => {}
         }
@@ -531,12 +611,58 @@ impl<T: Clone + PartialEq + 'static> ComboBoxState<T> {
 impl<T: Clone + PartialEq + 'static> Render for ComboBoxState<T> {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let search_focused = self.search_input.focus_handle(cx).is_focused(window);
-        let focused = self.focus_handle.is_focused(window) || search_focused;
-        // The trigger shows its ring for keyboard focus only; typing in the
-        // search field keeps it.
-        let ring_focus = self.focus_handle.is_focus_visible(window) || search_focused;
         let entity = cx.entity();
+        let entity_id = cx.entity_id();
+        let search_focused = !self.disabled && self.search_input.focus_handle(cx).is_focused(window);
+        let focused = !self.disabled && (self.focus_handle.is_focused(window) || search_focused);
+        let query_is_empty = self.search_input.read(cx).value().is_empty();
+
+        let selected_opt = (!self.multiple)
+            .then(|| {
+                self.selected
+                    .first()
+                    .and_then(|val| self.options.iter().find(|o| &o.value == val))
+            })
+            .flatten();
+
+        // Keep embedded input size and placeholder synchronized without triggering extra notifies.
+        let desired_input_size = if self.multiple {
+            ComponentSize::Sm
+        } else {
+            self.size
+        };
+        let desired_placeholder: SharedString = if self.multiple {
+            if self.selected.is_empty() {
+                self.placeholder.clone()
+            } else if self.open || focused {
+                self.search_placeholder.clone()
+            } else {
+                SharedString::new_static("")
+            }
+        } else if selected_opt.is_some() {
+            SharedString::new_static("")
+        } else {
+            self.placeholder.clone()
+        };
+        {
+            let inp = self.search_input.read(cx);
+            let needs_size = inp.size_value() != desired_input_size;
+            let needs_ph = *inp.placeholder_text() != desired_placeholder;
+            let needs_dis = inp.is_disabled() != self.disabled;
+            if needs_size || needs_ph || needs_dis {
+                self.search_input.update(cx, |inp, cx| {
+                    if needs_size {
+                        inp.set_size_silent(desired_input_size);
+                    }
+                    if needs_ph {
+                        inp.set_placeholder_silent(desired_placeholder);
+                    }
+                    if needs_dis {
+                        inp.set_disabled(self.disabled, cx);
+                    }
+                });
+            }
+        }
 
         let border_color = if self.invalid {
             theme.destructive
@@ -559,15 +685,10 @@ impl<T: Clone + PartialEq + 'static> Render for ComboBoxState<T> {
             .unwrap_or(px(240.))
             .max(px(220.));
 
-        let show_clear = self.clearable && !self.selected.is_empty() && !self.disabled;
+        let show_clear =
+            self.clearable && (!self.selected.is_empty() || !query_is_empty) && !self.disabled;
 
-        let trigger_content = if self.selected.is_empty() {
-            div()
-                .truncate()
-                .text_color(theme.placeholder)
-                .child(self.placeholder.clone())
-                .into_any_element()
-        } else if self.multiple {
+        let trigger_content = if self.multiple {
             let mut chips = div()
                 .flex()
                 .flex_row()
@@ -606,8 +727,9 @@ impl<T: Clone + PartialEq + 'static> Render for ComboBoxState<T> {
                                     .rounded_full()
                                     .cursor_pointer()
                                     .hover(|s| s.bg(theme.primary.opacity(0.2)))
-                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                        cx.stop_propagation()
+                                    .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                                        window.prevent_default();
+                                        cx.stop_propagation();
                                     })
                                     .on_click(move |_, _, cx| {
                                         cx.stop_propagation();
@@ -624,44 +746,108 @@ impl<T: Clone + PartialEq + 'static> Render for ComboBoxState<T> {
                         }),
                 );
             }
+
+            if !self.disabled {
+                chips = chips.child(
+                    div().flex_1().min_w(px(72.)).child(
+                        Input::new(&self.search_input)
+                            .border_0()
+                            .shadow_none()
+                            .bg(transparent_black())
+                            .h(px(26.)),
+                    ),
+                );
+            } else if self.selected.is_empty() {
+                chips = chips.child(
+                    div()
+                        .truncate()
+                        .text_color(theme.placeholder)
+                        .child(self.placeholder.clone()),
+                );
+            }
+
             chips.into_any_element()
         } else {
-            let selected_opt = self
-                .selected
-                .first()
-                .and_then(|val| self.options.iter().find(|o| &o.value == val));
+            let input_h = px((self.size.height().0 - 2.0).max(20.0));
+            let selected_icon = query_is_empty
+                .then(|| selected_opt.and_then(|o| o.icon))
+                .flatten();
+            let selected_label = query_is_empty
+                .then(|| selected_opt.map(|o| o.label.clone()))
+                .flatten();
+
             div()
                 .flex()
                 .flex_row()
                 .items_center()
                 .gap(px(8.))
+                .w_full()
                 .min_w_0()
-                .when_some(selected_opt.and_then(|o| o.icon), |el, icon| {
+                .when_some(selected_icon, |el, icon| {
                     el.child(
                         Icon::new(icon)
                             .size(self.size.icon_size())
-                            .color(theme.muted_foreground),
+                            .color(if self.open {
+                                theme.placeholder
+                            } else {
+                                theme.muted_foreground
+                            }),
                     )
                 })
                 .child(
                     div()
-                        .truncate()
-                        .text_color(if self.disabled {
-                            theme.disabled_foreground
-                        } else {
-                            theme.foreground
+                        .relative()
+                        .flex()
+                        .items_center()
+                        .flex_1()
+                        .min_w_0()
+                        .when_some(selected_label, |el, label| {
+                            let label_color = if self.disabled {
+                                theme.disabled_foreground
+                            } else if self.open {
+                                theme.placeholder
+                            } else {
+                                theme.foreground
+                            };
+                            el.child(
+                                div()
+                                    .absolute()
+                                    .inset_0()
+                                    .flex()
+                                    .items_center()
+                                    .overflow_hidden()
+                                    .child(
+                                        div()
+                                            .truncate()
+                                            .text_size(self.size.font_size())
+                                            .text_color(label_color)
+                                            .child(label),
+                                    ),
+                            )
                         })
-                        .child(
-                            selected_opt
-                                .map(|o| o.label.clone())
-                                .unwrap_or_else(|| self.placeholder.clone()),
-                        ),
+                        .when(!self.disabled, |el| {
+                            el.child(
+                                Input::new(&self.search_input)
+                                    .border_0()
+                                    .shadow_none()
+                                    .bg(transparent_black())
+                                    .h(input_h),
+                            )
+                        })
+                        .when(self.disabled && selected_opt.is_none(), |el| {
+                            el.child(
+                                div()
+                                    .truncate()
+                                    .text_color(theme.placeholder)
+                                    .child(self.placeholder.clone()),
+                            )
+                        }),
                 )
                 .into_any_element()
         };
 
         let mut trigger = div()
-            .id("gpui-combobox-trigger")
+            .id(("gpui-combobox-trigger", entity_id))
             .relative()
             .flex()
             .flex_row()
@@ -677,10 +863,10 @@ impl<T: Clone + PartialEq + 'static> Render for ComboBoxState<T> {
             .border_color(border_color)
             .text_size(self.size.font_size())
             .when(!self.disabled, |el| {
-                el.cursor_pointer()
+                el.cursor_text()
                     .when(theme.elevation_shadows, |el| el.shadow_2xs())
             })
-            .when((ring_focus || self.open) && !self.disabled, |el| {
+            .when((focused || self.open) && !self.disabled, |el| {
                 let ring = focus_ring_shadow(&theme, self.invalid);
                 el.when(!ring.is_empty(), |el| el.shadow(ring))
             })
@@ -693,16 +879,26 @@ impl<T: Clone + PartialEq + 'static> Render for ComboBoxState<T> {
                 el.hover(move |s| s.border_color(hover_border))
             })
             .when(self.disabled, |el| el.opacity(0.6).cursor_not_allowed())
-            .track_focus(&self.focus_handle.clone().tab_stop(!self.disabled))
-            .on_key_down(cx.listener(Self::on_key_down))
             .when(!self.disabled, |el| {
-                el.on_click(cx.listener(|this, _, window, cx| {
-                    if this.open {
-                        this.close_menu(cx);
-                    } else {
-                        this.open_menu(window, cx);
-                    }
-                }))
+                el.track_focus(&self.focus_handle.clone().tab_stop(false))
+                    .capture_action(cx.listener(
+                        |this, _: &input_actions::Backspace, _, cx| {
+                            if this.pop_last_if_query_empty(cx) {
+                                cx.stop_propagation();
+                            }
+                        },
+                    ))
+                    .on_key_down(cx.listener(Self::on_key_down))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, window, cx| {
+                            let search_focus = this.search_input.focus_handle(cx);
+                            window.focus(&search_focus, cx);
+                            if !this.open {
+                                this.open_menu(window, cx);
+                            }
+                        }),
+                    )
             })
             .child(
                 canvas(
@@ -726,14 +922,18 @@ impl<T: Clone + PartialEq + 'static> Render for ComboBoxState<T> {
                         let entity_clear = entity.clone();
                         el.child(
                             div()
-                                .id("gpui-combobox-clear")
+                                .id(("gpui-combobox-clear", entity_id))
                                 .flex()
                                 .items_center()
                                 .justify_center()
                                 .p(px(2.))
                                 .rounded_full()
+                                .cursor_pointer()
                                 .hover(|s| s.bg(theme.surface_hover))
-                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                                    window.prevent_default();
+                                    cx.stop_propagation();
+                                })
                                 .on_click(move |_, _, cx| {
                                     cx.stop_propagation();
                                     entity_clear.update(cx, |state, cx| state.clear(cx));
@@ -746,9 +946,34 @@ impl<T: Clone + PartialEq + 'static> Render for ComboBoxState<T> {
                         )
                     })
                     .child(
-                        Icon::new(LucideIcon::ChevronsUpDown)
-                            .size(IconSize::Sm)
-                            .color(theme.muted_foreground),
+                        div()
+                            .id(("gpui-combobox-toggle", entity_id))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .p(px(2.))
+                            .rounded(theme.radius_sm)
+                            .when(!self.disabled, |el| {
+                                el.cursor_pointer()
+                                    .hover(|s| s.bg(theme.surface_hover))
+                                    .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                                        window.prevent_default();
+                                        cx.stop_propagation();
+                                    })
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        cx.stop_propagation();
+                                        if this.open {
+                                            this.close_menu(cx);
+                                        } else {
+                                            this.open_menu(window, cx);
+                                        }
+                                    }))
+                            })
+                            .child(
+                                Icon::new(LucideIcon::ChevronsUpDown)
+                                    .size(IconSize::Sm)
+                                    .color(theme.muted_foreground),
+                            ),
                     ),
             );
 
@@ -758,7 +983,7 @@ impl<T: Clone + PartialEq + 'static> Render for ComboBoxState<T> {
             let query_text = self.search_input.read(cx).value().trim().to_owned();
 
             let mut list_body = div()
-                .id("gpui-combobox-list")
+                .id(("gpui-combobox-list", entity_id))
                 .flex()
                 .flex_col()
                 .w_full()
@@ -775,7 +1000,7 @@ impl<T: Clone + PartialEq + 'static> Render for ComboBoxState<T> {
                         .items_center()
                         .justify_center()
                         .gap(px(6.))
-                        .py(px(18.))
+                        .py(px(14.))
                         .px(px(12.))
                         .text_size(px(13.))
                         .text_color(theme.muted_foreground)
@@ -787,7 +1012,7 @@ impl<T: Clone + PartialEq + 'static> Render for ComboBoxState<T> {
                     let entity_create = entity;
                     list_body = list_body.child(
                         div()
-                            .id("gpui-combobox-create")
+                            .id(("gpui-combobox-create", entity_id))
                             .flex()
                             .flex_row()
                             .items_center()
@@ -838,6 +1063,7 @@ impl<T: Clone + PartialEq + 'static> Render for ComboBoxState<T> {
 
                     let is_selected = self.selected.contains(&option.value);
                     let is_highlighted = self.highlighted_filtered_pos == Some(filtered_pos);
+                    let entity_hover = entity.clone();
                     let entity_opt = entity.clone();
 
                     list_body = list_body.child(
@@ -852,10 +1078,21 @@ impl<T: Clone + PartialEq + 'static> Render for ComboBoxState<T> {
                             .px(px(10.))
                             .py(px(7.))
                             .rounded(theme.radius_sm)
-                            .when(is_highlighted, |el| el.bg(theme.surface_hover))
+                            .when(is_highlighted, |el| el.bg(theme.primary_soft))
                             .when(!option.disabled, |el| {
                                 el.cursor_pointer()
-                                    .hover(|s| s.bg(theme.surface_hover))
+                                    .when(!is_highlighted, |el| {
+                                        el.hover(|s| s.bg(theme.surface_hover))
+                                    })
+                                    .on_mouse_move(move |_, _, cx| {
+                                        entity_hover.update(cx, |state, cx| {
+                                            if state.highlighted_filtered_pos != Some(filtered_pos)
+                                            {
+                                                state.highlighted_filtered_pos = Some(filtered_pos);
+                                                cx.notify();
+                                            }
+                                        });
+                                    })
                                     .on_click(move |_, _, cx| {
                                         entity_opt.update(cx, |state, cx| {
                                             state.toggle_option_index(opt_idx, cx);
@@ -878,6 +1115,8 @@ impl<T: Clone + PartialEq + 'static> Render for ComboBoxState<T> {
                                                 .size(IconSize::Sm)
                                                 .color(if is_selected {
                                                     theme.primary
+                                                } else if is_highlighted {
+                                                    theme.primary_soft_foreground
                                                 } else {
                                                     theme.muted_foreground
                                                 }),
@@ -897,7 +1136,11 @@ impl<T: Clone + PartialEq + 'static> Render for ComboBoxState<T> {
                                                     } else {
                                                         FontWeight::NORMAL
                                                     })
-                                                    .text_color(theme.popover_foreground)
+                                                    .text_color(if is_highlighted {
+                                                        theme.primary_soft_foreground
+                                                    } else {
+                                                        theme.popover_foreground
+                                                    })
                                                     .child(option.label.clone()),
                                             )
                                             .when_some(option.description.clone(), |el, desc| {
@@ -932,19 +1175,18 @@ impl<T: Clone + PartialEq + 'static> Render for ComboBoxState<T> {
                 .border_1()
                 .border_color(theme.border)
                 .shadow_lg()
-                .on_key_down(cx.listener(Self::on_key_down))
-                // Clicking an option keeps focus in the search field.
+                // Clicking an option keeps focus in the inline search field.
                 .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
-                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                .on_mouse_down_out(cx.listener(|this, ev: &MouseDownEvent, _, cx| {
+                    if this
+                        .trigger_bounds
+                        .get()
+                        .is_some_and(|b| b.contains(&ev.position))
+                    {
+                        return;
+                    }
                     this.close_menu(cx);
                 }))
-                .child(
-                    div()
-                        .p(px(6.))
-                        .border_b_1()
-                        .border_color(theme.border)
-                        .child(self.search_input.clone()),
-                )
                 .child(list_body);
 
             let panel_el = if reduce_motion {
@@ -952,7 +1194,7 @@ impl<T: Clone + PartialEq + 'static> Render for ComboBoxState<T> {
             } else {
                 panel
                     .with_animation(
-                        "gpui-combobox-menu-anim",
+                        ("gpui-combobox-menu-anim", entity_id),
                         Animation::new(ANIM_FAST).with_easing(ease_out_quint()),
                         |el, delta| el.opacity(delta).mt(px(-6.0 * (1.0 - delta))),
                     )
