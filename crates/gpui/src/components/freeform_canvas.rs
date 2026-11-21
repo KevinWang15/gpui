@@ -2272,17 +2272,12 @@ fn paint_dot_grid(bounds: Bounds<Pixels>, grid_step: f32, color: Hsla, window: &
     let ox = bounds.origin.x.0;
     let oy = bounds.origin.y.0;
 
-    // Fine (< 8px) grids draw subtle minor dots at the true snap step with stronger major dots
-    // every 4 steps (16px for a 4px grid); coarser grids (>= 8px) draw crisp dots at the true
-    // step with major accents every 4 steps (32px for an 8px grid), so switching 4px <-> 8px
-    // produces an immediate, legible visual change in both density and rhythm.
-    let fine = step < 8.0;
-    let minor_size = if fine { 1.0 } else { 1.3 };
-    let major_size = if fine { 1.6 } else { 1.85 };
-    let mut minor_col = color;
-    minor_col.a = (color.a * if fine { 0.45 } else { 0.90 }).clamp(0.0, 1.0);
-    let mut major_col = color;
-    major_col.a = (color.a * if fine { 1.45 } else { 1.55 }).clamp(0.0, 0.48);
+    // Draw uniform dots at the exact resolved `step` so a finer step (e.g. 4px) is
+    // unambiguously denser than a coarser step (e.g. 8px).
+    let dot_size = if step < 8.0 { 1.1 } else { 1.4 };
+    let half = dot_size * 0.5;
+    let mut dot_col = color;
+    dot_col.a = (color.a * if step < 8.0 { 0.85 } else { 1.05 }).clamp(0.0, 0.45);
 
     let mut ix: usize = 1;
     loop {
@@ -2296,19 +2291,12 @@ fn paint_dot_grid(bounds: Bounds<Pixels>, grid_step: f32, color: Hsla, window: &
             if y >= h - 2.0 {
                 break;
             }
-            let is_major = ix % 4 == 0 && iy % 4 == 0;
-            let (sz, col) = if is_major {
-                (major_size, major_col)
-            } else {
-                (minor_size, minor_col)
-            };
-            let half = sz * 0.5;
             window.paint_quad(fill(
                 Bounds::new(
                     point(px(ox + x - half), px(oy + y - half)),
-                    size(px(sz), px(sz)),
+                    size(px(dot_size), px(dot_size)),
                 ),
-                col,
+                dot_col,
             ));
             iy += 1;
         }
