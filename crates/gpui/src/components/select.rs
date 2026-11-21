@@ -525,6 +525,7 @@ impl<T: Clone + PartialEq + 'static> Render for SelectState<T> {
             let reduce_motion = cx.reduce_motion();
             let mut list = div()
                 .id("gpui-select-menu")
+                .occlude()
                 .flex()
                 .flex_col()
                 .min_w(menu_min_w)

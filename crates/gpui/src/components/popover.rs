@@ -94,6 +94,7 @@ impl RenderOnce for Popover {
         let panel = if self.open {
             let mut card = div()
                 .id((self.id.clone(), "panel"))
+                .occlude()
                 .flex()
                 .flex_col()
                 .min_w(px(200.))

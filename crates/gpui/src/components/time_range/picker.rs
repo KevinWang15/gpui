@@ -837,19 +837,30 @@ impl TimeRangePicker {
 
         if snap.quick_unit_open {
             let mut menu = div()
-                .absolute()
-                .top(px(38.))
-                .left_0()
+                .id((self.id.clone(), "unit-menu"))
+                .occlude()
                 .w(px(104.))
                 .p(px(4.))
                 .rounded(theme.radius_md)
                 .bg(theme.popover)
+                .text_color(theme.popover_foreground)
                 .border_1()
                 .border_color(theme.border)
                 .shadow_lg()
                 .flex()
                 .flex_col()
-                .gap(px(2.));
+                .gap(px(2.))
+                .on_any_mouse_down({
+                    let state = self.state.clone();
+                    move |_, window, cx| {
+                        let bar = state.read(cx).focus_handle.clone();
+                        if !bar.contains_focused(window, cx) {
+                            window.focus(&bar, cx);
+                        }
+                        window.prevent_default();
+                        cx.stop_propagation();
+                    }
+                });
             for (u_idx, unit) in [
                 TimeRangeUnit::Hours,
                 TimeRangeUnit::Days,
@@ -882,7 +893,20 @@ impl TimeRangePicker {
                         .child(unit.label()),
                 );
             }
-            unit_picker = unit_picker.child(menu);
+            unit_picker = unit_picker.child(
+                div()
+                    .absolute()
+                    .top(px(38.))
+                    .left_0()
+                    .child(
+                        deferred(
+                            anchored()
+                                .snap_to_window_with_margin(px(8.))
+                                .child(menu),
+                        )
+                        .with_priority(35),
+                    ),
+            );
         }
 
         let mut preset_list = div().flex().flex_col().gap(px(2.));
@@ -918,10 +942,12 @@ impl TimeRangePicker {
 
         let panel = div()
             .id((self.id.clone(), "quick-popover"))
+            .occlude()
             .w(px(340.))
             .mt(px(6.))
             .rounded(theme.radius_xl)
             .bg(theme.popover)
+            .text_color(theme.popover_foreground)
             .border_1()
             .border_color(theme.border)
             .shadow_lg()
@@ -1016,7 +1042,7 @@ impl TimeRangePicker {
                 .snap_to_window_with_margin(px(8.))
                 .child(panel),
         )
-        .with_priority(2)
+        .with_priority(25)
         .into_any_element()
     }
 
@@ -1094,11 +1120,13 @@ impl TimeRangePicker {
 
         let mut panel = div()
             .id((self.id.clone(), "custom-popover"))
+            .occlude()
             .w(px(320.))
             .mt(px(6.))
             .p(px(16.))
             .rounded(theme.radius_xl)
             .bg(theme.popover)
+            .text_color(theme.popover_foreground)
             .border_1()
             .border_color(theme.border)
             .shadow_lg()
@@ -1193,7 +1221,7 @@ impl TimeRangePicker {
                 .snap_to_window_with_margin(px(8.))
                 .child(animated_panel),
         )
-        .with_priority(2)
+        .with_priority(25)
         .into_any_element()
     }
 }
@@ -1222,5 +1250,101 @@ impl RenderOnce for TimeRangePicker {
             .flex_shrink_0()
             .child(bar)
             .when_some(popover, |el, p| el.child(p))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{TestAppContext, VisualTestContext};
+
+    struct PickerHost {
+        state: Entity<TimeRangePickerState>,
+    }
+
+    impl Render for PickerHost {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .p(px(24.))
+                .child(time_range_picker("test-range", &self.state))
+        }
+    }
+
+    #[crate::test]
+    fn quick_unit_dropdown_renders_above_presets_and_occludes_clicks(cx: &mut TestAppContext) {
+        cx.update(crate::components::init_components);
+        let state = cx.new(|cx| TimeRangePickerState::new(CalendarDate::new(2026, 11, 21), cx));
+        let (view, cx) = cx.add_window_view(|_, _| PickerHost {
+            state: state.clone(),
+        });
+        let cx: &mut VisualTestContext = cx;
+
+        state.update(cx, |s, cx| {
+            s.active_popover = ActivePopover::QuickSelect;
+            s.quick_unit_open = true;
+            cx.notify();
+        });
+        view.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+
+        let (unit_btn_bounds, unit_menu_bounds, months_point, menu_idx, popover_idx) =
+            cx.update(|window, _| {
+                let mut btn = None;
+                let mut menu = None;
+                let mut menu_ix = None;
+                let mut popover_ix = None;
+                for (ix, hb) in window.rendered_frame.hitboxes.iter().enumerate() {
+                    let b = hb.bounds;
+                    if (b.size.width - px(340.)).abs() < px(1.) && b.size.height > px(200.) {
+                        popover_ix = Some(ix);
+                    }
+                    if (b.size.width - px(104.)).abs() < px(1.) && b.size.height > px(90.) {
+                        menu = Some(b);
+                        menu_ix = Some(ix);
+                    }
+                    if b.size.width >= px(80.)
+                        && b.size.width <= px(95.)
+                        && (b.size.height - px(34.)).abs() < px(1.)
+                    {
+                        btn = Some(b);
+                    }
+                }
+                let menu_b = menu.expect("unit-menu hitbox should be rendered");
+                let months = crate::point(menu_b.center().x, menu_b.bottom() - px(14.));
+                (btn, menu_b, months, menu_ix.unwrap(), popover_ix.unwrap())
+            });
+
+        assert!(
+            menu_idx > popover_idx,
+            "unit-menu hitbox ({menu_idx}) must render in a higher layer than quick-popover ({popover_idx})",
+        );
+        if let Some(btn) = unit_btn_bounds {
+            assert!(
+                (unit_menu_bounds.origin.x - btn.origin.x).abs() <= px(1.),
+                "unit-menu x ({:?}) should align with unit-btn x ({:?})",
+                unit_menu_bounds.origin.x,
+                btn.origin.x,
+            );
+            assert!(
+                (unit_menu_bounds.origin.y - (btn.origin.y + px(38.))).abs() <= px(1.),
+                "unit-menu y ({:?}) should sit 38px below unit-btn y ({:?})",
+                unit_menu_bounds.origin.y,
+                btn.origin.y,
+            );
+        }
+
+        // Click "months" at the bottom of the unit dropdown (geometrically overlapping
+        // the COMMONLY USED presets behind it). It must pick Months without closing
+        // the Quick Select popover or triggering an underlying preset.
+        cx.simulate_click(months_point, crate::Modifiers::none());
+        cx.run_until_parked();
+        let (unit, unit_open, active_popover, preset) = state.read_with(cx, |s, _| {
+            (s.quick_unit, s.quick_unit_open, s.active_popover, s.preset)
+        });
+        assert_eq!(unit, TimeRangeUnit::Months);
+        assert!(!unit_open);
+        assert_eq!(active_popover, ActivePopover::QuickSelect);
+        assert_eq!(preset, TimeRangePreset::Last30Days);
     }
 }
