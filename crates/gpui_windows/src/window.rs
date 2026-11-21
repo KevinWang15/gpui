@@ -50,6 +50,7 @@ pub struct WindowsWindowState {
     pub border_offset: WindowBorderOffset,
     pub appearance: Cell<WindowAppearance>,
     pub background_appearance: Cell<WindowBackgroundAppearance>,
+    pub backdrop_corner_radius: Cell<Pixels>,
     pub scale_factor: Cell<f32>,
     pub restore_from_minimized: Cell<Option<Box<dyn FnMut(RequestFrameOptions)>>>,
 
@@ -166,6 +167,7 @@ impl WindowsWindowState {
             border_offset,
             appearance: Cell::new(appearance),
             background_appearance: Cell::new(WindowBackgroundAppearance::Opaque),
+            backdrop_corner_radius: Cell::new(px(0.)),
             scale_factor: Cell::new(scale_factor),
             restore_from_minimized: Cell::new(restore_from_minimized),
             min_size,
@@ -928,27 +930,66 @@ impl PlatformWindow for WindowsWindow {
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance) {
         self.state.background_appearance.set(background_appearance);
         let hwnd = self.0.hwnd;
+        let has_winrt = self
+            .state
+            .renderer
+            .try_borrow()
+            .is_ok_and(|r| r.has_winrt_backdrop());
+        let radius_px =
+            f32::from(self.state.backdrop_corner_radius.get()) * self.state.scale_factor.get();
 
-        // using Dwm APIs for Mica and MicaAlt backdrops.
-        // others follow the set_window_composition_attribute approach
         match background_appearance {
             WindowBackgroundAppearance::Opaque => {
+                set_dwm_host_backdrop(hwnd, false);
+                if let Ok(mut renderer) = self.state.renderer.try_borrow_mut() {
+                    renderer.sync_backdrop(false, radius_px);
+                }
                 set_window_composition_attribute(hwnd, None, 0);
             }
             WindowBackgroundAppearance::Transparent => {
+                set_dwm_host_backdrop(hwnd, false);
+                if let Ok(mut renderer) = self.state.renderer.try_borrow_mut() {
+                    renderer.sync_backdrop(false, radius_px);
+                }
                 set_window_composition_attribute(hwnd, None, 2);
             }
             WindowBackgroundAppearance::Blurred => {
-                set_window_composition_attribute(hwnd, Some((0, 0, 0, 0)), 4);
+                if has_winrt {
+                    set_window_composition_attribute(hwnd, None, 0);
+                    set_dwm_host_backdrop(hwnd, true);
+                    if let Ok(mut renderer) = self.state.renderer.try_borrow_mut() {
+                        renderer.sync_backdrop(true, radius_px);
+                    }
+                } else {
+                    set_window_composition_attribute(hwnd, Some((0, 0, 0, 0)), 4);
+                }
             }
             WindowBackgroundAppearance::MicaBackdrop => {
+                set_dwm_host_backdrop(hwnd, false);
+                if let Ok(mut renderer) = self.state.renderer.try_borrow_mut() {
+                    renderer.sync_backdrop(false, radius_px);
+                }
                 // DWMSBT_MAINWINDOW => MicaBase
                 dwm_set_window_composition_attribute(hwnd, 2);
             }
             WindowBackgroundAppearance::MicaAltBackdrop => {
+                set_dwm_host_backdrop(hwnd, false);
+                if let Ok(mut renderer) = self.state.renderer.try_borrow_mut() {
+                    renderer.sync_backdrop(false, radius_px);
+                }
                 // DWMSBT_TABBEDWINDOW => MicaAlt
                 dwm_set_window_composition_attribute(hwnd, 4);
             }
+        }
+    }
+
+    fn set_backdrop_corner_radius(&self, radius: Pixels) {
+        self.state.backdrop_corner_radius.set(radius);
+        let blur_enabled =
+            self.state.background_appearance.get() == WindowBackgroundAppearance::Blurred;
+        let radius_px = f32::from(radius) * self.state.scale_factor.get();
+        if let Ok(mut renderer) = self.state.renderer.try_borrow_mut() {
+            renderer.sync_backdrop(blur_enabled, radius_px);
         }
     }
 
@@ -1046,11 +1087,12 @@ impl PlatformWindow for WindowsWindow {
     }
 
     fn draw(&self, scene: &Scene) {
-        self.state
-            .renderer
-            .borrow_mut()
-            .draw(scene, self.state.background_appearance.get())
-            .log_err();
+        let bg = self.state.background_appearance.get();
+        let radius_px =
+            f32::from(self.state.backdrop_corner_radius.get()) * self.state.scale_factor.get();
+        let mut renderer = self.state.renderer.borrow_mut();
+        renderer.sync_backdrop(bg == WindowBackgroundAppearance::Blurred, radius_px);
+        renderer.draw(scene, bg).log_err();
     }
 
     fn capture_transition_snapshot(

@@ -1,5 +1,6 @@
 #![cfg(target_os = "windows")]
 
+mod backdrop_blur;
 mod clipboard;
 mod destination_list;
 mod dialog;
@@ -20,6 +21,7 @@ mod vsync;
 mod window;
 mod wrapper;
 
+pub(crate) use backdrop_blur::*;
 pub(crate) use clipboard::*;
 pub(crate) use destination_list::*;
 pub(crate) use direct_write::*;

@@ -3916,6 +3916,11 @@ impl Window {
             .set_background_appearance(background_appearance);
     }
 
+    /// Sets the corner radius used to clip platform frosted backdrop blur (Windows 10/11).
+    pub fn set_backdrop_corner_radius(&self, radius: Pixels) {
+        self.platform_window.set_backdrop_corner_radius(radius);
+    }
+
     /// Mark the window as dirty at the platform level.
     pub fn set_window_edited(&mut self, edited: bool) {
         self.platform_window.set_edited(edited);

@@ -52,6 +52,11 @@ pub(crate) struct DirectXRenderer {
     width: u32,
     height: u32,
 
+    /// Active WinRT host-backdrop frosted blur state and physical corner radius (px).
+    backdrop_blur_enabled: bool,
+    backdrop_radius_px: f32,
+    backdrop_applied_size: (u32, u32),
+
     /// Whether we want to skip drwaing due to device lost events.
     ///
     /// In that case we want to discard the first frame that we draw as we got reset in the middle of a frame
@@ -201,10 +206,13 @@ impl Drop for Annotation<'_> {
     }
 }
 
-struct DirectComposition {
-    comp_device: IDCompositionDevice,
-    comp_target: IDCompositionTarget,
-    comp_visual: IDCompositionVisual,
+enum DirectComposition {
+    WinRt(WinRtComposition),
+    Legacy {
+        comp_device: IDCompositionDevice,
+        comp_target: IDCompositionTarget,
+        comp_visual: IDCompositionVisual,
+    },
 }
 
 impl DirectXRendererDevices {
@@ -283,8 +291,31 @@ impl DirectXRenderer {
             backdrop_blur: None,
             width: 1,
             height: 1,
+            backdrop_blur_enabled: false,
+            backdrop_radius_px: 0.0,
+            backdrop_applied_size: (0, 0),
             skip_draws: false,
         })
+    }
+
+    pub(crate) fn has_winrt_backdrop(&self) -> bool {
+        matches!(self.direct_composition, Some(DirectComposition::WinRt(_)))
+    }
+
+    pub(crate) fn sync_backdrop(&mut self, blur_enabled: bool, radius_px: f32) {
+        let size_now = (self.width, self.height);
+        if self.backdrop_blur_enabled == blur_enabled
+            && (self.backdrop_radius_px - radius_px).abs() <= 0.25
+            && self.backdrop_applied_size == size_now
+        {
+            return;
+        }
+        self.backdrop_blur_enabled = blur_enabled;
+        self.backdrop_radius_px = radius_px;
+        self.backdrop_applied_size = size_now;
+        if let Some(DirectComposition::WinRt(winrt)) = &self.direct_composition {
+            winrt.update_bounds(self.width, self.height, radius_px, blur_enabled);
+        }
     }
 
     pub(crate) fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
@@ -435,6 +466,8 @@ impl DirectXRenderer {
         self.globals = globals;
         self.pipelines = pipelines;
         self.direct_composition = direct_composition;
+        self.backdrop_applied_size = (0, 0);
+        self.sync_backdrop(self.backdrop_blur_enabled, self.backdrop_radius_px);
         self.skip_draws = true;
         Ok(())
     }
@@ -1039,6 +1072,11 @@ impl DirectXRenderer {
                 Some(slice::from_ref(&resources.render_target_view)),
                 resources.depth_stencil_view.as_ref(),
             );
+        }
+
+        if let Some(DirectComposition::WinRt(winrt)) = &self.direct_composition {
+            winrt.update_bounds(width, height, self.backdrop_radius_px, self.backdrop_blur_enabled);
+            self.backdrop_applied_size = (width, height);
         }
 
         Ok(())
@@ -1758,24 +1796,39 @@ impl TransitionFrames {
 
 impl DirectComposition {
     pub fn new(dxgi_device: &IDXGIDevice, hwnd: HWND) -> Result<Self> {
-        let comp_device = get_comp_device(dxgi_device)?;
-        let comp_target = unsafe { comp_device.CreateTargetForHwnd(hwnd, false) }?;
-        let comp_visual = unsafe { comp_device.CreateVisual() }?;
+        match WinRtComposition::new(hwnd) {
+            Ok(winrt) => Ok(Self::WinRt(winrt)),
+            Err(err) => {
+                log::warn!("WinRT composition unavailable, falling back to legacy DirectComposition: {err:#}");
+                let comp_device = get_comp_device(dxgi_device)?;
+                let comp_target = unsafe { comp_device.CreateTargetForHwnd(hwnd, false) }?;
+                let comp_visual = unsafe { comp_device.CreateVisual() }?;
 
-        Ok(Self {
-            comp_device,
-            comp_target,
-            comp_visual,
-        })
+                Ok(Self::Legacy {
+                    comp_device,
+                    comp_target,
+                    comp_visual,
+                })
+            }
+        }
     }
 
     pub fn set_swap_chain(&self, swap_chain: &IDXGISwapChain1) -> Result<()> {
-        unsafe {
-            self.comp_visual.SetContent(swap_chain)?;
-            self.comp_target.SetRoot(&self.comp_visual)?;
-            self.comp_device.Commit()?;
+        match self {
+            Self::WinRt(winrt) => winrt.set_swap_chain(swap_chain),
+            Self::Legacy {
+                comp_device,
+                comp_target,
+                comp_visual,
+            } => {
+                unsafe {
+                    comp_visual.SetContent(swap_chain)?;
+                    comp_target.SetRoot(comp_visual)?;
+                    comp_device.Commit()?;
+                }
+                Ok(())
+            }
         }
-        Ok(())
     }
 }
 
