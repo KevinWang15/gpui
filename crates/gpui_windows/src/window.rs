@@ -666,6 +666,35 @@ impl PlatformWindow for WindowsWindow {
         self.state.content_size()
     }
 
+    fn move_on_display(&mut self, display: &dyn PlatformDisplay, offset: Point<Pixels>) -> bool {
+        let Some(monitor) = WindowsDisplay::new(display.id()) else {
+            return false;
+        };
+        let bounds = Bounds::new(display.bounds().origin + offset, self.bounds().size)
+            .to_device_pixels(monitor.scale_factor());
+        let rect = calculate_window_rect(bounds, &self.state.border_offset);
+        let hwnd = self.0.hwnd;
+        self.0
+            .executor
+            .spawn(async move {
+                unsafe {
+                    SetWindowPos(
+                        hwnd,
+                        None,
+                        rect.left,
+                        rect.top,
+                        0,
+                        0,
+                        SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                    )
+                    .context("unable to move window")
+                    .log_err();
+                }
+            })
+            .detach();
+        true
+    }
+
     fn resize(&mut self, size: Size<Pixels>) {
         let hwnd = self.0.hwnd;
         let bounds = gpui::bounds(self.bounds().origin, size).to_device_pixels(self.scale_factor());

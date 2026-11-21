@@ -697,6 +697,14 @@ pub trait PlatformDisplay: Debug {
         self.bounds()
     }
 
+    /// The display rectangle in a common desktop coordinate space. To map a
+    /// point between monitors, normalize it within its local display bounds
+    /// before mapping into this rectangle. On Windows these coordinates use
+    /// the virtual desktop at scale 1, even on mixed-DPI desktops.
+    fn desktop_bounds(&self) -> Bounds<Pixels> {
+        self.bounds()
+    }
+
     /// Get the default bounds for this display to place a window
     fn default_bounds(&self) -> Bounds<Pixels> {
         let bounds = self.bounds();
@@ -1306,6 +1314,11 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
         false
     }
     fn resize(&mut self, size: Size<Pixels>);
+    /// Request a move to a logical offset from a display's top-left, preserving
+    /// size, focus and stacking order. False when positioning is unsupported.
+    fn move_on_display(&mut self, _display: &dyn PlatformDisplay, _offset: Point<Pixels>) -> bool {
+        false
+    }
     fn scale_factor(&self) -> f32;
     fn appearance(&self) -> WindowAppearance;
     fn display(&self) -> Option<Rc<dyn PlatformDisplay>>;

@@ -124,6 +124,14 @@ impl PlatformDisplay for MacDisplay {
         }
     }
 
+    fn desktop_bounds(&self) -> Bounds<Pixels> {
+        let rect = CGDisplay::new(self.0).bounds();
+        Bounds::new(
+            point(px(rect.origin.x as f32), px(rect.origin.y as f32)),
+            self.bounds().size,
+        )
+    }
+
     fn visible_bounds(&self) -> Bounds<Pixels> {
         let Some(dominated_screen) = self.get_nsscreen() else {
             return self.bounds();
@@ -166,7 +174,7 @@ impl PlatformDisplay for MacDisplay {
 
 impl MacDisplay {
     /// Find the NSScreen corresponding to this display
-    fn get_nsscreen(&self) -> Option<Retained<NSScreen>> {
+    pub(crate) fn get_nsscreen(&self) -> Option<Retained<NSScreen>> {
         let main_thread = main_thread_marker().expect("displays require the main thread");
         NSScreen::screens(main_thread).into_iter().find(|screen| {
             screen

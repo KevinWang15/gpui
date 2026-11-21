@@ -1468,6 +1468,26 @@ impl PlatformWindow for X11Window {
         self.0.state.borrow().content_size()
     }
 
+    fn move_on_display(
+        &mut self,
+        display: &dyn PlatformDisplay,
+        offset: gpui::Point<Pixels>,
+    ) -> bool {
+        let scale = self.scale_factor();
+        let origin = display.bounds().origin + offset;
+        let config = xproto::ConfigureWindowAux::new()
+            .x((origin.x.as_f32() * scale).round() as i32)
+            .y((origin.y.as_f32() * scale).round() as i32);
+        let ok = check_reply(
+            || "X11 ConfigureWindow position failed.",
+            self.0.xcb.configure_window(self.0.x_window, &config),
+        )
+        .log_err()
+        .is_some();
+        xcb_flush(&self.0.xcb);
+        ok
+    }
+
     fn resize(&mut self, size: Size<Pixels>) {
         let state = self.0.state.borrow();
         let size = size.to_device_pixels(state.scale_factor);

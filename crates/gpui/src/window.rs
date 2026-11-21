@@ -3732,6 +3732,17 @@ impl Window {
         self.rendered_frame.scene.underlines.clone()
     }
 
+    /// Requests a move without resizing, focusing or raising this window.
+    /// `offset` is in logical pixels from the top-left of `display`.
+    /// Returns false on platforms where the compositor controls placement.
+    pub fn move_on_display(
+        &mut self,
+        display: &dyn PlatformDisplay,
+        offset: Point<Pixels>,
+    ) -> bool {
+        self.platform_window.move_on_display(display, offset)
+    }
+
     /// Set the content size of the window.
     pub fn resize(&mut self, size: Size<Pixels>) {
         self.platform_window.resize(size);
@@ -9565,6 +9576,18 @@ mod tests {
             .update(cx, |_, window, _| assert!(window.is_visible()))
             .unwrap();
         assert_eq!(test_window.frame_wake_count(), frame_wake_count);
+    }
+
+    #[gpui::test]
+    fn moving_a_window_preserves_its_size(cx: &mut TestAppContext) {
+        let handle = cx.add_window(|_, _| EmptyView);
+        handle.update(cx, |_, window, cx| {
+            let display = window.display(cx).unwrap();
+            let offset = point(px(40.), px(70.));
+            let size = window.bounds().size;
+            assert!(window.move_on_display(display.as_ref(), offset));
+            assert_eq!(window.bounds(), Bounds::new(display.bounds().origin + offset, size));
+        }).unwrap();
     }
 
     /// App learns display state from the platform's display notifications,
