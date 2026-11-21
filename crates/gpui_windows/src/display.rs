@@ -148,6 +148,10 @@ impl PlatformDisplay for WindowsDisplay {
         self.bounds
     }
 
+    fn desktop_bounds(&self) -> Bounds<Pixels> {
+        self.physical_bounds.to_pixels(1.0)
+    }
+
     fn visible_bounds(&self) -> Bounds<Pixels> {
         self.visible_bounds
     }

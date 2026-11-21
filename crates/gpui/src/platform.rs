@@ -697,9 +697,10 @@ pub trait PlatformDisplay: Debug {
         self.bounds()
     }
 
-    /// The display bounds in desktop coordinates. On platforms where window
-    /// placement is display-relative, this exposes the desktop origin without
-    /// changing the coordinate system of `bounds` or `visible_bounds`.
+    /// The display rectangle in a common desktop coordinate space. To map a
+    /// point between monitors, normalize it within its local display bounds
+    /// before mapping into this rectangle. On Windows these coordinates use
+    /// the virtual desktop at scale 1, even on mixed-DPI desktops.
     fn desktop_bounds(&self) -> Bounds<Pixels> {
         self.bounds()
     }
