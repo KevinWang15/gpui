@@ -1515,6 +1515,30 @@ impl PlatformWindow for MacWindow {
         self.0.as_ref().lock().content_size()
     }
 
+    fn move_on_display(&mut self, display: &dyn PlatformDisplay, offset: Point<Pixels>) -> bool {
+        let Some(screen) = MacDisplay::find_by_id(display.id()).and_then(|d| d.get_nsscreen())
+        else {
+            return false;
+        };
+        let frame = screen.frame();
+        let top_left = NSPoint::new(
+            frame.origin.x + f64::from(offset.x.as_f32()),
+            frame.origin.y + frame.size.height - f64::from(offset.y.as_f32()),
+        );
+        let state = self.0.lock();
+        let native = state.native_window;
+        let closed = state.closed.clone();
+        state
+            .foreground_executor
+            .spawn(async move {
+                if_window_not_closed(closed, || unsafe {
+                    let _: () = msg_send![native, setFrameTopLeftPoint: top_left];
+                })
+            })
+            .detach();
+        true
+    }
+
     fn resize(&mut self, size: Size<Pixels>) {
         let this = self.0.lock();
         let window = this.native_window;

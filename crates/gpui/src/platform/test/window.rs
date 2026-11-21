@@ -371,6 +371,19 @@ impl PlatformWindow for TestWindow {
         self.bounds().size
     }
 
+    fn move_on_display(
+        &mut self,
+        display: &dyn crate::PlatformDisplay,
+        offset: Point<Pixels>,
+    ) -> bool {
+        let mut state = self.0.lock();
+        if state.display.id() != display.id() {
+            return false;
+        }
+        state.bounds.origin = display.bounds().origin + offset;
+        true
+    }
+
     fn resize(&mut self, size: Size<Pixels>) {
         let mut lock = self.0.lock();
         lock.bounds.size = size;
