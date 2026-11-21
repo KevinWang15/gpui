@@ -10,7 +10,7 @@ use windows::Win32::Graphics::{
 
 use gpui::{
     AtlasBackend, AtlasKey, AtlasState, AtlasTextureId, AtlasTextureKind, AtlasTextureList,
-    AtlasTile, Bounds, DevicePixels, PlatformAtlas, Point, Size,
+    AtlasTile, Bounds, DevicePixels, PlatformAtlas, Point, RenderImage, Size,
 };
 
 pub(crate) struct DirectXAtlas(Mutex<AtlasState<DirectXAtlasTextures>>);
@@ -83,6 +83,15 @@ impl PlatformAtlas for DirectXAtlas {
         self.0.lock().get_or_insert_with(key, build)
     }
 
+    fn replace_image_regions(
+        &self,
+        old: &RenderImage,
+        new: &RenderImage,
+        regions: &[Bounds<DevicePixels>],
+    ) -> bool {
+        self.0.lock().replace_image_regions(old, new, regions)
+    }
+
     fn remove(&self, key: &AtlasKey) {
         self.0.lock().remove(key);
     }
@@ -101,8 +110,38 @@ impl AtlasBackend for DirectXAtlasTextures {
         let texture = self
             .texture(tile.texture_id)
             .ok_or_else(|| anyhow::anyhow!("allocated tile refers to a missing texture"))?;
-        texture.upload(&self.device_context, tile.bounds, bytes);
+        texture.upload(
+            &self.device_context,
+            tile.bounds,
+            bytes,
+            size.width.to_bytes(texture.bytes_per_pixel as u8),
+        );
         Ok(tile)
+    }
+
+    fn update_image_regions(
+        &mut self,
+        tile: AtlasTile,
+        image: &RenderImage,
+        regions: &[Bounds<DevicePixels>],
+    ) -> bool {
+        let Some(texture) = self.texture(tile.texture_id) else {
+            return false;
+        };
+        let bytes = image.as_bytes(0).expect("validated single-frame image");
+        let pitch = tile.bounds.size.width.to_bytes(4);
+        // Validate the complete source before issuing any writes. The atlas state
+        // already checked every region against these dimensions.
+        if bytes.len() < pitch as usize * tile.bounds.size.height.0 as usize {
+            return false;
+        }
+        for region in regions {
+            let offset =
+                region.origin.y.0 as usize * pitch as usize + region.origin.x.0 as usize * 4;
+            let dst = Bounds::new(tile.bounds.origin + region.origin, region.size);
+            texture.upload(&self.device_context, dst, &bytes[offset..], pitch);
+        }
+        true
     }
 
     fn remove(&mut self, tile: AtlasTile) {
@@ -281,14 +320,13 @@ impl DirectXAtlasTexture {
         device_context: &ID3D11DeviceContext,
         bounds: Bounds<DevicePixels>,
         bytes: &[u8],
+        row_pitch: u32,
     ) {
-        // `UpdateSubresource` reads `row_pitch * height` bytes from `bytes` based on the
-        // `D3D11_BOX` below. If the caller hands us a slice shorter than that, the driver would
-        // over-read past the end of the source buffer (potentially by multiple megabytes), so bail
-        // out instead. This is a first-insert path rather than a per-frame one, so the check is
-        // effectively free.
+        // A subrectangle can start in the middle of a source row. D3D skips by
+        // the full row pitch but reads only the rectangle width on the last row.
         let row_bytes = bounds.size.width.to_bytes(self.bytes_per_pixel as u8) as usize;
-        let expected = row_bytes * bounds.size.height.0.max(0) as usize;
+        let rows = bounds.size.height.0.max(0) as usize;
+        let expected = rows.saturating_sub(1) * row_pitch as usize + row_bytes;
         if bytes.len() < expected {
             log::error!(
                 "DirectXAtlasTexture::upload: source slice is {} bytes but the {}x{} region \
@@ -313,7 +351,7 @@ impl DirectXAtlasTexture {
                     back: 1,
                 }),
                 bytes.as_ptr() as _,
-                bounds.size.width.to_bytes(self.bytes_per_pixel as u8),
+                row_pitch,
                 0,
             );
         }
@@ -387,6 +425,107 @@ mod tests {
             })
             .expect("allocation should succeed")
             .expect("callback returns Some")
+    }
+
+    fn read_tile(atlas: &DirectXAtlas, tile: AtlasTile) -> Vec<u8> {
+        use windows::Win32::Graphics::Direct3D11::{
+            D3D11_CPU_ACCESS_READ, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_USAGE_STAGING,
+        };
+        let atlas = atlas.0.lock();
+        let backend = &atlas.backend;
+        let texture = &backend.texture(tile.texture_id).unwrap().texture;
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        unsafe { texture.GetDesc(&mut desc) };
+        let desc = D3D11_TEXTURE2D_DESC {
+            Usage: D3D11_USAGE_STAGING,
+            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+            BindFlags: 0,
+            ..desc
+        };
+        let mut staging = None;
+        unsafe {
+            backend
+                .device
+                .CreateTexture2D(&desc, None, Some(&mut staging))
+                .unwrap()
+        };
+        let staging = staging.unwrap();
+        let context = &backend.device_context;
+        let mut pixels = Vec::new();
+        // The tile is a region of this texture. Map supplies the texture's actual
+        // pitch (including padding), and the rows remain readable until Unmap.
+        unsafe {
+            context.CopyResource(&staging, texture);
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            context
+                .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                .unwrap();
+            for y in tile.bounds.top().0..tile.bounds.bottom().0 {
+                let offset =
+                    y as usize * mapped.RowPitch as usize + tile.bounds.left().0 as usize * 4;
+                let row = mapped.pData.cast::<u8>().add(offset);
+                pixels.extend_from_slice(std::slice::from_raw_parts(
+                    row,
+                    tile.bounds.size.width.0 as usize * 4,
+                ));
+            }
+            context.Unmap(&staging, 0);
+        }
+        pixels
+    }
+
+    #[test]
+    fn sparse_image_replacement_reuses_tile_and_uploads_only_selected_pixels() {
+        use gpui::{point, size};
+        use image::{Frame, Rgba, RgbaImage};
+        let atlas = create_atlas().expect("create D3D11 WARP device");
+        let old = RenderImage::new(vec![Frame::new(RgbaImage::new(5, 4))]);
+        // Fill even the gaps with sentinel data to detect an accidental full upload.
+        let new = RenderImage::new(vec![Frame::new(RgbaImage::from_fn(5, 4, |x, y| {
+            Rgba([x as u8, y as u8, 42, 255])
+        }))]);
+        let key = |img: &RenderImage| {
+            AtlasKey::Image(RenderImageParams {
+                image_id: img.id,
+                frame_index: 0,
+            })
+        };
+        let rect = |x: i32, y: i32, w: i32, h: i32| {
+            Bounds::new(point(x.into(), y.into()), size(w.into(), h.into()))
+        };
+        // Multirow rectangle with a nonzero source offset, plus the last pixel.
+        let regions = [rect(1, 1, 2, 3), rect(4, 3, 1, 1)];
+        assert!(!atlas.replace_image_regions(&old, &new, &regions));
+        insert_tile(&atlas, make_image_key(usize::MAX), old.size(0));
+        let tile = insert_tile(&atlas, key(&old), old.size(0));
+        let mismatch = RenderImage::new(vec![Frame::new(RgbaImage::new(4, 4))]);
+        let animated = RenderImage::new(vec![Frame::new(RgbaImage::new(5, 4)); 2]);
+        assert!(!atlas.replace_image_regions(&old, &mismatch, &regions));
+        assert!(!atlas.replace_image_regions(&old, &animated, &regions));
+        // Reject the whole batch before writing its valid first rectangle.
+        assert!(!atlas.replace_image_regions(&old, &new, &[regions[0], rect(i32::MAX, 0, 1, 1)]));
+        assert_eq!(read_tile(&atlas, tile), old.as_bytes(0).unwrap());
+        insert_tile(&atlas, key(&new), new.size(0));
+        assert!(!atlas.replace_image_regions(&old, &new, &regions));
+        atlas.remove(&key(&new));
+
+        assert!(atlas.replace_image_regions(&old, &new, &regions));
+        assert!(!atlas.0.lock().contains(&key(&old)));
+        atlas.remove(&key(&old));
+        assert_eq!(
+            atlas
+                .get_or_insert_with(key(&new), &mut || panic!("replacement must be cached"))
+                .unwrap(),
+            Some(tile)
+        );
+        let expected = RgbaImage::from_fn(5, 4, |x, y| {
+            if ((1..3).contains(&x) && y >= 1) || (x == 4 && y == 3) {
+                Rgba([x as u8, y as u8, 42, 255])
+            } else {
+                Rgba([0, 0, 0, 0])
+            }
+        });
+        assert_eq!(read_tile(&atlas, tile), expected.into_raw());
     }
 
     #[test]

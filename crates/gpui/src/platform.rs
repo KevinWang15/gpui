@@ -1882,6 +1882,16 @@ pub trait PlatformAtlas {
         key: AtlasKey,
         build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
     ) -> Result<Option<AtlasTile>>;
+    /// Optionally reuse the cached old image for a sparse update in this atlas.
+    fn replace_image_regions(
+        &self,
+        _old: &RenderImage,
+        _new: &RenderImage,
+        _regions: &[Bounds<DevicePixels>],
+    ) -> bool {
+        false
+    }
+
     fn remove(&self, key: &AtlasKey);
 
     #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
@@ -1898,6 +1908,17 @@ pub trait AtlasBackend {
         size: Size<DevicePixels>,
         bytes: &[u8],
     ) -> Result<AtlasTile>;
+
+    /// Write validated, image-local regions into an existing tile. Returning false
+    /// leaves the tile intact so the caller can fall back to a fresh allocation.
+    fn update_image_regions(
+        &mut self,
+        _tile: AtlasTile,
+        _image: &RenderImage,
+        _regions: &[Bounds<DevicePixels>],
+    ) -> bool {
+        false
+    }
 
     fn remove(&mut self, tile: AtlasTile);
 }
@@ -1952,6 +1973,51 @@ impl<Backend: AtlasBackend> AtlasState<Backend> {
                 Ok(Some(tile))
             }
         }
+    }
+
+    pub fn replace_image_regions(
+        &mut self,
+        old: &RenderImage,
+        new: &RenderImage,
+        regions: &[Bounds<DevicePixels>],
+    ) -> bool {
+        if old.id == new.id || old.frame_count() != 1 || new.frame_count() != 1 {
+            return false;
+        }
+        let key = |image: &RenderImage| {
+            AtlasKey::Image(RenderImageParams {
+                image_id: image.id,
+                frame_index: 0,
+            })
+        };
+        let old_key = key(old);
+        let new_key = key(new);
+        let Some(&tile) = self.tiles_by_key.get(&old_key) else {
+            return false;
+        };
+        let size = tile.bounds.size;
+        if self.contains(&new_key)
+            || old.size(0) != size
+            || new.size(0) != size
+            || size.width.0 <= 0
+            || size.height.0 <= 0
+            || regions.iter().any(|r| {
+                r.origin.x.0 < 0
+                    || r.origin.y.0 < 0
+                    || r.size.width.0 <= 0
+                    || r.size.height.0 <= 0
+                    || r.origin.x.0 > size.width.0 - r.size.width.0
+                    || r.origin.y.0 > size.height.0 - r.size.height.0
+            })
+        {
+            return false;
+        }
+        if !self.backend.update_image_regions(tile, new, regions) {
+            return false;
+        }
+        self.tiles_by_key.remove(&old_key);
+        self.tiles_by_key.insert(new_key, tile);
+        true
     }
 
     pub fn remove(&mut self, key: &AtlasKey) {

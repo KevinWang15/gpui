@@ -6337,6 +6337,28 @@ impl Window {
         });
     }
 
+    /// Reuse a retired image's atlas tile for a replacement with the same pixel dimensions.
+    ///
+    /// Call before painting the replacement. Both images must have a single frame, and
+    /// `regions` must cover every changed pixel in image-local device pixels. An empty
+    /// list asserts that the pixel data is identical. Retire all draws of the old image
+    /// in this window, including cached paints that would otherwise replay its tile.
+    ///
+    /// Returns true when the backend updates the tile and transfers it to the new image.
+    /// On a cache miss, invalid request, or unsupported backend this returns false.
+    /// In either case, drop the old image and paint the replacement normally.
+    /// Currently accelerated by the Windows Direct3D backend. For example, an image
+    /// editor can pass the last brush stroke's bounds when replacing a raster layer,
+    /// avoiding a full GPU upload while keeping the complete image available for repaint.
+    pub fn replace_image_regions(
+        &mut self,
+        old: &RenderImage,
+        new: &RenderImage,
+        regions: &[Bounds<DevicePixels>],
+    ) -> bool {
+        self.sprite_atlas.replace_image_regions(old, new, regions)
+    }
+
     /// Removes an image from the sprite atlas.
     pub fn drop_image(&mut self, data: Arc<RenderImage>) -> Result<()> {
         for frame_index in 0..data.frame_count() {
