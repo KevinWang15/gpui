@@ -2249,28 +2249,70 @@ impl RenderOnce for FreeformCanvas {
     }
 }
 
+const MAX_DOT_GRID_QUADS: f32 = 12_000.0;
+
+fn resolve_dot_grid_step(grid_step: f32, width: f32, height: f32) -> f32 {
+    let mut step = grid_step.max(4.0);
+    if width <= 4.0 || height <= 4.0 {
+        return step;
+    }
+    while (width / step) * (height / step) > MAX_DOT_GRID_QUADS {
+        step *= 2.0;
+    }
+    step
+}
+
 fn paint_dot_grid(bounds: Bounds<Pixels>, grid_step: f32, color: Hsla, window: &mut Window) {
     if grid_step < 4.0 {
         return;
     }
-    let step = if grid_step < 8.0 { grid_step * 2.0 } else { grid_step };
-    let mut x = step;
-    while x < bounds.size.width.0 - 2.0 {
-        let mut y = step;
-        while y < bounds.size.height.0 - 2.0 {
+    let w = bounds.size.width.0;
+    let h = bounds.size.height.0;
+    let step = resolve_dot_grid_step(grid_step, w, h);
+    let ox = bounds.origin.x.0;
+    let oy = bounds.origin.y.0;
+
+    // Fine (< 8px) grids draw subtle minor dots at the true snap step with stronger major dots
+    // every 4 steps (16px for a 4px grid); coarser grids (>= 8px) draw crisp dots at the true
+    // step with major accents every 4 steps (32px for an 8px grid), so switching 4px <-> 8px
+    // produces an immediate, legible visual change in both density and rhythm.
+    let fine = step < 8.0;
+    let minor_size = if fine { 1.0 } else { 1.3 };
+    let major_size = if fine { 1.6 } else { 1.85 };
+    let mut minor_col = color;
+    minor_col.a = (color.a * if fine { 0.45 } else { 0.90 }).clamp(0.0, 1.0);
+    let mut major_col = color;
+    major_col.a = (color.a * if fine { 1.45 } else { 1.55 }).clamp(0.0, 0.48);
+
+    let mut ix: usize = 1;
+    loop {
+        let x = ix as f32 * step;
+        if x >= w - 2.0 {
+            break;
+        }
+        let mut iy: usize = 1;
+        loop {
+            let y = iy as f32 * step;
+            if y >= h - 2.0 {
+                break;
+            }
+            let is_major = ix % 4 == 0 && iy % 4 == 0;
+            let (sz, col) = if is_major {
+                (major_size, major_col)
+            } else {
+                (minor_size, minor_col)
+            };
+            let half = sz * 0.5;
             window.paint_quad(fill(
                 Bounds::new(
-                    point(
-                        px(bounds.origin.x.0 + x - 0.5),
-                        px(bounds.origin.y.0 + y - 0.5),
-                    ),
-                    size(px(1.2), px(1.2)),
+                    point(px(ox + x - half), px(oy + y - half)),
+                    size(px(sz), px(sz)),
                 ),
-                color,
+                col,
             ));
-            y += step;
+            iy += 1;
         }
-        x += step;
+        ix += 1;
     }
 }
 
@@ -2821,5 +2863,14 @@ mod tests {
             view.read_with(cx, |v, _| (v.size, v.committed_canvas_resizes));
         assert_eq!(next_size, CanvasSize::new(280.0, 144.0));
         assert_eq!(committed_canvas, 1, "canvas resize drag should emit exactly one committed event");
+    }
+
+    #[test]
+    fn dot_grid_step_preserves_4px_vs_8px_and_caps_huge_canvases() {
+        assert_eq!(resolve_dot_grid_step(4.0, 404.0, 208.0), 4.0);
+        assert_eq!(resolve_dot_grid_step(8.0, 404.0, 208.0), 8.0);
+        assert_eq!(resolve_dot_grid_step(4.0, 540.0, 340.0), 4.0);
+        // Oversized canvas doubles step so quad counts stay bounded.
+        assert!(resolve_dot_grid_step(4.0, 1600.0, 1200.0) >= 8.0);
     }
 }
