@@ -198,24 +198,14 @@ impl FilterClause {
 
     /// Returns `(primary_text, extra_count)` for structured single-line chip rendering,
     /// where `extra_count` is rendered as a dedicated `+N` pill badge when present.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn chip_value_parts(&self) -> (SharedString, Option<usize>) {
-        match self.values.len() {
-            0 => (SharedString::default(), None),
-            1 => (self.values[0].clone(), None),
-            2 if self.values[0].chars().count() + self.values[1].chars().count()
-                <= INLINE_PAIR_MAX_CHARS =>
-            {
-                (
-                    SharedString::from(format!("{}, {}", self.values[0], self.values[1])),
-                    None,
-                )
-            }
-            n => (self.values[0].clone(), Some(n - 1)),
-        }
+        display_value_parts(&self.values)
     }
 
     /// Returns `true` when the chip value is multi-value or long enough to truncate,
     /// warranting a full-value hover tooltip.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn needs_value_tooltip(&self) -> bool {
         self.values.len() > 1
             || self
@@ -249,6 +239,33 @@ pub enum FilterBarEvent {
 /// Reactive callback computing dynamic facet options & counts given active sibling clauses.
 pub type FacetProvider =
     Rc<dyn Fn(&[FilterClause], &str, &str) -> Vec<FilterFacetOption> + 'static>;
+
+/// Optional formatter turning `(field_key, raw_value)` into a human-readable display label
+/// for chips, draft previews, and hover tooltips while keeping [`FilterClause::values`] on raw IDs.
+pub type ValueLabelFormatter = Rc<dyn Fn(&str, &str) -> SharedString + 'static>;
+
+fn format_value_label(
+    formatter: Option<&ValueLabelFormatter>,
+    field: &str,
+    raw: &SharedString,
+) -> SharedString {
+    match formatter {
+        Some(fmt) => fmt(field, raw.as_ref()),
+        None => raw.clone(),
+    }
+}
+
+fn display_value_parts(labels: &[SharedString]) -> (SharedString, Option<usize>) {
+    match labels.len() {
+        0 => (SharedString::default(), None),
+        1 => (labels[0].clone(), None),
+        2 if labels[0].chars().count() + labels[1].chars().count() <= INLINE_PAIR_MAX_CHARS => (
+            SharedString::from(format!("{}, {}", labels[0], labels[1])),
+            None,
+        ),
+        n => (labels[0].clone(), Some(n - 1)),
+    }
+}
 
 #[derive(Clone, Debug)]
 enum FilterDraft {
@@ -293,6 +310,7 @@ pub struct FilterBarState {
     highlighted: usize,
     placeholder: SharedString,
     facet_provider: FacetProvider,
+    value_label: Option<ValueLabelFormatter>,
     cached_facets: RefCell<Option<CachedFacets>>,
     scroll_handle: UniformListScrollHandle,
     focus_handle: FocusHandle,
@@ -324,6 +342,7 @@ impl FilterBarState {
             highlighted: 0,
             placeholder: "Filter by field, operator, value...".into(),
             facet_provider: Rc::new(facet_provider),
+            value_label: None,
             cached_facets: RefCell::new(None),
             scroll_handle: UniformListScrollHandle::new(),
             focus_handle: cx.focus_handle().tab_stop(true),
@@ -340,6 +359,23 @@ impl FilterBarState {
     pub fn placeholder(mut self, placeholder: impl Into<SharedString>) -> Self {
         self.placeholder = placeholder.into();
         self
+    }
+
+    /// Sets a display-name formatter mapping `(field_key, raw_value)` to a readable label for
+    /// chips, draft previews, and tooltips while keeping [`FilterClause::values`] on raw IDs.
+    pub fn value_label(
+        mut self,
+        formatter: impl Fn(&str, &str) -> SharedString + 'static,
+    ) -> Self {
+        self.value_label = Some(Rc::new(formatter));
+        self
+    }
+
+    /// Invalidates cached facet suggestions and re-renders the bar (e.g. after async facet
+    /// values or display names arrive).
+    pub fn invalidate_facets(&mut self, cx: &mut Context<Self>) {
+        self.invalidate_facet_cache();
+        cx.notify();
     }
 
     /// Seeds initial [`FilterClause`]s.
@@ -981,11 +1017,18 @@ pub fn filter_bar(id: impl Into<ElementId>, state: &Entity<FilterBarState>) -> F
     FilterBar::new(id, state)
 }
 
+#[derive(Clone)]
+struct TooltipValue {
+    label: SharedString,
+    /// Raw wire ID shown muted beneath `label` when it differs meaningfully from `label`.
+    raw: Option<SharedString>,
+}
+
 /// Rich multi-line hover tooltip showing full untruncated filter clause values.
 struct FilterClauseTooltip {
     field_label: SharedString,
     operator_label: &'static str,
-    values: SmallVec<[SharedString; 4]>,
+    values: SmallVec<[TooltipValue; 4]>,
 }
 
 impl crate::Render for FilterClauseTooltip {
@@ -1007,28 +1050,44 @@ impl crate::Render for FilterClauseTooltip {
         };
         let extra = self.values.len().saturating_sub(TOOLTIP_MAX_LISTED_VALUES);
 
-        let mut list = div().flex().flex_col().gap(px(3.));
+        let mut list = div().flex().flex_col().gap(px(4.));
         for val in self.values.iter().take(TOOLTIP_MAX_LISTED_VALUES) {
             list = list.child(
                 div()
                     .flex()
-                    .items_center()
-                    .gap(px(6.))
-                    .text_size(px(12.))
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(fg)
-                    .font_features(tabular_numerals())
-                    .when(multi, |el| {
+                    .flex_col()
+                    .gap(px(1.))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .text_size(px(12.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(fg)
+                            .font_features(tabular_numerals())
+                            .when(multi, |el| {
+                                el.child(
+                                    div()
+                                        .w(px(4.))
+                                        .h(px(4.))
+                                        .flex_shrink_0()
+                                        .rounded_full()
+                                        .bg(fg.opacity(0.55)),
+                                )
+                            })
+                            .child(val.label.clone()),
+                    )
+                    .when_some(val.raw.clone(), |el, raw| {
                         el.child(
                             div()
-                                .w(px(4.))
-                                .h(px(4.))
-                                .flex_shrink_0()
-                                .rounded_full()
-                                .bg(fg.opacity(0.55)),
+                                .when(multi, |d| d.pl(px(10.)))
+                                .text_size(px(10.5))
+                                .text_color(fg.opacity(0.6))
+                                .font_features(tabular_numerals())
+                                .child(raw),
                         )
-                    })
-                    .child(val.clone()),
+                    }),
             );
         }
         if extra > 0 {
@@ -1085,22 +1144,40 @@ impl FilterBar {
         &self,
         idx: usize,
         clause: &FilterClause,
+        value_label: Option<&ValueLabelFormatter>,
         theme: &Theme,
     ) -> impl IntoElement {
         let hover_bg = theme.surface_hover;
         let state_op = self.state.clone();
         let state_val = self.state.clone();
         let state_rm = self.state.clone();
-        let (primary_val, extra_count) = clause.chip_value_parts();
+        let labels: SmallVec<[SharedString; 4]> = clause
+            .values
+            .iter()
+            .map(|v| format_value_label(value_label, clause.field.as_ref(), v))
+            .collect();
+        let (primary_val, extra_count) = display_value_parts(&labels);
         let val_max_w = if extra_count.is_some() {
             MAX_MULTI_VALUE_WIDTH
         } else {
             MAX_SINGLE_VALUE_WIDTH
         };
-        let needs_tooltip = clause.needs_value_tooltip();
+        let tip_values: SmallVec<[TooltipValue; 4]> = clause
+            .values
+            .iter()
+            .zip(labels.iter())
+            .map(|(raw, label)| TooltipValue {
+                label: label.clone(),
+                raw: (!label.eq_ignore_ascii_case(raw.as_ref())).then(|| raw.clone()),
+            })
+            .collect();
+        let needs_tooltip = labels.len() > 1
+            || labels
+                .first()
+                .is_some_and(|v| v.chars().count() > VALUE_TOOLTIP_MIN_CHARS)
+            || tip_values.iter().any(|v| v.raw.is_some());
         let tip_field = clause.field_label.clone();
         let tip_op = clause.operator.label();
-        let tip_values = clause.values.clone();
 
         let val_el = div()
             .id(("clause-val", idx))
@@ -1235,7 +1312,11 @@ impl FilterBar {
             )
     }
 
-    fn render_draft_chip(draft: &FilterDraft, theme: &Theme) -> Option<AnyElement> {
+    fn render_draft_chip(
+        draft: &FilterDraft,
+        value_label: Option<&ValueLabelFormatter>,
+        theme: &Theme,
+    ) -> Option<AnyElement> {
         let (field_label, operator, pending_parts) = match draft {
             FilterDraft::Field => return None,
             FilterDraft::Operator { field_label, .. } => (field_label.clone(), None, None),
@@ -1245,23 +1326,19 @@ impl FilterBar {
                 ..
             } => (field_label.clone(), Some(*operator), None),
             FilterDraft::MultiValue {
+                field,
                 field_label,
                 operator,
                 pending,
-                ..
             } => {
-                let parts = match pending.len() {
-                    0 => None,
-                    1 => Some((pending[0].clone(), None)),
-                    2 if pending[0].chars().count() + pending[1].chars().count()
-                        <= INLINE_PAIR_MAX_CHARS =>
-                    {
-                        Some((
-                            SharedString::from(format!("{}, {}", pending[0], pending[1])),
-                            None,
-                        ))
-                    }
-                    n => Some((pending[0].clone(), Some(n - 1))),
+                let parts = if pending.is_empty() {
+                    None
+                } else {
+                    let labels: SmallVec<[SharedString; 4]> = pending
+                        .iter()
+                        .map(|v| format_value_label(value_label, field.as_ref(), v))
+                        .collect();
+                    Some(display_value_parts(&labels))
                 };
                 (field_label.clone(), Some(*operator), parts)
             }
@@ -1923,6 +2000,7 @@ impl RenderOnce for FilterBar {
             open,
             highlighted,
             placeholder,
+            value_label,
             focus_handle,
             scroll_handle,
             focused,
@@ -1940,6 +2018,7 @@ impl RenderOnce for FilterBar {
             let open = snap.open;
             let highlighted = snap.highlighted;
             let placeholder = snap.placeholder.clone();
+            let value_label = snap.value_label.clone();
             let focus_handle = snap.focus_handle.clone();
             let scroll_handle = snap.scroll_handle.clone();
             let focused = focus_handle.is_focused(window);
@@ -1979,6 +2058,7 @@ impl RenderOnce for FilterBar {
                 open,
                 highlighted,
                 placeholder,
+                value_label,
                 focus_handle,
                 scroll_handle,
                 focused,
@@ -2026,9 +2106,14 @@ impl RenderOnce for FilterBar {
             .gap(px(6.));
 
         for (idx, clause) in clauses.iter().enumerate() {
-            tokens_row = tokens_row.child(self.render_committed_chip(idx, clause, &theme));
+            tokens_row = tokens_row.child(self.render_committed_chip(
+                idx,
+                clause,
+                value_label.as_ref(),
+                &theme,
+            ));
         }
-        if let Some(draft_chip) = Self::render_draft_chip(&draft, &theme) {
+        if let Some(draft_chip) = Self::render_draft_chip(&draft, value_label.as_ref(), &theme) {
             tokens_row = tokens_row.child(draft_chip);
         }
         tokens_row = tokens_row.child(Self::render_inline_input(
@@ -2277,5 +2362,87 @@ mod tests {
             .unwrap();
         cx.run_until_parked();
         assert_eq!(changes.get(), 1);
+    }
+
+    #[crate::test]
+    fn value_label_formats_chips_and_drafts_without_mutating_wire_values(cx: &mut TestAppContext) {
+        cx.update(crate::components::init_components);
+        let uuid_a: SharedString = "1d8acbc2-5644-4ade-ad5b-6a7033eee00a".into();
+        let uuid_b: SharedString = "700c0e37-d268-4db8-8ffa-83df9e63fb1f".into();
+        let names = Rc::new(RefCell::new(std::collections::HashMap::<String, String>::new()));
+        let names_fmt = names.clone();
+        let names_facets = names.clone();
+        let (uuid_a2, uuid_b2) = (uuid_a.clone(), uuid_b.clone());
+        let (uuid_a_init, uuid_b_init) = (uuid_a.clone(), uuid_b.clone());
+
+        let window = cx.open_window(size(px(640.), px(420.)), move |_, cx| {
+            struct Host(Entity<FilterBarState>);
+            impl crate::Render for Host {
+                fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                    div().w(px(520.)).child(filter_bar("fb-labels", &self.0))
+                }
+            }
+            let filter = cx.new(|cx| {
+                FilterBarState::new(
+                    vec![FilterFieldDef::new("label.virtual_key", "virtual_key").operators([
+                        FilterOperator::Eq,
+                        FilterOperator::OneOf,
+                    ])],
+                    move |_, _, _| {
+                        let map = names_facets.borrow();
+                        let opt = |id: &SharedString, n| {
+                            let label = map
+                                .get(id.as_ref())
+                                .cloned()
+                                .unwrap_or_else(|| id.to_string());
+                            FilterFacetOption::new(id.clone(), Some(n)).label(label)
+                        };
+                        vec![opt(&uuid_a2, 80), opt(&uuid_b2, 15)]
+                    },
+                    cx,
+                )
+                .value_label(move |field, raw| {
+                    if field == "label.virtual_key"
+                        && let Some(display) = names_fmt.borrow().get(raw)
+                    {
+                        return display.clone().into();
+                    }
+                    raw.to_string().into()
+                })
+                .initial_clauses(vec![FilterClause {
+                    field: "label.virtual_key".into(),
+                    field_label: "virtual_key".into(),
+                    operator: FilterOperator::OneOf,
+                    values: smallvec::smallvec![uuid_a_init, uuid_b_init],
+                }])
+            });
+            Host(filter)
+        });
+        cx.run_until_parked();
+
+        // Populate display names asynchronously after initial render, invalidate, and re-render.
+        names
+            .borrow_mut()
+            .insert(uuid_a.to_string(), "cursor-workstation · Alex Chen".into());
+        names
+            .borrow_mut()
+            .insert(uuid_b.to_string(), "ci-eval-runner · Alex Chen".into());
+        window
+            .update(cx, |host, window, cx| {
+                host.0.update(cx, |s, cx| {
+                    s.invalidate_facets(cx);
+                    // Raw wire values stay untouched on FilterClause even when display labels are active.
+                    assert_eq!(s.clauses()[0].values.as_slice(), &[uuid_a.clone(), uuid_b.clone()]);
+                    // Multi-value draft keeps raw values too while rendering display labels.
+                    s.edit_clause_value(0, window, cx);
+                    let facets = s.matching_facets("label.virtual_key");
+                    assert_eq!(facets[0].value, uuid_a);
+                    assert_eq!(facets[0].label.as_ref(), "cursor-workstation · Alex Chen");
+                    s.close_menu(cx);
+                    assert_eq!(s.clauses()[0].values.as_slice(), &[uuid_a.clone(), uuid_b.clone()]);
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
     }
 }

@@ -134,7 +134,7 @@ pub use file_dropzone::{
 };
 pub use filter_bar::{
     FacetProvider, FilterBar, FilterBarEvent, FilterBarState, FilterClause, FilterFacetOption,
-    FilterFieldDef, FilterOperator, filter_bar,
+    FilterFieldDef, FilterOperator, ValueLabelFormatter, filter_bar,
 };
 pub use form::{FormRule, FormState};
 pub use freeform_canvas::{
