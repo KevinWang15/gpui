@@ -225,6 +225,34 @@ fn clicking_an_open_selects_option_selects_it(cx: &mut TestAppContext) {
 }
 
 #[crate::test]
+fn pointer_open_select_does_not_prehighlight_and_hover_tracks_single_row(cx: &mut TestAppContext) {
+    let (view, cx, _) = setup(cx);
+    let select = select_state(cx, &view);
+    let trigger = cx.debug_bounds("select").expect("select bounds");
+    let trigger_center = point(
+        trigger.left() + trigger.size.width / 2.,
+        trigger.top() + trigger.size.height / 2.,
+    );
+    // Opening via mouse click leaves no option falsely pre-highlighted.
+    cx.simulate_click(trigger_center, Modifiers::none());
+    assert!(select.read_with(cx, |s, _| s.is_open()));
+    assert_eq!(select.read_with(cx, |s, _| s.highlighted_index()), None);
+
+    // Moving the pointer over the second option highlights only that option.
+    let second_option = point(trigger.left() + px(20.), trigger.bottom() + px(48.));
+    cx.simulate_mouse_move(second_option, None, Modifiers::none());
+    assert_eq!(select.read_with(cx, |s, _| s.highlighted_index()), Some(1));
+
+    // Moving away from the menu clears the highlight cleanly.
+    cx.simulate_mouse_move(point(px(2.), px(2.)), None, Modifiers::none());
+    assert_eq!(select.read_with(cx, |s, _| s.highlighted_index()), None);
+
+    // Arrow key from None steps to the first enabled option.
+    keys(cx, "down");
+    assert_eq!(select.read_with(cx, |s, _| s.highlighted_index()), Some(0));
+}
+
+#[crate::test]
 fn a_drawer_keeps_tab_inside_and_gives_focus_back(cx: &mut TestAppContext) {
     let (view, cx, log) = setup(cx);
     // Input, select, slider, two thumbs, number input, combobox, After, Open.

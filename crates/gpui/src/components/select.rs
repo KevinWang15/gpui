@@ -185,6 +185,11 @@ impl<T: Clone + PartialEq + 'static> SelectState<T> {
         self.selected_index
     }
 
+    /// Returns the index of the currently highlighted (hovered or keyboard-active) option.
+    pub fn highlighted_index(&self) -> Option<usize> {
+        self.highlighted_index
+    }
+
     /// Returns `true` if the dropdown menu is currently open.
     pub fn is_open(&self) -> bool {
         self.open
@@ -206,14 +211,25 @@ impl<T: Clone + PartialEq + 'static> SelectState<T> {
 
     /// Opens the dropdown menu.
     pub fn open_menu(&mut self, cx: &mut Context<Self>) {
+        self.open_menu_inner(true, cx);
+    }
+
+    fn open_menu_inner(&mut self, highlight_initial: bool, cx: &mut Context<Self>) {
         if self.disabled || self.open {
             return;
         }
         self.open = true;
-        self.highlighted_index = self
-            .selected_index
-            .or_else(|| self.options.iter().position(|o| !o.disabled));
-        self.scroll_highlighted_into_view();
+        self.highlighted_index = if highlight_initial {
+            self.selected_index
+                .or_else(|| self.options.iter().position(|o| !o.disabled))
+        } else {
+            None
+        };
+        if let Some(idx) = self.highlighted_index.or(self.selected_index) {
+            self.scroll_option_into_view(idx);
+        } else {
+            self.scroll_handle.scroll_to_item(0);
+        }
         cx.emit(SelectEvent::Open);
         cx.notify();
     }
@@ -224,6 +240,7 @@ impl<T: Clone + PartialEq + 'static> SelectState<T> {
             return;
         }
         self.open = false;
+        self.highlighted_index = None;
         cx.emit(SelectEvent::Close);
         cx.notify();
     }
@@ -288,10 +305,18 @@ impl<T: Clone + PartialEq + 'static> SelectState<T> {
         child_idx
     }
 
+    fn scroll_option_into_view(&self, idx: usize) {
+        let child_idx = if idx == 0 {
+            0
+        } else {
+            self.child_index_for_option(idx)
+        };
+        self.scroll_handle.scroll_to_item(child_idx);
+    }
+
     fn scroll_highlighted_into_view(&self) {
         if let Some(idx) = self.highlighted_index {
-            self.scroll_handle
-                .scroll_to_item(self.child_index_for_option(idx));
+            self.scroll_option_into_view(idx);
         }
     }
 
@@ -315,7 +340,8 @@ impl<T: Clone + PartialEq + 'static> SelectState<T> {
                 return;
             }
             let enabled: Vec<bool> = self.options.iter().map(|o| !o.disabled).collect();
-            if let Some(next) = list_step(key, self.highlighted_index, &enabled, 6, true) {
+            let start = self.highlighted_index.or(self.selected_index);
+            if let Some(next) = list_step(key, start, &enabled, 6, true) {
                 self.highlighted_index = Some(next);
                 self.scroll_highlighted_into_view();
                 cx.notify();
@@ -346,7 +372,10 @@ impl<T: Clone + PartialEq + 'static> SelectState<T> {
                     && !event.keystroke.modifiers.platform
                 {
                     let needle = ch.to_lowercase();
-                    let start = self.highlighted_index.map_or(0, |i| i + 1);
+                    let start = self
+                        .highlighted_index
+                        .or(self.selected_index)
+                        .map_or(0, |i| i + 1);
                     let len = self.options.len();
                     for offset in 0..len {
                         let idx = (start + offset) % len;
@@ -435,9 +464,13 @@ impl<T: Clone + PartialEq + 'static> Render for SelectState<T> {
             .track_focus(&self.focus_handle.clone().tab_stop(!self.disabled))
             .on_key_down(cx.listener(Self::on_key_down))
             .when(!self.disabled, |el| {
-                el.on_click(cx.listener(|this, _: &crate::ClickEvent, window, cx| {
+                el.on_click(cx.listener(|this, ev: &crate::ClickEvent, window, cx| {
                     window.focus(&this.focus_handle, cx);
-                    this.toggle_menu(cx);
+                    if this.open {
+                        this.close_menu(cx);
+                    } else {
+                        this.open_menu_inner(ev.is_keyboard(), cx);
+                    }
                 }))
             })
             .child(
@@ -577,6 +610,7 @@ impl<T: Clone + PartialEq + 'static> Render for SelectState<T> {
                 } else {
                     crate::transparent_black()
                 };
+                let entity_hover = entity.clone();
                 let entity_opt = entity.clone();
 
                 list = list.child(
@@ -594,7 +628,19 @@ impl<T: Clone + PartialEq + 'static> Render for SelectState<T> {
                         .bg(row_bg)
                         .when(!option.disabled, |el| {
                             el.cursor_pointer()
-                                .hover(|s| s.bg(theme.surface_hover))
+                                .on_hover(move |hovered, _, cx| {
+                                    entity_hover.update(cx, |state, cx| {
+                                        if *hovered {
+                                            if state.highlighted_index != Some(index) {
+                                                state.highlighted_index = Some(index);
+                                                cx.notify();
+                                            }
+                                        } else if state.highlighted_index == Some(index) {
+                                            state.highlighted_index = None;
+                                            cx.notify();
+                                        }
+                                    });
+                                })
                                 .on_click(move |_, _, cx| {
                                     entity_opt.update(cx, |state, cx| {
                                         state.select_index(index, cx);
