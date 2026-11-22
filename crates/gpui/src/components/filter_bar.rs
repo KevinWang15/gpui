@@ -16,6 +16,22 @@ use crate::icons::{Icon, IconSize, LucideIcon};
 
 use super::cursor_blink::{CursorBlink, is_mounted_and_focused};
 use super::theme::{ANIM_FAST, ActiveTheme, Theme, tabular_numerals};
+use super::tooltip::Tooltip;
+
+/// Maximum logical width for a single-value chip segment before ellipsizing.
+const MAX_SINGLE_VALUE_WIDTH: f32 = 200.0;
+/// Maximum logical width for the primary value inside a multi-value chip (`value +N`).
+const MAX_MULTI_VALUE_WIDTH: f32 = 148.0;
+/// Maximum logical width for a field label inside a chip before ellipsizing.
+const MAX_FIELD_LABEL_WIDTH: f32 = 140.0;
+/// Combined character length threshold below which a 2-value clause renders inline (`a, b`).
+const INLINE_PAIR_MAX_CHARS: usize = 24;
+/// Character threshold above which a single value attaches a full-value hover tooltip.
+const VALUE_TOOLTIP_MIN_CHARS: usize = 22;
+/// Character threshold above which a popover facet option attaches a full-label hover tooltip.
+const FACET_TOOLTIP_MIN_CHARS: usize = 36;
+/// Maximum values listed individually inside a chip hover tooltip before summarizing `+N more`.
+const TOOLTIP_MAX_LISTED_VALUES: usize = 10;
 
 /// Allocation-free ASCII case-insensitive substring check with Unicode fallback.
 #[inline]
@@ -163,14 +179,49 @@ pub struct FilterClause {
 }
 
 impl FilterClause {
-    /// Formats the selected value(s) compactly for chip display.
+    /// Formats the selected value(s) compactly for plain-text display.
+    ///
+    /// Two short values join inline (`"OpenAI, Anthropic"`); longer pairs or 3+ values
+    /// show the first value followed by `"+N"` so wide tokens (e.g. UUIDs) stay compact.
     pub fn values_summary(&self) -> String {
         match self.values.len() {
             0 => String::new(),
             1 => self.values[0].to_string(),
-            2 => format!("{}, {}", self.values[0], self.values[1]),
+            2 if self.values[0].chars().count() + self.values[1].chars().count()
+                <= INLINE_PAIR_MAX_CHARS =>
+            {
+                format!("{}, {}", self.values[0], self.values[1])
+            }
             n => format!("{}, +{}", self.values[0], n - 1),
         }
+    }
+
+    /// Returns `(primary_text, extra_count)` for structured single-line chip rendering,
+    /// where `extra_count` is rendered as a dedicated `+N` pill badge when present.
+    pub(crate) fn chip_value_parts(&self) -> (SharedString, Option<usize>) {
+        match self.values.len() {
+            0 => (SharedString::default(), None),
+            1 => (self.values[0].clone(), None),
+            2 if self.values[0].chars().count() + self.values[1].chars().count()
+                <= INLINE_PAIR_MAX_CHARS =>
+            {
+                (
+                    SharedString::from(format!("{}, {}", self.values[0], self.values[1])),
+                    None,
+                )
+            }
+            n => (self.values[0].clone(), Some(n - 1)),
+        }
+    }
+
+    /// Returns `true` when the chip value is multi-value or long enough to truncate,
+    /// warranting a full-value hover tooltip.
+    pub(crate) fn needs_value_tooltip(&self) -> bool {
+        self.values.len() > 1
+            || self
+                .values
+                .first()
+                .is_some_and(|v| v.chars().count() > VALUE_TOOLTIP_MIN_CHARS)
     }
 
     /// Evaluates whether a candidate field value satisfies this clause.
@@ -233,6 +284,9 @@ struct CachedFacets {
 pub struct FilterBarState {
     fields: Vec<FilterFieldDef>,
     clauses: Vec<FilterClause>,
+    /// Original `(index, clause)` held aside while editing an existing committed chip so
+    /// cancelling (Escape or clicking outside) restores it cleanly without losing the filter.
+    editing_original: Option<(usize, FilterClause)>,
     draft: FilterDraft,
     query: String,
     open: bool,
@@ -263,6 +317,7 @@ impl FilterBarState {
         Self {
             fields,
             clauses: Vec::new(),
+            editing_original: None,
             draft: FilterDraft::Field,
             query: String::new(),
             open: false,
@@ -383,6 +438,11 @@ impl FilterBarState {
     pub fn remove_clause(&mut self, index: usize, cx: &mut Context<Self>) {
         if index < self.clauses.len() {
             self.clauses.remove(index);
+            if let Some((orig_idx, _)) = &mut self.editing_original
+                && index < *orig_idx
+            {
+                *orig_idx = orig_idx.saturating_sub(1);
+            }
             self.invalidate_facet_cache();
             cx.emit(FilterBarEvent::Change(self.clauses.clone()));
             cx.notify();
@@ -391,17 +451,30 @@ impl FilterBarState {
 
     /// Clears all committed clauses and any in-progress draft.
     pub fn clear_all(&mut self, cx: &mut Context<Self>) {
-        let changed = !self.clauses.is_empty();
+        let changed = !self.clauses.is_empty() || self.editing_original.is_some();
         self.clauses.clear();
+        self.editing_original = None;
         self.draft = FilterDraft::Field;
         self.query.clear();
         self.highlighted = 0;
+        self.open = false;
         self.invalidate_facet_cache();
         self.blink.reset(cx);
         if changed {
             cx.emit(FilterBarEvent::Change(self.clauses.clone()));
         }
         cx.notify();
+    }
+
+    /// Restores any in-progress edit back into `self.clauses` without emitting `Change`.
+    fn restore_editing_original(&mut self) -> bool {
+        if let Some((orig_idx, orig_clause)) = self.editing_original.take() {
+            let insert_at = orig_idx.min(self.clauses.len());
+            self.clauses.insert(insert_at, orig_clause);
+            true
+        } else {
+            false
+        }
     }
 
     fn open_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -414,7 +487,13 @@ impl FilterBarState {
     }
 
     fn close_menu(&mut self, cx: &mut Context<Self>) {
-        if self.open {
+        let restored = self.restore_editing_original();
+        if restored {
+            self.draft = FilterDraft::Field;
+            self.query.clear();
+            self.highlighted = 0;
+        }
+        if self.open || restored {
             self.open = false;
             self.invalidate_facet_cache();
             cx.notify();
@@ -422,50 +501,52 @@ impl FilterBarState {
     }
 
     fn edit_clause_operator(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.restore_editing_original();
         if index >= self.clauses.len() {
             return;
         }
         let clause = self.clauses.remove(index);
         self.draft = FilterDraft::Operator {
-            field: clause.field,
-            field_label: clause.field_label,
+            field: clause.field.clone(),
+            field_label: clause.field_label.clone(),
         };
+        self.editing_original = Some((index, clause));
         self.query.clear();
         self.highlighted = 0;
         self.open = true;
         self.invalidate_facet_cache();
         self.blink.reset(cx);
         window.focus(&self.focus_handle, cx);
-        cx.emit(FilterBarEvent::Change(self.clauses.clone()));
         cx.notify();
     }
 
     fn edit_clause_value(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.restore_editing_original();
         if index >= self.clauses.len() {
             return;
         }
         let clause = self.clauses.remove(index);
         self.draft = if clause.operator.is_multi() {
             FilterDraft::MultiValue {
-                field: clause.field,
-                field_label: clause.field_label,
+                field: clause.field.clone(),
+                field_label: clause.field_label.clone(),
                 operator: clause.operator,
-                pending: clause.values,
+                pending: clause.values.clone(),
             }
         } else {
             FilterDraft::SingleValue {
-                field: clause.field,
-                field_label: clause.field_label,
+                field: clause.field.clone(),
+                field_label: clause.field_label.clone(),
                 operator: clause.operator,
             }
         };
+        self.editing_original = Some((index, clause));
         self.query.clear();
         self.highlighted = 0;
         self.open = true;
         self.invalidate_facet_cache();
         self.blink.reset(cx);
         window.focus(&self.focus_handle, cx);
-        cx.emit(FilterBarEvent::Change(self.clauses.clone()));
         cx.notify();
     }
 
@@ -552,6 +633,12 @@ impl FilterBarState {
             FilterDraft::Operator { field, field_label } => (field.clone(), field_label.clone()),
             _ => return,
         };
+        let carried_values: SmallVec<[SharedString; 4]> = self
+            .editing_original
+            .as_ref()
+            .filter(|(_, orig)| orig.field == field)
+            .map(|(_, orig)| orig.values.clone())
+            .unwrap_or_default();
         self.query.clear();
         self.highlighted = 0;
         self.invalidate_facet_cache();
@@ -560,7 +647,7 @@ impl FilterBarState {
                 field,
                 field_label,
                 operator: op,
-                pending: SmallVec::new(),
+                pending: carried_values,
             }
         } else {
             FilterDraft::SingleValue {
@@ -583,18 +670,30 @@ impl FilterBarState {
             } => (field.clone(), field_label.clone(), *operator),
             _ => return,
         };
-        self.clauses.push(FilterClause {
+        let new_clause = FilterClause {
             field,
             field_label,
             operator,
             values: smallvec::smallvec![value],
-        });
+        };
+        let unchanged = self
+            .editing_original
+            .as_ref()
+            .is_some_and(|(_, orig)| orig == &new_clause);
+        if let Some((orig_idx, _)) = self.editing_original.take() {
+            let insert_at = orig_idx.min(self.clauses.len());
+            self.clauses.insert(insert_at, new_clause);
+        } else {
+            self.clauses.push(new_clause);
+        }
         self.draft = FilterDraft::Field;
         self.query.clear();
         self.highlighted = 0;
         self.invalidate_facet_cache();
         self.blink.reset(cx);
-        cx.emit(FilterBarEvent::Change(self.clauses.clone()));
+        if !unchanged {
+            cx.emit(FilterBarEvent::Change(self.clauses.clone()));
+        }
         cx.notify();
     }
 
@@ -605,6 +704,16 @@ impl FilterBarState {
             } else {
                 pending.push(value);
             }
+            self.blink.reset(cx);
+            cx.notify();
+        }
+    }
+
+    fn clear_multi_pending(&mut self, cx: &mut Context<Self>) {
+        if let FilterDraft::MultiValue { pending, .. } = &mut self.draft
+            && !pending.is_empty()
+        {
+            pending.clear();
             self.blink.reset(cx);
             cx.notify();
         }
@@ -635,18 +744,30 @@ impl FilterBarState {
                 return;
             }
         }
-        self.clauses.push(FilterClause {
+        let new_clause = FilterClause {
             field,
             field_label,
             operator,
             values: pending,
-        });
+        };
+        let unchanged = self
+            .editing_original
+            .as_ref()
+            .is_some_and(|(_, orig)| orig == &new_clause);
+        if let Some((orig_idx, _)) = self.editing_original.take() {
+            let insert_at = orig_idx.min(self.clauses.len());
+            self.clauses.insert(insert_at, new_clause);
+        } else {
+            self.clauses.push(new_clause);
+        }
         self.draft = FilterDraft::Field;
         self.query.clear();
         self.highlighted = 0;
         self.invalidate_facet_cache();
         self.blink.reset(cx);
-        cx.emit(FilterBarEvent::Change(self.clauses.clone()));
+        if !unchanged {
+            cx.emit(FilterBarEvent::Change(self.clauses.clone()));
+        }
         cx.notify();
     }
 
@@ -689,6 +810,10 @@ impl FilterBarState {
             FilterDraft::Operator { .. } => {
                 self.draft = FilterDraft::Field;
                 self.highlighted = 0;
+                if self.editing_original.take().is_some() {
+                    self.invalidate_facet_cache();
+                    cx.emit(FilterBarEvent::Change(self.clauses.clone()));
+                }
                 cx.notify();
             }
             FilterDraft::Field => {
@@ -731,6 +856,7 @@ impl FilterBarState {
         }
         match key {
             "escape" => {
+                self.restore_editing_original();
                 self.open = false;
                 self.draft = FilterDraft::Field;
                 self.query.clear();
@@ -855,6 +981,96 @@ pub fn filter_bar(id: impl Into<ElementId>, state: &Entity<FilterBarState>) -> F
     FilterBar::new(id, state)
 }
 
+/// Rich multi-line hover tooltip showing full untruncated filter clause values.
+struct FilterClauseTooltip {
+    field_label: SharedString,
+    operator_label: &'static str,
+    values: SmallVec<[SharedString; 4]>,
+}
+
+impl crate::Render for FilterClauseTooltip {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let bg = theme.tooltip_bg;
+        let fg = theme.tooltip_foreground;
+        let border = theme.tooltip_border;
+        let multi = self.values.len() > 1;
+        let header = if multi {
+            format!(
+                "{} {} ({})",
+                self.field_label,
+                self.operator_label,
+                self.values.len()
+            )
+        } else {
+            format!("{} {}", self.field_label, self.operator_label)
+        };
+        let extra = self.values.len().saturating_sub(TOOLTIP_MAX_LISTED_VALUES);
+
+        let mut list = div().flex().flex_col().gap(px(3.));
+        for val in self.values.iter().take(TOOLTIP_MAX_LISTED_VALUES) {
+            list = list.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .text_size(px(12.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(fg)
+                    .font_features(tabular_numerals())
+                    .when(multi, |el| {
+                        el.child(
+                            div()
+                                .w(px(4.))
+                                .h(px(4.))
+                                .flex_shrink_0()
+                                .rounded_full()
+                                .bg(fg.opacity(0.55)),
+                        )
+                    })
+                    .child(val.clone()),
+            );
+        }
+        if extra > 0 {
+            list = list.child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(fg.opacity(0.7))
+                    .child(format!("+{extra} more")),
+            );
+        }
+
+        div()
+            .max_w(px(420.))
+            .px(px(10.))
+            .py(px(7.))
+            .rounded(theme.radius_md)
+            .bg(bg)
+            .text_color(fg)
+            .border_1()
+            .border_color(border)
+            .when(theme.elevation_shadows, |el| el.shadow_md())
+            .flex()
+            .flex_col()
+            .gap(px(4.))
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(fg.opacity(0.7))
+                    .child(header),
+            )
+            .child(list)
+            .child(
+                div()
+                    .pt(px(2.))
+                    .text_size(px(10.5))
+                    .text_color(fg.opacity(0.55))
+                    .child("Click to edit"),
+            )
+    }
+}
+
 impl FilterBar {
     /// Creates a new [`FilterBar`] bound to `state`.
     pub fn new(id: impl Into<ElementId>, state: &Entity<FilterBarState>) -> Self {
@@ -875,9 +1091,76 @@ impl FilterBar {
         let state_op = self.state.clone();
         let state_val = self.state.clone();
         let state_rm = self.state.clone();
+        let (primary_val, extra_count) = clause.chip_value_parts();
+        let val_max_w = if extra_count.is_some() {
+            MAX_MULTI_VALUE_WIDTH
+        } else {
+            MAX_SINGLE_VALUE_WIDTH
+        };
+        let needs_tooltip = clause.needs_value_tooltip();
+        let tip_field = clause.field_label.clone();
+        let tip_op = clause.operator.label();
+        let tip_values = clause.values.clone();
+
+        let val_el = div()
+            .id(("clause-val", idx))
+            .min_w_0()
+            .px(px(7.))
+            .h_full()
+            .flex()
+            .items_center()
+            .gap(px(5.))
+            .overflow_hidden()
+            .cursor_pointer()
+            .hover(move |s| s.bg(hover_bg))
+            .on_click(move |_: &ClickEvent, window, cx| {
+                cx.stop_propagation();
+                state_val.update(cx, |s, cx| s.edit_clause_value(idx, window, cx));
+            })
+            .child(
+                div()
+                    .min_w_0()
+                    .max_w(px(val_max_w))
+                    .truncate()
+                    .whitespace_nowrap()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.foreground)
+                    .child(primary_val),
+            )
+            .when_some(extra_count, |el, extra| {
+                el.child(
+                    div()
+                        .flex_shrink_0()
+                        .px(px(5.))
+                        .py(px(1.))
+                        .rounded_full()
+                        .bg(theme.primary_soft)
+                        .text_size(px(10.5))
+                        .line_height(px(13.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme.primary_soft_foreground)
+                        .font_features(tabular_numerals())
+                        .whitespace_nowrap()
+                        .child(format!("+{extra}")),
+                )
+            })
+            .when(needs_tooltip, |el| {
+                el.tooltip(move |_window, cx| {
+                    let field_label = tip_field.clone();
+                    let values = tip_values.clone();
+                    cx.new(|_| FilterClauseTooltip {
+                        field_label,
+                        operator_label: tip_op,
+                        values,
+                    })
+                    .into()
+                })
+            });
 
         div()
             .id(("clause", idx))
+            .max_w_full()
+            .min_w_0()
             .flex()
             .items_center()
             .h(px(26.))
@@ -889,18 +1172,29 @@ impl FilterBar {
             .text_size(px(12.))
             .child(
                 div()
+                    .flex_shrink_0()
+                    .max_w(px(MAX_FIELD_LABEL_WIDTH))
                     .px(px(7.))
                     .h_full()
                     .flex()
                     .items_center()
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(theme.muted_foreground)
-                    .child(clause.field_label.clone()),
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .whitespace_nowrap()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme.muted_foreground)
+                            .child(clause.field_label.clone()),
+                    ),
             )
-            .child(div().w(px(1.)).h_full().bg(theme.border))
+            .child(div().w(px(1.)).h_full().flex_shrink_0().bg(theme.border))
             .child(
                 div()
                     .id(("clause-op", idx))
+                    .flex_shrink_0()
+                    .whitespace_nowrap()
                     .px(px(7.))
                     .h_full()
                     .flex()
@@ -909,31 +1203,18 @@ impl FilterBar {
                     .text_color(theme.muted_foreground)
                     .hover(move |s| s.bg(hover_bg))
                     .on_click(move |_: &ClickEvent, window, cx| {
+                        cx.stop_propagation();
                         state_op.update(cx, |s, cx| s.edit_clause_operator(idx, window, cx));
                     })
                     .child(clause.operator.label()),
             )
-            .child(div().w(px(1.)).h_full().bg(theme.border))
-            .child(
-                div()
-                    .id(("clause-val", idx))
-                    .px(px(7.))
-                    .h_full()
-                    .flex()
-                    .items_center()
-                    .cursor_pointer()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme.foreground)
-                    .hover(move |s| s.bg(hover_bg))
-                    .on_click(move |_: &ClickEvent, window, cx| {
-                        state_val.update(cx, |s, cx| s.edit_clause_value(idx, window, cx));
-                    })
-                    .child(clause.values_summary()),
-            )
-            .child(div().w(px(1.)).h_full().bg(theme.border))
+            .child(div().w(px(1.)).h_full().flex_shrink_0().bg(theme.border))
+            .child(val_el)
+            .child(div().w(px(1.)).h_full().flex_shrink_0().bg(theme.border))
             .child(
                 div()
                     .id(("clause-rm", idx))
+                    .flex_shrink_0()
                     .px(px(5.))
                     .h_full()
                     .flex()
@@ -941,7 +1222,9 @@ impl FilterBar {
                     .justify_center()
                     .cursor_pointer()
                     .hover(move |s| s.bg(hover_bg))
+                    .tooltip(|window, cx| Tooltip::text("Remove filter", window, cx))
                     .on_click(move |_: &ClickEvent, _, cx| {
+                        cx.stop_propagation();
                         state_rm.update(cx, |s, cx| s.remove_clause(idx, cx));
                     })
                     .child(
@@ -953,7 +1236,7 @@ impl FilterBar {
     }
 
     fn render_draft_chip(draft: &FilterDraft, theme: &Theme) -> Option<AnyElement> {
-        let (field_label, operator, pending_summary) = match draft {
+        let (field_label, operator, pending_parts) = match draft {
             FilterDraft::Field => return None,
             FilterDraft::Operator { field_label, .. } => (field_label.clone(), None, None),
             FilterDraft::SingleValue {
@@ -967,18 +1250,28 @@ impl FilterBar {
                 pending,
                 ..
             } => {
-                let summary = match pending.len() {
+                let parts = match pending.len() {
                     0 => None,
-                    1 => Some(pending[0].to_string()),
-                    n => Some(format!("{}, +{}", pending[0], n - 1)),
+                    1 => Some((pending[0].clone(), None)),
+                    2 if pending[0].chars().count() + pending[1].chars().count()
+                        <= INLINE_PAIR_MAX_CHARS =>
+                    {
+                        Some((
+                            SharedString::from(format!("{}, {}", pending[0], pending[1])),
+                            None,
+                        ))
+                    }
+                    n => Some((pending[0].clone(), Some(n - 1))),
                 };
-                (field_label.clone(), Some(*operator), summary)
+                (field_label.clone(), Some(*operator), parts)
             }
         };
 
-        let sep = || div().w(px(1.)).h_full().bg(theme.ring.opacity(0.3));
+        let sep = || div().w(px(1.)).h_full().flex_shrink_0().bg(theme.ring.opacity(0.3));
         Some(
             div()
+                .max_w_full()
+                .min_w_0()
                 .flex()
                 .items_center()
                 .h(px(26.))
@@ -990,17 +1283,28 @@ impl FilterBar {
                 .text_size(px(12.))
                 .child(
                     div()
+                        .flex_shrink_0()
+                        .max_w(px(MAX_FIELD_LABEL_WIDTH))
                         .px(px(8.))
                         .h_full()
                         .flex()
                         .items_center()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme.primary_soft_foreground)
-                        .child(field_label),
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .whitespace_nowrap()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(theme.primary_soft_foreground)
+                                .child(field_label),
+                        ),
                 )
                 .when_some(operator, |el, op| {
                     el.child(sep()).child(
                         div()
+                            .flex_shrink_0()
+                            .whitespace_nowrap()
                             .px(px(8.))
                             .h_full()
                             .flex()
@@ -1010,16 +1314,48 @@ impl FilterBar {
                             .child(op.label()),
                     )
                 })
-                .when_some(pending_summary, |el, summary| {
+                .when_some(pending_parts, |el, (primary, extra_count)| {
+                    let max_w = if extra_count.is_some() {
+                        MAX_MULTI_VALUE_WIDTH
+                    } else {
+                        MAX_SINGLE_VALUE_WIDTH
+                    };
                     el.child(sep()).child(
                         div()
+                            .min_w_0()
                             .px(px(8.))
                             .h_full()
                             .flex()
                             .items_center()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.foreground)
-                            .child(summary),
+                            .gap(px(5.))
+                            .overflow_hidden()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .max_w(px(max_w))
+                                    .truncate()
+                                    .whitespace_nowrap()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme.foreground)
+                                    .child(primary),
+                            )
+                            .when_some(extra_count, |el, extra| {
+                                el.child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .px(px(5.))
+                                        .py(px(1.))
+                                        .rounded_full()
+                                        .bg(theme.primary.opacity(0.2))
+                                        .text_size(px(10.5))
+                                        .line_height(px(13.))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(theme.primary_soft_foreground)
+                                        .font_features(tabular_numerals())
+                                        .whitespace_nowrap()
+                                        .child(format!("+{extra}")),
+                                )
+                            }),
                     )
                 })
                 .into_any_element(),
@@ -1036,8 +1372,10 @@ impl FilterBar {
     ) -> impl IntoElement {
         if !query.is_empty() {
             div()
+                .min_h(px(24.))
                 .flex()
                 .items_center()
+                .whitespace_nowrap()
                 .text_size(px(13.))
                 .text_color(theme.foreground)
                 .child(query)
@@ -1052,6 +1390,7 @@ impl FilterBar {
                 })
         } else if focused {
             div()
+                .min_h(px(24.))
                 .flex()
                 .items_center()
                 .gap(px(4.))
@@ -1064,6 +1403,7 @@ impl FilterBar {
                 .when(!has_content, |el| {
                     el.child(
                         div()
+                            .whitespace_nowrap()
                             .text_size(px(13.))
                             .text_color(theme.placeholder)
                             .child(placeholder),
@@ -1071,11 +1411,15 @@ impl FilterBar {
                 })
         } else if !has_content {
             div()
+                .min_h(px(24.))
+                .flex()
+                .items_center()
+                .whitespace_nowrap()
                 .text_size(px(13.))
                 .text_color(theme.placeholder)
                 .child(placeholder)
         } else {
-            div().w(px(4.))
+            div().w(px(4.)).h(px(24.))
         }
     }
 
@@ -1097,6 +1441,8 @@ impl FilterBar {
     ) -> impl IntoElement + use<> {
         let hover_bg = theme.surface_hover;
         let val = opt.value.clone();
+        let long_label = opt.label.chars().count() > FACET_TOOLTIP_MIN_CHARS;
+        let tip_text = opt.label.clone();
         div()
             .id(("opt-val", idx))
             .w_full()
@@ -1106,11 +1452,14 @@ impl FilterBar {
             .flex()
             .items_center()
             .justify_between()
-            .gap(px(16.))
+            .gap(px(12.))
             .cursor_pointer()
             .text_size(px(13.))
             .when(active, |el| el.bg(theme.primary_soft))
             .when(!active, |el| el.hover(move |s| s.bg(hover_bg)))
+            .when(long_label, |el| {
+                el.tooltip(move |window, cx| Tooltip::text(tip_text.clone(), window, cx))
+            })
             .on_click(move |_: &ClickEvent, _, cx| {
                 state.update(cx, |s, cx| {
                     s.commit_single_value(val.clone(), cx);
@@ -1118,6 +1467,8 @@ impl FilterBar {
             })
             .child(
                 div()
+                    .flex_1()
+                    .min_w_0()
                     .font_weight(if active {
                         FontWeight::SEMIBOLD
                     } else {
@@ -1129,6 +1480,7 @@ impl FilterBar {
                         theme.foreground
                     })
                     .truncate()
+                    .whitespace_nowrap()
                     .child(opt.label.clone()),
             )
             .when_some(opt.count, |el, count| {
@@ -1153,6 +1505,8 @@ impl FilterBar {
     ) -> impl IntoElement + use<> {
         let hover_bg = theme.surface_hover;
         let val = opt.value.clone();
+        let long_label = opt.label.chars().count() > FACET_TOOLTIP_MIN_CHARS;
+        let tip_text = opt.label.clone();
         let checkbox_box = div()
             .w(px(16.))
             .h(px(16.))
@@ -1184,11 +1538,14 @@ impl FilterBar {
             .flex()
             .items_center()
             .justify_between()
-            .gap(px(16.))
+            .gap(px(12.))
             .cursor_pointer()
             .text_size(px(13.))
             .when(active, |el| el.bg(theme.primary_soft))
             .when(!active, |el| el.hover(move |s| s.bg(hover_bg)))
+            .when(long_label, |el| {
+                el.tooltip(move |window, cx| Tooltip::text(tip_text.clone(), window, cx))
+            })
             .on_click(move |_: &ClickEvent, _, cx| {
                 state.update(cx, |s, cx| {
                     s.toggle_multi_value(val.clone(), cx);
@@ -1196,13 +1553,16 @@ impl FilterBar {
             })
             .child(
                 div()
+                    .flex_1()
+                    .min_w_0()
                     .flex()
                     .items_center()
                     .gap(px(8.))
-                    .min_w_0()
                     .child(checkbox_box)
                     .child(
                         div()
+                            .flex_1()
+                            .min_w_0()
                             .font_weight(if checked || active {
                                 FontWeight::SEMIBOLD
                             } else {
@@ -1214,6 +1574,7 @@ impl FilterBar {
                                 theme.foreground
                             })
                             .truncate()
+                            .whitespace_nowrap()
                             .child(opt.label.clone()),
                     ),
             )
@@ -1260,6 +1621,7 @@ impl FilterBar {
                     list = list.child(
                         div()
                             .id(("opt-field", idx))
+                            .w_full()
                             .px(px(10.))
                             .py(px(7.))
                             .rounded(theme.radius_md)
@@ -1276,6 +1638,10 @@ impl FilterBar {
                             })
                             .child(
                                 div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .whitespace_nowrap()
                                     .font_weight(FontWeight::MEDIUM)
                                     .text_color(if active {
                                         theme.primary_soft_foreground
@@ -1287,6 +1653,8 @@ impl FilterBar {
                             .when_some(field.hint.clone(), |el, hint| {
                                 el.child(
                                     div()
+                                        .flex_shrink_0()
+                                        .whitespace_nowrap()
                                         .text_size(px(11.5))
                                         .text_color(theme.muted_foreground)
                                         .child(hint),
@@ -1294,7 +1662,12 @@ impl FilterBar {
                             }),
                     );
                 }
-                list.into_any_element()
+                div()
+                    .id((self.id.clone(), "filter-field-scroll"))
+                    .max_h(px(280.))
+                    .overflow_y_scroll()
+                    .child(list)
+                    .into_any_element()
             }
             FilterDraft::Operator { .. } => {
                 let mut list = div().flex().flex_col().gap(px(2.));
@@ -1424,6 +1797,7 @@ impl FilterBar {
         let multi_footer = match draft {
             FilterDraft::MultiValue { pending, .. } if !pending.is_empty() => {
                 let state_commit = self.state.clone();
+                let state_clear = self.state.clone();
                 Some(
                     div()
                         .mt(px(4.))
@@ -1434,11 +1808,34 @@ impl FilterBar {
                         .flex()
                         .items_center()
                         .justify_between()
+                        .gap(px(8.))
                         .child(
                             div()
-                                .text_size(px(11.5))
-                                .text_color(theme.muted_foreground)
-                                .child(format!("{} selected", pending.len())),
+                                .flex()
+                                .items_center()
+                                .gap(px(8.))
+                                .child(
+                                    div()
+                                        .text_size(px(11.5))
+                                        .text_color(theme.muted_foreground)
+                                        .child(format!("{} selected", pending.len())),
+                                )
+                                .child(
+                                    div()
+                                        .id("multi-clear")
+                                        .px(px(6.))
+                                        .py(px(2.))
+                                        .rounded(theme.radius_sm)
+                                        .text_size(px(11.5))
+                                        .text_color(theme.muted_foreground)
+                                        .cursor_pointer()
+                                        .hover(move |s| s.bg(hover_bg))
+                                        .on_click(move |_: &ClickEvent, _, cx| {
+                                            state_clear
+                                                .update(cx, |s, cx| s.clear_multi_pending(cx));
+                                        })
+                                        .child("Clear"),
+                                ),
                         )
                         .child(
                             div()
@@ -1463,8 +1860,9 @@ impl FilterBar {
 
         let popover = div()
             .id((self.id.clone(), "filter-popover"))
-            .min_w(px(260.))
-            .max_w(px(340.))
+            .occlude()
+            .min_w(px(280.))
+            .max_w(px(440.))
             .mt(px(6.))
             .p(px(6.))
             .rounded(theme.radius_xl)
@@ -1671,9 +2069,15 @@ impl RenderOnce for FilterBar {
             .when(theme.elevation_shadows, |el| el.shadow_xs())
             .cursor_text()
             .child(
-                Icon::new(LucideIcon::Funnel)
-                    .size(IconSize::Sm)
-                    .color(theme.muted_foreground),
+                div()
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .child(
+                        Icon::new(LucideIcon::Funnel)
+                            .size(IconSize::Sm)
+                            .color(theme.muted_foreground),
+                    ),
             )
             .child(tokens_row)
             .when(has_content, |el| {
@@ -1681,6 +2085,7 @@ impl RenderOnce for FilterBar {
                 el.child(
                     div()
                         .id("clear-all")
+                        .flex_shrink_0()
                         .w(px(22.))
                         .h(px(22.))
                         .flex()
@@ -1689,7 +2094,9 @@ impl RenderOnce for FilterBar {
                         .rounded(theme.radius_sm)
                         .cursor_pointer()
                         .hover(move |s| s.bg(hover_bg))
+                        .tooltip(|window, cx| Tooltip::text("Clear all filters", window, cx))
                         .on_click(move |_: &ClickEvent, _, cx| {
+                            cx.stop_propagation();
                             state.update(cx, |s, cx| s.clear_all(cx));
                         })
                         .child(
@@ -1721,5 +2128,154 @@ impl RenderOnce for FilterBar {
             .flex_shrink_0()
             .child(bar)
             .when_some(popover, |el, p| el.child(p))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{TestAppContext, size};
+
+    #[test]
+    fn chip_value_parts_and_summary_keep_long_values_compact() {
+        let short_pair = FilterClause {
+            field: "provider".into(),
+            field_label: "Provider".into(),
+            operator: FilterOperator::OneOf,
+            values: smallvec::smallvec!["OpenAI".into(), "Anthropic".into()],
+        };
+        assert_eq!(short_pair.values_summary(), "OpenAI, Anthropic");
+        assert_eq!(
+            short_pair.chip_value_parts(),
+            ("OpenAI, Anthropic".into(), None)
+        );
+        assert!(short_pair.needs_value_tooltip());
+
+        let uuid_pair = FilterClause {
+            field: "label.virtual_key".into(),
+            field_label: "virtual_key".into(),
+            operator: FilterOperator::OneOf,
+            values: smallvec::smallvec![
+                "1d8acbc2-5644-4ade-ad5b-6a7033eee00a".into(),
+                "700c0e37-d268-4db8-8ffa-83df9e63fb1f".into(),
+            ],
+        };
+        assert_eq!(
+            uuid_pair.values_summary(),
+            "1d8acbc2-5644-4ade-ad5b-6a7033eee00a, +1"
+        );
+        assert_eq!(
+            uuid_pair.chip_value_parts(),
+            ("1d8acbc2-5644-4ade-ad5b-6a7033eee00a".into(), Some(1))
+        );
+        assert!(uuid_pair.needs_value_tooltip());
+
+        let short_single = FilterClause {
+            field: "service".into(),
+            field_label: "Service".into(),
+            operator: FilterOperator::Eq,
+            values: smallvec::smallvec!["gateway".into()],
+        };
+        assert!(!short_single.needs_value_tooltip());
+
+        let long_single = FilterClause {
+            field: "label.virtual_key".into(),
+            field_label: "virtual_key".into(),
+            operator: FilterOperator::Eq,
+            values: smallvec::smallvec!["1d8acbc2-5644-4ade-ad5b-6a7033eee00a".into()],
+        };
+        assert!(long_single.needs_value_tooltip());
+    }
+
+    #[crate::test]
+    fn non_destructive_edit_restores_on_cancel_and_updates_in_place(cx: &mut TestAppContext) {
+        cx.update(crate::components::init_components);
+        let uuid_a: SharedString = "1d8acbc2-5644-4ade-ad5b-6a7033eee00a".into();
+        let uuid_b: SharedString = "700c0e37-d268-4db8-8ffa-83df9e63fb1f".into();
+        let uuid_c: SharedString = "9f10b8e4-1200-4c9a-9ab1-112233445566".into();
+        let changes = Rc::new(std::cell::Cell::new(0usize));
+        let changes_sub = changes.clone();
+
+        let (uuid_a2, uuid_b2, uuid_c2) = (uuid_a.clone(), uuid_b.clone(), uuid_c.clone());
+        let window = cx.open_window(size(px(640.), px(420.)), move |_, cx| {
+            struct Host(Entity<FilterBarState>);
+            impl crate::Render for Host {
+                fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                    div().w(px(520.)).child(filter_bar("fb-test", &self.0))
+                }
+            }
+            let filter = cx.new(|cx| {
+                FilterBarState::new(
+                    vec![
+                        FilterFieldDef::new("label.virtual_key", "virtual_key").operators([
+                            FilterOperator::Eq,
+                            FilterOperator::OneOf,
+                            FilterOperator::Neq,
+                        ]),
+                        FilterFieldDef::new("service", "Service"),
+                    ],
+                    move |_, _, _| {
+                        vec![
+                            FilterFacetOption::new(uuid_a2.clone(), Some(120)),
+                            FilterFacetOption::new(uuid_b2.clone(), Some(42)),
+                            FilterFacetOption::new(uuid_c2.clone(), Some(10)),
+                        ]
+                    },
+                    cx,
+                )
+                .initial_clauses(vec![
+                    FilterClause {
+                        field: "label.virtual_key".into(),
+                        field_label: "virtual_key".into(),
+                        operator: FilterOperator::OneOf,
+                        values: smallvec::smallvec![uuid_a.clone(), uuid_b.clone()],
+                    },
+                    FilterClause {
+                        field: "service".into(),
+                        field_label: "Service".into(),
+                        operator: FilterOperator::Eq,
+                        values: smallvec::smallvec!["gateway".into()],
+                    },
+                ])
+            });
+            cx.subscribe(&filter, move |_, _, _: &FilterBarEvent, _| {
+                changes_sub.set(changes_sub.get() + 1);
+            })
+            .detach();
+            Host(filter)
+        });
+        cx.run_until_parked();
+
+        // Starting an edit and cancelling (close_menu) restores original clause at index 0 with 0 Change events.
+        window
+            .update(cx, |host, window, cx| {
+                host.0.update(cx, |s, cx| {
+                    s.edit_clause_value(0, window, cx);
+                    assert_eq!(s.clauses().len(), 1);
+                    s.close_menu(cx);
+                    assert_eq!(s.clauses().len(), 2);
+                    assert_eq!(s.clauses()[0].field.as_ref(), "label.virtual_key");
+                    assert_eq!(s.clauses()[0].values.len(), 2);
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(changes.get(), 0);
+
+        // Editing value and committing adds the 3rd value in place at index 0 and emits 1 Change event.
+        window
+            .update(cx, |host, window, cx| {
+                host.0.update(cx, |s, cx| {
+                    s.edit_clause_value(0, window, cx);
+                    s.toggle_multi_value(uuid_c.clone(), cx);
+                    s.commit_multi_values(cx);
+                    assert_eq!(s.clauses().len(), 2);
+                    assert_eq!(s.clauses()[0].field.as_ref(), "label.virtual_key");
+                    assert_eq!(s.clauses()[0].values.len(), 3);
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(changes.get(), 1);
     }
 }
