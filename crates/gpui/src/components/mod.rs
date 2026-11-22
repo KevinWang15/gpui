@@ -140,8 +140,8 @@ pub use form::{FormRule, FormState};
 pub use freeform_canvas::{
     AlignAction, CanvasItemSpec, CanvasPaletteItem, CanvasRect, CanvasSize, FreeformCanvas,
     FreeformCanvasEvent, FreeformCanvasState, GuideAxis, GuideKind, ResizeHandle, SnapConfig,
-    SnapGuide, align_item, canvas_palette_item, freeform_canvas, snap_canvas_resize, snap_move,
-    snap_resize,
+    SnapGuide, align_item, align_items, bounding_rect, canvas_palette_item, freeform_canvas,
+    snap_canvas_resize, snap_move, snap_resize,
 };
 pub use hierarchical_select::{
     Cascader, CascaderEvent, CascaderOption, CascaderState, TreeSelect, TreeSelectEvent,

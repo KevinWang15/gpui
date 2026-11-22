@@ -101,6 +101,36 @@ impl CanvasRect {
             height: self.height.round().max(1.0),
         }
     }
+
+    /// Returns `true` if this rectangle overlaps `other` (with positive intersection area).
+    #[inline]
+    pub fn intersects(self, other: CanvasRect) -> bool {
+        self.x < other.right()
+            && self.right() > other.x
+            && self.y < other.bottom()
+            && self.bottom() > other.y
+    }
+}
+
+/// Computes the tightest [`CanvasRect`] enclosing all rectangles in `rects`, or `None` if empty.
+pub fn bounding_rect(rects: &[CanvasRect]) -> Option<CanvasRect> {
+    let first = *rects.first()?;
+    let mut min_x = first.x;
+    let mut min_y = first.y;
+    let mut max_r = first.right();
+    let mut max_b = first.bottom();
+    for r in &rects[1..] {
+        min_x = min_x.min(r.x);
+        min_y = min_y.min(r.y);
+        max_r = max_r.max(r.right());
+        max_b = max_b.max(r.bottom());
+    }
+    Some(CanvasRect::new(
+        min_x,
+        min_y,
+        (max_r - min_x).max(0.0),
+        (max_b - min_y).max(0.0),
+    ))
 }
 
 /// Logical dimensions of a [`FreeformCanvas`].
@@ -294,27 +324,31 @@ impl CanvasResizeHandle {
     }
 }
 
-/// One-click auto-alignment operations for [`align_item`].
+/// One-click alignment and distribution operations for [`align_item`] and [`align_items`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AlignAction {
-    /// Align to the canvas's inner left margin.
+    /// Align to the canvas's inner left margin (1 item) or the selection's left edge (2+ items).
     Left,
-    /// Center horizontally inside the canvas.
+    /// Center horizontally inside the canvas (1 item) or along the selection's center (2+ items).
     CenterHorizontal,
-    /// Align to the canvas's inner right margin.
+    /// Align to the canvas's inner right margin (1 item) or the selection's right edge (2+ items).
     Right,
-    /// Align to the canvas's inner top margin.
+    /// Align to the canvas's inner top margin (1 item) or the selection's top edge (2+ items).
     Top,
-    /// Center vertically inside the canvas.
+    /// Center vertically inside the canvas (1 item) or along the selection's center (2+ items).
     CenterVertical,
-    /// Align to the canvas's inner bottom margin.
+    /// Align to the canvas's inner bottom margin (1 item) or the selection's bottom edge (2+ items).
     Bottom,
-    /// Center both horizontally and vertically inside the canvas.
+    /// Center the single item or entire multi-selection group inside the canvas.
     CenterInCanvas,
     /// Stretch width to fill the canvas inside its left/right padding.
     FillWidth,
     /// Snap position and size to the nearest grid step.
     SnapToGrid,
+    /// Equalize horizontal gaps across 3 or more selected items.
+    DistributeHorizontal,
+    /// Equalize vertical gaps across 3 or more selected items.
+    DistributeVertical,
 }
 
 #[derive(Clone)]
@@ -891,22 +925,149 @@ pub fn align_item(
             next.width = snap_to_step(item.width, step).max(step);
             next.height = snap_to_step(item.height, step).max(step);
         }
+        AlignAction::DistributeHorizontal | AlignAction::DistributeVertical => {
+            return item;
+        }
     }
     next.clamped_in(canvas).rounded()
+}
+
+/// Aligns or distributes one or more selected items.
+///
+/// - With **1 item**, aligns relative to `canvas` (delegating to [`align_item`]).
+/// - With **2+ items**, edge/center actions align items **to each other** within their shared
+///   selection bounding box, [`AlignAction::CenterInCanvas`] shifts the group rigidly as a unit,
+///   and [`AlignAction::DistributeHorizontal`] / [`AlignAction::DistributeVertical`] equalize
+///   spacing across 3+ items while pinning the outer endpoints.
+pub fn align_items(
+    items: &[CanvasRect],
+    canvas: CanvasSize,
+    padding: f32,
+    grid: f32,
+    action: AlignAction,
+) -> Vec<CanvasRect> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+    if items.len() == 1 {
+        return vec![align_item(items[0], canvas, padding, grid, action)];
+    }
+
+    let bounds = bounding_rect(items).expect("non-empty items");
+    let mut out = items.to_vec();
+
+    match action {
+        AlignAction::Left => {
+            for r in &mut out {
+                r.x = bounds.x;
+            }
+        }
+        AlignAction::CenterHorizontal => {
+            let cx = bounds.center_x();
+            for r in &mut out {
+                r.x = cx - r.width * 0.5;
+            }
+        }
+        AlignAction::Right => {
+            let right = bounds.right();
+            for r in &mut out {
+                r.x = right - r.width;
+            }
+        }
+        AlignAction::Top => {
+            for r in &mut out {
+                r.y = bounds.y;
+            }
+        }
+        AlignAction::CenterVertical => {
+            let cy = bounds.center_y();
+            for r in &mut out {
+                r.y = cy - r.height * 0.5;
+            }
+        }
+        AlignAction::Bottom => {
+            let bottom = bounds.bottom();
+            for r in &mut out {
+                r.y = bottom - r.height;
+            }
+        }
+        AlignAction::CenterInCanvas => {
+            let raw_dx = (canvas.width * 0.5 - bounds.center_x()).round();
+            let raw_dy = (canvas.height * 0.5 - bounds.center_y()).round();
+            let dx = raw_dx.clamp(-bounds.x, (canvas.width - bounds.right()).max(-bounds.x));
+            let dy = raw_dy.clamp(-bounds.y, (canvas.height - bounds.bottom()).max(-bounds.y));
+            for r in &mut out {
+                r.x += dx;
+                r.y += dy;
+            }
+        }
+        AlignAction::FillWidth | AlignAction::SnapToGrid => {
+            for r in &mut out {
+                *r = align_item(*r, canvas, padding, grid, action);
+            }
+            return out;
+        }
+        AlignAction::DistributeHorizontal => {
+            if out.len() < 3 {
+                return out;
+            }
+            let mut order: Vec<usize> = (0..out.len()).collect();
+            order.sort_by(|&a, &b| {
+                out[a]
+                    .x
+                    .total_cmp(&out[b].x)
+                    .then_with(|| out[a].center_x().total_cmp(&out[b].center_x()))
+                    .then_with(|| a.cmp(&b))
+            });
+            let first = out[order[0]];
+            let last = out[*order.last().unwrap()];
+            let total_span = last.right() - first.x;
+            let sum_w: f32 = order.iter().map(|&i| out[i].width).sum();
+            let gap = (total_span - sum_w) / (order.len() - 1) as f32;
+            let mut cursor = first.x + first.width + gap;
+            for &idx in &order[1..order.len() - 1] {
+                out[idx].x = cursor;
+                cursor += out[idx].width + gap;
+            }
+        }
+        AlignAction::DistributeVertical => {
+            if out.len() < 3 {
+                return out;
+            }
+            let mut order: Vec<usize> = (0..out.len()).collect();
+            order.sort_by(|&a, &b| {
+                out[a]
+                    .y
+                    .total_cmp(&out[b].y)
+                    .then_with(|| out[a].center_y().total_cmp(&out[b].center_y()))
+                    .then_with(|| a.cmp(&b))
+            });
+            let first = out[order[0]];
+            let last = out[*order.last().unwrap()];
+            let total_span = last.bottom() - first.y;
+            let sum_h: f32 = order.iter().map(|&i| out[i].height).sum();
+            let gap = (total_span - sum_h) / (order.len() - 1) as f32;
+            let mut cursor = first.y + first.height + gap;
+            for &idx in &order[1..order.len() - 1] {
+                out[idx].y = cursor;
+                cursor += out[idx].height + gap;
+            }
+        }
+    }
+
+    for r in &mut out {
+        *r = r.clamped_in(canvas).rounded();
+    }
+    out
 }
 
 /// Events emitted by [`FreeformCanvasState`].
 #[derive(Clone, Debug, PartialEq)]
 pub enum FreeformCanvasEvent {
-    /// Selection changed (`None` when clicking empty canvas or pressing Escape).
-    Select(Option<SharedString>),
-    /// An existing component moved to `rect`.
-    Move {
-        /// Component ID.
-        id: SharedString,
-        /// New canvas-local rectangle.
-        rect: CanvasRect,
-    },
+    /// Selection changed (`empty` when clicking empty canvas or pressing Escape).
+    Select(Vec<SharedString>),
+    /// One or more existing components moved to new canvas-local rectangles (atomic batch).
+    Move(Vec<(SharedString, CanvasRect)>),
     /// An existing component resized to `rect`.
     ///
     /// Emitted with `committed: false` while dragging a resize handle and once with
@@ -926,8 +1087,8 @@ pub enum FreeformCanvasEvent {
         /// Snapped drop rectangle on the canvas.
         rect: CanvasRect,
     },
-    /// A component was removed (via `Delete`/`Backspace` or dragging outside the canvas).
-    Remove(SharedString),
+    /// One or more components were removed (via `Delete`/`Backspace` or dragging outside the canvas).
+    Remove(Vec<SharedString>),
     /// The canvas frame itself was resized to `size`.
     ///
     /// Emitted with `committed: false` while dragging a canvas handle and once with
@@ -947,11 +1108,25 @@ enum DragKind {
         default_size: (f32, f32),
     },
     Move {
-        id: SharedString,
-        start_rect: CanvasRect,
+        /// All moved items with their starting canvas-local rectangles.
+        items: Vec<(SharedString, CanvasRect)>,
+        /// Bounding box enclosing `items` when the drag started.
+        group_start_bounds: CanvasRect,
+        /// Pointer offset from `group_start_bounds` top-left at drag start.
         grab_offset: Point<Pixels>,
+        /// Unselected sibling rects used as magnetic snap targets.
         siblings: Vec<CanvasRect>,
     },
+}
+
+#[derive(Clone)]
+struct ActiveMarquee {
+    start_mouse: Point<Pixels>,
+    current_mouse: Point<Pixels>,
+    additive: bool,
+    base_selection: Vec<SharedString>,
+    items: Vec<(SharedString, CanvasRect)>,
+    dragging: bool,
 }
 
 #[derive(Clone)]
@@ -1047,6 +1222,16 @@ impl Render for CanvasDragGhost {
                 .into_any_element(),
         };
 
+        let remove_count = match &drag.kind {
+            DragKind::Move { items, .. } => items.len(),
+            DragKind::New { .. } => 1,
+        };
+        let remove_label = if remove_count > 1 {
+            format!("Remove {remove_count}")
+        } else {
+            "Remove".to_string()
+        };
+
         div()
             .relative()
             .child(body)
@@ -1063,7 +1248,7 @@ impl Render for CanvasDragGhost {
                         .text_color(theme.destructive_foreground)
                         .text_size(px(10.5))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .child("Remove"),
+                        .child(remove_label),
                 )
             })
             .into_any_element()
@@ -1073,14 +1258,17 @@ impl Render for CanvasDragGhost {
 /// Entity state backing a [`FreeformCanvas`] and its [`CanvasPaletteItem`] sources.
 pub struct FreeformCanvasState {
     focus_handle: FocusHandle,
-    selected: Option<SharedString>,
+    selected: Vec<SharedString>,
+    pending_narrow_click: Option<SharedString>,
     snap: SnapConfig,
     show_grid: bool,
     drag_out_to_remove: bool,
     canvas_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    root_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     active_drag: Option<ActiveDrag>,
     active_resize: Option<ActiveResize>,
     active_canvas_resize: Option<ActiveCanvasResize>,
+    active_marquee: Option<ActiveMarquee>,
 }
 
 impl EventEmitter<FreeformCanvasEvent> for FreeformCanvasState {}
@@ -1096,14 +1284,17 @@ impl FreeformCanvasState {
     pub fn new(cx: &mut Context<Self>) -> Self {
         Self {
             focus_handle: cx.focus_handle(),
-            selected: None,
+            selected: Vec::new(),
+            pending_narrow_click: None,
             snap: SnapConfig::default(),
             show_grid: true,
             drag_out_to_remove: true,
             canvas_bounds: Rc::new(Cell::new(None)),
+            root_bounds: Rc::new(Cell::new(None)),
             active_drag: None,
             active_resize: None,
             active_canvas_resize: None,
+            active_marquee: None,
         }
     }
 
@@ -1125,18 +1316,55 @@ impl FreeformCanvasState {
         self
     }
 
-    /// Currently selected component ID, if any.
-    pub fn selected(&self) -> Option<&SharedString> {
-        self.selected.as_ref()
+    /// All currently selected component IDs in selection order.
+    pub fn selected_ids(&self) -> &[SharedString] {
+        &self.selected
     }
 
-    /// Programmatically selects or deselects a component.
+    /// Returns `true` if `id` is currently selected.
+    pub fn is_selected(&self, id: &str) -> bool {
+        self.selected.iter().any(|s| s.as_ref() == id)
+    }
+
+    /// Primary selected component ID (only when at least one item is selected).
+    pub fn selected(&self) -> Option<&SharedString> {
+        self.selected.first()
+    }
+
+    /// Programmatically selects a single component or clears the selection.
     pub fn select(&mut self, id: Option<SharedString>, cx: &mut Context<Self>) {
-        if self.selected != id {
-            self.selected = id.clone();
-            cx.emit(FreeformCanvasEvent::Select(id));
+        self.set_selection(id.into_iter().collect(), cx);
+    }
+
+    /// Replaces the current selection with `ids` (deduplicated, preserving order).
+    pub fn set_selection(&mut self, ids: Vec<SharedString>, cx: &mut Context<Self>) {
+        let mut deduped = Vec::with_capacity(ids.len());
+        for id in ids {
+            if !deduped.contains(&id) {
+                deduped.push(id);
+            }
+        }
+        if self.selected != deduped {
+            self.selected = deduped.clone();
+            cx.emit(FreeformCanvasEvent::Select(deduped));
             cx.notify();
         }
+    }
+
+    /// Toggles `id` in or out of the current selection.
+    pub fn toggle_select(&mut self, id: SharedString, cx: &mut Context<Self>) {
+        let mut next = self.selected.clone();
+        if let Some(pos) = next.iter().position(|s| s == &id) {
+            next.remove(pos);
+        } else {
+            next.push(id);
+        }
+        self.set_selection(next, cx);
+    }
+
+    /// Clears the selection.
+    pub fn clear_selection(&mut self, cx: &mut Context<Self>) {
+        self.set_selection(Vec::new(), cx);
     }
 
     /// Current [`SnapConfig`].
@@ -1165,11 +1393,91 @@ impl FreeformCanvasState {
         }
     }
 
-    /// Whether a drag, component resize, or canvas resize is currently in progress.
+    /// Whether a drag, marquee, component resize, or canvas resize is currently in progress.
     pub fn is_interacting(&self) -> bool {
         self.active_drag.is_some()
             || self.active_resize.is_some()
             || self.active_canvas_resize.is_some()
+            || self.active_marquee.as_ref().is_some_and(|m| m.dragging)
+    }
+
+    fn start_marquee(
+        &mut self,
+        mouse: Point<Pixels>,
+        additive: bool,
+        items: Vec<(SharedString, CanvasRect)>,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_narrow_click = None;
+        let base_selection = if additive {
+            self.selected.clone()
+        } else {
+            Vec::new()
+        };
+        if !additive {
+            self.set_selection(Vec::new(), cx);
+        }
+        self.active_marquee = Some(ActiveMarquee {
+            start_mouse: mouse,
+            current_mouse: mouse,
+            additive,
+            base_selection,
+            items,
+            dragging: false,
+        });
+        cx.notify();
+    }
+
+    fn move_marquee(&mut self, ev: &MouseMoveEvent, cx: &mut Context<Self>) {
+        let Some(cb) = self.canvas_bounds.get() else {
+            return;
+        };
+        let next_selection = {
+            let Some(m) = self.active_marquee.as_mut() else {
+                return;
+            };
+            m.current_mouse = ev.position;
+            if !m.dragging {
+                let dx = (m.current_mouse.x - m.start_mouse.x).0.abs();
+                let dy = (m.current_mouse.y - m.start_mouse.y).0.abs();
+                if dx < 3.0 && dy < 3.0 {
+                    return;
+                }
+                m.dragging = true;
+            }
+            let x0 = (m.start_mouse.x - cb.origin.x)
+                .0
+                .min((m.current_mouse.x - cb.origin.x).0);
+            let y0 = (m.start_mouse.y - cb.origin.y)
+                .0
+                .min((m.current_mouse.y - cb.origin.y).0);
+            let x1 = (m.start_mouse.x - cb.origin.x)
+                .0
+                .max((m.current_mouse.x - cb.origin.x).0);
+            let y1 = (m.start_mouse.y - cb.origin.y)
+                .0
+                .max((m.current_mouse.y - cb.origin.y).0);
+            let marquee = CanvasRect::new(x0, y0, (x1 - x0).max(0.5), (y1 - y0).max(0.5));
+            let mut next = if m.additive {
+                m.base_selection.clone()
+            } else {
+                Vec::new()
+            };
+            for (id, rect) in &m.items {
+                if rect.intersects(marquee) && !next.contains(id) {
+                    next.push(id.clone());
+                }
+            }
+            next
+        };
+        self.set_selection(next_selection, cx);
+        cx.notify();
+    }
+
+    fn end_marquee(&mut self, cx: &mut Context<Self>) {
+        if self.active_marquee.take().is_some() {
+            cx.notify();
+        }
     }
 
     fn effective_snap(&self, alt_held: bool) -> SnapConfig {
@@ -1196,7 +1504,8 @@ impl FreeformCanvasState {
         canvas_size: CanvasSize,
         cx: &mut Context<Self>,
     ) {
-        self.selected = Some(id.clone());
+        self.pending_narrow_click = None;
+        self.set_selection(vec![id.clone()], cx);
         self.active_resize = Some(ActiveResize {
             id,
             handle,
@@ -1570,9 +1879,11 @@ impl RenderOnce for FreeformCanvas {
             show_grid,
             drag_out_to_remove,
             canvas_bounds_cell,
+            root_bounds_cell,
             active_drag,
             active_resize,
             active_canvas_resize,
+            active_marquee,
         ) = {
             let s = self.state.read(cx);
             (
@@ -1582,9 +1893,11 @@ impl RenderOnce for FreeformCanvas {
                 s.show_grid,
                 s.drag_out_to_remove,
                 s.canvas_bounds.clone(),
+                s.root_bounds.clone(),
                 s.active_drag.clone(),
                 s.active_resize.clone(),
                 s.active_canvas_resize.clone(),
+                s.active_marquee.clone(),
             )
         };
 
@@ -1619,12 +1932,26 @@ impl RenderOnce for FreeformCanvas {
         } else if let Some(r) = active_resize.as_ref() {
             Some(format!("{} × {}", r.live_rect.width as i32, r.live_rect.height as i32))
         } else if let Some(d) = active_drag.as_ref().filter(|d| d.inside_canvas) {
-            Some(format!("x: {}  y: {}", d.preview_rect.x as i32, d.preview_rect.y as i32))
+            let count = match &d.kind {
+                DragKind::Move { items, .. } => items.len(),
+                DragKind::New { .. } => 1,
+            };
+            if count > 1 {
+                Some(format!(
+                    "{count} items · x: {}  y: {}",
+                    d.preview_rect.x as i32, d.preview_rect.y as i32
+                ))
+            } else {
+                Some(format!(
+                    "x: {}  y: {}",
+                    d.preview_rect.x as i32, d.preview_rect.y as i32
+                ))
+            }
         } else {
             None
         };
 
-        // Keyboard nudge / delete for the currently selected item
+        // Keyboard nudge / delete / select-all state
         let key_state = self.state.clone();
         let key_selected = selected.clone();
         let key_rects = all_rects.clone();
@@ -1637,31 +1964,56 @@ impl RenderOnce for FreeformCanvas {
         let guide_center_color = theme.primary;
         let guide_gap_color: Hsla = rgb(0x10b981).into();
 
-        // Build placed item elements
+        // Group drag offset (dx, dy) when moving an active selection inside the canvas
+        let move_delta = active_drag.as_ref().and_then(|d| match &d.kind {
+            DragKind::Move {
+                group_start_bounds, ..
+            } => Some((
+                d.preview_rect.x - group_start_bounds.x,
+                d.preview_rect.y - group_start_bounds.y,
+            )),
+            DragKind::New { .. } => None,
+        });
+
+        // Build placed item elements & live selected rects (for the dashed multi-select group frame)
         let mut placed_elements: Vec<AnyElement> = Vec::with_capacity(self.items.len());
+        let mut live_selected_rects: Vec<CanvasRect> = Vec::new();
         let is_empty = self.items.is_empty()
             && !active_drag.as_ref().is_some_and(|d| d.inside_canvas);
+        let single_selected = selected.len() == 1;
 
         for item in self.items {
             let item_id = item.id.clone();
-            let is_selected = selected.as_ref() == Some(&item_id);
-            let is_moving = active_drag.as_ref().is_some_and(|d| {
-                matches!(&d.kind, DragKind::Move { id, .. } if id == &item_id)
+            let is_selected = selected.iter().any(|s| s == &item_id);
+            let moved_start = active_drag.as_ref().and_then(|d| match &d.kind {
+                DragKind::Move { items, .. } => items
+                    .iter()
+                    .find(|(id, _)| id == &item_id)
+                    .map(|(_, r)| *r),
+                DragKind::New { .. } => None,
             });
+            let is_moving = moved_start.is_some();
             let moving_outside = is_moving
                 && active_drag
                     .as_ref()
                     .is_some_and(|d| !d.inside_canvas);
 
-            let rect = if is_moving {
-                active_drag
-                    .as_ref()
-                    .map_or(item.rect, |d| d.preview_rect)
+            let rect = if let (Some(start_r), Some((dx, dy))) = (moved_start, move_delta) {
+                CanvasRect::new(
+                    start_r.x + dx,
+                    start_r.y + dy,
+                    start_r.width,
+                    start_r.height,
+                )
             } else if let Some(r) = active_resize.as_ref().filter(|r| r.id == item_id) {
                 r.live_rect
             } else {
                 item.rect
             };
+
+            if is_selected && !moving_outside {
+                live_selected_rects.push(rect);
+            }
 
             let siblings: Vec<CanvasRect> = all_rects
                 .iter()
@@ -1673,9 +2025,11 @@ impl RenderOnce for FreeformCanvas {
             let source_for_drag = source.clone();
             let drag_state = self.state.clone();
             let select_state = self.state.clone();
+            let up_state = self.state.clone();
             let drag_id = item_id.clone();
             let select_id = item_id.clone();
-            let drag_siblings = siblings.clone();
+            let up_id = item_id.clone();
+            let drag_all_rects = all_rects.clone();
             let hover_border = theme.primary.opacity(0.45);
             let sel_border = theme.primary;
             let focus_on_click = focus_handle.clone();
@@ -1693,10 +2047,36 @@ impl RenderOnce for FreeformCanvas {
                     CursorStyle::OpenHand
                 })
                 .when(moving_outside, |el| el.opacity(0.18))
-                .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
                     window.focus(&focus_on_click, cx);
-                    select_state.update(cx, |s, cx| s.select(Some(select_id.clone()), cx));
+                    let additive =
+                        ev.modifiers.shift || ev.modifiers.control || ev.modifiers.platform;
+                    select_state.update(cx, |s, cx| {
+                        if additive {
+                            s.pending_narrow_click = None;
+                            s.toggle_select(select_id.clone(), cx);
+                        } else if s.is_selected(select_id.as_ref()) {
+                            if s.selected.len() > 1 {
+                                s.pending_narrow_click = Some(select_id.clone());
+                            } else {
+                                s.pending_narrow_click = None;
+                            }
+                        } else {
+                            s.pending_narrow_click = None;
+                            s.select(Some(select_id.clone()), cx);
+                        }
+                    });
                     cx.stop_propagation();
+                })
+                .on_mouse_up(MouseButton::Left, move |_, _, cx| {
+                    up_state.update(cx, |s, cx| {
+                        if s.pending_narrow_click.as_ref() == Some(&up_id)
+                            && s.active_drag.is_none()
+                        {
+                            s.pending_narrow_click = None;
+                            s.select(Some(up_id.clone()), cx);
+                        }
+                    });
                 })
                 .on_drag(
                     CanvasDragPayload {
@@ -1706,20 +2086,43 @@ impl RenderOnce for FreeformCanvas {
                         let snapshot = source_for_drag.snapshot(window);
                         let snap_size = size(px(rect.width), px(rect.height));
                         payload.state.update(cx, |s, cx| {
-                            s.selected = Some(drag_id.clone());
+                            s.pending_narrow_click = None;
+                            if !s.is_selected(drag_id.as_ref()) {
+                                s.set_selection(vec![drag_id.clone()], cx);
+                            }
+                            let mut moving_items: Vec<(SharedString, CanvasRect)> = drag_all_rects
+                                .iter()
+                                .filter(|(id, _)| s.is_selected(id.as_ref()))
+                                .cloned()
+                                .collect();
+                            if moving_items.is_empty() {
+                                moving_items.push((drag_id.clone(), rect));
+                            }
+                            let moving_rects: Vec<CanvasRect> =
+                                moving_items.iter().map(|(_, r)| *r).collect();
+                            let group_start_bounds =
+                                bounding_rect(&moving_rects).unwrap_or(rect);
+                            let group_grab_offset = point(
+                                offset.x + px(rect.x - group_start_bounds.x),
+                                offset.y + px(rect.y - group_start_bounds.y),
+                            );
+                            let drag_siblings: Vec<CanvasRect> = drag_all_rects
+                                .iter()
+                                .filter(|(id, _)| !moving_items.iter().any(|(mid, _)| mid == id))
+                                .map(|(_, r)| *r)
+                                .collect();
                             s.active_drag = Some(ActiveDrag {
                                 kind: DragKind::Move {
-                                    id: drag_id.clone(),
-                                    start_rect: rect,
-                                    grab_offset: offset,
-                                    siblings: drag_siblings.clone(),
+                                    items: moving_items,
+                                    group_start_bounds,
+                                    grab_offset: group_grab_offset,
+                                    siblings: drag_siblings,
                                 },
-                                preview_rect: rect,
+                                preview_rect: group_start_bounds,
                                 inside_canvas: true,
                                 guides: Vec::new(),
                                 outside_to_remove: false,
                             });
-                            cx.emit(FreeformCanvasEvent::Select(Some(drag_id.clone())));
                             cx.notify();
                         });
                         window.refresh();
@@ -1735,13 +2138,18 @@ impl RenderOnce for FreeformCanvas {
                                     if let Some(drag) = s.active_drag.take() {
                                         if drag.outside_to_remove
                                             && s.drag_out_to_remove
-                                            && let DragKind::Move { id, .. } = drag.kind
+                                            && let DragKind::Move { items, .. } = drag.kind
                                         {
-                                            if s.selected.as_ref() == Some(&id) {
-                                                s.selected = None;
-                                                cx.emit(FreeformCanvasEvent::Select(None));
-                                            }
-                                            cx.emit(FreeformCanvasEvent::Remove(id));
+                                            let removed: Vec<SharedString> =
+                                                items.into_iter().map(|(id, _)| id).collect();
+                                            let remaining: Vec<SharedString> = s
+                                                .selected
+                                                .iter()
+                                                .filter(|id| !removed.contains(id))
+                                                .cloned()
+                                                .collect();
+                                            s.set_selection(remaining, cx);
+                                            cx.emit(FreeformCanvasEvent::Remove(removed));
                                         }
                                         cx.notify();
                                     }
@@ -1771,8 +2179,8 @@ impl RenderOnce for FreeformCanvas {
                         .when(!is_selected, |el| el.hover(move |s| s.border_color(hover_border))),
                 );
 
-            // 8-direction resize handles on the selected component (hidden while dragging to move)
-            if is_selected && !is_moving {
+            // 8-direction resize handles when a single component is selected (hidden while moving)
+            if is_selected && single_selected && !is_moving {
                 let handle_size = 9.0_f32;
                 let half = handle_size * 0.5;
                 for handle in ResizeHandle::ALL {
@@ -1881,11 +2289,16 @@ impl RenderOnce for FreeformCanvas {
         });
 
         let guide_badges = build_guide_badges(&active_guides, cw, ch, guide_gap_color);
+        let group_sel_bounds = (live_selected_rects.len() >= 2)
+            .then(|| bounding_rect(&live_selected_rects))
+            .flatten();
+        let group_frame_color = theme.primary.opacity(0.65);
 
         // Inner editable canvas box (exact 1:1 logical pixels of the floating pane)
         let bounds_measure = canvas_bounds_cell.clone();
-        let deselect_state = self.state.clone();
-        let deselect_focus = focus_handle.clone();
+        let marquee_start_state = self.state.clone();
+        let marquee_focus = focus_handle.clone();
+        let marquee_items = all_rects.clone();
         let guides_for_paint = active_guides;
         let inner_canvas = div()
             .id((self.id.clone(), "canvas-surface"))
@@ -1934,11 +2347,14 @@ impl RenderOnce for FreeformCanvas {
                     )
                 })
             })
-            // Smart alignment guides painted above all items
+            // Multi-select group bounding box + smart alignment guides painted above all items
             .child(
                 canvas(
                     |_, _, _| {},
                     move |bounds, _, window, _| {
+                        if let Some(gb) = group_sel_bounds {
+                            paint_dashed_rect(bounds, gb, group_frame_color, window);
+                        }
                         paint_snap_guides(
                             bounds,
                             &guides_for_paint,
@@ -1966,7 +2382,7 @@ impl RenderOnce for FreeformCanvas {
             theme.primary,
         );
 
-        // Window-level pointer capture for active item resize or canvas resize
+        // Window-level pointer capture for active item resize, canvas resize, or marquee drag
         let capture_state = self.state.clone();
         let active_cursor = active_resize
             .as_ref()
@@ -1974,6 +2390,14 @@ impl RenderOnce for FreeformCanvas {
             .or_else(|| active_canvas_resize.as_ref().map(|r| r.handle.cursor()));
         let is_item_resizing = active_resize.is_some();
         let is_canvas_resizing = active_canvas_resize.is_some();
+        let is_marquee_active = active_marquee.is_some();
+        let marquee_paint = active_marquee
+            .as_ref()
+            .filter(|m| m.dragging)
+            .map(|m| (m.start_mouse, m.current_mouse));
+        let marquee_fill = theme.primary.opacity(0.14);
+        let marquee_stroke = theme.primary.opacity(0.85);
+        let root_bounds_measure = root_bounds_cell;
 
         // Outer workbench container hosting the canvas, canvas resize grips, HUD readout, and DnD listeners
         let dnd_move_state = self.state.clone();
@@ -2013,50 +2437,78 @@ impl RenderOnce for FreeformCanvas {
             .items_center()
             .justify_center()
             .p(px(32.))
-            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
-                window.focus(&deselect_focus, cx);
-                deselect_state.update(cx, |s, cx| s.select(None, cx));
+            .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
+                window.focus(&marquee_focus, cx);
+                let additive =
+                    ev.modifiers.shift || ev.modifiers.control || ev.modifiers.platform;
+                marquee_start_state.update(cx, |s, cx| {
+                    s.start_marquee(ev.position, additive, marquee_items.clone(), cx);
+                });
             })
             .on_key_down(move |ev: &KeyDownEvent, _, cx| {
                 let mods = &ev.keystroke.modifiers;
+                let key = ev.keystroke.key.as_str();
+                if (mods.control || mods.platform) && !mods.alt && !mods.shift && key == "a" {
+                    let all_ids: Vec<SharedString> =
+                        key_rects.iter().map(|(id, _)| id.clone()).collect();
+                    key_state.update(cx, |s, cx| s.set_selection(all_ids, cx));
+                    cx.stop_propagation();
+                    return;
+                }
                 if mods.control || mods.alt || mods.platform {
                     return;
                 }
-                match ev.keystroke.key.as_str() {
+                match key {
                     "escape" => {
-                        key_state.update(cx, |s, cx| s.select(None, cx));
+                        key_state.update(cx, |s, cx| s.clear_selection(cx));
                         cx.stop_propagation();
                     }
                     "delete" | "backspace" => {
-                        if let Some(id) = key_selected.clone() {
+                        if !key_selected.is_empty() {
+                            let removed = key_selected.clone();
                             key_state.update(cx, |s, cx| {
-                                s.select(None, cx);
-                                cx.emit(FreeformCanvasEvent::Remove(id));
+                                s.clear_selection(cx);
+                                cx.emit(FreeformCanvasEvent::Remove(removed));
                             });
                             cx.stop_propagation();
                         }
                     }
                     "left" | "right" | "up" | "down" => {
-                        if let Some(id) = key_selected.clone()
-                            && let Some((_, rect)) = key_rects.iter().find(|(k, _)| k == &id)
-                        {
+                        let sel_items: Vec<(SharedString, CanvasRect)> = key_rects
+                            .iter()
+                            .filter(|(id, _)| key_selected.contains(id))
+                            .cloned()
+                            .collect();
+                        if !sel_items.is_empty() {
                             let step = if mods.shift { key_grid } else { 1.0 };
-                            let (dx, dy) = match ev.keystroke.key.as_str() {
+                            let (raw_dx, raw_dy) = match key {
                                 "left" => (-step, 0.0),
                                 "right" => (step, 0.0),
                                 "up" => (0.0, -step),
                                 _ => (0.0, step),
                             };
-                            let next = CanvasRect::new(
-                                rect.x + dx,
-                                rect.y + dy,
-                                rect.width,
-                                rect.height,
-                            )
-                            .clamped_in(canvas_size)
-                            .rounded();
+                            let rects: Vec<CanvasRect> =
+                                sel_items.iter().map(|(_, r)| *r).collect();
+                            let Some(bounds) = bounding_rect(&rects) else {
+                                return;
+                            };
+                            let dx = raw_dx
+                                .clamp(-bounds.x, (canvas_size.width - bounds.right()).max(-bounds.x));
+                            let dy = raw_dy
+                                .clamp(-bounds.y, (canvas_size.height - bounds.bottom()).max(-bounds.y));
+                            let moved: Vec<(SharedString, CanvasRect)> = sel_items
+                                .into_iter()
+                                .map(|(id, r)| {
+                                    (
+                                        id,
+                                        CanvasRect::new(r.x + dx, r.y + dy, r.width, r.height)
+                                            .clamped_in(canvas_size)
+                                            .rounded(),
+                                    )
+                                })
+                                .collect();
                             key_state.update(cx, |_, cx| {
-                                cx.emit(FreeformCanvasEvent::Move { id, rect: next });
+                                cx.emit(FreeformCanvasEvent::Move(moved));
                                 cx.notify();
                             });
                             cx.stop_propagation();
@@ -2107,7 +2559,7 @@ impl RenderOnce for FreeformCanvas {
                             diff
                         }
                         DragKind::Move {
-                            start_rect,
+                            group_start_bounds,
                             grab_offset,
                             siblings,
                             ..
@@ -2120,8 +2572,8 @@ impl RenderOnce for FreeformCanvas {
                             let proposed = CanvasRect::new(
                                 rel_x - grab_offset.x.0,
                                 rel_y - grab_offset.y.0,
-                                start_rect.width,
-                                start_rect.height,
+                                group_start_bounds.width,
+                                group_start_bounds.height,
                             );
                             let (next_rect, next_guides) = if inside {
                                 snap_move(proposed, siblings, canvas_size, &snap)
@@ -2165,35 +2617,67 @@ impl RenderOnce for FreeformCanvas {
                             });
                         }
                     }
-                    DragKind::Move { id, start_rect, .. } => {
+                    DragKind::Move {
+                        items,
+                        group_start_bounds,
+                        ..
+                    } => {
                         if drag.inside_canvas {
-                            if drag.preview_rect != start_rect {
+                            let dx = drag.preview_rect.x - group_start_bounds.x;
+                            let dy = drag.preview_rect.y - group_start_bounds.y;
+                            if dx.abs() > 0.01 || dy.abs() > 0.01 {
+                                let moved: Vec<(SharedString, CanvasRect)> = items
+                                    .into_iter()
+                                    .map(|(id, r)| {
+                                        (
+                                            id,
+                                            CanvasRect::new(r.x + dx, r.y + dy, r.width, r.height)
+                                                .clamped_in(canvas_size)
+                                                .rounded(),
+                                        )
+                                    })
+                                    .collect();
                                 dnd_drop_state.update(cx, |_, cx| {
-                                    cx.emit(FreeformCanvasEvent::Move {
-                                        id,
-                                        rect: drag.preview_rect,
-                                    });
+                                    cx.emit(FreeformCanvasEvent::Move(moved));
                                     cx.notify();
                                 });
                             }
                         } else if drag.outside_to_remove && drag_out_to_remove {
+                            let removed: Vec<SharedString> =
+                                items.into_iter().map(|(id, _)| id).collect();
                             dnd_drop_state.update(cx, |s, cx| {
-                                if s.selected.as_ref() == Some(&id) {
-                                    s.selected = None;
-                                    cx.emit(FreeformCanvasEvent::Select(None));
-                                }
-                                cx.emit(FreeformCanvasEvent::Remove(id));
+                                let remaining: Vec<SharedString> = s
+                                    .selected
+                                    .iter()
+                                    .filter(|id| !removed.contains(id))
+                                    .cloned()
+                                    .collect();
+                                s.set_selection(remaining, cx);
+                                cx.emit(FreeformCanvasEvent::Remove(removed));
                                 cx.notify();
                             });
                         }
                     }
                 }
             })
-            // Window-level mouse capture while resizing an item or the canvas
+            .child(frame_wrapper)
+            // Window-level pointer capture + top-most marquee rubber-band overlay
             .child(
                 canvas(
-                    |_, _, _| {},
-                    move |_, _, window, _| {
+                    move |bounds, _, _| {
+                        root_bounds_measure.set(Some(bounds));
+                    },
+                    move |bounds, _, window, _| {
+                        if let Some((start_pt, cur_pt)) = marquee_paint {
+                            paint_marquee_rect(
+                                bounds,
+                                start_pt,
+                                cur_pt,
+                                marquee_fill,
+                                marquee_stroke,
+                                window,
+                            );
+                        }
                         if let Some(cursor) = active_cursor {
                             window.set_window_cursor_style(cursor);
                         }
@@ -2235,13 +2719,31 @@ impl RenderOnce for FreeformCanvas {
                                     st_u.update(cx, |s, cx| s.end_canvas_resize(cx));
                                 }
                             });
+                        } else if is_marquee_active {
+                            let st_m = capture_state.clone();
+                            let st_u = capture_state;
+                            window.on_mouse_event(move |ev: &MouseMoveEvent, phase, _, cx| {
+                                if phase == DispatchPhase::Capture {
+                                    if ev.pressed_button != Some(MouseButton::Left) {
+                                        st_m.update(cx, |s, cx| s.end_marquee(cx));
+                                    } else {
+                                        st_m.update(cx, |s, cx| s.move_marquee(ev, cx));
+                                    }
+                                }
+                            });
+                            window.on_mouse_event(move |ev: &MouseUpEvent, phase, _, cx| {
+                                if phase == DispatchPhase::Capture
+                                    && ev.button == MouseButton::Left
+                                {
+                                    st_u.update(cx, |s, cx| s.end_marquee(cx));
+                                }
+                            });
                         }
                     },
                 )
                 .absolute()
                 .inset_0(),
-            )
-            .child(frame_wrapper);
+            );
 
         let _ = window;
         crate::Refineable::refine(root.style(), &self.style);
@@ -2302,6 +2804,85 @@ fn paint_dot_grid(bounds: Bounds<Pixels>, grid_step: f32, color: Hsla, window: &
         }
         ix += 1;
     }
+}
+
+fn paint_dashed_rect(bounds: Bounds<Pixels>, rect: CanvasRect, color: Hsla, window: &mut Window) {
+    let x0 = bounds.origin.x.0 + rect.x - 1.0;
+    let y0 = bounds.origin.y.0 + rect.y - 1.0;
+    let w = (rect.width + 2.0).max(2.0);
+    let h = (rect.height + 2.0).max(2.0);
+    let dash = 4.0_f32;
+    let step = 7.0_f32;
+
+    let mut x = 0.0_f32;
+    while x < w {
+        let len = (w - x).min(dash);
+        window.paint_quad(fill(
+            Bounds::new(point(px(x0 + x), px(y0)), size(px(len), px(1.0))),
+            color,
+        ));
+        window.paint_quad(fill(
+            Bounds::new(point(px(x0 + x), px(y0 + h - 1.0)), size(px(len), px(1.0))),
+            color,
+        ));
+        x += step;
+    }
+
+    let mut y = 0.0_f32;
+    while y < h {
+        let len = (h - y).min(dash);
+        window.paint_quad(fill(
+            Bounds::new(point(px(x0), px(y0 + y)), size(px(1.0), px(len))),
+            color,
+        ));
+        window.paint_quad(fill(
+            Bounds::new(point(px(x0 + w - 1.0), px(y0 + y)), size(px(1.0), px(len))),
+            color,
+        ));
+        y += step;
+    }
+}
+
+fn paint_marquee_rect(
+    clip_bounds: Bounds<Pixels>,
+    start: Point<Pixels>,
+    current: Point<Pixels>,
+    fill_color: Hsla,
+    stroke_color: Hsla,
+    window: &mut Window,
+) {
+    let min_x = clip_bounds.origin.x.0;
+    let min_y = clip_bounds.origin.y.0;
+    let max_x = min_x + clip_bounds.size.width.0;
+    let max_y = min_y + clip_bounds.size.height.0;
+
+    let x0 = start.x.0.min(current.x.0).clamp(min_x, max_x);
+    let y0 = start.y.0.min(current.y.0).clamp(min_y, max_y);
+    let x1 = start.x.0.max(current.x.0).clamp(min_x, max_x);
+    let y1 = start.y.0.max(current.y.0).clamp(min_y, max_y);
+    let w = (x1 - x0).max(1.0);
+    let h = (y1 - y0).max(1.0);
+
+    window.paint_quad(fill(
+        Bounds::new(point(px(x0), px(y0)), size(px(w), px(h))),
+        fill_color,
+    ));
+    window.paint_quad(fill(
+        Bounds::new(point(px(x0), px(y0)), size(px(w), px(1.0))),
+        stroke_color,
+    ));
+    window.paint_quad(fill(
+        Bounds::new(point(px(x0), px(y0 + h - 1.0)), size(px(w), px(1.0))),
+        stroke_color,
+    ));
+    window.paint_quad(fill(
+        Bounds::new(point(px(x0), px(y0)), size(px(1.0), px(h))),
+        stroke_color,
+    ));
+    window.paint_quad(fill(
+        Bounds::new(point(px(x0 + w - 1.0), px(y0)), size(px(1.0), px(h))),
+        stroke_color,
+    ));
 }
 
 fn paint_snap_guides(
@@ -2622,14 +3203,20 @@ mod tests {
                     FreeformCanvasEvent::DropNew { kind, rect } => {
                         this.items.push((format!("{kind}-1").into(), *rect));
                     }
-                    FreeformCanvasEvent::Move { id, rect }
-                    | FreeformCanvasEvent::Resize { id, rect, .. } => {
+                    FreeformCanvasEvent::Move(moves) => {
+                        for (id, rect) in moves {
+                            if let Some(it) = this.items.iter_mut().find(|(k, _)| k == id) {
+                                it.1 = *rect;
+                            }
+                        }
+                    }
+                    FreeformCanvasEvent::Resize { id, rect, .. } => {
                         if let Some(it) = this.items.iter_mut().find(|(k, _)| k == id) {
                             it.1 = *rect;
                         }
                     }
-                    FreeformCanvasEvent::Remove(id) => {
-                        this.items.retain(|(k, _)| k != id);
+                    FreeformCanvasEvent::Remove(ids) => {
+                        this.items.retain(|(k, _)| !ids.contains(k));
                     }
                     FreeformCanvasEvent::ResizeCanvas { size, .. } => {
                         this.size = *size;
@@ -2860,5 +3447,236 @@ mod tests {
         assert_eq!(resolve_dot_grid_step(4.0, 540.0, 340.0), 4.0);
         // Oversized canvas doubles step so quad counts stay bounded.
         assert!(resolve_dot_grid_step(4.0, 1600.0, 1200.0) >= 8.0);
+    }
+
+    #[test]
+    fn align_items_aligns_group_mutually_and_distributes_evenly() {
+        let canvas = CanvasSize::new(300.0, 160.0);
+        let rects = vec![
+            CanvasRect::new(20.0, 10.0, 40.0, 20.0),
+            CanvasRect::new(70.0, 34.0, 20.0, 16.0),
+            CanvasRect::new(180.0, 60.0, 40.0, 30.0),
+        ];
+
+        // Left aligns all items to the group's leftmost edge (20), NOT canvas padding (12).
+        let left = align_items(&rects, canvas, 12.0, 4.0, AlignAction::Left);
+        assert!(left.iter().all(|r| r.x == 20.0));
+
+        // Right aligns all items' right edges to the group's rightmost edge (220).
+        let right = align_items(&rects, canvas, 12.0, 4.0, AlignAction::Right);
+        assert!(right.iter().all(|r| r.right() == 220.0));
+
+        // CenterVertical aligns all items' vertical centers to group center_y = (10 + 90) / 2 = 50.
+        let cv = align_items(&rects, canvas, 12.0, 4.0, AlignAction::CenterVertical);
+        assert_eq!(cv[0].y, 40.0);
+        assert_eq!(cv[1].y, 42.0);
+        assert_eq!(cv[2].y, 35.0);
+
+        // DistributeHorizontal pins outer items (x=20, right=220 -> span=200, sum_w=100 -> gap=50).
+        let dist_h = align_items(&rects, canvas, 12.0, 4.0, AlignAction::DistributeHorizontal);
+        assert_eq!(dist_h[0].x, 20.0);
+        assert_eq!(dist_h[1].x, 110.0); // 20 + 40 + 50
+        assert_eq!(dist_h[2].x, 180.0); // 110 + 20 + 50
+
+        // DistributeVertical pins top (y=10) & bottom (bottom=90 -> span=80, sum_h=66 -> gap=7).
+        let dist_v = align_items(&rects, canvas, 12.0, 4.0, AlignAction::DistributeVertical);
+        assert_eq!(dist_v[0].y, 10.0);
+        assert_eq!(dist_v[1].y, 37.0); // 10 + 20 + 7
+        assert_eq!(dist_v[2].y, 60.0); // 37 + 16 + 7
+
+        // CenterInCanvas shifts the whole group rigidly preserving relative offsets.
+        let centered = align_items(&rects, canvas, 12.0, 4.0, AlignAction::CenterInCanvas);
+        assert_eq!(centered[1].x - centered[0].x, rects[1].x - rects[0].x);
+        assert_eq!(centered[2].y - centered[0].y, rects[2].y - rects[0].y);
+        let gb = bounding_rect(&centered).unwrap();
+        assert!((gb.center_x() - 150.0).abs() <= 1.0);
+        assert!((gb.center_y() - 80.0).abs() <= 1.0);
+    }
+
+    #[crate::test]
+    fn marquee_multiselect_shift_toggle_and_group_move_work_end_to_end(
+        cx: &mut crate::TestAppContext,
+    ) {
+        use crate::{Modifiers, MouseDownEvent, MouseMoveEvent, MouseUpEvent};
+        cx.update(super::super::init_components);
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let canvas = cx.new(FreeformCanvasState::new);
+            let sub = cx.subscribe(&canvas, |this: &mut StudioView, _, ev: &FreeformCanvasEvent, cx| {
+                match ev {
+                    FreeformCanvasEvent::Move(moves) => {
+                        for (id, rect) in moves {
+                            if let Some(it) = this.items.iter_mut().find(|(k, _)| k == id) {
+                                it.1 = *rect;
+                            }
+                        }
+                    }
+                    FreeformCanvasEvent::Remove(ids) => {
+                        this.items.retain(|(k, _)| !ids.contains(k));
+                    }
+                    _ => {}
+                }
+                cx.notify();
+            });
+            StudioView {
+                canvas,
+                items: vec![
+                    ("a".into(), CanvasRect::new(16.0, 16.0, 40.0, 20.0)),
+                    ("b".into(), CanvasRect::new(72.0, 16.0, 40.0, 20.0)),
+                    ("c".into(), CanvasRect::new(160.0, 80.0, 40.0, 20.0)),
+                ],
+                size: CanvasSize::new(240.0, 120.0),
+                committed_resizes: 0,
+                committed_canvas_resizes: 0,
+                _sub: sub,
+            }
+        });
+        cx.run_until_parked();
+
+        let cb = view
+            .read_with(cx, |v, cx| v.canvas.read(cx).canvas_bounds.get())
+            .unwrap();
+
+        // 1. Marquee drag starting OUTSIDE top-left of canvas and sweeping over "a" and "b" (not "c")
+        let m_start = point(cb.origin.x - px(10.), cb.origin.y - px(10.));
+        let m_end = point(cb.origin.x + px(120.), cb.origin.y + px(48.));
+        cx.simulate_event(MouseDownEvent {
+            position: m_start,
+            button: MouseButton::Left,
+            modifiers: Modifiers::none(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        cx.run_until_parked();
+        cx.simulate_event(MouseMoveEvent {
+            position: m_end,
+            pressed_button: Some(MouseButton::Left),
+            modifiers: Modifiers::none(),
+        });
+        cx.run_until_parked();
+        cx.simulate_event(MouseUpEvent {
+            position: m_end,
+            button: MouseButton::Left,
+            modifiers: Modifiers::none(),
+            click_count: 1,
+        });
+        cx.run_until_parked();
+
+        let sel: Vec<SharedString> =
+            view.read_with(cx, |v, cx| v.canvas.read(cx).selected_ids().to_vec());
+        assert_eq!(sel, vec![SharedString::from("a"), SharedString::from("b")]);
+
+        // 2. Drag "a" while both "a" and "b" are selected -> moves BOTH rigidly preserving offset
+        let a_pt = point(cb.origin.x + px(30.), cb.origin.y + px(26.));
+        let a_mid = point(cb.origin.x + px(36.), cb.origin.y + px(30.));
+        let a_end = point(cb.origin.x + px(60.), cb.origin.y + px(58.));
+        cx.simulate_event(MouseDownEvent {
+            position: a_pt,
+            button: MouseButton::Left,
+            modifiers: Modifiers::none(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        for &pos in &[a_mid, a_end, a_end] {
+            cx.simulate_event(MouseMoveEvent {
+                position: pos,
+                pressed_button: Some(MouseButton::Left),
+                modifiers: Modifiers::none(),
+            });
+            cx.run_until_parked();
+        }
+        cx.simulate_event(MouseUpEvent {
+            position: a_end,
+            button: MouseButton::Left,
+            modifiers: Modifiers::none(),
+            click_count: 1,
+        });
+        cx.run_until_parked();
+
+        let (ra, rb, rc) = view.read_with(cx, |v, _| (v.items[0].1, v.items[1].1, v.items[2].1));
+        assert!(ra.x >= 32.0 && ra.y >= 40.0, "expected 'a' to move, got {ra:?}");
+        assert_eq!(rb.x - ra.x, 56.0, "expected rigid group horizontal offset");
+        assert_eq!(rb.y, ra.y, "expected rigid group vertical alignment");
+        assert_eq!(rc, CanvasRect::new(160.0, 80.0, 40.0, 20.0), "'c' must stay untouched");
+
+        // 3. Shift+click "c" adds it to the selection; Shift+click "a" removes it
+        let c_pt = point(cb.origin.x + px(180.), cb.origin.y + px(90.));
+        cx.simulate_event(MouseDownEvent {
+            position: c_pt,
+            button: MouseButton::Left,
+            modifiers: Modifiers::shift(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        cx.simulate_event(MouseUpEvent {
+            position: c_pt,
+            button: MouseButton::Left,
+            modifiers: Modifiers::shift(),
+            click_count: 1,
+        });
+        cx.run_until_parked();
+        let sel: Vec<SharedString> =
+            view.read_with(cx, |v, cx| v.canvas.read(cx).selected_ids().to_vec());
+        assert_eq!(
+            sel,
+            vec![SharedString::from("a"), SharedString::from("b"), SharedString::from("c")]
+        );
+
+        let a_now = point(cb.origin.x + px(ra.x + 12.), cb.origin.y + px(ra.y + 8.));
+        cx.simulate_event(MouseDownEvent {
+            position: a_now,
+            button: MouseButton::Left,
+            modifiers: Modifiers::shift(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        cx.simulate_event(MouseUpEvent {
+            position: a_now,
+            button: MouseButton::Left,
+            modifiers: Modifiers::shift(),
+            click_count: 1,
+        });
+        cx.run_until_parked();
+        let sel: Vec<SharedString> =
+            view.read_with(cx, |v, cx| v.canvas.read(cx).selected_ids().to_vec());
+        assert_eq!(sel, vec![SharedString::from("b"), SharedString::from("c")]);
+
+        // 4. Plain click on already-selected "c" (no drag) narrows selection to just "c"
+        cx.simulate_event(MouseDownEvent {
+            position: c_pt,
+            button: MouseButton::Left,
+            modifiers: Modifiers::none(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        cx.simulate_event(MouseUpEvent {
+            position: c_pt,
+            button: MouseButton::Left,
+            modifiers: Modifiers::none(),
+            click_count: 1,
+        });
+        cx.run_until_parked();
+        let sel: Vec<SharedString> =
+            view.read_with(cx, |v, cx| v.canvas.read(cx).selected_ids().to_vec());
+        assert_eq!(sel, vec![SharedString::from("c")]);
+
+        // 5. Ctrl+A selects all, rigid Shift+Left nudges all together without crushing offsets, Delete removes all
+        cx.simulate_keystrokes("ctrl-a");
+        cx.run_until_parked();
+        let sel: Vec<SharedString> =
+            view.read_with(cx, |v, cx| v.canvas.read(cx).selected_ids().to_vec());
+        assert_eq!(sel.len(), 3);
+
+        let before = view.read_with(cx, |v, _| v.items.clone());
+        cx.simulate_keystrokes("shift-left");
+        cx.run_until_parked();
+        let after = view.read_with(cx, |v, _| v.items.clone());
+        assert_eq!(after[0].1.x, before[0].1.x - 4.0);
+        assert_eq!(after[1].1.x - after[0].1.x, before[1].1.x - before[0].1.x);
+        assert_eq!(after[2].1.x - after[0].1.x, before[2].1.x - before[0].1.x);
+
+        cx.simulate_keystrokes("delete");
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |v, _| v.items.is_empty()));
+        assert!(view.read_with(cx, |v, cx| v.canvas.read(cx).selected_ids().is_empty()));
     }
 }
