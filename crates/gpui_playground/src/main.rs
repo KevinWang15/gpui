@@ -562,6 +562,78 @@ impl Render for PlaygroundApp {
                     ),
             )
             .child(command_palette(&self.command_palette))
+            .child({
+                let fw_bounds = self
+                    .demo_floating_window
+                    .read(cx)
+                    .custom_bounds();
+                let bounds_text = match fw_bounds {
+                    Some(b) => format!(
+                        "{:.0} × {:.0} at ({:.0}, {:.0})",
+                        f32::from(b.size.width),
+                        f32::from(b.size.height),
+                        f32::from(b.origin.x),
+                        f32::from(b.origin.y),
+                    ),
+                    None => "Default centered geometry".to_owned(),
+                };
+                floating_window("pg-demo-floating-window", &self.demo_floating_window)
+                    .title("Floating Inspector")
+                    .subtitle("Drag header · double-click maximize · resize any edge or corner")
+                    .icon(LucideIcon::AppWindow)
+                    .modal(self.demo_floating_modal)
+                    .header_action(
+                        button("fw-reset-hdr")
+                            .ghost()
+                            .size(ComponentSize::Xs)
+                            .tooltip_text("Reset position & size")
+                            .leading_icon(LucideIcon::RotateCcw)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.demo_floating_window
+                                    .update(cx, |w, cx| w.reset_layout(cx));
+                            })),
+                    )
+                    .child(
+                        v_stack()
+                            .p(px(16.))
+                            .spacing(px(12.))
+                            .child(
+                                alert("8-way perimeter resize + draggable header")
+                                    .variant(AlertVariant::Info)
+                                    .description(
+                                        "Grab any of the 4 edges (N/S/E/W) or 4 corners (NW/NE/SW/SE) to resize with exact OS cursors. Drag the header to move, or double-click it to maximize/restore.",
+                                    ),
+                            )
+                            .child(
+                                setting_row("Modal backdrop")
+                                    .description("Toggle between non-blocking floating window and modal scrim")
+                                    .control(
+                                        toggle("fw-modal-tog", self.demo_floating_modal)
+                                            .size(ComponentSize::Sm)
+                                            .on_change(cx.listener(|this, v, _, cx| {
+                                                this.demo_floating_modal = *v;
+                                                cx.notify();
+                                            })),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(theme.muted_foreground)
+                                    .child(format!("Bounds: {bounds_text}")),
+                            ),
+                    )
+                    .footer(
+                        button("fw-close-footer")
+                            .secondary()
+                            .size(ComponentSize::Sm)
+                            .label("Close")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.demo_floating_window
+                                    .update(cx, |w, cx| w.set_open(false, cx));
+                            })),
+                    )
+            })
             .child(tour(&self.demo_tour))
             .child(
                 ask_ai_overlay("pg-ai-overlay", &self.ai_overlay_ask)

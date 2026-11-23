@@ -701,6 +701,100 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
                         )),
                 ),
         )
+        // Reusable In-App Floating Window Showcase (8-way resize + draggable header)
+        .child({
+            let fw_open = app.demo_floating_window.read(cx).is_open();
+            let fw_max = app.demo_floating_window.read(cx).is_maximized();
+            card()
+                .child(
+                    card_header().bordered().child(
+                        h_stack()
+                            .justify_between()
+                            .flex_wrap()
+                            .spacing(px(8.))
+                            .child(
+                                h_stack()
+                                    .spacing(px(8.))
+                                    .child(card_title("Floating Window (In-App)"))
+                                    .child(
+                                        badge("8-Way Resize · Draggable")
+                                            .color(BadgeColor::Indigo)
+                                            .pill(true),
+                                    ),
+                            )
+                            .when(fw_open, |el| {
+                                el.child(
+                                    badge(if fw_max { "Maximized" } else { "Open" })
+                                        .color(BadgeColor::Green)
+                                        .dot(true)
+                                        .pill(true),
+                                )
+                            }),
+                    ),
+                )
+                .child(
+                    card_content()
+                        .child(
+                            h_stack()
+                                .flex_wrap()
+                                .justify_between()
+                                .spacing(px(12.))
+                                .child(
+                                    h_stack()
+                                        .flex_wrap()
+                                        .spacing(px(8.))
+                                        .child(
+                                            button("launch-floating-win")
+                                                .primary()
+                                                .leading_icon(LucideIcon::AppWindow)
+                                                .label(if fw_open {
+                                                    "Close Floating Window"
+                                                } else {
+                                                    "Open Floating Window"
+                                                })
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.demo_floating_window
+                                                        .update(cx, |w, cx| w.toggle_open(cx));
+                                                })),
+                                        )
+                                        .child(
+                                            button("reset-floating-win")
+                                                .outline()
+                                                .leading_icon(LucideIcon::RotateCcw)
+                                                .label("Reset Layout")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.demo_floating_window
+                                                        .update(cx, |w, cx| w.reset_layout(cx));
+                                                })),
+                                        ),
+                                )
+                                .child(
+                                    toggle("pg-fw-modal-toggle", app.demo_floating_modal)
+                                        .size(ComponentSize::Sm)
+                                        .label("Modal scrim")
+                                        .on_change(cx.listener(|this, v, _, cx| {
+                                            this.demo_floating_modal = *v;
+                                            cx.notify();
+                                        })),
+                                ),
+                        )
+                        .child(code_snippet(
+                            "copy-floating-window-code",
+                            "FloatingWindow Rust API",
+                            "let win = cx.new(|cx| {\n    FloatingWindowState::new(cx)\n        .default_size(size(px(440.), px(340.)))\n        .min_size(size(px(280.), px(200.)))\n        .anchor(FloatingWindowAnchor::Center)\n});\n\nfloating_window(\"inspector\", &win)\n    .title(\"Inspector\")\n    .subtitle(\"Drag header · resize any edge or corner\")\n    .icon(LucideIcon::SlidersHorizontal)\n    .modal(false)\n    .child(body_element)".to_owned(),
+                            cx.listener(|this, _, window, cx| {
+                                this.push_toast_on_display(
+                                    ToastVariant::Success,
+                                    "Copied FloatingWindow snippet",
+                                    Some("Reusable in-app floating window with 8-way resize."),
+                                    window.display(cx).map(|d| d.id()),
+                                    cx,
+                                );
+                            }),
+                            cx,
+                        )),
+                )
+        })
         // DropdownMenu + Popover + Tooltips & GPU Frosted Glass Showcase
         .child(
             grid(2)

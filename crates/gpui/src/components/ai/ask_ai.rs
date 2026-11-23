@@ -21,10 +21,9 @@ use serde_json::Value;
 use crate::icons::{Icon, IconSize, LucideIcon};
 use crate::{
     AnyElement, App, ClipboardItem, Context, CursorStyle, ElementId, Entity, EventEmitter,
-    FileFilter, FontWeight, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, OpenPromptOptions, Pixels, Point, Render, RenderOnce, ScrollEvent, ScrollHandle,
-    ScrollbarVisibility, SharedString, Size, StyleRefinement, Styled, Task, Window, deferred, div,
-    point, prelude::*, px, size,
+    FileFilter, FontWeight, IntoElement, MouseButton, MouseDownEvent, OpenPromptOptions, Pixels,
+    Render, RenderOnce, ScrollEvent, ScrollHandle, ScrollbarVisibility, SharedString,
+    StyleRefinement, Styled, Task, Window, deferred, div, point, prelude::*, px, size,
 };
 
 use super::agent::{
@@ -52,6 +51,10 @@ use super::workspace::{
 use crate::components::alert::{AlertVariant, alert};
 use crate::components::badge::{BadgeColor, badge};
 use crate::components::button::{Button, ButtonVariant, button};
+use crate::components::floating_window::{
+    FloatingWindow, FloatingWindowAnchor, FloatingWindowEvent, FloatingWindowState,
+    floating_window,
+};
 use crate::components::input::{Input, InputEvent, InputState};
 use crate::components::layout::{divider, h_stack, v_stack};
 use crate::components::textbox::{AutoGrowInputEvent, AutoGrowInputState, auto_grow_input};
@@ -145,14 +148,10 @@ pub struct AskAiState {
     connection: Option<AiConnection>,
     last_registry_gen: u64,
     open: bool,
-    maximized: bool,
     page: AskAiPage,
 
-    // Floating overlay geometry (draggable & resizable, like byok-ai's usePanelLayout)
-    overlay_offset: Point<Pixels>,
-    overlay_size: Option<Size<Pixels>>,
-    overlay_drag: Option<(Point<Pixels>, Point<Pixels>)>,
-    overlay_resize: Option<(Point<Pixels>, Size<Pixels>)>,
+    // Reusable in-app floating window state (8-way resize, drag, maximize/restore)
+    floating_window: Entity<FloatingWindowState>,
 
     // Provider setup draft state
     draft_provider_id: Option<SharedString>,
@@ -303,6 +302,34 @@ impl AskAiState {
         let first = Conversation::new();
         let active_id = first.id.clone();
 
+        let floating_window = cx.new(|cx| {
+            FloatingWindowState::new(cx)
+                .default_size(size(px(460.), px(600.)))
+                .min_size(size(px(340.), px(360.)))
+                .anchor(FloatingWindowAnchor::BottomRight {
+                    right: px(24.),
+                    bottom: px(76.),
+                })
+        });
+        cx.subscribe(&floating_window, |this, _, ev: &FloatingWindowEvent, cx| {
+            match ev {
+                FloatingWindowEvent::OpenChanged(open) => {
+                    if this.open != *open {
+                        this.open = *open;
+                        if *open && this.chat_stick_to_bottom {
+                            this.force_chat_scroll_to_bottom();
+                        }
+                        cx.emit(AskAiEvent::OpenChanged(*open));
+                        cx.notify();
+                    }
+                }
+                FloatingWindowEvent::MaximizedChanged(_) | FloatingWindowEvent::BoundsChanged(_) => {
+                    cx.notify();
+                }
+            }
+        })
+        .detach();
+
         Self {
             mode: AiAssistantMode::Ask,
             title: "Ask AI".into(),
@@ -315,12 +342,8 @@ impl AskAiState {
             connection: None,
             last_registry_gen: 0,
             open: false,
-            maximized: false,
             page: AskAiPage::Chat,
-            overlay_offset: point(px(0.), px(0.)),
-            overlay_size: None,
-            overlay_drag: None,
-            overlay_resize: None,
+            floating_window,
             draft_provider_id: None,
             draft_inputs: BTreeMap::new(),
             draft_revealed: HashSet::new(),
@@ -588,10 +611,17 @@ impl AskAiState {
         self.open
     }
 
+    /// Returns the underlying reusable [`FloatingWindowState`] controlling overlay geometry,
+    /// drag repositioning, 8-way resize, and maximize/restore.
+    pub fn floating_window(&self) -> &Entity<FloatingWindowState> {
+        &self.floating_window
+    }
+
     /// Opens or closes the floating overlay.
     pub fn set_open(&mut self, open: bool, cx: &mut Context<Self>) {
         if self.open != open {
             self.open = open;
+            self.floating_window.update(cx, |w, cx| w.set_open(open, cx));
             if open && self.chat_stick_to_bottom {
                 self.force_chat_scroll_to_bottom();
             }
@@ -1644,12 +1674,17 @@ impl AskAiState {
                     })),
             );
 
+        let (is_maximized, is_dragging) = {
+            let w = self.floating_window.read(cx);
+            (w.is_maximized(), w.is_dragging())
+        };
+
         if show_window_controls {
             actions = actions
                 .child(
                     Button::icon(
                         ("ask-max", cx.entity_id()),
-                        if self.maximized {
+                        if is_maximized {
                             LucideIcon::Minimize2
                         } else {
                             LucideIcon::Maximize2
@@ -1657,14 +1692,14 @@ impl AskAiState {
                     )
                     .ghost()
                     .size(ComponentSize::Xs)
-                    .tooltip_text(if self.maximized {
+                    .tooltip_text(if is_maximized {
                         "Restore size"
                     } else {
                         "Maximize"
                     })
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.maximized = !this.maximized;
-                        cx.notify();
+                        this.floating_window
+                            .update(cx, |w, cx| w.toggle_maximized(cx));
                     })),
                 )
                 .child(
@@ -1676,11 +1711,13 @@ impl AskAiState {
                 );
         }
 
-        let can_drag = show_window_controls && !self.maximized;
+        let can_drag = show_window_controls && !is_maximized;
+        let inner_radius = FloatingWindow::inner_radius(&theme);
         div()
             .w_full()
             .px(px(14.))
             .py(px(10.))
+            .rounded_t(inner_radius)
             .border_b_1()
             .border_color(theme.border)
             .bg(theme.surface)
@@ -1703,17 +1740,25 @@ impl AskAiState {
                             .flex_1()
                             .min_w_0()
                             .when(can_drag, |el| {
-                                el.cursor(if self.overlay_drag.is_some() {
+                                el.cursor(if is_dragging {
                                     CursorStyle::ClosedHand
                                 } else {
                                     CursorStyle::OpenHand
                                 })
-                                .on_mouse_down(
+                            })
+                            .when(show_window_controls, |el| {
+                                el.on_mouse_down(
                                     MouseButton::Left,
-                                    cx.listener(|this, ev: &MouseDownEvent, _, cx| {
-                                        this.overlay_drag =
-                                            Some((ev.position, this.overlay_offset));
-                                        cx.notify();
+                                    cx.listener(|this, ev: &MouseDownEvent, window, cx| {
+                                        cx.stop_propagation();
+                                        if ev.click_count >= 2 {
+                                            this.floating_window
+                                                .update(cx, |w, cx| w.toggle_maximized(cx));
+                                        } else {
+                                            let vp = window.viewport_size();
+                                            this.floating_window
+                                                .update(cx, |w, cx| w.begin_drag(ev.position, vp, cx));
+                                        }
                                     }),
                                 )
                             })
@@ -2935,8 +2980,10 @@ impl AskAiState {
             )
         };
 
+        let inner_radius = (theme.radius_xl - px(1.)).max(px(0.));
         let composer = v_stack()
             .w_full()
+            .rounded_b(inner_radius)
             .border_t_1()
             .border_color(theme.border)
             .bg(theme.surface)
@@ -3695,10 +3742,12 @@ impl AskAiState {
             AskAiPage::Tools => self.render_tools(cx),
         };
 
+        let inner_radius = (theme.radius_xl - px(1.)).max(px(0.));
         div()
             .size_full()
             .flex()
             .flex_col()
+            .rounded(inner_radius)
             .bg(theme.background)
             .text_color(theme.foreground)
             .overflow_hidden()
@@ -3749,6 +3798,7 @@ impl RenderOnce for AskAi {
             .w_full()
             .h(px(560.))
             .rounded(theme.radius_xl)
+            .bg(theme.background)
             .border_1()
             .border_color(theme.border)
             .overflow_hidden()
@@ -3876,38 +3926,25 @@ impl AskAiOverlay {
 }
 
 impl RenderOnce for AskAiOverlay {
-    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
-        let viewport = window.viewport_size();
-        let (is_open, is_max, mode, offset, custom_size, is_dragging, is_resizing) = {
+        let (mode, floating_win) = {
             let s = self.state.read(cx);
-            (
-                s.open,
-                s.maximized,
-                s.mode,
-                s.overlay_offset,
-                s.overlay_size,
-                s.overlay_drag.is_some(),
-                s.overlay_resize.is_some(),
-            )
+            (s.mode, s.floating_window.clone())
         };
-        let panel_sz = custom_size.unwrap_or_else(|| size(self.panel_width, self.panel_height));
-        let panel_w = panel_sz.width.clamp(px(340.), (viewport.width - px(32.)).max(px(340.)));
-        let panel_h = panel_sz.height.clamp(px(360.), (viewport.height - px(48.)).max(px(360.)));
-        let base_right = px(24.);
+
         let base_bottom = if self.show_trigger { px(76.) } else { px(24.) };
-        let max_right = (viewport.width - panel_w - px(16.)).max(px(16.));
-        let max_bottom = (viewport.height - panel_h - px(16.)).max(px(16.));
-        let cur_right = (base_right - offset.x).clamp(px(16.), max_right);
-        let cur_bottom = (base_bottom - offset.y).clamp(px(16.), max_bottom);
+        floating_win.update(cx, |win, _| {
+            win.sync_defaults(
+                size(self.panel_width, self.panel_height),
+                FloatingWindowAnchor::BottomRight {
+                    right: px(24.),
+                    bottom: base_bottom,
+                },
+            );
+        });
 
         let state_trigger = self.state.clone();
-        let state_backdrop = self.state.clone();
-        let state_esc = self.state.clone();
-        let state_resize_down = self.state.clone();
-        let state_move = self.state.clone();
-        let state_up = self.state.clone();
-        let state_up_out = self.state.clone();
         let state_panel = self.state;
         let id = self.id;
         let label = self.trigger_label;
@@ -3917,7 +3954,6 @@ impl RenderOnce for AskAiOverlay {
         let trigger_right = self.trigger_right;
         let trigger_bottom = self.trigger_bottom;
         let priority = self.priority;
-        let pointer_active = is_dragging || is_resizing;
 
         let trigger = {
             let base = div()
@@ -3962,134 +3998,33 @@ impl RenderOnce for AskAiOverlay {
             }
         };
 
-        deferred(
-            div()
-                .absolute()
-                .inset_0()
-                .when(pointer_active, |el| {
-                    el.occlude()
-                        .on_mouse_move(move |ev: &MouseMoveEvent, window, cx| {
-                        let vp = window.viewport_size();
-                        state_move.update(cx, |s, cx| {
-                            if let Some((start_pos, start_offset)) = s.overlay_drag {
-                                let delta = ev.position - start_pos;
-                                s.overlay_offset = start_offset + delta;
-                                cx.notify();
-                            } else if let Some((start_pos, start_sz)) = s.overlay_resize {
-                                // Dragging the top-left grip grows the panel as the pointer moves
-                                // up/left while keeping its bottom-right corner anchored.
-                                let dx = start_pos.x - ev.position.x;
-                                let dy = start_pos.y - ev.position.y;
-                                let max_w = (vp.width - px(32.)).max(px(340.));
-                                let max_h = (vp.height - px(48.)).max(px(360.));
-                                s.overlay_size = Some(size(
-                                    (start_sz.width + dx).clamp(px(340.), max_w),
-                                    (start_sz.height + dy).clamp(px(360.), max_h),
-                                ));
-                                cx.notify();
-                            }
-                        });
-                    })
-                    .on_mouse_up(MouseButton::Left, move |_: &MouseUpEvent, _, cx| {
-                        state_up.update(cx, |s, cx| {
-                            s.overlay_drag = None;
-                            s.overlay_resize = None;
-                            cx.notify();
-                        });
-                    })
-                    .on_mouse_up_out(MouseButton::Left, move |_: &MouseUpEvent, _, cx| {
-                        state_up_out.update(cx, |s, cx| {
-                            s.overlay_drag = None;
-                            s.overlay_resize = None;
-                            cx.notify();
-                        });
-                    })
-                })
-                .when(is_open, |el| {
-                    el.on_key_down(move |ev: &KeyDownEvent, _, cx| {
-                        if ev.keystroke.key.as_str() == "escape" {
-                            state_esc.update(cx, |s, cx| s.set_open(false, cx));
-                        }
-                    })
-                    .when(is_modal, |el| {
-                        el.child(
+        let panel_body = if floating_win.read(cx).is_open() {
+            Some(state_panel.update(cx, |s, cx| s.render_panel_inner(true, cx)))
+        } else {
+            None
+        };
+
+        div()
+            .child(
+                floating_window((id.clone(), "window"), &floating_win)
+                    .show_header(false)
+                    .modal(is_modal)
+                    .priority(priority)
+                    .children(panel_body),
+            )
+            .when(show_trigger, |el| {
+                el.child(
+                    deferred(
+                        div().absolute().inset_0().child(
                             div()
-                                .id((id.clone(), "scrim"))
                                 .absolute()
-                                .inset_0()
-                                .bg(theme.backdrop)
-                                .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                                    state_backdrop.update(cx, |s, cx| s.set_open(false, cx));
-                                }),
-                        )
-                    })
-                    .child({
-                        let mut panel_box = div()
-                            .id((id.clone(), "panel"))
-                            .occlude()
-                            .absolute()
-                            .rounded(theme.radius_xl)
-                            .border_1()
-                            .border_color(if is_dragging || is_resizing {
-                                theme.primary
-                            } else {
-                                theme.border
-                            })
-                            .bg(theme.background)
-                            .shadow_lg()
-                            .overflow_hidden()
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                            .child(state_panel.update(cx, |s, cx| {
-                                s.render_panel_inner(true, cx)
-                            }));
-
-                        if !is_max {
-                            let init_sz = size(panel_w, panel_h);
-                            panel_box = panel_box.child(
-                                div()
-                                    .id((id.clone(), "resize-nw"))
-                                    .absolute()
-                                    .top(px(0.))
-                                    .left(px(0.))
-                                    .w(px(14.))
-                                    .h(px(14.))
-                                    .cursor(CursorStyle::ResizeUpLeftDownRight)
-                                    .rounded_tl(theme.radius_xl)
-                                    .hover(|s| s.bg(theme.primary.opacity(0.28)))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        move |ev: &MouseDownEvent, _, cx| {
-                                            cx.stop_propagation();
-                                            state_resize_down.update(cx, |s, cx| {
-                                                s.overlay_resize = Some((ev.position, init_sz));
-                                                cx.notify();
-                                            });
-                                        },
-                                    ),
-                            );
-                        }
-
-                        if is_max {
-                            panel_box.inset(px(20.))
-                        } else {
-                            panel_box
-                                .right(cur_right)
-                                .bottom(cur_bottom)
-                                .w(panel_w)
-                                .h(panel_h)
-                        }
-                    })
-                })
-                .when(show_trigger, |el| {
-                    el.child(
-                        div()
-                            .absolute()
-                            .right(trigger_right)
-                            .bottom(trigger_bottom)
-                            .child(trigger),
+                                .right(trigger_right)
+                                .bottom(trigger_bottom)
+                                .child(trigger),
+                        ),
                     )
-                }),
-        )
-        .with_priority(priority)
+                    .with_priority(priority),
+                )
+            })
     }
 }

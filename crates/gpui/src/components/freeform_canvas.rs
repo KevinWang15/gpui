@@ -269,10 +269,10 @@ impl ResizeHandle {
             ResizeHandle::North | ResizeHandle::South => CursorStyle::ResizeUpDown,
             ResizeHandle::East | ResizeHandle::West => CursorStyle::ResizeLeftRight,
             ResizeHandle::NorthWest | ResizeHandle::SouthEast => {
-                CursorStyle::ResizeUpRightDownLeft
+                CursorStyle::ResizeUpLeftDownRight
             }
             ResizeHandle::NorthEast | ResizeHandle::SouthWest => {
-                CursorStyle::ResizeUpLeftDownRight
+                CursorStyle::ResizeUpRightDownLeft
             }
         }
     }
@@ -319,7 +319,7 @@ impl CanvasResizeHandle {
         match self {
             CanvasResizeHandle::East => CursorStyle::ResizeLeftRight,
             CanvasResizeHandle::South => CursorStyle::ResizeUpDown,
-            CanvasResizeHandle::SouthEast => CursorStyle::ResizeUpRightDownLeft,
+            CanvasResizeHandle::SouthEast => CursorStyle::ResizeUpLeftDownRight,
         }
     }
 }
@@ -3745,5 +3745,41 @@ mod tests {
         cx.run_until_parked();
         assert!(view.read_with(cx, |v, _| v.items.is_empty()));
         assert!(view.read_with(cx, |v, cx| v.canvas.read(cx).selected_ids().is_empty()));
+    }
+
+    #[test]
+    fn resize_handle_cursors_match_diagonals() {
+        assert_eq!(ResizeHandle::North.cursor(), CursorStyle::ResizeUpDown);
+        assert_eq!(ResizeHandle::South.cursor(), CursorStyle::ResizeUpDown);
+        assert_eq!(ResizeHandle::East.cursor(), CursorStyle::ResizeLeftRight);
+        assert_eq!(ResizeHandle::West.cursor(), CursorStyle::ResizeLeftRight);
+        assert_eq!(
+            ResizeHandle::NorthWest.cursor(),
+            CursorStyle::ResizeUpLeftDownRight
+        );
+        assert_eq!(
+            ResizeHandle::SouthEast.cursor(),
+            CursorStyle::ResizeUpLeftDownRight
+        );
+        assert_eq!(
+            ResizeHandle::NorthEast.cursor(),
+            CursorStyle::ResizeUpRightDownLeft
+        );
+        assert_eq!(
+            ResizeHandle::SouthWest.cursor(),
+            CursorStyle::ResizeUpRightDownLeft
+        );
+        assert_eq!(
+            CanvasResizeHandle::East.cursor(),
+            CursorStyle::ResizeLeftRight
+        );
+        assert_eq!(
+            CanvasResizeHandle::South.cursor(),
+            CursorStyle::ResizeUpDown
+        );
+        assert_eq!(
+            CanvasResizeHandle::SouthEast.cursor(),
+            CursorStyle::ResizeUpLeftDownRight
+        );
     }
 }

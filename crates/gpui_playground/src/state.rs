@@ -318,6 +318,8 @@ pub struct PlaygroundApp {
 
     // Interactive & Blur showcase state
     pub command_palette: Entity<CommandPaletteState>,
+    pub demo_floating_window: Entity<FloatingWindowState>,
+    pub demo_floating_modal: bool,
     pub drawer_open: bool,
     pub drawer_side: DrawerSide,
     pub drawer_size: DrawerSize,
@@ -2745,6 +2747,25 @@ impl PlaygroundApp {
         })
         .detach();
 
+        let demo_floating_window = cx.new(|cx| {
+            FloatingWindowState::new(cx)
+                .default_size(gpui::size(px(420.), px(320.)))
+                .min_size(gpui::size(px(280.), px(200.)))
+                .anchor(FloatingWindowAnchor::Center)
+        });
+        cx.subscribe(&demo_floating_window, |this, _, ev: &FloatingWindowEvent, cx| match ev {
+            FloatingWindowEvent::OpenChanged(open) => {
+                this.log_event("FloatingWindow", format!("open -> {open}"), cx);
+            }
+            FloatingWindowEvent::MaximizedChanged(max) => {
+                this.log_event("FloatingWindow", format!("maximized -> {max}"), cx);
+            }
+            FloatingWindowEvent::BoundsChanged(_) => {
+                cx.notify();
+            }
+        })
+        .detach();
+
         let mut app = Self {
             page: Page::InteractiveBlur,
             accent: AccentPreset::Indigo,
@@ -2923,6 +2944,8 @@ impl PlaygroundApp {
             native_status_pulsing: true,
 
             command_palette,
+            demo_floating_window,
+            demo_floating_modal: false,
             drawer_open: false,
             drawer_side: DrawerSide::Right,
             drawer_size: DrawerSize::Md,

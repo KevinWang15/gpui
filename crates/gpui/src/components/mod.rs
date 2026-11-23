@@ -44,6 +44,7 @@ mod keyboard_tests_controls;
 mod keyboard_tests_fields;
 pub mod file_dropzone;
 pub mod filter_bar;
+pub mod floating_window;
 pub mod form;
 pub mod freeform_canvas;
 pub mod hierarchical_select;
@@ -168,6 +169,10 @@ pub use file_dropzone::{
 pub use filter_bar::{
     FacetProvider, FilterBar, FilterBarEvent, FilterBarState, FilterClause, FilterFacetOption,
     FilterFieldDef, FilterOperator, ValueLabelFormatter, filter_bar,
+};
+pub use floating_window::{
+    FloatingWindow, FloatingWindowAnchor, FloatingWindowEdge, FloatingWindowEvent,
+    FloatingWindowState, floating_window,
 };
 pub use form::{FormRule, FormState};
 pub use freeform_canvas::{
