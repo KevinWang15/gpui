@@ -1,24 +1,92 @@
-//! Built-in BYOK LLM provider presets, credential validation, pure-Rust SSE streaming clients
-//! (OpenAI, Anthropic, Google Gemini, OpenAI-compatible), and an offline [`SimulatedModel`]
-//! for deterministic tests and zero-key playground demos.
+//! Built-in BYOK LLM provider presets, credential validation, and production [`rig_core`]
+//! completion models (OpenAI Responses API, Anthropic Messages, Google Gemini, OpenAI-compatible
+//! Chat Completions) plus an offline [`SimulatedModel`] adapter that plugs straight into
+//! [`rig_agent::Agent`].
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
-use futures::AsyncReadExt as _;
+use futures::StreamExt as _;
 use futures::future::BoxFuture;
-use http_client::{AsyncBody, HttpClient, HttpRequestExt as _, Method, Request, Url};
+use http::header;
+use rig_core::completion::options::{Mapping, OptionFields, OptionMap};
+use rig_core::completion::{Accepts, CompletionRequest, FinishReason, ReplayTarget, Usage};
+use rig_core::driver::{Exchange, Model, Opened, Opening, Transport};
+use rig_core::error::{EncodeError, ProviderError};
+use rig_core::http_client::DynHttpClient;
+use rig_core::message::{Api, Message, ToolChoice, UserContent};
+use rig_core::operation::{Block, CallFragment, Completion, Finish};
+use rig_core::providers::anthropic::wire::AnthropicConfig;
+use rig_core::providers::gemini::GeminiConfig;
+use rig_core::providers::openai::{OpenAIConfig, Route};
+use rig_core::wire::document::{Reassemble, Serves};
+use rig_core::wire::{Capabilities, Decoder, Descriptor, Flow, Mode, Out, Wire, WireEvent};
+use rig_reqwest::{ReqwestClient, reqwest};
 use serde_json::{Value, json};
+use url::Url;
 
 use crate::BackgroundExecutor;
 
 use super::types::{
-    AiTokenUsage, ProviderField, ProviderPreset, ProviderProtocol, ProviderValues, ToolDefinition,
-    base64_encode,
+    AiTokenUsage, ProviderField, ProviderPreset, ProviderProtocol, ProviderValues,
 };
+
+/// Type-erased [`rig_core`] completion model accepted by [`rig_agent::AgentBuilder`].
+pub type RigCompletionModel = rig_core::DynModel<Completion>;
+
+// ---------------------------------------------------------------------------
+// Shared Tokio Runtime & Reqwest HTTP Client (for Rig & rmcp)
+// ---------------------------------------------------------------------------
+
+/// Lazily initialized background Tokio runtime shared by [`rig_core`], [`rig_agent`],
+/// [`rig_reqwest`], and [`rmcp`] transports so GPUI callers can invoke them from any thread.
+pub fn ai_tokio_handle() -> &'static tokio::runtime::Handle {
+    static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_name("gpui-ai-tokio")
+                .enable_all()
+                .build()
+                .expect("failed to start gpui-ai tokio runtime")
+        })
+        .handle()
+}
+
+/// Builds a [`reqwest::Client`] configured with system roots plus any optional extra PEM root
+/// bundle supplied via `SSL_CERT_FILE`, `CODEX_CA_CERTIFICATE`, or `NODE_EXTRA_CA_CERTS`.
+pub(crate) fn build_reqwest_client() -> reqwest::Client {
+    let mut builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(concat!("gpui-ai/", env!("CARGO_PKG_VERSION")));
+
+    for env_var in ["SSL_CERT_FILE", "CODEX_CA_CERTIFICATE", "NODE_EXTRA_CA_CERTS"] {
+        if let Ok(path) = std::env::var(env_var)
+            && !path.trim().is_empty()
+            && let Ok(pem) = std::fs::read(&path)
+            && let Ok(certs) = reqwest::Certificate::from_pem_bundle(&pem)
+        {
+            for cert in certs {
+                builder = builder.add_root_certificate(cert);
+            }
+        }
+    }
+
+    builder.build().unwrap_or_else(|_| reqwest::Client::new())
+}
+
+/// Shared [`DynHttpClient`] backed by [`build_reqwest_client`] for all Rig providers.
+pub(crate) fn shared_rig_http() -> DynHttpClient {
+    static CLIENT: OnceLock<ReqwestClient> = OnceLock::new();
+    let reqwest_client = CLIENT
+        .get_or_init(|| ReqwestClient::from(build_reqwest_client()))
+        .clone();
+    DynHttpClient::new(reqwest_client)
+}
 
 // ---------------------------------------------------------------------------
 // Built-in Provider Presets (matching byok-ai)
@@ -45,17 +113,31 @@ pub fn validate_compatible_base_url(raw: &str) -> Option<String> {
     }
 }
 
-/// Returns the four standard BYOK provider presets matching `byok-ai`:
-/// OpenAI, Anthropic, Google Gemini, and OpenAI-compatible.
+/// Normalizes an OpenAI-compatible base URL: strips trailing slashes and appends `/v1` when the
+/// caller supplied only a bare host root (e.g. `https://gateway.example.com/`).
+pub(crate) fn normalize_compatible_base_url(raw: &str) -> String {
+    let trimmed = raw.trim().trim_end_matches('/');
+    if let Ok(url) = Url::parse(trimmed)
+        && (url.path().is_empty() || url.path() == "/")
+        && url.query().is_none()
+    {
+        return format!("{trimmed}/v1");
+    }
+    trimmed.to_owned()
+}
+
+/// Returns the 4 standard BYOK provider presets matching `byok-ai`:
+/// OpenAI (Responses API), Anthropic (Messages API), Google Gemini, and OpenAI-compatible.
 pub fn default_providers() -> Vec<ProviderPreset> {
     vec![
         ProviderPreset {
             id: "openai".into(),
             name: "OpenAI".into(),
-            description: "GPT-4.1, GPT-4o, and o-series models directly via OpenAI.".into(),
+            description: "Direct connection to OpenAI's Responses API with your own API key."
+                .into(),
             protocol: ProviderProtocol::OpenAi,
             fields: vec![
-                ProviderField::password("apiKey", "API key").placeholder("sk-..."),
+                ProviderField::password("apiKey", "API Key").placeholder("sk-..."),
                 ProviderField::text("model", "Model").placeholder("gpt-4.1-mini"),
             ],
             default_values: BTreeMap::from([("model".to_owned(), "gpt-4.1-mini".to_owned())]),
@@ -66,10 +148,11 @@ pub fn default_providers() -> Vec<ProviderPreset> {
         ProviderPreset {
             id: "anthropic".into(),
             name: "Anthropic".into(),
-            description: "Claude models via the Anthropic Messages API.".into(),
+            description: "Direct connection to Claude models via the Anthropic Messages API."
+                .into(),
             protocol: ProviderProtocol::Anthropic,
             fields: vec![
-                ProviderField::password("apiKey", "API key").placeholder("sk-ant-..."),
+                ProviderField::password("apiKey", "API Key").placeholder("sk-ant-..."),
                 ProviderField::text("model", "Model").placeholder("claude-sonnet-4-5"),
             ],
             default_values: BTreeMap::from([(
@@ -83,10 +166,10 @@ pub fn default_providers() -> Vec<ProviderPreset> {
         ProviderPreset {
             id: "google".into(),
             name: "Google Gemini".into(),
-            description: "Gemini 2.5 and multimodal models via Google AI Studio.".into(),
+            description: "Direct connection to Gemini models via Google AI Studio.".into(),
             protocol: ProviderProtocol::GoogleGemini,
             fields: vec![
-                ProviderField::password("apiKey", "API key").placeholder("AIza..."),
+                ProviderField::password("apiKey", "API Key").placeholder("AIza..."),
                 ProviderField::text("model", "Model").placeholder("gemini-2.5-flash"),
             ],
             default_values: BTreeMap::from([("model".to_owned(), "gemini-2.5-flash".to_owned())]),
@@ -96,25 +179,23 @@ pub fn default_providers() -> Vec<ProviderPreset> {
         },
         ProviderPreset {
             id: "compatible".into(),
-            name: "OpenAI Compatible".into(),
-            description: "Local Ollama, vLLM, DeepSeek, OpenRouter, or a private gateway.".into(),
+            name: "OpenAI-compatible".into(),
+            description:
+                "Connect to Ollama, vLLM, OpenRouter, DeepSeek, or any OpenAI-compatible gateway."
+                    .into(),
             protocol: ProviderProtocol::OpenAiCompatible,
             fields: vec![
-                ProviderField::url("baseURL", "API base URL")
-                    .placeholder("https://api.example.com/v1"),
-                ProviderField::password("apiKey", "API key")
+                ProviderField::url("baseURL", "Base URL").placeholder("http://localhost:11434/v1"),
+                ProviderField::password("apiKey", "API Key")
                     .placeholder("Optional for local servers")
                     .required(false),
                 ProviderField::text("model", "Model").placeholder("llama3.2"),
             ],
-            default_values: BTreeMap::from([
-                ("baseURL".to_owned(), String::new()),
-                ("model".to_owned(), String::new()),
-            ]),
+            default_values: BTreeMap::new(),
             accepts_images: true,
-            validator: Some(Arc::new(|vals| {
-                let url = vals.get("baseURL").map(String::as_str).unwrap_or("");
-                validate_compatible_base_url(url)
+            validator: Some(Arc::new(|values| {
+                let raw = values.get("baseURL").map(String::as_str).unwrap_or("");
+                validate_compatible_base_url(raw)
             })),
             custom_model: None,
         },
@@ -122,12 +203,12 @@ pub fn default_providers() -> Vec<ProviderPreset> {
 }
 
 /// Optional offline simulated provider preset (no API key required) for interactive playgrounds
-/// and local UI evaluation.
+/// and local UI evaluation. Runs through the exact same [`rig_agent::Agent`] loop as live models.
 pub fn simulated_provider() -> ProviderPreset {
     ProviderPreset {
         id: "simulated".into(),
         name: "Simulated (Offline Demo)".into(),
-        description: "Local offline model exercising tool calls, streaming Markdown, and answer components without an API key.".into(),
+        description: "Local offline model running through Rig's agent loop to exercise tool calls, streaming Markdown, and answer components without an API key.".into(),
         protocol: ProviderProtocol::Simulated,
         fields: vec![
             ProviderField::text("model", "Profile")
@@ -158,11 +239,12 @@ pub fn validate_provider_values(preset: &ProviderPreset, values: &ProviderValues
     None
 }
 
-/// Instantiates a streaming [`LanguageModel`] from a validated [`ProviderPreset`] and [`ProviderValues`].
-pub fn build_language_model(
+/// Instantiates a production [`RigCompletionModel`] (`rig_core::DynModel<Completion>`) from a
+/// validated [`ProviderPreset`] and [`ProviderValues`].
+pub fn build_completion_model(
     preset: &ProviderPreset,
     values: &ProviderValues,
-) -> Result<Arc<dyn LanguageModel>> {
+) -> Result<RigCompletionModel> {
     if let Some(ref factory) = preset.custom_model {
         return factory(values);
     }
@@ -177,1095 +259,394 @@ pub fn build_language_model(
         .map(|s| s.trim().to_owned())
         .unwrap_or_default();
 
+    let http = shared_rig_http();
     match preset.protocol {
-        ProviderProtocol::OpenAi => Ok(Arc::new(OpenAiChatModel {
-            base_url: "https://api.openai.com/v1".to_owned(),
-            api_key,
-            model,
-        })),
+        ProviderProtocol::OpenAi => Ok(OpenAIConfig::new(api_key)
+            .connect(http)
+            .responses(model)
+            .erase()),
         ProviderProtocol::OpenAiCompatible => {
-            let base_url = values
-                .get("baseURL")
-                .map(|s| s.trim().trim_end_matches('/').to_owned())
-                .unwrap_or_default();
-            if let Some(problem) = validate_compatible_base_url(&base_url) {
+            let raw_base = values.get("baseURL").map(String::as_str).unwrap_or("");
+            if let Some(problem) = validate_compatible_base_url(raw_base) {
                 bail!("{problem}");
             }
+            let base_url = normalize_compatible_base_url(raw_base);
             let key = if api_key.is_empty() {
                 "local".to_owned()
             } else {
                 api_key
             };
-            Ok(Arc::new(OpenAiChatModel {
-                base_url,
-                api_key: key,
-                model,
-            }))
+            Ok(OpenAIConfig::new(key)
+                .with_base_url(base_url)
+                .with_route(Route::Chat)
+                .connect(http)
+                .chat(model)
+                .erase())
         }
-        ProviderProtocol::Anthropic => Ok(Arc::new(AnthropicModel { api_key, model })),
-        ProviderProtocol::GoogleGemini => Ok(Arc::new(GeminiModel { api_key, model })),
-        ProviderProtocol::Simulated => Ok(Arc::new(SimulatedModel::default())),
+        ProviderProtocol::Anthropic => Ok(AnthropicConfig::new(api_key)
+            .connect(http)
+            .completion(model)
+            .erase()),
+        ProviderProtocol::GoogleGemini => Ok(GeminiConfig::new(api_key)
+            .connect(http)
+            .completion(model)
+            .erase()),
+        ProviderProtocol::Simulated => Ok(SimulatedModel::default().into_dyn_model()),
     }
 }
 
-/// Performs a lightweight connectivity check against a provider without leaking API keys in errors.
+/// Performs a lightweight connectivity check against a provider via `rig-core`'s native
+/// `.verify()` endpoint (without leaking API keys in error messages).
 pub async fn test_provider_connection(
     preset: &ProviderPreset,
     values: &ProviderValues,
-    http: Arc<dyn HttpClient>,
 ) -> Result<String> {
     if let Some(err) = validate_provider_values(preset, values) {
         bail!("{err}");
     }
-    let api_key = values.get("apiKey").map(|s| s.trim()).unwrap_or("");
-    let timeout = Duration::from_secs(15);
+    let protocol = preset.protocol;
+    let api_key = values
+        .get("apiKey")
+        .map(|s| s.trim().to_owned())
+        .unwrap_or_default();
+    let raw_base = values
+        .get("baseURL")
+        .map(|s| s.trim().to_owned())
+        .unwrap_or_default();
 
-    match preset.protocol {
-        ProviderProtocol::Simulated => Ok("Connected to offline simulated model.".to_owned()),
-        ProviderProtocol::OpenAi | ProviderProtocol::OpenAiCompatible => {
-            let base = if preset.protocol == ProviderProtocol::OpenAi {
-                "https://api.openai.com/v1".to_owned()
-            } else {
-                values
-                    .get("baseURL")
-                    .map(|s| s.trim().trim_end_matches('/').to_owned())
-                    .unwrap_or_default()
-            };
-            let url = format!("{base}/models");
-            let mut req = Request::builder()
-                .method(Method::GET)
-                .uri(url.as_str())
-                .timeout(timeout);
-            if !api_key.is_empty() {
-                req = req.header("Authorization", format!("Bearer {api_key}"));
-            }
-            let resp = http
-                .send(req.body(AsyncBody::empty())?)
-                .await
-                .map_err(|_| anyhow!("Could not reach provider endpoint. Check URL and network."))?;
-            let status = resp.status();
-            if status.is_success() {
-                Ok("Connection verified.".to_owned())
-            } else if status.as_u16() == 401 || status.as_u16() == 403 {
-                bail!("Authentication rejected (HTTP {}). Check your API key.", status.as_u16());
-            } else {
-                bail!("Provider responded with HTTP {}. Check endpoint and model.", status.as_u16());
-            }
-        }
-        ProviderProtocol::Anthropic => {
-            let req = Request::builder()
-                .method(Method::GET)
-                .uri("https://api.anthropic.com/v1/models")
-                .header("x-api-key", api_key)
-                .header("anthropic-version", "2023-06-01")
-                .timeout(timeout)
-                .body(AsyncBody::empty())?;
-            let resp = http
-                .send(req)
-                .await
-                .map_err(|_| anyhow!("Could not reach Anthropic API. Check your network."))?;
-            let status = resp.status();
-            if status.is_success() {
-                Ok("Anthropic connection verified.".to_owned())
-            } else if status.as_u16() == 401 || status.as_u16() == 403 {
-                bail!("Anthropic rejected the API key (HTTP {}).", status.as_u16());
-            } else {
-                bail!("Anthropic responded with HTTP {}.", status.as_u16());
-            }
-        }
-        ProviderProtocol::GoogleGemini => {
-            let req = Request::builder()
-                .method(Method::GET)
-                .uri("https://generativelanguage.googleapis.com/v1beta/models")
-                .header("x-goog-api-key", api_key)
-                .timeout(timeout)
-                .body(AsyncBody::empty())?;
-            let resp = http
-                .send(req)
-                .await
-                .map_err(|_| anyhow!("Could not reach Google Gemini API. Check your network."))?;
-            let status = resp.status();
-            if status.is_success() {
-                Ok("Google Gemini connection verified.".to_owned())
-            } else if status.as_u16() == 401 || status.as_u16() == 403 || status.as_u16() == 400 {
-                bail!("Gemini rejected the API key (HTTP {}).", status.as_u16());
-            } else {
-                bail!("Gemini responded with HTTP {}.", status.as_u16());
-            }
-        }
+    if protocol == ProviderProtocol::Simulated {
+        return Ok("Connected to offline simulated model (Rig agent runtime).".to_owned());
     }
-}
 
-// ---------------------------------------------------------------------------
-// LanguageModel Streaming Interface
-// ---------------------------------------------------------------------------
-
-/// Wire-neutral content block sent to a [`LanguageModel`].
-#[derive(Clone, Debug)]
-pub enum ModelContentPart {
-    /// Text content.
-    Text(String),
-    /// Encoded image attachment (`media_type`, raw bytes).
-    Image {
-        /// MIME type (`image/png`, `image/jpeg`, `image/webp`).
-        media_type: String,
-        /// Encoded binary bytes.
-        bytes: Arc<Vec<u8>>,
-    },
-    /// Assistant tool call invocation.
-    ToolCall {
-        /// Tool call ID.
-        id: String,
-        /// Tool name.
-        name: String,
-        /// Parsed JSON arguments object.
-        arguments: Value,
-    },
-    /// Tool call result fed back to the model.
-    ToolResult {
-        /// Matching tool call ID.
-        tool_call_id: String,
-        /// Tool name.
-        tool_name: String,
-        /// Serialized output text.
-        output: String,
-        /// Whether execution failed.
-        is_error: bool,
-    },
-}
-
-/// Wire-neutral conversation turn sent to a [`LanguageModel`].
-#[derive(Clone, Debug)]
-pub enum ModelMessage {
-    /// User message parts (text and/or images).
-    User(Vec<ModelContentPart>),
-    /// Assistant message parts (text and/or tool calls).
-    Assistant(Vec<ModelContentPart>),
-    /// Tool result message parts.
-    Tool(Vec<ModelContentPart>),
-}
-
-/// Tool availability policy for a single model step.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ToolChoice {
-    /// Model may invoke tools freely.
-    Auto,
-    /// Tools are disabled for this step (used on final step and empty-answer recovery).
-    None,
-}
-
-/// Full input to one streaming [`LanguageModel::stream_step`] call.
-#[derive(Clone, Debug)]
-pub struct ModelRequest {
-    /// System prompt instructions.
-    pub system: String,
-    /// Conversation history + prior tool steps.
-    pub messages: Vec<ModelMessage>,
-    /// Available tools for this step.
-    pub tools: Vec<ToolDefinition>,
-    /// Tool choice constraint.
-    pub tool_choice: ToolChoice,
-    /// Optional output token limit.
-    pub max_output_tokens: Option<u32>,
-}
-
-/// Reason a single streaming model step terminated.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FinishReason {
-    /// Natural end of turn.
-    Stop,
-    /// Model requested tool calls.
-    ToolCalls,
-    /// Hit output token cap.
-    Length,
-    /// Cancelled via abort signal.
-    Cancelled,
-}
-
-/// Incremental streaming events emitted by a [`LanguageModel`].
-#[derive(Clone, Debug)]
-pub enum ModelStreamEvent {
-    /// Incremental assistant text chunk.
-    TextDelta(String),
-    /// Incremental model reasoning / thinking chunk.
-    ReasoningDelta(String),
-    /// Complete tool call requested by the model.
-    ToolCall {
-        /// Provider tool call ID.
-        id: String,
-        /// Namespaced tool name.
-        name: String,
-        /// Parsed JSON arguments object.
-        arguments: Value,
-    },
-    /// Token usage report for the step.
-    Usage(AiTokenUsage),
-    /// Final termination reason for the step.
-    Finish(FinishReason),
-}
-
-/// Provider-agnostic streaming language model interface (pure Rust).
-pub trait LanguageModel: Send + Sync + 'static {
-    /// Streams one model step into `tx`, honoring cooperative `abort`.
-    fn stream_step(
-        &self,
-        request: ModelRequest,
-        http: Arc<dyn HttpClient>,
-        abort: Arc<AtomicBool>,
-        tx: async_channel::Sender<ModelStreamEvent>,
-    ) -> BoxFuture<'static, Result<()>>;
-}
-
-// ---------------------------------------------------------------------------
-// Streaming SSE Parser
-// ---------------------------------------------------------------------------
-
-struct SseEvent {
-    event: Option<String>,
-    data: String,
-}
-
-async fn read_sse_stream(
-    mut body: AsyncBody,
-    abort: Arc<AtomicBool>,
-    mut on_event: impl FnMut(SseEvent) -> bool,
-) -> Result<()> {
-    let mut buf = [0u8; 4096];
-    let mut pending = String::new();
-    let mut current_event: Option<String> = None;
-    let mut data_lines: Vec<String> = Vec::new();
-
-    loop {
-        if abort.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-        let n = body.read(&mut buf).await?;
-        if n == 0 {
-            break;
-        }
-        pending.push_str(&String::from_utf8_lossy(&buf[..n]));
-
-        while let Some(pos) = pending.find('\n') {
-            let line = pending[..pos].trim_end_matches('\r').to_owned();
-            pending.drain(..=pos);
-
-            if line.is_empty() {
-                if !data_lines.is_empty() {
-                    let ev = SseEvent {
-                        event: current_event.take(),
-                        data: data_lines.join("\n"),
+    ai_tokio_handle()
+        .spawn(async move {
+            let http = shared_rig_http();
+            let timeout = Duration::from_secs(15);
+            match protocol {
+                ProviderProtocol::OpenAi => {
+                    let client = OpenAIConfig::new(api_key).connect(http);
+                    tokio::time::timeout(timeout, client.verify())
+                        .await
+                        .map_err(|_| anyhow!("Connection check timed out."))?
+                        .map_err(|e| anyhow!("Provider verification failed: {e}"))?;
+                    Ok("Connected to OpenAI.".to_owned())
+                }
+                ProviderProtocol::OpenAiCompatible => {
+                    let base_url = normalize_compatible_base_url(&raw_base);
+                    let key = if api_key.is_empty() {
+                        "local".to_owned()
+                    } else {
+                        api_key
                     };
-                    data_lines.clear();
-                    if !on_event(ev) {
-                        return Ok(());
+                    let client = OpenAIConfig::new(key.clone())
+                        .with_base_url(base_url.clone())
+                        .with_route(Route::Chat)
+                        .connect(http);
+                    match tokio::time::timeout(timeout, client.verify()).await {
+                        Ok(Ok(())) => Ok(format!("Connected to {base_url}.")),
+                        Ok(Err(_)) => {
+                            // Some OpenAI-compatible servers return non-standard shapes on /models
+                            // but still respond 2xx on GET /models.
+                            let req = build_reqwest_client()
+                                .get(format!("{base_url}/models"))
+                                .header(header::AUTHORIZATION, format!("Bearer {key}"));
+                            let resp = tokio::time::timeout(timeout, req.send())
+                                .await
+                                .map_err(|_| anyhow!("Connection check timed out."))?
+                                .map_err(|e| anyhow!("Endpoint unreachable: {e}"))?;
+                            if resp.status().is_success() {
+                                Ok(format!("Endpoint reachable at {base_url}."))
+                            } else {
+                                bail!("Endpoint returned HTTP {}.", resp.status().as_u16())
+                            }
+                        }
+                        Err(_) => bail!("Connection check timed out."),
                     }
-                } else {
-                    current_event = None;
                 }
-                continue;
+                ProviderProtocol::Anthropic => {
+                    let client = AnthropicConfig::new(api_key).connect(http);
+                    tokio::time::timeout(timeout, client.verify())
+                        .await
+                        .map_err(|_| anyhow!("Connection check timed out."))?
+                        .map_err(|e| anyhow!("Anthropic verification failed: {e}"))?;
+                    Ok("Connected to Anthropic.".to_owned())
+                }
+                ProviderProtocol::GoogleGemini => {
+                    let client = GeminiConfig::new(api_key).connect(http);
+                    tokio::time::timeout(timeout, client.verify())
+                        .await
+                        .map_err(|_| anyhow!("Connection check timed out."))?
+                        .map_err(|e| anyhow!("Gemini verification failed: {e}"))?;
+                    Ok("Connected to Google Gemini.".to_owned())
+                }
+                ProviderProtocol::Simulated => unreachable!(),
             }
-            if line.starts_with(':') {
-                continue;
+        })
+        .await
+        .map_err(|e| anyhow!("Connection check task failed: {e}"))?
+}
+
+// ---------------------------------------------------------------------------
+// Local / Scripted Rig Completion Model Adapter (for Playground & Unit Tests)
+// ---------------------------------------------------------------------------
+
+/// Event emitted by a local/offline [`LocalCompletionHandler`] into Rig's completion driver.
+#[derive(Clone, Debug)]
+pub enum LocalCompletionEvent {
+    /// Incremental reasoning/thought text fragment.
+    ReasoningDelta(String),
+    /// Incremental assistant answer text fragment.
+    TextDelta(String),
+    /// Complete tool invocation request emitted by the local model.
+    ToolCall {
+        /// Unique call ID.
+        id: String,
+        /// Registered tool name.
+        name: String,
+        /// JSON arguments object.
+        arguments: Value,
+    },
+    /// Terminal completion frame with token usage and finish reason.
+    Finish {
+        /// Token accounting for this step.
+        usage: AiTokenUsage,
+        /// Why generation ended.
+        reason: FinishReason,
+    },
+}
+
+/// Async handler powering a local [`RigCompletionModel`] (such as [`SimulatedModel`] or a
+/// custom playground demo model) that runs directly inside [`rig_agent::Agent`].
+pub type LocalCompletionHandler = Arc<
+    dyn Fn(
+            CompletionRequest,
+            async_channel::Sender<LocalCompletionEvent>,
+        ) -> BoxFuture<'static, Result<()>>
+        + Send
+        + Sync,
+>;
+
+/// Wraps an async [`LocalCompletionHandler`] into a native [`RigCompletionModel`]
+/// (`rig_core::DynModel<Completion>`) that works seamlessly with [`rig_agent::AgentBuilder`].
+pub fn local_completion_model(
+    provider_name: impl Into<String>,
+    model_id: impl Into<String>,
+    handler: LocalCompletionHandler,
+) -> RigCompletionModel {
+    Model::new(
+        LocalCompletionWire {
+            provider_name: provider_name.into(),
+            model_id: model_id.into(),
+        },
+        LocalCompletionTransport { handler },
+    )
+    .erase()
+}
+
+#[derive(Clone, Debug)]
+struct LocalCompletionWire {
+    provider_name: String,
+    model_id: String,
+}
+
+#[derive(Default)]
+struct LocalCompletionDecoder {
+    reasoning_index: Option<usize>,
+}
+
+impl<'id> Decoder<'id, Completion, LocalCompletionEvent> for LocalCompletionDecoder {
+    type Event = LocalCompletionEvent;
+
+    fn classify(&self, frame: LocalCompletionEvent) -> WireEvent<LocalCompletionEvent> {
+        WireEvent::Known(frame)
+    }
+
+    fn decode(
+        &mut self,
+        event: LocalCompletionEvent,
+        mut out: Out<'id, Completion>,
+    ) -> std::result::Result<Flow, ProviderError> {
+        match event {
+            LocalCompletionEvent::ReasoningDelta(chunk) => {
+                out.end_run()?;
+                let index = match self.reasoning_index {
+                    Some(idx) => idx,
+                    None => {
+                        let idx = out.fresh_index();
+                        out.open(idx, Block::Reasoning { redacted: false }, Value::Null)?;
+                        self.reasoning_index = Some(idx);
+                        idx
+                    }
+                };
+                out.push(index, &chunk)?;
             }
-            if let Some(rest) = line.strip_prefix("event:") {
-                current_event = Some(rest.trim().to_owned());
-            } else if let Some(rest) = line.strip_prefix("data:") {
-                data_lines.push(rest.trim_start().to_owned());
+            LocalCompletionEvent::TextDelta(chunk) => {
+                if let Some(idx) = self.reasoning_index.take() {
+                    out.finish(idx)?;
+                }
+                out.run(Block::Text, &chunk)?;
             }
+            LocalCompletionEvent::ToolCall {
+                id,
+                name,
+                arguments,
+            } => {
+                if let Some(idx) = self.reasoning_index.take() {
+                    out.finish(idx)?;
+                }
+                out.end_run()?;
+                let idx = out.fresh_index();
+                out.fragment(
+                    Some(idx),
+                    CallFragment {
+                        id: Some(id.as_str()),
+                        name: Some(name.as_str()),
+                        ..CallFragment::default()
+                    },
+                )?;
+                out.announce(idx, arguments)?;
+                out.finish(idx)?;
+            }
+            LocalCompletionEvent::Finish { usage, reason } => {
+                if let Some(idx) = self.reasoning_index.take() {
+                    out.finish(idx)?;
+                }
+                out.end_run()?;
+                let mut rig_usage = Usage::default();
+                rig_usage.input_tokens = Some(usage.input_tokens);
+                rig_usage.output_tokens = Some(usage.output_tokens);
+                rig_usage.total_tokens = Some(usage.total());
+                return Ok(out.end(Finish {
+                    usage: rig_usage,
+                    reason: Some(reason),
+                    ..Finish::default()
+                }));
+            }
+        }
+        Ok(Flow::More)
+    }
+}
+
+#[derive(Default)]
+struct LocalCompletionReassembler;
+
+impl Reassemble<LocalCompletionEvent> for LocalCompletionReassembler {
+    fn absorb(&mut self, _event: &LocalCompletionEvent) {}
+
+    fn finish(self) -> Value {
+        Value::Null
+    }
+}
+
+impl Serves<Completion> for LocalCompletionReassembler {}
+
+const LOCAL_COMPLETION_API: Api = Api::from_static("gpui.local");
+
+impl ReplayTarget for LocalCompletionWire {
+    fn api(&self) -> Api {
+        LOCAL_COMPLETION_API
+    }
+
+    fn map_options(&self, _request: &CompletionRequest, fields: OptionFields<'_>) -> OptionMap {
+        let omit_if = |present: bool| {
+            if present {
+                Mapping::Omit("local model ignores generation options")
+            } else {
+                Mapping::Nothing
+            }
+        };
+        OptionMap {
+            reasoning: omit_if(fields.reasoning.is_some()),
+            cache: omit_if(fields.cache.is_some()),
+            service_tier: omit_if(fields.service_tier.is_some()),
+            verbosity: omit_if(fields.verbosity.is_some()),
+            parallel_tool_calls: omit_if(fields.parallel_tool_calls.is_some()),
+            top_p: omit_if(fields.top_p.is_some()),
+            seed: omit_if(fields.seed.is_some()),
+            stop: omit_if(!fields.stop.is_empty()),
+            cache_key: Mapping::unrouted(fields.cache_key),
         }
     }
 
-    if !data_lines.is_empty() {
-        let ev = SseEvent {
-            event: current_event.take(),
-            data: data_lines.join("\n"),
-        };
-        let _ = on_event(ev);
+    fn states_finish_reason(&self) -> bool {
+        true
     }
-    Ok(())
+
+    fn provider(&self) -> &str {
+        &self.provider_name
+    }
+
+    fn model(&self) -> &str {
+        &self.model_id
+    }
+
+    fn accepts(&self, _model: &str) -> Accepts {
+        Accepts::ALL
+    }
 }
 
-// ---------------------------------------------------------------------------
-// 1. OpenAI & OpenAI-Compatible Chat Completions SSE Model
-// ---------------------------------------------------------------------------
+impl Wire for LocalCompletionWire {
+    type Op = Completion;
+    type Payload = CompletionRequest;
+    type Frame = LocalCompletionEvent;
+    type Event = LocalCompletionEvent;
+    type Decoder<'id> = LocalCompletionDecoder;
+    type Reassembler = LocalCompletionReassembler;
 
-struct OpenAiChatModel {
-    base_url: String,
-    api_key: String,
-    model: String,
-}
+    fn describe(&self) -> Descriptor<'_> {
+        Descriptor::new(&self.provider_name)
+            .model(Some(self.model_id.as_str()))
+            .capabilities(Capabilities::default())
+            .replay(self)
+    }
 
-impl LanguageModel for OpenAiChatModel {
-    fn stream_step(
+    fn encode(
         &self,
-        request: ModelRequest,
-        http: Arc<dyn HttpClient>,
-        abort: Arc<AtomicBool>,
-        tx: async_channel::Sender<ModelStreamEvent>,
-    ) -> BoxFuture<'static, Result<()>> {
-        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let api_key = self.api_key.clone();
-        let model = self.model.clone();
+        request: CompletionRequest,
+        _mode: Mode,
+    ) -> std::result::Result<CompletionRequest, EncodeError> {
+        Ok(request)
+    }
 
-        Box::pin(async move {
-            let mut msgs: Vec<Value> = Vec::new();
-            if !request.system.trim().is_empty() {
-                msgs.push(json!({ "role": "system", "content": request.system }));
-            }
-            for msg in &request.messages {
-                match msg {
-                    ModelMessage::User(parts) => {
-                        let has_images = parts
-                            .iter()
-                            .any(|p| matches!(p, ModelContentPart::Image { .. }));
-                        if !has_images {
-                            let text: String = parts
-                                .iter()
-                                .filter_map(|p| match p {
-                                    ModelContentPart::Text(t) => Some(t.as_str()),
-                                    _ => None,
-                                })
-                                .collect::<Vec<_>>()
-                                .join("\n");
-                            msgs.push(json!({ "role": "user", "content": text }));
-                        } else {
-                            let content: Vec<Value> = parts
-                                .iter()
-                                .filter_map(|p| match p {
-                                    ModelContentPart::Text(t) if !t.is_empty() => {
-                                        Some(json!({ "type": "text", "text": t }))
-                                    }
-                                    ModelContentPart::Image { media_type, bytes } => {
-                                        let data_url =
-                                            format!("data:{media_type};base64,{}", base64_encode(bytes));
-                                        Some(json!({
-                                            "type": "image_url",
-                                            "image_url": { "url": data_url }
-                                        }))
-                                    }
-                                    _ => None,
-                                })
-                                .collect();
-                            msgs.push(json!({ "role": "user", "content": content }));
-                        }
-                    }
-                    ModelMessage::Assistant(parts) => {
-                        let mut text = String::new();
-                        let mut tool_calls = Vec::new();
-                        for p in parts {
-                            match p {
-                                ModelContentPart::Text(t) => {
-                                    if !text.is_empty() && !t.is_empty() {
-                                        text.push_str("\n\n");
-                                    }
-                                    text.push_str(t);
-                                }
-                                ModelContentPart::ToolCall {
-                                    id,
-                                    name,
-                                    arguments,
-                                } => {
-                                    tool_calls.push(json!({
-                                        "id": id,
-                                        "type": "function",
-                                        "function": {
-                                            "name": name,
-                                            "arguments": serde_json::to_string(arguments).unwrap_or_else(|_| "{}".to_owned())
-                                        }
-                                    }));
-                                }
-                                _ => {}
-                            }
-                        }
-                        let mut obj = json!({ "role": "assistant" });
-                        if let Some(map) = obj.as_object_mut() {
-                            if !text.is_empty() || tool_calls.is_empty() {
-                                map.insert("content".to_owned(), Value::String(text));
-                            } else {
-                                map.insert("content".to_owned(), Value::Null);
-                            }
-                            if !tool_calls.is_empty() {
-                                map.insert("tool_calls".to_owned(), Value::Array(tool_calls));
-                            }
-                        }
-                        msgs.push(obj);
-                    }
-                    ModelMessage::Tool(parts) => {
-                        for p in parts {
-                            if let ModelContentPart::ToolResult {
-                                tool_call_id,
-                                output,
-                                ..
-                            } = p
-                            {
-                                msgs.push(json!({
-                                    "role": "tool",
-                                    "tool_call_id": tool_call_id,
-                                    "content": output
-                                }));
-                            }
-                        }
-                    }
-                }
-            }
+    fn decoder<'id>(&self) -> Self::Decoder<'id> {
+        LocalCompletionDecoder::default()
+    }
+}
 
-            let mut body_json = json!({
-                "model": model,
-                "messages": msgs,
-                "stream": true,
-                "stream_options": { "include_usage": true },
-            });
-            if let Some(max_toks) = request.max_output_tokens {
-                body_json["max_tokens"] = json!(max_toks);
-            }
-            if !request.tools.is_empty() && request.tool_choice != ToolChoice::None {
-                let tools: Vec<Value> = request
-                    .tools
-                    .iter()
-                    .map(|t| {
-                        json!({
-                            "type": "function",
-                            "function": {
-                                "name": t.name,
-                                "description": t.description,
-                                "parameters": t.input_schema
-                            }
-                        })
-                    })
-                    .collect();
-                body_json["tools"] = Value::Array(tools);
-                body_json["tool_choice"] = json!("auto");
-            }
+#[derive(Clone)]
+struct LocalCompletionTransport {
+    handler: LocalCompletionHandler,
+}
 
-            let mut req_builder = Request::builder()
-                .method(Method::POST)
-                .uri(url.as_str())
-                .header("Content-Type", "application/json")
-                .header("Accept", "text/event-stream");
-            if !api_key.is_empty() {
-                req_builder = req_builder.header("Authorization", format!("Bearer {api_key}"));
+impl Transport<LocalCompletionWire> for LocalCompletionTransport {
+    fn send(&self, request: CompletionRequest, _exchange: Exchange) -> Opening<LocalCompletionEvent> {
+        let handler = self.handler.clone();
+        let (tx, rx) = async_channel::unbounded::<LocalCompletionEvent>();
+        let (err_tx, err_rx) = async_channel::bounded::<String>(1);
+        ai_tokio_handle().spawn(async move {
+            if let Err(err) = handler(request, tx).await {
+                let _ = err_tx.send(err.to_string()).await;
             }
-            let req = req_builder.body(AsyncBody::from(serde_json::to_vec(&body_json)?))?;
-            let resp = http.send(req).await?;
-            let status = resp.status();
-            if !status.is_success() {
-                bail!("provider HTTP {}", status.as_u16());
+        });
+        let stream = futures::stream::unfold((rx, err_rx, false), |(rx, err_rx, done)| async move {
+            if done {
+                return None;
             }
-
-            // Accumulate streamed tool call fragments by index.
-            #[derive(Default)]
-            struct PendingTool {
-                id: String,
-                name: String,
-                args: String,
+            match rx.recv().await {
+                Ok(ev) => Some((Ok(ev), (rx, err_rx, false))),
+                Err(_) => match err_rx.try_recv() {
+                    Ok(msg) => Some((Err(ProviderError::Provider(msg)), (rx, err_rx, true))),
+                    Err(_) => None,
+                },
             }
-            let mut pending_tools: BTreeMap<usize, PendingTool> = BTreeMap::new();
-            let mut finish_reason = FinishReason::Stop;
-
-            read_sse_stream(resp.into_body(), abort.clone(), |ev| {
-                let data = ev.data.trim();
-                if data == "[DONE]" {
-                    return false;
-                }
-                let Ok(val) = serde_json::from_str::<Value>(data) else {
-                    return true;
-                };
-                if let Some(usage) = val.get("usage")
-                    && !usage.is_null()
-                {
-                    let input_tokens = usage
-                        .get("prompt_tokens")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0);
-                    let output_tokens = usage
-                        .get("completion_tokens")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0);
-                    if input_tokens > 0 || output_tokens > 0 {
-                        let _ = tx.try_send(ModelStreamEvent::Usage(AiTokenUsage {
-                            input_tokens,
-                            output_tokens,
-                        }));
-                    }
-                }
-                if let Some(choice) = val
-                    .get("choices")
-                    .and_then(Value::as_array)
-                    .and_then(|arr| arr.first())
-                {
-                    if let Some(delta) = choice.get("delta") {
-                        if let Some(reasoning) = delta
-                            .get("reasoning_content")
-                            .or_else(|| delta.get("reasoning"))
-                            .and_then(Value::as_str)
-                            && !reasoning.is_empty()
-                        {
-                            let _ = tx.try_send(ModelStreamEvent::ReasoningDelta(
-                                reasoning.to_owned(),
-                            ));
-                        }
-                        if let Some(text) = delta.get("content").and_then(Value::as_str)
-                            && !text.is_empty()
-                        {
-                            let _ = tx.try_send(ModelStreamEvent::TextDelta(text.to_owned()));
-                        }
-                        if let Some(tcs) = delta.get("tool_calls").and_then(Value::as_array) {
-                            for tc in tcs {
-                                let idx = tc.get("index").and_then(Value::as_u64).unwrap_or(0)
-                                    as usize;
-                                let entry = pending_tools.entry(idx).or_default();
-                                if let Some(id) = tc.get("id").and_then(Value::as_str) {
-                                    entry.id.push_str(id);
-                                }
-                                if let Some(func) = tc.get("function") {
-                                    if let Some(name) = func.get("name").and_then(Value::as_str) {
-                                        entry.name.push_str(name);
-                                    }
-                                    if let Some(args) =
-                                        func.get("arguments").and_then(Value::as_str)
-                                    {
-                                        entry.args.push_str(args);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if let Some(fr) = choice.get("finish_reason").and_then(Value::as_str) {
-                        finish_reason = match fr {
-                            "tool_calls" | "function_call" => FinishReason::ToolCalls,
-                            "length" => FinishReason::Length,
-                            _ => FinishReason::Stop,
-                        };
-                    }
-                }
-                true
-            })
-            .await?;
-
-            if abort.load(Ordering::Relaxed) {
-                let _ = tx.send(ModelStreamEvent::Finish(FinishReason::Cancelled)).await;
-                return Ok(());
-            }
-
-            let had_tools = !pending_tools.is_empty();
-            for (_, tc) in pending_tools {
-                if tc.name.is_empty() {
-                    continue;
-                }
-                let id = if tc.id.is_empty() {
-                    super::types::new_id()
-                } else {
-                    tc.id
-                };
-                let arguments = serde_json::from_str::<Value>(&tc.args).unwrap_or_else(|_| json!({}));
-                let _ = tx
-                    .send(ModelStreamEvent::ToolCall {
-                        id,
-                        name: tc.name,
-                        arguments,
-                    })
-                    .await;
-            }
-            if had_tools && finish_reason == FinishReason::Stop {
-                finish_reason = FinishReason::ToolCalls;
-            }
-            let _ = tx.send(ModelStreamEvent::Finish(finish_reason)).await;
-            Ok(())
         })
+        .boxed();
+        Opening::ready(Opened::new(stream))
     }
 }
 
 // ---------------------------------------------------------------------------
-// 2. Anthropic Messages API SSE Model
-// ---------------------------------------------------------------------------
-
-struct AnthropicModel {
-    api_key: String,
-    model: String,
-}
-
-impl LanguageModel for AnthropicModel {
-    fn stream_step(
-        &self,
-        request: ModelRequest,
-        http: Arc<dyn HttpClient>,
-        abort: Arc<AtomicBool>,
-        tx: async_channel::Sender<ModelStreamEvent>,
-    ) -> BoxFuture<'static, Result<()>> {
-        let api_key = self.api_key.clone();
-        let model = self.model.clone();
-
-        Box::pin(async move {
-            let mut msgs: Vec<Value> = Vec::new();
-            for msg in &request.messages {
-                match msg {
-                    ModelMessage::User(parts) => {
-                        let content: Vec<Value> = parts
-                            .iter()
-                            .filter_map(|p| match p {
-                                ModelContentPart::Text(t) if !t.is_empty() => {
-                                    Some(json!({ "type": "text", "text": t }))
-                                }
-                                ModelContentPart::Image { media_type, bytes } => Some(json!({
-                                    "type": "image",
-                                    "source": {
-                                        "type": "base64",
-                                        "media_type": media_type,
-                                        "data": base64_encode(bytes),
-                                    }
-                                })),
-                                _ => None,
-                            })
-                            .collect();
-                        if !content.is_empty() {
-                            msgs.push(json!({ "role": "user", "content": content }));
-                        }
-                    }
-                    ModelMessage::Assistant(parts) => {
-                        let content: Vec<Value> = parts
-                            .iter()
-                            .filter_map(|p| match p {
-                                ModelContentPart::Text(t) if !t.is_empty() => {
-                                    Some(json!({ "type": "text", "text": t }))
-                                }
-                                ModelContentPart::ToolCall {
-                                    id,
-                                    name,
-                                    arguments,
-                                } => Some(json!({
-                                    "type": "tool_use",
-                                    "id": id,
-                                    "name": name,
-                                    "input": if arguments.is_object() { arguments.clone() } else { json!({}) }
-                                })),
-                                _ => None,
-                            })
-                            .collect();
-                        if !content.is_empty() {
-                            msgs.push(json!({ "role": "assistant", "content": content }));
-                        }
-                    }
-                    ModelMessage::Tool(parts) => {
-                        let content: Vec<Value> = parts
-                            .iter()
-                            .filter_map(|p| match p {
-                                ModelContentPart::ToolResult {
-                                    tool_call_id,
-                                    output,
-                                    is_error,
-                                    ..
-                                } => Some(json!({
-                                    "type": "tool_result",
-                                    "tool_use_id": tool_call_id,
-                                    "content": output,
-                                    "is_error": is_error
-                                })),
-                                _ => None,
-                            })
-                            .collect();
-                        if !content.is_empty() {
-                            msgs.push(json!({ "role": "user", "content": content }));
-                        }
-                    }
-                }
-            }
-
-            let mut body_json = json!({
-                "model": model,
-                "max_tokens": request.max_output_tokens.unwrap_or(4096),
-                "messages": msgs,
-                "stream": true,
-            });
-            if !request.system.trim().is_empty() {
-                body_json["system"] = Value::String(request.system);
-            }
-            if !request.tools.is_empty() && request.tool_choice != ToolChoice::None {
-                let tools: Vec<Value> = request
-                    .tools
-                    .iter()
-                    .map(|t| {
-                        json!({
-                            "name": t.name,
-                            "description": t.description,
-                            "input_schema": t.input_schema
-                        })
-                    })
-                    .collect();
-                body_json["tools"] = Value::Array(tools);
-            }
-
-            let req = Request::builder()
-                .method(Method::POST)
-                .uri("https://api.anthropic.com/v1/messages")
-                .header("Content-Type", "application/json")
-                .header("Accept", "text/event-stream")
-                .header("x-api-key", api_key.as_str())
-                .header("anthropic-version", "2023-06-01")
-                .body(AsyncBody::from(serde_json::to_vec(&body_json)?))?;
-            let resp = http.send(req).await?;
-            let status = resp.status();
-            if !status.is_success() {
-                bail!("anthropic HTTP {}", status.as_u16());
-            }
-
-            struct PendingAnthropicTool {
-                id: String,
-                name: String,
-                args: String,
-            }
-            let mut active_tools: BTreeMap<usize, PendingAnthropicTool> = BTreeMap::new();
-            let mut completed_tools: Vec<(String, String, Value)> = Vec::new();
-            let mut finish_reason = FinishReason::Stop;
-            let mut input_tokens = 0u64;
-            let mut output_tokens = 0u64;
-
-            read_sse_stream(resp.into_body(), abort.clone(), |ev| {
-                let Ok(val) = serde_json::from_str::<Value>(ev.data.trim()) else {
-                    return true;
-                };
-                let kind = ev
-                    .event
-                    .as_deref()
-                    .or_else(|| val.get("type").and_then(Value::as_str))
-                    .unwrap_or("");
-                match kind {
-                    "message_start" => {
-                        if let Some(u) = val.pointer("/message/usage/input_tokens").and_then(Value::as_u64) {
-                            input_tokens = u;
-                        }
-                    }
-                    "content_block_start" => {
-                        let idx = val.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-                        if let Some(cb) = val.get("content_block")
-                            && cb.get("type").and_then(Value::as_str) == Some("tool_use")
-                        {
-                            let id = cb
-                                .get("id")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default()
-                                .to_owned();
-                            let name = cb
-                                .get("name")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default()
-                                .to_owned();
-                            active_tools.insert(
-                                idx,
-                                PendingAnthropicTool {
-                                    id,
-                                    name,
-                                    args: String::new(),
-                                },
-                            );
-                        }
-                    }
-                    "content_block_delta" => {
-                        let idx = val.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-                        if let Some(delta) = val.get("delta") {
-                            match delta.get("type").and_then(Value::as_str).unwrap_or("") {
-                                "text_delta" => {
-                                    if let Some(t) = delta.get("text").and_then(Value::as_str)
-                                        && !t.is_empty()
-                                    {
-                                        let _ = tx.try_send(ModelStreamEvent::TextDelta(t.to_owned()));
-                                    }
-                                }
-                                "thinking_delta" => {
-                                    if let Some(t) = delta.get("thinking").and_then(Value::as_str)
-                                        && !t.is_empty()
-                                    {
-                                        let _ = tx.try_send(ModelStreamEvent::ReasoningDelta(
-                                            t.to_owned(),
-                                        ));
-                                    }
-                                }
-                                "input_json_delta" => {
-                                    if let Some(part) =
-                                        delta.get("partial_json").and_then(Value::as_str)
-                                        && let Some(tool) = active_tools.get_mut(&idx)
-                                    {
-                                        tool.args.push_str(part);
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    "content_block_stop" => {
-                        let idx = val.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-                        if let Some(tool) = active_tools.remove(&idx) {
-                            let args = serde_json::from_str::<Value>(&tool.args)
-                                .unwrap_or_else(|_| json!({}));
-                            completed_tools.push((tool.id, tool.name, args));
-                        }
-                    }
-                    "message_delta" => {
-                        if let Some(sr) = val.pointer("/delta/stop_reason").and_then(Value::as_str)
-                        {
-                            finish_reason = match sr {
-                                "tool_use" => FinishReason::ToolCalls,
-                                "max_tokens" => FinishReason::Length,
-                                _ => FinishReason::Stop,
-                            };
-                        }
-                        if let Some(u) = val.pointer("/usage/output_tokens").and_then(Value::as_u64)
-                        {
-                            output_tokens = u;
-                        }
-                    }
-                    "message_stop" => return false,
-                    _ => {}
-                }
-                true
-            })
-            .await?;
-
-            if abort.load(Ordering::Relaxed) {
-                let _ = tx.send(ModelStreamEvent::Finish(FinishReason::Cancelled)).await;
-                return Ok(());
-            }
-
-            if input_tokens > 0 || output_tokens > 0 {
-                let _ = tx
-                    .send(ModelStreamEvent::Usage(AiTokenUsage {
-                        input_tokens,
-                        output_tokens,
-                    }))
-                    .await;
-            }
-            for (id, name, arguments) in completed_tools {
-                let _ = tx
-                    .send(ModelStreamEvent::ToolCall {
-                        id,
-                        name,
-                        arguments,
-                    })
-                    .await;
-            }
-            let _ = tx.send(ModelStreamEvent::Finish(finish_reason)).await;
-            Ok(())
-        })
-    }
-}
-
-// ---------------------------------------------------------------------------
-// 3. Google Gemini streamGenerateContent?alt=sse Model
-// ---------------------------------------------------------------------------
-
-struct GeminiModel {
-    api_key: String,
-    model: String,
-}
-
-impl LanguageModel for GeminiModel {
-    fn stream_step(
-        &self,
-        request: ModelRequest,
-        http: Arc<dyn HttpClient>,
-        abort: Arc<AtomicBool>,
-        tx: async_channel::Sender<ModelStreamEvent>,
-    ) -> BoxFuture<'static, Result<()>> {
-        let api_key = self.api_key.clone();
-        let url = format!(
-            "https://generativelanguage.googleapis.com/v1beta/models/{}:streamGenerateContent?alt=sse",
-            self.model
-        );
-
-        Box::pin(async move {
-            let mut contents: Vec<Value> = Vec::new();
-            for msg in &request.messages {
-                match msg {
-                    ModelMessage::User(parts) => {
-                        let gparts: Vec<Value> = parts
-                            .iter()
-                            .filter_map(|p| match p {
-                                ModelContentPart::Text(t) if !t.is_empty() => {
-                                    Some(json!({ "text": t }))
-                                }
-                                ModelContentPart::Image { media_type, bytes } => Some(json!({
-                                    "inlineData": {
-                                        "mimeType": media_type,
-                                        "data": base64_encode(bytes),
-                                    }
-                                })),
-                                _ => None,
-                            })
-                            .collect();
-                        if !gparts.is_empty() {
-                            contents.push(json!({ "role": "user", "parts": gparts }));
-                        }
-                    }
-                    ModelMessage::Assistant(parts) => {
-                        let gparts: Vec<Value> = parts
-                            .iter()
-                            .filter_map(|p| match p {
-                                ModelContentPart::Text(t) if !t.is_empty() => {
-                                    Some(json!({ "text": t }))
-                                }
-                                ModelContentPart::ToolCall {
-                                    name, arguments, ..
-                                } => Some(json!({
-                                    "functionCall": {
-                                        "name": name,
-                                        "args": if arguments.is_object() { arguments.clone() } else { json!({}) }
-                                    }
-                                })),
-                                _ => None,
-                            })
-                            .collect();
-                        if !gparts.is_empty() {
-                            contents.push(json!({ "role": "model", "parts": gparts }));
-                        }
-                    }
-                    ModelMessage::Tool(parts) => {
-                        let gparts: Vec<Value> = parts
-                            .iter()
-                            .filter_map(|p| match p {
-                                ModelContentPart::ToolResult {
-                                    tool_name, output, ..
-                                } => Some(json!({
-                                    "functionResponse": {
-                                        "name": tool_name,
-                                        "response": { "content": output }
-                                    }
-                                })),
-                                _ => None,
-                            })
-                            .collect();
-                        if !gparts.is_empty() {
-                            contents.push(json!({ "role": "user", "parts": gparts }));
-                        }
-                    }
-                }
-            }
-
-            let mut body_json = json!({ "contents": contents });
-            if !request.system.trim().is_empty() {
-                body_json["systemInstruction"] = json!({
-                    "parts": [{ "text": request.system }]
-                });
-            }
-            if let Some(max_toks) = request.max_output_tokens {
-                body_json["generationConfig"] = json!({ "maxOutputTokens": max_toks });
-            }
-            if !request.tools.is_empty() && request.tool_choice != ToolChoice::None {
-                let decls: Vec<Value> = request
-                    .tools
-                    .iter()
-                    .map(|t| {
-                        json!({
-                            "name": t.name,
-                            "description": t.description,
-                            "parameters": t.input_schema
-                        })
-                    })
-                    .collect();
-                body_json["tools"] = json!([{ "functionDeclarations": decls }]);
-            }
-
-            let req = Request::builder()
-                .method(Method::POST)
-                .uri(url.as_str())
-                .header("Content-Type", "application/json")
-                .header("Accept", "text/event-stream")
-                .header("x-goog-api-key", api_key.as_str())
-                .body(AsyncBody::from(serde_json::to_vec(&body_json)?))?;
-            let resp = http.send(req).await?;
-            let status = resp.status();
-            if !status.is_success() {
-                bail!("gemini HTTP {}", status.as_u16());
-            }
-
-            let mut tool_calls: Vec<(String, String, Value)> = Vec::new();
-            let mut finish_reason = FinishReason::Stop;
-
-            read_sse_stream(resp.into_body(), abort.clone(), |ev| {
-                let Ok(val) = serde_json::from_str::<Value>(ev.data.trim()) else {
-                    return true;
-                };
-                if let Some(meta) = val.get("usageMetadata") {
-                    let input_tokens = meta
-                        .get("promptTokenCount")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0);
-                    let output_tokens = meta
-                        .get("candidatesTokenCount")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0);
-                    if input_tokens > 0 || output_tokens > 0 {
-                        let _ = tx.try_send(ModelStreamEvent::Usage(AiTokenUsage {
-                            input_tokens,
-                            output_tokens,
-                        }));
-                    }
-                }
-                if let Some(cand) = val
-                    .get("candidates")
-                    .and_then(Value::as_array)
-                    .and_then(|c| c.first())
-                {
-                    if let Some(parts) = cand
-                        .pointer("/content/parts")
-                        .and_then(Value::as_array)
-                    {
-                        for part in parts {
-                            if let Some(text) = part.get("text").and_then(Value::as_str)
-                                && !text.is_empty()
-                            {
-                                if part.get("thought").and_then(Value::as_bool) == Some(true) {
-                                    let _ = tx.try_send(ModelStreamEvent::ReasoningDelta(
-                                        text.to_owned(),
-                                    ));
-                                } else {
-                                    let _ = tx.try_send(ModelStreamEvent::TextDelta(
-                                        text.to_owned(),
-                                    ));
-                                }
-                            }
-                            if let Some(fc) = part.get("functionCall")
-                                && let Some(name) = fc.get("name").and_then(Value::as_str)
-                            {
-                                let args = fc.get("args").cloned().unwrap_or_else(|| json!({}));
-                                tool_calls.push((super::types::new_id(), name.to_owned(), args));
-                            }
-                        }
-                    }
-                    if let Some(fr) = cand.get("finishReason").and_then(Value::as_str) {
-                        if fr == "MAX_TOKENS" {
-                            finish_reason = FinishReason::Length;
-                        }
-                    }
-                }
-                true
-            })
-            .await?;
-
-            if abort.load(Ordering::Relaxed) {
-                let _ = tx.send(ModelStreamEvent::Finish(FinishReason::Cancelled)).await;
-                return Ok(());
-            }
-
-            let had_tools = !tool_calls.is_empty();
-            for (id, name, arguments) in tool_calls {
-                let _ = tx
-                    .send(ModelStreamEvent::ToolCall {
-                        id,
-                        name,
-                        arguments,
-                    })
-                    .await;
-            }
-            if had_tools {
-                finish_reason = FinishReason::ToolCalls;
-            }
-            let _ = tx.send(ModelStreamEvent::Finish(finish_reason)).await;
-            Ok(())
-        })
-    }
-}
-
-// ---------------------------------------------------------------------------
-// 4. Offline Simulated Streaming Model (for Playground & Unit Tests)
+// Offline Simulated Model (for Playground & Unit Tests — runs on Rig Agent)
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
@@ -1284,12 +665,13 @@ impl std::fmt::Debug for SimulatedPacing {
     }
 }
 
-async fn sleep_or_abort(
+async fn sleep_or_closed(
     pacing: Option<&SimulatedPacing>,
     duration: Duration,
-    abort: &AtomicBool,
+    tx: &async_channel::Sender<LocalCompletionEvent>,
+    abort: Option<&AtomicBool>,
 ) -> bool {
-    if abort.load(Ordering::Relaxed) {
+    if tx.is_closed() || abort.is_some_and(|a| a.load(Ordering::Relaxed)) {
         return false;
     }
     let Some(pacing) = pacing else {
@@ -1303,7 +685,7 @@ async fn sleep_or_abort(
     while !remaining.is_zero() {
         let wait = remaining.min(slice);
         pacing.executor.timer(wait).await;
-        if abort.load(Ordering::Relaxed) {
+        if tx.is_closed() || abort.is_some_and(|a| a.load(Ordering::Relaxed)) {
             return false;
         }
         remaining = remaining.saturating_sub(wait);
@@ -1333,34 +715,80 @@ fn utf8_chunks(text: &str, max_chars: usize) -> Vec<String> {
 async fn stream_reasoning(
     text: &str,
     pacing: Option<&SimulatedPacing>,
-    abort: &AtomicBool,
-    tx: &async_channel::Sender<ModelStreamEvent>,
+    tx: &async_channel::Sender<LocalCompletionEvent>,
 ) -> bool {
     if let Some(p) = pacing {
         for chunk in utf8_chunks(text, 18) {
-            if !sleep_or_abort(Some(p), p.chunk_delay, abort).await {
+            if !sleep_or_closed(Some(p), p.chunk_delay, tx, None).await {
                 return false;
             }
-            let _ = tx.send(ModelStreamEvent::ReasoningDelta(chunk)).await;
+            if tx.send(LocalCompletionEvent::ReasoningDelta(chunk)).await.is_err() {
+                return false;
+            }
         }
-    } else {
-        if abort.load(Ordering::Relaxed) {
-            return false;
-        }
-        let _ = tx
-            .send(ModelStreamEvent::ReasoningDelta(text.to_owned()))
-            .await;
+    } else if tx
+        .send(LocalCompletionEvent::ReasoningDelta(text.to_owned()))
+        .await
+        .is_err()
+    {
+        return false;
     }
     true
 }
 
-/// Offline deterministic streaming [`LanguageModel`] that demonstrates multi-step tool calling,
-/// workspace file operations, reasoning traces, Markdown rendering, and ```` ```component:* ````
-/// generative UI blocks with zero network requests.
+/// Extracts the most recent user text prompt and any trailing tool result from a Rig
+/// [`CompletionRequest`]. Handy for offline/demo [`LocalCompletionHandler`] implementations.
+pub fn extract_request_summary(
+    request: &CompletionRequest,
+) -> (String, bool, Option<(String, String)>) {
+    let last_user_text = request
+        .chat_history
+        .iter()
+        .rev()
+        .find_map(|m| match m.as_ref() {
+            Message::User { content } => {
+                let text = content
+                    .iter()
+                    .filter_map(|p| match p {
+                        UserContent::Text(t) => Some(t.text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                (!text.is_empty()).then_some(text)
+            }
+            _ => None,
+        })
+        .unwrap_or_default();
+
+    let last_is_tool = request.chat_history.last().is_some_and(|m| {
+        matches!(m.as_ref(), Message::User { content } if content.iter().any(|p| matches!(p, UserContent::ToolResult(_))))
+    });
+
+    let last_tool_output = request.chat_history.iter().rev().find_map(|m| match m.as_ref() {
+        Message::User { content } => content.iter().rev().find_map(|p| match p {
+            UserContent::ToolResult(tr) => {
+                let out = tr
+                    .content
+                    .iter()
+                    .map(|c| c.to_text("[image]"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                Some((tr.name.as_str().to_owned(), out))
+            }
+            _ => None,
+        }),
+        _ => None,
+    });
+
+    (last_user_text, last_is_tool, last_tool_output)
+}
+
+/// Offline deterministic streaming model running natively inside [`rig_agent::Agent`].
 ///
 /// Defaults to zero latency (`SimulatedModel::default()`) for deterministic unit tests; use
 /// [`SimulatedModel::interactive`] or [`SimulatedModel::with_pacing`] in interactive demos to
-/// showcase the thinking indicator, streamed reasoning, tool execution states, and token streaming.
+/// showcase thinking, streamed reasoning, tool execution states, and token-by-token streaming.
 #[derive(Clone, Debug, Default)]
 pub struct SimulatedModel {
     pacing: Option<SimulatedPacing>,
@@ -1391,180 +819,156 @@ impl SimulatedModel {
             }),
         }
     }
-}
 
-impl LanguageModel for SimulatedModel {
-    fn stream_step(
-        &self,
-        request: ModelRequest,
-        _http: Arc<dyn HttpClient>,
-        abort: Arc<AtomicBool>,
-        tx: async_channel::Sender<ModelStreamEvent>,
-    ) -> BoxFuture<'static, Result<()>> {
-        let pacing = self.pacing.clone();
-        Box::pin(async move {
-            let last_user_text = request
-                .messages
-                .iter()
-                .rev()
-                .find_map(|m| match m {
-                    ModelMessage::User(parts) => Some(
-                        parts
-                            .iter()
-                            .filter_map(|p| match p {
-                                ModelContentPart::Text(t) => Some(t.as_str()),
-                                _ => None,
+    /// Converts this simulated model into a native [`RigCompletionModel`].
+    pub fn into_dyn_model(self) -> RigCompletionModel {
+        let pacing = self.pacing;
+        let handler: LocalCompletionHandler = Arc::new(move |request, tx| {
+            let pacing = pacing.clone();
+            Box::pin(async move {
+                let (last_user_text, last_is_tool, last_tool_output) =
+                    extract_request_summary(&request);
+                let lower = last_user_text.to_ascii_lowercase();
+                let tools_allowed = !matches!(request.tool_choice, Some(ToolChoice::None));
+                let has_tool = |name: &str| request.tools.iter().any(|t| t.name.as_str() == name);
+
+                if let Some(ref p) = pacing
+                    && !sleep_or_closed(Some(p), p.thinking_delay, &tx, None).await
+                {
+                    return Ok(());
+                }
+
+                // Step 1: exercise a relevant client / workspace tool before answering if allowed.
+                if !last_is_tool && tools_allowed {
+                    if (lower.contains("tool") || lower.contains("search") || lower.contains("doc"))
+                        && let Some(tool) = request.tools.iter().find(|t| {
+                            t.name.as_str().contains("search") || t.name.as_str().contains("list")
+                        })
+                    {
+                        let tool_name = tool.name.as_str().to_owned();
+                        let thought = format!(
+                            "Analyzing the request and checking registered tools…\nSelected `{tool_name}` to gather grounded data before composing the reply.\n"
+                        );
+                        if !stream_reasoning(&thought, pacing.as_ref(), &tx).await {
+                            return Ok(());
+                        }
+                        if let Some(ref p) = pacing
+                            && !sleep_or_closed(Some(p), Duration::from_millis(260), &tx, None)
+                                .await
+                        {
+                            return Ok(());
+                        }
+                        let args = if tool_name.contains("search") {
+                            json!({ "query": last_user_text })
+                        } else {
+                            json!({})
+                        };
+                        let _ = tx
+                            .send(LocalCompletionEvent::ToolCall {
+                                id: super::types::new_id(),
+                                name: tool_name,
+                                arguments: args,
                             })
-                            .collect::<Vec<_>>()
-                            .join(" "),
-                    ),
-                    _ => None,
-                })
-                .unwrap_or_default();
-            let last_is_tool = matches!(request.messages.last(), Some(ModelMessage::Tool(_)));
-            let last_tool_output = request
-                .messages
-                .iter()
-                .rev()
-                .find_map(|m| match m {
-                    ModelMessage::Tool(parts) => parts.iter().find_map(|p| match p {
-                        ModelContentPart::ToolResult {
-                            tool_name, output, ..
-                        } => Some((tool_name.clone(), output.clone())),
-                        _ => None,
-                    }),
-                    _ => None,
-                });
-
-            let lower = last_user_text.to_ascii_lowercase();
-            let has_tool = |name: &str| request.tools.iter().any(|t| t.name == name);
-
-            // Initial thinking beat so the UI visibly displays "Thinking…" before deltas arrive.
-            if let Some(ref p) = pacing
-                && !sleep_or_abort(Some(p), p.thinking_delay, &abort).await
-            {
-                let _ = tx.send(ModelStreamEvent::Finish(FinishReason::Cancelled)).await;
-                return Ok(());
-            }
-
-            // Step 1: exercise a relevant client / workspace tool before answering if tools are allowed.
-            if !last_is_tool && request.tool_choice == ToolChoice::Auto {
-                if (lower.contains("tool") || lower.contains("search") || lower.contains("doc"))
-                    && let Some(tool) = request
-                        .tools
-                        .iter()
-                        .find(|t| t.name.contains("search") || t.name.contains("list"))
-                {
-                    let thought = format!(
-                        "Analyzing the request and checking registered tools…\nSelected `{}` to gather grounded data before composing the reply.\n",
-                        tool.name
-                    );
-                    if !stream_reasoning(&thought, pacing.as_ref(), &abort, &tx).await {
-                        let _ = tx.send(ModelStreamEvent::Finish(FinishReason::Cancelled)).await;
+                            .await;
+                        let _ = tx
+                            .send(LocalCompletionEvent::Finish {
+                                usage: AiTokenUsage {
+                                    input_tokens: 24,
+                                    output_tokens: 18,
+                                },
+                                reason: FinishReason::ToolCalls,
+                            })
+                            .await;
                         return Ok(());
                     }
-                    if let Some(ref p) = pacing
-                        && !sleep_or_abort(Some(p), Duration::from_millis(260), &abort).await
+
+                    if (lower.contains("workspace")
+                        || lower.contains("file")
+                        || lower.contains("calc"))
+                        && has_tool("workspace__write_file")
                     {
-                        let _ = tx.send(ModelStreamEvent::Finish(FinishReason::Cancelled)).await;
+                        let thought = "Planning workspace output…\nWriting structured metrics into `summary.json` so they remain inspectable in the conversation workspace.\n";
+                        if !stream_reasoning(thought, pacing.as_ref(), &tx).await {
+                            return Ok(());
+                        }
+                        if let Some(ref p) = pacing
+                            && !sleep_or_closed(Some(p), Duration::from_millis(260), &tx, None)
+                                .await
+                        {
+                            return Ok(());
+                        }
+                        let _ = tx
+                            .send(LocalCompletionEvent::ToolCall {
+                                id: super::types::new_id(),
+                                name: "workspace__write_file".to_owned(),
+                                arguments: json!({
+                                    "name": "summary.json",
+                                    "text": serde_json::to_string_pretty(&json!([
+                                        { "name": "Design", "score": 92 },
+                                        { "name": "Latency", "score": 97 },
+                                        { "name": "Coverage", "score": 88 }
+                                    ])).unwrap_or_default()
+                                }),
+                            })
+                            .await;
+                        let _ = tx
+                            .send(LocalCompletionEvent::Finish {
+                                usage: AiTokenUsage {
+                                    input_tokens: 24,
+                                    output_tokens: 22,
+                                },
+                                reason: FinishReason::ToolCalls,
+                            })
+                            .await;
                         return Ok(());
                     }
-                    let args = if tool.name.contains("search") {
-                        json!({ "query": last_user_text })
-                    } else {
-                        json!({})
-                    };
-                    let _ = tx
-                        .send(ModelStreamEvent::ToolCall {
-                            id: super::types::new_id(),
-                            name: tool.name.clone(),
-                            arguments: args,
-                        })
-                        .await;
-                    let _ = tx.send(ModelStreamEvent::Finish(FinishReason::ToolCalls)).await;
+                }
+
+                let is_chart_prompt = lower.contains("dashboard")
+                    || lower.contains("card")
+                    || lower.contains("chart")
+                    || lower.contains("table");
+
+                let thought = if let Some((ref tool_name, _)) = last_tool_output {
+                    format!(
+                        "Reviewing the output returned by `{tool_name}`…\nStructuring a concise summary with Markdown and native GPUI answer components.\n"
+                    )
+                } else if is_chart_prompt {
+                    "Organizing metrics into stat cards, a breakdown bar chart, a sparkline, and a structured table.\n"
+                        .to_owned()
+                } else {
+                    format!(
+                        "Checking available capabilities ({} registered tools) and outlining the key features.\n",
+                        request.tools.len()
+                    )
+                };
+                if !stream_reasoning(&thought, pacing.as_ref(), &tx).await {
+                    return Ok(());
+                }
+                if let Some(ref p) = pacing
+                    && !sleep_or_closed(Some(p), Duration::from_millis(240), &tx, None).await
+                {
                     return Ok(());
                 }
 
-                if (lower.contains("workspace") || lower.contains("file") || lower.contains("calc"))
-                    && has_tool("workspace__write_file")
-                {
-                    let thought = "Planning workspace output…\nWriting structured metrics into `summary.json` so they remain inspectable in the conversation workspace.\n";
-                    if !stream_reasoning(thought, pacing.as_ref(), &abort, &tx).await {
-                        let _ = tx.send(ModelStreamEvent::Finish(FinishReason::Cancelled)).await;
-                        return Ok(());
-                    }
-                    if let Some(ref p) = pacing
-                        && !sleep_or_abort(Some(p), Duration::from_millis(260), &abort).await
-                    {
-                        let _ = tx.send(ModelStreamEvent::Finish(FinishReason::Cancelled)).await;
-                        return Ok(());
-                    }
-                    let _ = tx
-                        .send(ModelStreamEvent::ToolCall {
-                            id: super::types::new_id(),
-                            name: "workspace__write_file".to_owned(),
-                            arguments: json!({
-                                "name": "summary.json",
-                                "text": serde_json::to_string_pretty(&json!([
-                                    { "name": "Design", "score": 92 },
-                                    { "name": "Latency", "score": 97 },
-                                    { "name": "Coverage", "score": 88 }
-                                ])).unwrap_or_default()
-                            }),
-                        })
-                        .await;
-                    let _ = tx.send(ModelStreamEvent::Finish(FinishReason::ToolCalls)).await;
-                    return Ok(());
-                }
-            }
-
-            let is_chart_prompt = lower.contains("dashboard")
-                || lower.contains("card")
-                || lower.contains("chart")
-                || lower.contains("table");
-
-            let thought = if let Some((ref tool_name, _)) = last_tool_output {
-                format!(
-                    "Reviewing the output returned by `{tool_name}`…\nStructuring a concise summary with Markdown and native GPUI answer components.\n"
-                )
-            } else if is_chart_prompt {
-                "Organizing metrics into stat cards, a breakdown bar chart, a sparkline, and a structured table.\n"
-                    .to_owned()
-            } else {
-                format!(
-                    "Checking available capabilities ({} registered tools) and outlining the key features.\n",
-                    request.tools.len()
-                )
-            };
-            if !stream_reasoning(&thought, pacing.as_ref(), &abort, &tx).await {
-                let _ = tx.send(ModelStreamEvent::Finish(FinishReason::Cancelled)).await;
-                return Ok(());
-            }
-            if let Some(ref p) = pacing
-                && !sleep_or_abort(Some(p), Duration::from_millis(240), &abort).await
-            {
-                let _ = tx.send(ModelStreamEvent::Finish(FinishReason::Cancelled)).await;
-                return Ok(());
-            }
-
-            let reply = if let Some((tool_name, output)) = last_tool_output {
-                format!(
-                    "Ran `{tool_name}` and summarized the result below.\n\n\
+                let reply = if let Some((tool_name, output)) = last_tool_output {
+                    format!(
+                        "Ran `{tool_name}` and summarized the result below.\n\n\
 ```component:stat-card\n\
-{{\"label\": \"Tool Executed\", \"value\": \"{tool_name}\", \"note\": \"Completed in client-side Rust agent loop\"}}\n\
+{{\"label\": \"Tool Executed\", \"value\": \"{tool_name}\", \"note\": \"Executed via rig-agent + rmcp\"}}\n\
 ```\n\n\
 ### Returned Data\n\n\
 ```json\n\
 {}\n\
 ```\n\n\
 ```component:callout\n\
-{{\"variant\": \"success\", \"title\": \"Ready for follow-up\", \"body\": \"You can switch to OpenAI, Anthropic, Gemini, or any OpenAI-compatible endpoint in Settings at any time.\"}}\n\
+{{\"variant\": \"success\", \"title\": \"Ready for follow-up\", \"body\": \"Switch to OpenAI, Anthropic, Gemini, or any OpenAI-compatible endpoint in Settings at any time.\"}}\n\
 ```",
-                    output.chars().take(600).collect::<String>()
-                )
-            } else if is_chart_prompt {
-                format!(
-                    "Here is a visual summary for **\"{}\"**:\n\n\
+                        output.chars().take(600).collect::<String>()
+                    )
+                } else if is_chart_prompt {
+                    format!(
+                        "Here is a visual summary for **\"{}\"**:\n\n\
 ```component:stat-card\n\
 {{\"label\": \"Active Workspaces\", \"value\": \"24\", \"delta\": 14.2, \"note\": \"Updated live from structured component props\"}}\n\
 ```\n\n\
@@ -1575,48 +979,49 @@ impl LanguageModel for SimulatedModel {
 {{\"title\": \"7-Day Trend\", \"kind\": \"area\", \"values\": [18, 24, 21, 32, 39, 44, 52], \"baseline\": [20, 22, 25, 29, 34, 38, 43]}}\n\
 ```\n\n\
 ```component:data-table\n\
-{{\"columns\": [\"Component\", \"Source\", \"Status\"], \"rows\": [[\"AskAi\", \"gpui::components::ai\", \"Ready\"], [\"AppTool\", \"Live Foreground Bridge\", \"Ready\"], [\"McpClient\", \"Streamable HTTP + Stdio\", \"Ready\"]]}}\n\
+{{\"columns\": [\"Component\", \"Source\", \"Status\"], \"rows\": [[\"AskAi\", \"rig-agent + rig-core\", \"Ready\"], [\"AppTool\", \"Live Foreground Bridge\", \"Ready\"], [\"McpClient\", \"Official rmcp + rig-rmcp\", \"Ready\"]]}}\n\
 ```",
-                    last_user_text.trim().replace('"', "'")
-                )
-            } else {
-                let tool_count = request.tools.len();
-                format!(
-                    "Here is an overview from the offline simulated model (`{tool_count}` registered tools available):\n\n\
-- **Providers**: OpenAI, Anthropic, Google Gemini, and any OpenAI-compatible endpoint.\n\
-- **MCP & Live Tools**: Connect Streamable HTTP or Stdio MCP servers alongside background `ClientTool` and foreground `AppTool` handlers.\n\
+                        last_user_text.trim().replace('"', "'")
+                    )
+                } else {
+                    let tool_count = request.tools.len();
+                    format!(
+                        "Here is an overview from the offline simulated model running on **Rig** (`{tool_count}` registered tools available):\n\n\
+- **Providers (`rig-core`)**: OpenAI Responses API, Anthropic Messages, Google Gemini, and any OpenAI-compatible gateway.\n\
+- **MCP (`rmcp` + `rig-rmcp`)**: Official Rust MCP SDK supporting Streamable HTTP and Stdio servers alongside `ClientTool` and foreground `AppTool` handlers.\n\
 - **Branching & Workspace**: Edit or regenerate messages to branch with `< 1 / 2 >`, and store per-conversation files.\n\n\
 ```component:key-value\n\
-{{\"title\": \"Active Runtime\", \"items\": [{{\"label\": \"Agent Engine\", \"value\": \"Pure Rust (zero JS runtime)\"}}, {{\"label\": \"Tools Available\", \"value\": \"{tool_count}\"}}, {{\"label\": \"Answer Components\", \"value\": \"Enabled\"}}]}}\n\
+{{\"title\": \"Active Runtime\", \"items\": [{{\"label\": \"Agent Loop\", \"value\": \"rig-agent + rig-core\"}}, {{\"label\": \"MCP Client\", \"value\": \"Official rmcp SDK\"}}, {{\"label\": \"Tools Available\", \"value\": \"{tool_count}\"}}]}}\n\
 ```\n\n\
 Try asking me to **\"summarize with a chart\"** or **\"search tools\"** to see multi-step tool calls and live generative components."
-                )
-            };
+                    )
+                };
 
-            // Stream in UTF-8-safe chunks so the UI shows smooth streaming and honors cancellation.
-            let chunk_size = if pacing.is_some() { 18 } else { 28 };
-            for chunk in utf8_chunks(&reply, chunk_size) {
-                if let Some(ref p) = pacing
-                    && !sleep_or_abort(Some(p), p.chunk_delay, &abort).await
-                {
-                    let _ = tx.send(ModelStreamEvent::Finish(FinishReason::Cancelled)).await;
-                    return Ok(());
+                let chunk_size = if pacing.is_some() { 18 } else { 32 };
+                for chunk in utf8_chunks(&reply, chunk_size) {
+                    if let Some(ref p) = pacing
+                        && !sleep_or_closed(Some(p), p.chunk_delay, &tx, None).await
+                    {
+                        return Ok(());
+                    }
+                    if tx.send(LocalCompletionEvent::TextDelta(chunk)).await.is_err() {
+                        return Ok(());
+                    }
                 }
-                if abort.load(Ordering::Relaxed) {
-                    let _ = tx.send(ModelStreamEvent::Finish(FinishReason::Cancelled)).await;
-                    return Ok(());
-                }
-                let _ = tx.send(ModelStreamEvent::TextDelta(chunk)).await;
-            }
 
-            let _ = tx
-                .send(ModelStreamEvent::Usage(AiTokenUsage {
-                    input_tokens: (last_user_text.len() as u64 / 4).max(16),
-                    output_tokens: (reply.len() as u64 / 4).max(32),
-                }))
-                .await;
-            let _ = tx.send(ModelStreamEvent::Finish(FinishReason::Stop)).await;
-            Ok(())
-        })
+                let _ = tx
+                    .send(LocalCompletionEvent::Finish {
+                        usage: AiTokenUsage {
+                            input_tokens: (last_user_text.len() as u64 / 4).max(16),
+                            output_tokens: (reply.len() as u64 / 4).max(32),
+                        },
+                        reason: FinishReason::Stop,
+                    })
+                    .await;
+                Ok(())
+            })
+        });
+
+        local_completion_model("simulated", "demo-assistant", handler)
     }
 }

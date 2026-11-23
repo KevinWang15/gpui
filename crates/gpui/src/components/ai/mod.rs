@@ -1,21 +1,20 @@
-//! Bring-Your-Own-Key (BYOK) AI components, client-side Rust agent loop, MCP client,
-//! generative Answer Components, native Markdown renderer, **Ask AI**, and **Build with AI**.
+//! Bring-Your-Own-Key (BYOK) AI components powered by **`rig-core`**, **`rig-agent`**, and the
+//! official **`rmcp`** / **`rig-rmcp`** Model Context Protocol Rust SDK.
 //!
-//! Designed after `byok-ai` with zero JavaScript runtime dependency:
-//! - **Providers**: OpenAI, Anthropic, Google Gemini, OpenAI-compatible (Ollama/vLLM/DeepSeek/OpenRouter),
-//!   custom [`ProviderPreset`] factories, plus an offline [`SimulatedModel`] for demos/tests.
-//! - **MCP, Client & Live Editor Tools**: Native Streamable HTTP and Stdio [`McpClient`]
-//!   (`server_id__tool_name` namespacing, pagination, custom/dynamic headers), background
+//! - **Providers (`rig-core` + `rig-reqwest`)**: OpenAI Responses API, Anthropic Messages API,
+//!   Google Gemini, OpenAI-compatible gateways (Ollama/vLLM/DeepSeek/OpenRouter/Bifrost),
+//!   custom [`ProviderPreset`] factories returning [`RigCompletionModel`], plus an offline
+//!   [`SimulatedModel`] running through the exact same Rig agent loop.
+//! - **Agent Loop (`rig-agent`)**: Production multi-turn streaming agent loop (`AgentBuilder`,
+//!   `AgentHook` budget/final-step/abort enforcement, `MultiTurnStreamItem`), background
 //!   [`ClientTool`]s, foreground [`AppTool`]s (`AppTool::for_entity` for direct live read/write
-//!   access to GPUI editors/canvases), and 6 built-in `workspace__*` tools with a pure-Rust
-//!   sandboxed evaluator.
+//!   access to GPUI editors/canvases), and 6 built-in `workspace__*` tools.
+//! - **MCP (`rmcp` + `rig-rmcp`)**: Official Rust MCP SDK supporting both Streamable HTTP and
+//!   native desktop Stdio child-process servers with automatic `server_id__tool_name` namespacing.
 //! - **Ask AI & Build with AI ([`AskAi`], [`AskAiOverlay`], [`AskAiState`])**: One unified
 //!   assistant UI/UX (provider setup, MCP server configuration, branching conversation trees
 //!   `< 2 / 3 >`, message editing, regeneration, image attachments, collapsible reasoning &
-//!   grouped tool accordions, history, workspace files, and auto-scrolling). Use
-//!   [`AskAiState::build_with_ai`] + [`build_with_ai_overlay`] to launch it as a non-blocking,
-//!   draggable, resizable co-pilot over an existing live editor (e.g. `FreeformCanvas`), directly
-//!   reading and mutating editor state via [`AppTool`]s and live context providers.
+//!   grouped tool accordions, history, workspace files, auto-growing composer, and auto-scrolling).
 
 pub mod agent;
 pub mod answer_components;
@@ -32,7 +31,7 @@ mod tests;
 pub use agent::{
     AgentEvent, AgentRunConfig, AppTool, AppToolHandler, ClientTool, ClientToolHandler,
     DEFAULT_BUILD_SYSTEM_PROMPT, DEFAULT_SYSTEM_PROMPT, FAILURE_MESSAGE, FINAL_STEP_INSTRUCTION,
-    run_agent_turn, to_model_messages,
+    run_agent_turn, to_rig_messages,
 };
 pub use answer_components::{
     AnswerComponentRegistry, AnswerComponentRenderFn, AnswerComponentSpec, SplitStreamingMarkdown,
@@ -45,15 +44,18 @@ pub use ask_ai::{
 };
 pub use markdown::{LinkOpenHandler, LinkResolver, Markdown, is_safe_link_url, markdown};
 pub use mcp::{
-    MCP_PROTOCOL_VERSION, McpClient, WORKSPACE_SERVER_ID, format_mcp_tool_name,
-    friendly_tool_label, mcp_error, mcp_text, mcp_value, split_mcp_tool_name, tool_result_text,
+    McpClient, WORKSPACE_SERVER_ID, format_mcp_tool_name, friendly_tool_label, split_mcp_tool_name,
     validate_client_tool_name, validate_server_id,
 };
 pub use providers::{
-    FinishReason, LanguageModel, ModelContentPart, ModelMessage, ModelRequest, ModelStreamEvent,
-    SimulatedModel, ToolChoice, build_language_model, default_providers, simulated_provider,
-    test_provider_connection, validate_compatible_base_url, validate_provider_values,
+    LocalCompletionEvent, LocalCompletionHandler, RigCompletionModel, SimulatedModel,
+    ai_tokio_handle, build_completion_model, default_providers, extract_request_summary,
+    local_completion_model, simulated_provider, test_provider_connection,
+    validate_compatible_base_url, validate_provider_values,
 };
+pub use rig_agent;
+pub use rig_core;
+pub use rmcp;
 pub use types::{
     AgentLimits, AiActivity, AiConnection, AiImageRef, AiMessage, AiMessagePart, AiMessageStatus,
     AiRole, AiTokenUsage, BranchInfo, Conversation, ConversationNode, DynamicHeadersFn,

@@ -18,7 +18,7 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
             Page::AiComponents,
             LucideIcon::Bot,
             "AI Components",
-            "BYOK Ask AI, Build with AI, MCP client (HTTP & Stdio), pure-Rust agent loop, Markdown & generative Answer Components.",
+            "BYOK Ask AI, Build with AI, rig-core + rig-agent + rmcp (HTTP & Stdio), Markdown & generative Answer Components.",
         ),
         (
             Page::Analytics,

@@ -35,7 +35,7 @@ use super::answer_components::{AnswerComponentRegistry, answer_component_instruc
 use super::markdown::markdown;
 use super::mcp::{McpClient, friendly_tool_label, validate_server_id};
 use super::providers::{
-    build_language_model, default_providers, simulated_provider, test_provider_connection,
+    build_completion_model, default_providers, simulated_provider, test_provider_connection,
     validate_provider_values,
 };
 use super::types::{
@@ -885,9 +885,8 @@ impl AskAiState {
         self.setup_status = Some("Testing connection…".into());
         cx.notify();
 
-        let http = cx.http_client();
         self._probe_task = Some(cx.spawn(async move |weak, cx| {
-            let result = test_provider_connection(&preset, &values, http).await;
+            let result = test_provider_connection(&preset, &values).await;
             let _ = weak.update(cx, |this, cx| {
                 this.testing_connection = false;
                 match result {
@@ -916,14 +915,14 @@ impl AskAiState {
         };
         self.mcp_probe_status = Some(format!("Discovering tools from '{}'…", server.name).into());
         cx.notify();
-        let http = cx.http_client();
-        let abort = Arc::new(AtomicBool::new(false));
         let timeout = Duration::from_secs(self.limits.mcp_timeout_secs.min(20));
 
         self._probe_task = Some(cx.spawn(async move |weak, cx| {
             let res = async {
-                let client = McpClient::connect(&server, http, timeout, &abort).await?;
-                client.list_tools(&abort).await
+                let client = McpClient::connect(&server, timeout).await?;
+                let tools = client.list_tools().await;
+                client.close().await;
+                tools
             }
             .await;
             let _ = weak.update(cx, |this, cx| {
@@ -1266,7 +1265,7 @@ impl AskAiState {
         let Some(conn) = self.connection.clone() else {
             return;
         };
-        let model = match build_language_model(&conn.preset, &conn.values) {
+        let model = match build_completion_model(&conn.preset, &conn.values) {
             Ok(m) => m,
             Err(err) => {
                 self.error = Some(err.to_string().into());
@@ -1315,7 +1314,7 @@ impl AskAiState {
 
         // Bridge foreground GPUI `AppTool`s into background-callable `ClientTool` wrappers via a
         // per-turn request/reply channel so tools execute directly on `&mut App` / live entities
-        // while LLM SSE streaming and MCP network I/O stay off the UI thread.
+        // while Rig streaming and rmcp network I/O stay off the UI thread.
         let mut combined_tools = self.client_tools.clone();
         self._ui_tool_task = None;
         if !self.app_tools.is_empty() {
@@ -1373,7 +1372,6 @@ impl AskAiState {
 
         let config = AgentRunConfig {
             model,
-            http: cx.http_client(),
             system_prompt,
             history,
             mcp_servers: self.mcp_servers.clone(),

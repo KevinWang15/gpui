@@ -20,7 +20,16 @@ workspace = true
 [features]
 default = ["font-kit", "wayland", "x11", "windows-manifest", "lucide", "components"]
 lucide = []
-components = ["lucide"]
+components = [
+    "lucide",
+    "dep:http",
+    "dep:rig-agent",
+    "dep:rig-core",
+    "dep:rig-reqwest",
+    "dep:rig-rmcp",
+    "dep:rmcp",
+    "dep:tokio",
+]
 test-support = [
     "bench_metrics?/test-support",
     "collections/test-support",
@@ -77,6 +86,7 @@ futures.workspace = true
 futures-concurrency = { workspace = true, optional = true }
 gpui_macros.workspace = true
 gpui_shared_string.workspace = true
+http = { workspace = true, optional = true }
 http_client.workspace = true
 icu_segmenter.workspace = true
 image.workspace = true
@@ -96,6 +106,12 @@ regex = { workspace = true, default-features = true }
 refineable.workspace = true
 scheduler.workspace = true
 resvg.workspace = true
+rig-agent = { workspace = true, optional = true }
+rig-core = { workspace = true, optional = true }
+rig-reqwest = { workspace = true, optional = true }
+rig-rmcp = { workspace = true, optional = true }
+rmcp = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true, features = ["rt-multi-thread", "sync", "time", "process", "macros"] }
 usvg.workspace = true
 ttf-parser = "0.25"
 schemars = { workspace = true, features = ["derive"] }
@@ -194,6 +210,7 @@ util_macros.workspace = true
 http_client = { workspace = true, features = ["test-support"] }
 proptest.workspace = true
 reqwest_client = { workspace = true, features = ["test-support"] }
+rmcp = { workspace = true, features = ["server", "transport-async-rw"] }
 
 [target.'cfg(target_family = "wasm")'.dev-dependencies]
 gpui_web.workspace = true

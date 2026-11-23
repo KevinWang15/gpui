@@ -1,31 +1,30 @@
 # AI Components (`gpui::components::ai`)
 
-Pure-Rust Bring-Your-Own-Key (BYOK) AI components, client-side multi-step agent loop, MCP client (Streamable HTTP & Stdio), foreground live-editor `AppTool` bridge, Markdown renderer, and generative Answer Components built directly on GPUI with **zero JavaScript runtime dependency**.
+Pure-Rust Bring-Your-Own-Key (BYOK) AI components powered by **`rig-core` + `rig-agent` + `rmcp` (`rig-rmcp`)**, with a foreground live-editor `AppTool` bridge, Markdown renderer, and generative Answer Components built natively on GPUI.
 
 ## Architecture
 
 | Module | Responsibility |
 | --- | --- |
 | `ai::types` | Shared types: `ProviderPreset`, `ProviderField`, `ProviderValues`, `AiConnection`, `StoredConnection`, `McpServerConfig`, `McpTransport`, `AiMessage`, `Conversation`, `ConversationNode`, `BranchInfo`, `AgentLimits`, `WorkspaceLimits`, `ImageLimits`, RFC 4648 `base64_encode`/`base64_decode`. |
-| `ai::providers` | Streaming SSE `LanguageModel` implementations over GPUI's `http_client::HttpClient` for **OpenAI**, **Anthropic**, **Google Gemini**, and **OpenAI-compatible** endpoints (Ollama, vLLM, DeepSeek, OpenRouter, etc.), plus custom `ProviderPreset` factories and offline `SimulatedModel`. |
-| `ai::mcp` | Pure-Rust JSON-RPC 2.0 `McpClient` supporting **Streamable HTTP** (`application/json` + `text/event-stream` SSE responses, `mcp-session-id`, cursor pagination, static & dynamic headers) and native desktop **Stdio** subprocesses (`gpui_util::new_std_command`, no console flash on Windows). |
+| `ai::providers` | Production [`rig_core`](https://crates.io/crates/rig-core) + `rig-reqwest` completion models (`RigCompletionModel = rig_core::DynModel<Completion>`) for **OpenAI (Responses API)**, **Anthropic (Messages API)**, **Google Gemini**, and **OpenAI-compatible (Chat Completions)** endpoints (Ollama, vLLM, DeepSeek, OpenRouter, enterprise gateways), `.verify()` connectivity checks, shared lazy Tokio runtime (`ai_tokio_handle`), custom CA bundle support (`SSL_CERT_FILE` / `CODEX_CA_CERTIFICATE` / `NODE_EXTRA_CA_CERTS`), custom `ProviderPreset` factories (`local_completion_model`), and offline `SimulatedModel`. |
+| `ai::mcp` | `McpClient` built directly on the official [`rmcp`](https://crates.io/crates/rmcp) Rust SDK and `rig-rmcp` (`McpConnection`, `McpTool`) supporting **Streamable HTTP** (`StreamableHttpClientTransport`) and native desktop **Stdio** child processes (`TokioChildProcess`), paginated discovery, `{server_id}__{name}` namespaced `DynamicTool` conversion, and graceful `close()`. |
 | `ai::workspace` | Per-conversation `ConversationWorkspace` (in-memory or disk-backed atomic files with size/count quotas), `WorkspaceScriptRunner` trait + zero-dep pure-Rust `BuiltinScriptRunner`, multimodal `prepare_image_bytes` & `AiImageStore`, branching conversation tree helpers, `StoredConversations`, and cross-widget `AiConnectionRegistry`. |
-| `ai::agent` | Multi-step client-side `run_agent_turn` loop with background `ClientTool`s, foreground GPUI `AppTool`s (`AppTool::for_entity` / `AppTool::new` for direct live read/write access to GPUI editors), MCP tool discovery & namespacing (`{server_id}__{tool}`), 6 `workspace__*` tools, step/tool-call/token budgets (`ToolChoice::None` + `FINAL_STEP_INSTRUCTION`), empty-answer recovery, and cooperative cancellation. |
+| `ai::agent` | Multi-step agent execution (`run_agent_turn`) driven by [`rig_agent::AgentBuilder`](https://crates.io/crates/rig-agent) + `AgentHook` (`ByokBudgetHook`). Converts GPUI conversation branches via `to_rig_messages`, registers background `ClientTool`s, foreground GPUI `AppTool`s (`AppTool::for_entity` / `AppTool::new`), official `rmcp` MCP tools, and 6 `workspace__*` tools as native `rig_core::tool::DynamicTool`s, enforces `max_steps` / `max_tool_calls` (`ToolChoice::None` + `FINAL_STEP_INSTRUCTION`), handles empty-answer recovery (`ModelTurnAction::retry_with_feedback`), and supports cooperative cancellation. |
 | `ai::answer_components` | Extensible `AnswerComponentRegistry` for ```` ```component:<name>\n{...JSON...}\n``` ```` blocks with 7 built-in native GPUI widgets (`stat-card`, `callout`, `bar-chart`, `sparkline`, `data-table`, `key-value`, `badge-list`) and streaming fence detection (`split_open_component`). |
 | `ai::markdown` | Pure-GPUI GFM `Markdown` renderer with headings, lists, task lists, blockquotes, tables, horizontally scrollable code blocks with copy button, safe link validation (`javascript:`/`vbscript:`/`data:` blocked), blocked external image placeholders, and inline Answer Components. |
-| `ai::ask_ai` | Unified assistant UI/UX (`AskAiState`, `AskAi`, `AskAiOverlay`, `build_with_ai_overlay`) with provider credentials setup (mask/reveal, validation, test connection, disconnect), MCP server management & tool discovery, live foreground `AppTool` dispatch bridge, dynamic `context_provider`, branching (`< 2 / 3 >`), regenerate, inline message editing, image attachments, collapsible reasoning & grouped tool accordions, history search, workspace viewer, auto-scrolling with manual scroll-up detection, and draggable/resizable floating overlays (`modal(true)` or non-blocking `modal(false)`). |
+| `ai::ask_ai` | Unified assistant UI/UX (`AskAiState`, `AskAi`, `AskAiOverlay`, `build_with_ai_overlay`) with provider credentials setup (mask/reveal, validation, test connection, disconnect), MCP server management & tool discovery, live foreground `AppTool` dispatch bridge, dynamic `context_provider`, `AutoGrowInput` composer & inline edit box, branching (`< 2 / 3 >`), regenerate, image attachments, collapsible reasoning & grouped tool accordions, history search, workspace viewer, auto-scrolling with manual scroll-up detection, and draggable/resizable floating overlays (`modal(true)` or non-blocking `modal(false)`). |
 
 ## Ask AI vs. Build with AI
 
 Both **Ask AI** and **Build with AI** share the exact same UI/UX (`AskAiState` / `AskAi` / `AskAiOverlay`) and sync provider credentials through `AiConnectionRegistry` (`connection_key`):
 
-- **Ask AI (`AskAiState::new` + `ask_ai` / `ask_ai_overlay`)**: general conversational assistant with MCP servers, background `ClientTool`s, workspace files, and generative Answer Components.
+- **Ask AI (`AskAiState::new` + `ask_ai` / `ask_ai_overlay`)**: general conversational assistant with `rmcp` MCP servers, background `ClientTool`s, workspace files, and generative Answer Components.
 - **Build with AI (`AskAiState::build_with_ai` + `build_with_ai_overlay`)**: launched directly over an existing live GPUI editor (such as `FreeformCanvas`, a form editor, or a document editor) as a **non-blocking, draggable, resizable floating panel** (`modal(false)`). Instead of rendering static previews in a split pane, the model reads and mutates the live editor directly via foreground **`AppTool::for_entity`** tools while the user watches updates happen in real time and continues interacting with the editor behind it.
 
 ## Quick Start: Attaching Build with AI to a Live GPUI Editor
 
 ```rust
-use std::sync::Arc;
 use gpui::components::*;
 use gpui::{App, Context, Entity, prelude::*};
 use gpui_platform::application;
@@ -87,11 +86,76 @@ impl MyEditor {
 }
 
 fn main() {
-    application()
-        .with_http_client(Arc::new(reqwest_client::ReqwestClient::new()))
-        .run(|cx: &mut App| {
-            init_components(cx);
-            let _ = cx.new(MyEditor::new);
-        });
+    application().run(|cx: &mut App| {
+        init_components(cx);
+        let _ = cx.new(MyEditor::new);
+    });
 }
+```
+
+## Example: Connecting a Python MCP Server for Data Analytics
+
+Because `McpClient` is built directly on the official `rmcp` SDK (`TokioChildProcess` for Stdio and `StreamableHttpClientTransport` for HTTP), any GPUI app can attach a Python MCP server (using `pandas`, `numpy`, `scipy`, `duckdb`, etc.) with zero Python-specific code inside `gpui`.
+
+### 1. Write a minimal Python MCP server (`analytics_mcp.py`)
+
+```python
+# pip install mcp pandas  (or run via: uv run --with mcp --with pandas analytics_mcp.py)
+import pandas as pd
+from mcp.server.fastmcp import FastMCP
+
+mcp = FastMCP("python-analytics")
+
+@mcp.tool()
+def summarize_csv(path: str, group_by: str, metric: str) -> dict:
+    """Group a CSV file by a column and compute count/mean/sum/p95 statistics."""
+    df = pd.read_csv(path)
+    grouped = df.groupby(group_by)[metric].agg(["count", "mean", "sum", lambda s: s.quantile(0.95)])
+    grouped.columns = ["count", "mean", "sum", "p95"]
+    return grouped.round(3).reset_index().to_dict(orient="records")
+
+if __name__ == "__main__":
+    mcp.run(transport="stdio")
+```
+
+> **Tip (arbitrary code execution vs. scoped tools):** Exposing typed domain tools like `summarize_csv` keeps execution predictable and safe. If you need open-ended Python execution (e.g. running LLM-generated analysis scripts), point `McpServerConfig::stdio` at a sandboxed runner (such as `uvx` / container / Pyodide MCP server) or host it behind `McpServerConfig::http(...)` over Streamable HTTP.
+
+### 2. Register it on `AskAiState` (or add it at runtime in Settings)
+
+```rust
+use gpui::components::*;
+
+let ask_ai = cx.new(|cx| {
+    AskAiState::new(cx)
+        .connection_key("my-app:ai")
+        .workspace(true)
+        .mcp_servers(vec![
+            // Local Stdio Python MCP server (launched & cleaned up automatically by rmcp):
+            McpServerConfig::stdio(
+                "python",
+                "Python Analytics",
+                "uv",
+                ["run", "--with", "mcp", "--with", "pandas", "analytics_mcp.py"],
+            ),
+            // Or a remote/containerized Streamable HTTP Python MCP server:
+            // McpServerConfig::http("python", "Python Analytics", "http://127.0.0.1:8000/mcp"),
+        ])
+});
+```
+
+At runtime:
+- `rmcp` performs the MCP handshake, discovers all tools advertised by Python, and registers them into `rig-agent` as `python__summarize_csv` (namespaced by server ID).
+- During a turn, the model can call `python__summarize_csv`, inspect the returned JSON stats, and immediately render native GPUI `component:bar-chart`, `component:stat-card`, or `component:data-table` visualizations (or mutate a live editor via `AppTool`s).
+- End users can also add or toggle Stdio/HTTP Python MCP servers directly in **Settings → MCP Servers** without recompiling.
+- Alternatively, if you want the built-in `workspace__run_script` tool itself to execute Python over the conversation workspace files, implement `WorkspaceScriptRunner` and pass it to `AskAiState::script_runner(...)`.
+
+## Live Endpoint Integration Test
+
+An optional `#[ignore]` integration test exercises `test_provider_connection`, streaming replies, and multi-step tool calling against any live OpenAI-compatible endpoint via environment variables:
+
+```bash
+GPUI_AI_TEST_BASE_URL="https://your-gateway.example.com/" \
+GPUI_AI_TEST_API_KEY="sk-..." \
+GPUI_AI_TEST_MODEL="gpt-4.1-mini" \
+cargo test -p gpui --lib -- components::ai::tests::live_openai_compatible --ignored --nocapture
 ```

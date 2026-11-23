@@ -172,24 +172,25 @@ impl ProviderField {
 /// Map of provider configuration keys to user-supplied string values.
 pub type ProviderValues = BTreeMap<String, String>;
 
-/// Built-in wire protocol family for a [`ProviderPreset`].
+/// Built-in wire protocol family for a [`ProviderPreset`] (backed by `rig-core`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProviderProtocol {
-    /// OpenAI Chat Completions API (`POST https://api.openai.com/v1/chat/completions`).
+    /// OpenAI Responses API via `rig-core`.
     OpenAi,
-    /// Anthropic Messages API (`POST https://api.anthropic.com/v1/messages`).
+    /// Anthropic Messages API via `rig-core`.
     Anthropic,
-    /// Google Gemini Generative Language API (`streamGenerateContent?alt=sse`).
+    /// Google Gemini Generative Language API via `rig-core`.
     GoogleGemini,
-    /// OpenAI-compatible gateway / local server (`POST <baseURL>/chat/completions`).
+    /// OpenAI-compatible gateway / local server (Chat Completions via `rig-core`).
     OpenAiCompatible,
-    /// Built-in offline simulated provider for demos and deterministic testing.
+    /// Built-in offline simulated provider running on `rig-agent` for demos and tests.
     Simulated,
 }
 
 /// Custom model factory closure for non-built-in provider presets.
-pub type CustomModelFactory =
-    Arc<dyn Fn(&ProviderValues) -> anyhow::Result<Arc<dyn super::providers::LanguageModel>> + Send + Sync>;
+pub type CustomModelFactory = Arc<
+    dyn Fn(&ProviderValues) -> anyhow::Result<super::providers::RigCompletionModel> + Send + Sync,
+>;
 
 /// Custom validator returning `Some(error_message)` to block connection.
 pub type ProviderValidator = Arc<dyn Fn(&ProviderValues) -> Option<String> + Send + Sync>;
@@ -274,7 +275,7 @@ impl AiConnection {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum McpTransport {
-    /// Streamable HTTP (`POST` JSON-RPC 2.0 supporting both JSON and SSE responses).
+    /// Streamable HTTP via `rmcp::transport::StreamableHttpClientTransport`.
     StreamableHttp {
         /// Full HTTP(S) endpoint URL (e.g. `http://127.0.0.1:3000/api/mcp`).
         url: String,
@@ -282,7 +283,7 @@ pub enum McpTransport {
         #[serde(default)]
         headers: BTreeMap<String, String>,
     },
-    /// Native local subprocess speaking newline-delimited JSON-RPC 2.0 over stdin/stdout.
+    /// Native local subprocess via `rmcp::transport::TokioChildProcess` over stdin/stdout.
     Stdio {
         /// Executable name or path (e.g. `"npx"`, `"uvx"`, or a local binary).
         command: String,

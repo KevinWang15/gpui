@@ -92,13 +92,14 @@ pub use ai::{
     AiConnectionRegistry, AiContextProvider, AiImageRef, AiImageStore, AiMessage, AiMessagePart,
     AiMessageStatus, AiRole, AiTokenUsage, AnswerComponentRegistry, AnswerComponentSpec, AppTool,
     AppToolHandler, AskAi, AskAiEvent, AskAiOverlay, AskAiPage, AskAiState, AskAiSuggestion,
-    BranchInfo, BuiltinScriptRunner, ClientTool, Conversation, ConversationWorkspace, FinishReason,
-    ImageLimits, LanguageModel, Markdown, McpClient, McpServerConfig, McpTransport, ProviderField,
-    ProviderFieldKind, ProviderPreset, ProviderProtocol, ProviderValues, ScriptOutcome,
-    SimulatedModel, StoredConnection, StoredConversations, ToolCallStatus, ToolDefinition,
-    WorkspaceFileInfo, WorkspaceLimits, WorkspaceScriptRunner, answer_component_instructions,
-    ask_ai, ask_ai_overlay, build_language_model, build_with_ai_overlay, default_answer_components,
-    default_providers, markdown, simulated_provider,
+    BranchInfo, BuiltinScriptRunner, ClientTool, Conversation, ConversationWorkspace, ImageLimits,
+    LocalCompletionEvent, LocalCompletionHandler, Markdown, McpClient, McpServerConfig,
+    McpTransport, ProviderField, ProviderFieldKind, ProviderPreset, ProviderProtocol,
+    ProviderValues, RigCompletionModel, ScriptOutcome, SimulatedModel, StoredConnection,
+    StoredConversations, ToolCallStatus, ToolDefinition, WorkspaceFileInfo, WorkspaceLimits,
+    WorkspaceScriptRunner, answer_component_instructions, ask_ai, ask_ai_overlay,
+    build_completion_model, build_with_ai_overlay, default_answer_components, default_providers,
+    local_completion_model, markdown, simulated_provider,
 };
 pub use alert::{Alert, AlertVariant, alert};
 pub use app_controls::{

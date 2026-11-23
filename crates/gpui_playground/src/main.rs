@@ -8,7 +8,6 @@ mod pages;
 mod state;
 
 use std::borrow::Cow;
-use std::sync::Arc;
 
 use gpui::components::*;
 use gpui::icons::{Icon, IconSize, LucideAssetSource, LucideIcon};
@@ -586,7 +585,6 @@ impl Render for PlaygroundApp {
 fn main() {
     application()
         .with_assets(LucideAssetSource::new())
-        .with_http_client(Arc::new(reqwest_client::ReqwestClient::new()))
         .run(|cx: &mut App| {
             load_bundled_fonts(cx);
             init_components(cx);

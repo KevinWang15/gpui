@@ -1,17 +1,16 @@
-//! Unit and GPUI component tests for `gpui::components::ai`.
+//! Unit, `rmcp`, `rig-agent`, and GPUI component tests for `gpui::components::ai`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use anyhow::Result;
-use futures::{future::BoxFuture, io::AsyncReadExt as _};
-use http_client::{AsyncBody, FakeHttpClient, HttpClient, Response};
+use rig_core::completion::FinishReason;
+use rig_core::message::{Message, ToolChoice, UserContent};
 use serde_json::{Value, json};
 
 use super::agent::{
     AgentEvent, AgentRunConfig, AppTool, ClientTool, FINAL_STEP_INSTRUCTION, run_agent_turn,
-    to_model_messages,
+    to_rig_messages,
 };
 use super::answer_components::{
     AnswerComponentRegistry, answer_component_instructions, extract_component_blocks,
@@ -20,19 +19,19 @@ use super::answer_components::{
 use super::ask_ai::{AskAi, AskAiOverlay, AskAiPage, AskAiState, build_with_ai_overlay};
 use super::markdown::{is_safe_link_url, markdown};
 use super::mcp::{
-    McpClient, extract_sse_jsonrpc_response, format_mcp_tool_name, friendly_tool_label, mcp_error,
-    mcp_text, mcp_value, split_mcp_tool_name, tool_result_text, validate_client_tool_name,
-    validate_server_id,
+    McpClient, format_mcp_tool_name, friendly_tool_label, split_mcp_tool_name,
+    validate_client_tool_name, validate_server_id,
 };
 use super::providers::{
-    FinishReason, LanguageModel, ModelContentPart, ModelMessage, ModelRequest, ModelStreamEvent,
-    ToolChoice, default_providers, simulated_provider, validate_compatible_base_url,
-    validate_provider_values,
+    LocalCompletionEvent, RigCompletionModel, ai_tokio_handle, build_completion_model,
+    default_providers, extract_request_summary, local_completion_model,
+    normalize_compatible_base_url, simulated_provider, test_provider_connection,
+    validate_compatible_base_url, validate_provider_values,
 };
 use super::types::{
     AgentLimits, AiImageRef, AiMessage, AiMessagePart, AiMessageStatus, AiRole, AiTokenUsage,
-    Conversation, ImageLimits, McpServerConfig, ProviderValues, ToolCallStatus, WorkspaceLimits,
-    base64_decode, base64_encode,
+    Conversation, ImageLimits, ProviderValues, ToolCallStatus, WorkspaceLimits, base64_decode,
+    base64_encode,
 };
 use super::workspace::{
     AiConnectionRegistry, AiImageStore, BuiltinScriptRunner, ConversationWorkspace,
@@ -64,6 +63,19 @@ fn base64_and_provider_validation() {
     assert!(validate_compatible_base_url("http://localhost:11434/v1").is_none());
     assert!(validate_compatible_base_url("https://openrouter.ai/api/v1").is_none());
 
+    assert_eq!(
+        normalize_compatible_base_url("https://gateway.example.com/"),
+        "https://gateway.example.com/v1"
+    );
+    assert_eq!(
+        normalize_compatible_base_url("https://gateway.example.com/v1/"),
+        "https://gateway.example.com/v1"
+    );
+    assert_eq!(
+        normalize_compatible_base_url("https://openrouter.ai/api/v1"),
+        "https://openrouter.ai/api/v1"
+    );
+
     let presets = default_providers();
     assert_eq!(presets.len(), 4);
 
@@ -90,7 +102,7 @@ fn base64_and_provider_validation() {
 }
 
 #[test]
-fn mcp_naming_normalization_and_sse_extraction() {
+fn mcp_naming_and_friendly_labels() {
     assert!(validate_server_id("docs", true).is_ok());
     assert!(validate_server_id("workspace", true).is_err());
     assert!(validate_server_id("workspace", false).is_ok());
@@ -104,145 +116,136 @@ fn mcp_naming_normalization_and_sse_extraction() {
     assert_eq!(fq, "github__list_issues");
     assert_eq!(split_mcp_tool_name(&fq), Some(("github", "list_issues")));
     assert_eq!(friendly_tool_label(&fq), "List issues");
-    assert_eq!(friendly_tool_label("workspace__read_file"), "Read workspace file");
-
-    let mcp_ok = json!({
-        "content": [
-            { "type": "text", "text": "line 1" },
-            { "type": "text", "text": "line 2" }
-        ]
-    });
-    assert_eq!(mcp_text(&mcp_ok["content"]), "line 1\nline 2");
-    assert!(mcp_error(&mcp_ok).is_none());
-    assert_eq!(tool_result_text(&mcp_ok, true).unwrap(), "line 1\nline 2");
-
-    let mcp_json_val = json!({
-        "content": [{ "type": "text", "text": "{\"count\":42}" }]
-    });
-    assert_eq!(mcp_value(&mcp_json_val).unwrap(), json!({ "count": 42 }));
-
-    let mcp_err = json!({
-        "isError": true,
-        "content": [{ "type": "text", "text": "permission denied" }]
-    });
     assert_eq!(
-        mcp_error(&mcp_err).as_deref(),
-        Some("The tool reported an error: permission denied")
+        friendly_tool_label("workspace__read_file"),
+        "Read workspace file"
     );
-    assert!(tool_result_text(&mcp_err, true).is_err());
-
-    let sse = concat!(
-        "event: message\n",
-        "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progress\":50}}\n\n",
-        "event: message\n",
-        "data: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"tools\":[]}}\n\n"
-    );
-    let parsed = extract_sse_jsonrpc_response(sse, 7).expect("sse response");
-    assert_eq!(parsed["id"], 7);
-    assert_eq!(parsed["result"]["tools"], json!([]));
 }
 
-#[gpui::test]
-async fn mcp_streamable_http_handshake_pagination_and_tool_call() {
-    let saw_session = Arc::new(AtomicUsize::new(0));
-    let saw_session_clone = saw_session.clone();
+#[tokio::test]
+async fn mcp_rmcp_in_process_handshake_pagination_and_tool_call() {
+    use rig_rmcp::McpConnection;
+    use rmcp::model::{
+        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData,
+        Implementation, ListToolsResult, PaginatedRequestParams, ProtocolVersion,
+        ServerCapabilities, ServerConfig, Tool,
+    };
+    use rmcp::service::RequestContext;
+    use rmcp::{RoleServer, ServerHandler, ServiceExt as _};
 
-    let http: Arc<dyn HttpClient> = FakeHttpClient::create(move |mut req| {
-        let saw_session = saw_session_clone.clone();
-        async move {
-            let mut body_str = String::new();
-            req.body_mut().read_to_string(&mut body_str).await?;
-            let rpc: Value = serde_json::from_str(&body_str)?;
-            let method = rpc["method"].as_str().unwrap_or("");
-            let id = rpc.get("id").and_then(Value::as_u64).unwrap_or(0);
-            if req.headers().get("mcp-session-id").is_some() {
-                saw_session.fetch_add(1, Ordering::SeqCst);
-            }
+    #[derive(Clone)]
+    struct PaginatedDemoServer;
 
-            let resp = match method {
-                "initialize" => Response::builder()
-                    .status(200)
-                    .header("content-type", "application/json")
-                    .header("mcp-session-id", "sess-abc-123")
-                    .body(AsyncBody::from(
-                        json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "result": {
-                                "protocolVersion": "2025-03-26",
-                                "capabilities": { "tools": {} },
-                                "serverInfo": { "name": "test-mcp", "version": "1.0" }
-                            }
-                        })
-                        .to_string(),
-                    ))?,
-                "notifications/initialized" => Response::builder()
-                    .status(202)
-                    .body(AsyncBody::empty())?,
-                "tools/list" => {
-                    let cursor = rpc["params"].get("cursor").and_then(Value::as_str);
-                    let payload = if cursor.is_none() {
-                        json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "result": {
-                                "tools": [{ "name": "alpha", "description": "First tool" }],
-                                "nextCursor": "page-2"
-                            }
-                        })
-                    } else {
-                        json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "result": {
-                                "tools": [{ "name": "beta", "description": "Second tool" }]
-                            }
-                        })
-                    };
-                    Response::builder()
-                        .status(200)
-                        .header("content-type", "application/json")
-                        .body(AsyncBody::from(payload.to_string()))?
-                }
-                "tools/call" => {
-                    let sse = format!(
-                        "event: message\ndata: {}\n\n",
-                        json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "result": {
-                                "content": [{ "type": "text", "text": "hello from mcp sse" }]
-                            }
-                        })
-                    );
-                    Response::builder()
-                        .status(200)
-                        .header("content-type", "text/event-stream")
-                        .body(AsyncBody::from(sse))?
-                }
-                _ => Response::builder().status(404).body(AsyncBody::empty())?,
-            };
-            Ok(resp)
+    impl ServerHandler for PaginatedDemoServer {
+        fn get_info(&self) -> ServerConfig {
+            ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+                .with_protocol_version(ProtocolVersion::LATEST)
+                .with_server_info(Implementation::new("demo-mcp", "1.0.0"))
         }
-    });
 
-    let cfg = McpServerConfig::http("demo", "Demo MCP", "https://mcp.example.test/rpc")
-        .header("X-Test", "1");
-    let abort = Arc::new(AtomicBool::new(false));
-    let client = McpClient::connect(&cfg, http, Duration::from_secs(5), &abort)
+        async fn list_tools(
+            &self,
+            params: Option<PaginatedRequestParams>,
+            _: RequestContext<RoleServer>,
+        ) -> std::result::Result<ListToolsResult, ErrorData> {
+            let cursor = params.and_then(|p| p.cursor);
+            if cursor.is_none() {
+                let mut res = ListToolsResult::with_all_items(vec![Tool::new(
+                    "alpha",
+                    "First paginated tool",
+                    Arc::new(serde_json::Map::new()),
+                )]);
+                res.next_cursor = Some("page-2".to_owned());
+                Ok(res)
+            } else {
+                Ok(ListToolsResult::with_all_items(vec![Tool::new(
+                    "beta",
+                    "Second paginated tool",
+                    Arc::new(serde_json::Map::new()),
+                )]))
+            }
+        }
+
+        async fn call_tool(
+            &self,
+            request: CallToolRequestParams,
+            _: RequestContext<RoleServer>,
+        ) -> std::result::Result<CallToolResponse, ErrorData> {
+            let q = request
+                .arguments
+                .as_ref()
+                .and_then(|m| m.get("q"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                "rmcp:{}:{q}",
+                request.name
+            ))])
+            .into())
+        }
+    }
+
+    let handle = ai_tokio_handle();
+    let (client, server_task) = handle
+        .spawn(async move {
+            let (c2s, sfc) = tokio::io::duplex(8192);
+            let (s2c, cfs) = tokio::io::duplex(8192);
+            let server_task = tokio::spawn(async move {
+                let running = PaginatedDemoServer
+                    .serve((sfc, s2c))
+                    .await
+                    .expect("rmcp server serve");
+                let _ = running.waiting().await;
+            });
+            let running_client = rig_rmcp::client_config("gpui-ai-test", "0.1.0")
+                .serve((cfs, c2s))
+                .await
+                .expect("rmcp client serve");
+            let client =
+                McpClient::from_connection(McpConnection::new(running_client), Duration::from_secs(5));
+            (client, server_task)
+        })
         .await
-        .expect("mcp connect");
-    let tools = client.list_tools(&abort).await.expect("list_tools");
+        .expect("spawn rmcp fixture");
+
+    // 1. Paginated tool discovery via rig-rmcp + rmcp.
+    let tools = client.list_tools().await.expect("list_tools");
     assert_eq!(tools.len(), 2);
     assert_eq!(tools[0].name, "alpha");
     assert_eq!(tools[1].name, "beta");
 
-    let call = client
-        .call_tool("alpha", json!({ "q": "hi" }), &abort)
+    // 2. Namespaced DynamicTool conversion & execution through rig-core + rig-rmcp.
+    let dyn_tools = client.dynamic_tools("demo").await.expect("dynamic_tools");
+    assert_eq!(dyn_tools.len(), 2);
+    assert_eq!(dyn_tools[0].name().as_str(), "demo__alpha");
+    assert_eq!(dyn_tools[1].name().as_str(), "demo__beta");
+
+    let alpha_tool = dyn_tools[0].clone();
+    let output_text = handle
+        .spawn(async move {
+            let out = alpha_tool.run(json!({ "q": "hello" })).await.expect("run mcp tool");
+            out.into_content()
+                .into_iter()
+                .map(|c| c.to_text("[image]"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
         .await
-        .expect("call_tool");
-    assert_eq!(tool_result_text(&call, true).unwrap(), "hello from mcp sse");
-    assert!(saw_session.load(Ordering::SeqCst) >= 3);
+        .expect("join mcp tool");
+    assert_eq!(output_text, "rmcp:alpha:hello");
+
+    // 3. Clean teardown closes the rmcp server task.
+    drop(dyn_tools);
+    client.close().await;
+    handle
+        .spawn(async move {
+            tokio::time::timeout(Duration::from_secs(2), server_task)
+                .await
+                .expect("server shutdown timeout")
+                .expect("server join");
+        })
+        .await
+        .expect("shutdown join");
 }
 
 #[test]
@@ -431,13 +434,6 @@ fn answer_components_and_streaming_markdown_helpers() {
     assert!(!is_safe_link_url("data:text/html,<script>"));
 }
 
-/// Deterministic mock LanguageModel for testing multi-step tool dispatch, budgets, and recovery.
-struct MockScriptedModel {
-    step: Arc<AtomicUsize>,
-    mode: MockMode,
-    saw_final_instruction: Arc<AtomicBool>,
-}
-
 #[derive(Clone, Copy)]
 enum MockMode {
     ToolThenAnswer,
@@ -445,115 +441,143 @@ enum MockMode {
     EmptyRecovery,
 }
 
-impl LanguageModel for MockScriptedModel {
-    fn stream_step(
-        &self,
-        request: ModelRequest,
-        _http: Arc<dyn HttpClient>,
-        _abort: Arc<AtomicBool>,
-        tx: async_channel::Sender<ModelStreamEvent>,
-    ) -> BoxFuture<'static, Result<()>> {
-        let step = self.step.clone();
-        let mode = self.mode;
-        let saw_final = self.saw_final_instruction.clone();
-        Box::pin(async move {
-            let n = step.fetch_add(1, Ordering::SeqCst);
-            if request.system.contains(FINAL_STEP_INSTRUCTION)
-                && matches!(request.tool_choice, ToolChoice::None)
-            {
-                saw_final.store(true, Ordering::SeqCst);
-            }
-            match mode {
-                MockMode::ToolThenAnswer => {
-                    if n == 0 {
-                        let _ = tx
-                            .send(ModelStreamEvent::ReasoningDelta(
-                                "Planning tool call...".into(),
-                            ))
-                            .await;
-                        let _ = tx
-                            .send(ModelStreamEvent::ToolCall {
-                                id: "call-1".into(),
-                                name: "lookup_item".into(),
-                                arguments: json!({ "key": "alpha" }),
-                            })
-                            .await;
-                        let _ = tx
-                            .send(ModelStreamEvent::Usage(AiTokenUsage {
-                                input_tokens: 100,
-                                output_tokens: 25,
-                            }))
-                            .await;
-                        let _ = tx.send(ModelStreamEvent::Finish(FinishReason::ToolCalls)).await;
-                    } else {
-                        // Verify tool result reached the model.
-                        let has_tool_result = request.messages.iter().any(|m| match m {
-                            ModelMessage::Tool(parts) => parts
-                                .iter()
-                                .any(|p| matches!(p, ModelContentPart::ToolResult { .. })),
-                            _ => false,
-                        });
-                        assert!(has_tool_result, "expected ToolResult in step 2 messages");
-                        let _ = tx
-                            .send(ModelStreamEvent::TextDelta(
-                                "Final answer with lookup result.".into(),
-                            ))
-                            .await;
-                        let _ = tx
-                            .send(ModelStreamEvent::Usage(AiTokenUsage {
-                                input_tokens: 140,
-                                output_tokens: 30,
-                            }))
-                            .await;
-                        let _ = tx.send(ModelStreamEvent::Finish(FinishReason::Stop)).await;
+/// Builds a deterministic [`RigCompletionModel`] running through `rig-agent`'s real loop.
+fn scripted_rig_model(
+    mode: MockMode,
+    saw_final_instruction: Arc<AtomicBool>,
+) -> RigCompletionModel {
+    let step = Arc::new(AtomicUsize::new(0));
+    local_completion_model(
+        "mock-test",
+        "scripted-model",
+        Arc::new(move |request, tx| {
+            let step = step.clone();
+            let saw_final = saw_final_instruction.clone();
+            Box::pin(async move {
+                let n = step.fetch_add(1, Ordering::SeqCst);
+                let has_final_instruction = request.chat_history.iter().any(|m| {
+                    matches!(m.as_ref(), Message::System { content } if content.contains(FINAL_STEP_INSTRUCTION))
+                });
+                if has_final_instruction && matches!(request.tool_choice, Some(ToolChoice::None)) {
+                    saw_final.store(true, Ordering::SeqCst);
+                }
+                match mode {
+                    MockMode::ToolThenAnswer => {
+                        if n == 0 {
+                            let _ = tx
+                                .send(LocalCompletionEvent::ReasoningDelta(
+                                    "Planning tool call...".into(),
+                                ))
+                                .await;
+                            let _ = tx
+                                .send(LocalCompletionEvent::ToolCall {
+                                    id: "call-1".into(),
+                                    name: "lookup_item".into(),
+                                    arguments: json!({ "key": "alpha" }),
+                                })
+                                .await;
+                            let _ = tx
+                                .send(LocalCompletionEvent::Finish {
+                                    usage: AiTokenUsage {
+                                        input_tokens: 100,
+                                        output_tokens: 25,
+                                    },
+                                    reason: FinishReason::ToolCalls,
+                                })
+                                .await;
+                        } else {
+                            let (_, last_is_tool, last_tool) = extract_request_summary(&request);
+                            assert!(
+                                last_is_tool && last_tool.is_some(),
+                                "expected ToolResult in step 2 Rig chat_history"
+                            );
+                            let _ = tx
+                                .send(LocalCompletionEvent::TextDelta(
+                                    "Final answer with lookup result.".into(),
+                                ))
+                                .await;
+                            let _ = tx
+                                .send(LocalCompletionEvent::Finish {
+                                    usage: AiTokenUsage {
+                                        input_tokens: 140,
+                                        output_tokens: 30,
+                                    },
+                                    reason: FinishReason::Stop,
+                                })
+                                .await;
+                        }
+                    }
+                    MockMode::BudgetExhaustion => {
+                        if matches!(request.tool_choice, Some(ToolChoice::None)) {
+                            let _ = tx
+                                .send(LocalCompletionEvent::TextDelta("Budget summary.".into()))
+                                .await;
+                            let _ = tx
+                                .send(LocalCompletionEvent::Finish {
+                                    usage: AiTokenUsage::default(),
+                                    reason: FinishReason::Stop,
+                                })
+                                .await;
+                        } else {
+                            let _ = tx
+                                .send(LocalCompletionEvent::ToolCall {
+                                    id: format!("tc-{n}"),
+                                    name: "lookup_item".into(),
+                                    arguments: json!({ "key": "loop" }),
+                                })
+                                .await;
+                            let _ = tx
+                                .send(LocalCompletionEvent::Finish {
+                                    usage: AiTokenUsage::default(),
+                                    reason: FinishReason::ToolCalls,
+                                })
+                                .await;
+                        }
+                    }
+                    MockMode::EmptyRecovery => {
+                        if n == 0 {
+                            let _ = tx
+                                .send(LocalCompletionEvent::ToolCall {
+                                    id: "tc-empty".into(),
+                                    name: "lookup_item".into(),
+                                    arguments: json!({ "key": "x" }),
+                                })
+                                .await;
+                            let _ = tx
+                                .send(LocalCompletionEvent::Finish {
+                                    usage: AiTokenUsage::default(),
+                                    reason: FinishReason::ToolCalls,
+                                })
+                                .await;
+                        } else if n == 1 {
+                            // Model returns empty text after tool call -> ByokBudgetHook retries.
+                            let _ = tx
+                                .send(LocalCompletionEvent::Finish {
+                                    usage: AiTokenUsage::default(),
+                                    reason: FinishReason::Stop,
+                                })
+                                .await;
+                        } else {
+                            let _ = tx
+                                .send(LocalCompletionEvent::TextDelta("Recovered answer.".into()))
+                                .await;
+                            let _ = tx
+                                .send(LocalCompletionEvent::Finish {
+                                    usage: AiTokenUsage::default(),
+                                    reason: FinishReason::Stop,
+                                })
+                                .await;
+                        }
                     }
                 }
-                MockMode::BudgetExhaustion => {
-                    if matches!(request.tool_choice, ToolChoice::None) {
-                        let _ = tx
-                            .send(ModelStreamEvent::TextDelta("Budget summary.".into()))
-                            .await;
-                        let _ = tx.send(ModelStreamEvent::Finish(FinishReason::Stop)).await;
-                    } else {
-                        let _ = tx
-                            .send(ModelStreamEvent::ToolCall {
-                                id: format!("tc-{n}"),
-                                name: "lookup_item".into(),
-                                arguments: json!({ "key": "loop" }),
-                            })
-                            .await;
-                        let _ = tx.send(ModelStreamEvent::Finish(FinishReason::ToolCalls)).await;
-                    }
-                }
-                MockMode::EmptyRecovery => {
-                    if n == 0 {
-                        let _ = tx
-                            .send(ModelStreamEvent::ToolCall {
-                                id: "tc-empty".into(),
-                                name: "lookup_item".into(),
-                                arguments: json!({ "key": "x" }),
-                            })
-                            .await;
-                        let _ = tx.send(ModelStreamEvent::Finish(FinishReason::ToolCalls)).await;
-                    } else if n == 1 {
-                        // Model returns empty text after tool call -> agent should trigger recovery.
-                        let _ = tx.send(ModelStreamEvent::Finish(FinishReason::Stop)).await;
-                    } else {
-                        let _ = tx
-                            .send(ModelStreamEvent::TextDelta("Recovered answer.".into()))
-                            .await;
-                        let _ = tx.send(ModelStreamEvent::Finish(FinishReason::Stop)).await;
-                    }
-                }
-            }
-            Ok(())
-        })
-    }
+                Ok(())
+            })
+        }),
+    )
 }
 
-#[gpui::test]
+#[tokio::test]
 async fn agent_loop_multistep_tools_budget_and_empty_recovery() {
-    let http: Arc<dyn HttpClient> = FakeHttpClient::with_200_response();
     let tool = ClientTool::sync(
         "lookup_item",
         "Look up an item by key",
@@ -561,16 +585,14 @@ async fn agent_loop_multistep_tools_budget_and_empty_recovery() {
         |args| Ok(json!({ "found": true, "key": args["key"] })),
     );
 
-    // 1. Multi-step tool call + answer.
+    // 1. Multi-step tool call + reasoning + usage + final answer via rig-agent.
     let (tx, rx) = async_channel::unbounded();
     run_agent_turn(
         AgentRunConfig {
-            model: Arc::new(MockScriptedModel {
-                step: Arc::new(AtomicUsize::new(0)),
-                mode: MockMode::ToolThenAnswer,
-                saw_final_instruction: Arc::new(AtomicBool::new(false)),
-            }),
-            http: http.clone(),
+            model: scripted_rig_model(
+                MockMode::ToolThenAnswer,
+                Arc::new(AtomicBool::new(false)),
+            ),
             system_prompt: "Test".into(),
             history: vec![AiMessage::user("Find alpha", Vec::new())],
             mcp_servers: Vec::new(),
@@ -587,34 +609,35 @@ async fn agent_loop_multistep_tools_budget_and_empty_recovery() {
     .await;
 
     let mut text = String::new();
+    let mut reasoning = String::new();
     let mut completed_tools = 0usize;
     let mut usage_total = AiTokenUsage::default();
+    let mut errors = Vec::new();
     while let Ok(ev) = rx.recv().await {
         match ev {
             AgentEvent::TextDelta(t) => text.push_str(&t),
+            AgentEvent::ReasoningDelta(r) => reasoning.push_str(&r),
             AgentEvent::ToolCallFinish { .. } => completed_tools += 1,
             AgentEvent::Usage(u) => {
                 usage_total.input_tokens += u.input_tokens;
                 usage_total.output_tokens += u.output_tokens;
             }
+            AgentEvent::Error(e) => errors.push(e),
             _ => {}
         }
     }
+    assert!(errors.is_empty(), "unexpected agent errors: {errors:?}");
     assert_eq!(completed_tools, 1);
+    assert!(reasoning.contains("Planning tool call"));
     assert!(text.contains("Final answer with lookup result."));
     assert_eq!(usage_total.input_tokens, 240);
 
-    // 2. Tool budget exhaustion forces ToolChoice::None + FINAL_STEP_INSTRUCTION.
+    // 2. Tool budget exhaustion forces ToolChoice::None + FINAL_STEP_INSTRUCTION via AgentHook.
     let saw_final_budget = Arc::new(AtomicBool::new(false));
     let (tx2, rx2) = async_channel::unbounded();
     run_agent_turn(
         AgentRunConfig {
-            model: Arc::new(MockScriptedModel {
-                step: Arc::new(AtomicUsize::new(0)),
-                mode: MockMode::BudgetExhaustion,
-                saw_final_instruction: saw_final_budget.clone(),
-            }),
-            http: http.clone(),
+            model: scripted_rig_model(MockMode::BudgetExhaustion, saw_final_budget.clone()),
             system_prompt: "Test".into(),
             history: vec![AiMessage::user("Loop", Vec::new())],
             mcp_servers: Vec::new(),
@@ -642,16 +665,14 @@ async fn agent_loop_multistep_tools_budget_and_empty_recovery() {
     assert!(saw_final_budget.load(Ordering::SeqCst));
     assert!(budget_text.contains("Budget summary."));
 
-    // 3. Empty-answer recovery after tool calls.
+    // 3. Empty-answer recovery after tool calls via ByokBudgetHook::on_model_turn_finished.
     let (tx3, rx3) = async_channel::unbounded();
     run_agent_turn(
         AgentRunConfig {
-            model: Arc::new(MockScriptedModel {
-                step: Arc::new(AtomicUsize::new(0)),
-                mode: MockMode::EmptyRecovery,
-                saw_final_instruction: Arc::new(AtomicBool::new(false)),
-            }),
-            http,
+            model: scripted_rig_model(
+                MockMode::EmptyRecovery,
+                Arc::new(AtomicBool::new(false)),
+            ),
             system_prompt: "Test".into(),
             history: vec![AiMessage::user("Recover me", Vec::new())],
             mcp_servers: Vec::new(),
@@ -674,7 +695,7 @@ async fn agent_loop_multistep_tools_budget_and_empty_recovery() {
     }
     assert!(rec_text.contains("Recovered answer."));
 
-    // 4. to_model_messages image unsupported note.
+    // 4. to_rig_messages image unsupported note.
     let img_msg = AiMessage::user(
         "Describe",
         vec![AiImageRef {
@@ -687,19 +708,36 @@ async fn agent_loop_multistep_tools_budget_and_empty_recovery() {
         }],
     );
     let store = AiImageStore::in_memory();
-    let converted = to_model_messages(&[img_msg], &store, false);
-    assert_eq!(converted.len(), 1);
-    let ModelMessage::User(parts) = &converted[0] else {
+    let (history, prompt) = to_rig_messages(&[img_msg], &store, false);
+    assert!(history.is_empty());
+    let Message::User { content } = prompt else {
         panic!("expected User message");
     };
-    assert!(parts.iter().any(|p| matches!(
+    assert!(content.iter().any(|p| matches!(
         p,
-        ModelContentPart::Text(s) if s.contains("does not accept images")
+        UserContent::Text(t) if t.text.contains("does not accept images")
     )));
+}
+
+fn wait_until_idle(cx: &mut TestAppContext, entity: &crate::Entity<AskAiState>) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        cx.run_until_parked();
+        if !entity.read_with(cx, |s, _| s.is_busy()) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for AskAiState turn to complete"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    cx.run_until_parked();
 }
 
 #[gpui::test]
 fn ask_ai_build_with_ai_live_editor_app_tools_and_render(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
     cx.update(init_components);
 
     // Minimal live GPUI editor entity (analogous to FreeformCanvas in a real app).
@@ -738,83 +776,82 @@ fn ask_ai_build_with_ai_live_editor_app_tools_and_render(cx: &mut TestAppContext
             .workspace(true)
     });
 
-    // Custom offline editor-aware LanguageModel plugged via `ProviderPreset.custom_model`.
-    struct MockEditorModel;
-    impl LanguageModel for MockEditorModel {
-        fn stream_step(
-            &self,
-            request: ModelRequest,
-            _http: Arc<dyn HttpClient>,
-            _abort: Arc<AtomicBool>,
-            tx: async_channel::Sender<ModelStreamEvent>,
-        ) -> BoxFuture<'static, Result<()>> {
-            Box::pin(async move {
-                let last_user = request
-                    .messages
-                    .iter()
-                    .rev()
-                    .find_map(|m| match m {
-                        ModelMessage::User(parts) => parts.iter().find_map(|p| match p {
-                            ModelContentPart::Text(t) => Some(t.to_ascii_lowercase()),
-                            _ => None,
-                        }),
-                        _ => None,
-                    })
-                    .unwrap_or_default();
-                let last_tool = match request.messages.last() {
-                    Some(ModelMessage::Tool(parts)) => parts.iter().find_map(|p| match p {
-                        ModelContentPart::ToolResult { tool_name, .. } => Some(tool_name.clone()),
-                        _ => None,
-                    }),
-                    _ => None,
-                };
-                match last_tool.as_deref() {
-                    None => {
-                        let _ = tx
-                            .send(ModelStreamEvent::ToolCall {
-                                id: "ed-get".into(),
-                                name: "canvas_get_state".into(),
-                                arguments: json!({}),
-                            })
-                            .await;
-                        let _ = tx.send(ModelStreamEvent::Finish(FinishReason::ToolCalls)).await;
-                    }
-                    Some("canvas_get_state") => {
-                        if last_user.contains("remove") {
+    // Custom offline editor-aware RigCompletionModel plugged via `ProviderPreset.custom_model`.
+    let build_mock_editor_model = || -> RigCompletionModel {
+        local_completion_model(
+            "mock-editor",
+            "editor-agent",
+            Arc::new(|request, tx| {
+                Box::pin(async move {
+                    let (last_user, last_is_tool, last_tool) = extract_request_summary(&request);
+                    let last_user_lower = last_user.to_ascii_lowercase();
+                    let last_tool_name = last_is_tool
+                        .then_some(last_tool)
+                        .flatten()
+                        .map(|(name, _)| name);
+                    match last_tool_name.as_deref() {
+                        None => {
                             let _ = tx
-                                .send(ModelStreamEvent::ToolCall {
-                                    id: "ed-rm".into(),
-                                    name: "canvas_remove_widget".into(),
-                                    arguments: json!({ "ids": ["note-1"] }),
+                                .send(LocalCompletionEvent::ToolCall {
+                                    id: super::types::new_id(),
+                                    name: "canvas_get_state".into(),
+                                    arguments: json!({}),
                                 })
                                 .await;
-                        } else {
                             let _ = tx
-                                .send(ModelStreamEvent::ToolCall {
-                                    id: "ed-add".into(),
-                                    name: "canvas_add_widget".into(),
-                                    arguments: json!({ "kind": "chart" }),
+                                .send(LocalCompletionEvent::Finish {
+                                    usage: AiTokenUsage::default(),
+                                    reason: FinishReason::ToolCalls,
                                 })
                                 .await;
                         }
-                        let _ = tx.send(ModelStreamEvent::Finish(FinishReason::ToolCalls)).await;
+                        Some("canvas_get_state") => {
+                            if last_user_lower.contains("remove") {
+                                let _ = tx
+                                    .send(LocalCompletionEvent::ToolCall {
+                                        id: super::types::new_id(),
+                                        name: "canvas_remove_widget".into(),
+                                        arguments: json!({ "ids": ["note-1"] }),
+                                    })
+                                    .await;
+                            } else {
+                                let _ = tx
+                                    .send(LocalCompletionEvent::ToolCall {
+                                        id: super::types::new_id(),
+                                        name: "canvas_add_widget".into(),
+                                        arguments: json!({ "kind": "chart" }),
+                                    })
+                                    .await;
+                            }
+                            let _ = tx
+                                .send(LocalCompletionEvent::Finish {
+                                    usage: AiTokenUsage::default(),
+                                    reason: FinishReason::ToolCalls,
+                                })
+                                .await;
+                        }
+                        Some(done_tool) => {
+                            let _ = tx
+                                .send(LocalCompletionEvent::TextDelta(format!(
+                                    "Updated canvas via `{done_tool}`."
+                                )))
+                                .await;
+                            let _ = tx
+                                .send(LocalCompletionEvent::Finish {
+                                    usage: AiTokenUsage::default(),
+                                    reason: FinishReason::Stop,
+                                })
+                                .await;
+                        }
                     }
-                    Some(done_tool) => {
-                        let _ = tx
-                            .send(ModelStreamEvent::TextDelta(format!(
-                                "Updated canvas via `{done_tool}`."
-                            )))
-                            .await;
-                        let _ = tx.send(ModelStreamEvent::Finish(FinishReason::Stop)).await;
-                    }
-                }
-                Ok(())
-            })
-        }
-    }
+                    Ok(())
+                })
+            }),
+        )
+    };
 
     let mut editor_sim = simulated_provider();
-    editor_sim.custom_model = Some(Arc::new(|_| Ok(Arc::new(MockEditorModel))));
+    editor_sim.custom_model = Some(Arc::new(move |_| Ok(build_mock_editor_model())));
     let mut editor_providers = default_providers();
     editor_providers.push(editor_sim);
 
@@ -858,7 +895,11 @@ fn ask_ai_build_with_ai_live_editor_app_tools_and_render(cx: &mut TestAppContext
                     |ed, args, cx| {
                         let ids: Vec<String> = args["ids"]
                             .as_array()
-                            .map(|a| a.iter().filter_map(|v| v.as_str().map(ToOwned::to_owned)).collect())
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|v| v.as_str().map(ToOwned::to_owned))
+                                    .collect()
+                            })
                             .unwrap_or_default();
                         ed.items.retain(|(id, _)| !ids.contains(id));
                         cx.notify();
@@ -888,7 +929,8 @@ fn ask_ai_build_with_ai_live_editor_app_tools_and_render(cx: &mut TestAppContext
     build_entity.update(cx, |builder, cx| {
         builder.send_message("Add a chart widget onto the canvas", cx);
     });
-    cx.run_until_parked();
+    wait_until_idle(cx, &ask_entity);
+    wait_until_idle(cx, &build_entity);
 
     ask_entity.read_with(cx, |ask, _| {
         assert!(!ask.is_busy());
@@ -919,7 +961,7 @@ fn ask_ai_build_with_ai_live_editor_app_tools_and_render(cx: &mut TestAppContext
     build_entity.update(cx, |builder, cx| {
         builder.send_message("Remove the note widget", cx);
     });
-    cx.run_until_parked();
+    wait_until_idle(cx, &build_entity);
     editor.read_with(cx, |ed, _| {
         assert!(!ed.items.iter().any(|(_, k)| k == "note"));
     });
@@ -1012,6 +1054,7 @@ fn ask_ai_build_with_ai_live_editor_app_tools_and_render(cx: &mut TestAppContext
 
 #[gpui::test]
 fn ask_ai_scrollbar_auto_scrolls_to_bottom_and_respects_manual_scroll_up(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
     cx.update(init_components);
 
     let ask_entity = cx.new(|cx| {
@@ -1051,7 +1094,7 @@ fn ask_ai_scrollbar_auto_scrolls_to_bottom_and_respects_manual_scroll_up(cx: &mu
         "Write a workspace file and build another chart summary",
     ] {
         ask_entity.update(cx, |ask, cx| ask.send_message(prompt, cx));
-        cx.run_until_parked();
+        wait_until_idle(cx, &ask_entity);
         // Force a layout pass after final response so ScrollHandle settles.
         ask_entity.update(cx, |_, cx| cx.notify());
         cx.run_until_parked();
@@ -1095,7 +1138,7 @@ fn ask_ai_scrollbar_auto_scrolls_to_bottom_and_respects_manual_scroll_up(cx: &mu
     ask_entity.update(cx, |ask, cx| {
         ask.send_message("One more chart summary please", cx);
     });
-    cx.run_until_parked();
+    wait_until_idle(cx, &ask_entity);
     ask_entity.update(cx, |_, cx| cx.notify());
     cx.run_until_parked();
 
@@ -1109,4 +1152,153 @@ fn ask_ai_scrollbar_auto_scrolls_to_bottom_and_respects_manual_scroll_up(cx: &mu
             "expected sending a new message to auto-scroll back to bottom (max_y={max_y:?}, offset_y={offset_y:?})"
         );
     });
+}
+
+/// Optional env-driven live integration test against any OpenAI-compatible endpoint.
+///
+/// Run explicitly via:
+/// `GPUI_AI_TEST_BASE_URL=... GPUI_AI_TEST_API_KEY=... GPUI_AI_TEST_MODEL=... cargo test -p gpui --lib -- components::ai::tests::live_openai_compatible --ignored --nocapture`
+#[tokio::test]
+#[ignore = "requires GPUI_AI_TEST_BASE_URL, GPUI_AI_TEST_API_KEY, and GPUI_AI_TEST_MODEL"]
+async fn live_openai_compatible_streaming_and_tool_calling() {
+    let base_url = std::env::var("GPUI_AI_TEST_BASE_URL")
+        .expect("set GPUI_AI_TEST_BASE_URL for live integration test");
+    let api_key = std::env::var("GPUI_AI_TEST_API_KEY")
+        .expect("set GPUI_AI_TEST_API_KEY for live integration test");
+    let model_name = std::env::var("GPUI_AI_TEST_MODEL")
+        .expect("set GPUI_AI_TEST_MODEL for live integration test");
+
+    let preset = default_providers()
+        .into_iter()
+        .find(|p| p.id.as_ref() == "compatible")
+        .expect("compatible preset");
+    let mut values = ProviderValues::new();
+    values.insert("baseURL".into(), base_url);
+    values.insert("apiKey".into(), api_key);
+    values.insert("model".into(), model_name);
+
+    // 1. Connectivity verification via rig-core.
+    let status = test_provider_connection(&preset, &values)
+        .await
+        .expect("live test_provider_connection");
+    assert!(!status.is_empty());
+
+    // 2. Streaming text completion via rig-core + rig-agent.
+    let model = build_completion_model(&preset, &values).expect("build_completion_model");
+    let (tx, rx) = async_channel::unbounded();
+    run_agent_turn(
+        AgentRunConfig {
+            model,
+            system_prompt: "You are a concise assistant. Reply with one short sentence.".into(),
+            history: vec![AiMessage::user("Reply with exactly: RIG_LIVE_OK", Vec::new())],
+            mcp_servers: Vec::new(),
+            client_tools: Vec::new(),
+            workspace: None,
+            script_runner: None,
+            image_store: AiImageStore::in_memory(),
+            accepts_images: false,
+            limits: AgentLimits {
+                max_steps: 2,
+                max_output_tokens: Some(128),
+                ..AgentLimits::default()
+            },
+            abort: Arc::new(AtomicBool::new(false)),
+        },
+        tx,
+    )
+    .await;
+
+    let mut reply = String::new();
+    let mut errors = Vec::new();
+    let mut done_cancelled = None;
+    while let Ok(ev) = rx.recv().await {
+        match ev {
+            AgentEvent::TextDelta(t) => reply.push_str(&t),
+            AgentEvent::Error(e) => errors.push(e),
+            AgentEvent::Done { cancelled } => done_cancelled = Some(cancelled),
+            _ => {}
+        }
+    }
+    assert!(errors.is_empty(), "live streaming errors: {errors:?}");
+    assert_eq!(done_cancelled, Some(false));
+    assert!(
+        reply.contains("RIG_LIVE_OK"),
+        "expected RIG_LIVE_OK in reply, got: {reply:?}"
+    );
+
+    // 3. Multi-step ClientTool call via rig-core + rig-agent.
+    let tool_called = Arc::new(AtomicBool::new(false));
+    let tool_called_ref = tool_called.clone();
+    let secret_code_tool = ClientTool::sync(
+        "get_release_codename",
+        "Returns the current project release codename for a given year.",
+        json!({
+            "type": "object",
+            "properties": {
+                "year": { "type": "integer", "description": "Four-digit year." }
+            },
+            "required": ["year"]
+        }),
+        move |args| {
+            tool_called_ref.store(true, Ordering::SeqCst);
+            let year = args.get("year").and_then(Value::as_i64).unwrap_or(0);
+            Ok(json!({ "year": year, "codename": "ORION_RIG_47" }))
+        },
+    );
+
+    let model2 = build_completion_model(&preset, &values).expect("build_completion_model");
+    let (tx2, rx2) = async_channel::unbounded();
+    run_agent_turn(
+        AgentRunConfig {
+            model: model2,
+            system_prompt:
+                "You must call the `get_release_codename` tool to answer questions about release codenames, then include the exact codename in your final response."
+                    .into(),
+            history: vec![AiMessage::user(
+                "What is the release codename for year 2026? Call get_release_codename with year 2026.",
+                Vec::new(),
+            )],
+            mcp_servers: Vec::new(),
+            client_tools: vec![secret_code_tool],
+            workspace: None,
+            script_runner: None,
+            image_store: AiImageStore::in_memory(),
+            accepts_images: false,
+            limits: AgentLimits {
+                max_steps: 4,
+                max_output_tokens: Some(256),
+                ..AgentLimits::default()
+            },
+            abort: Arc::new(AtomicBool::new(false)),
+        },
+        tx2,
+    )
+    .await;
+
+    let mut tool_reply = String::new();
+    let mut tool_errors = Vec::new();
+    let mut finished_tools = 0usize;
+    while let Ok(ev) = rx2.recv().await {
+        match ev {
+            AgentEvent::TextDelta(t) => tool_reply.push_str(&t),
+            AgentEvent::ToolCallFinish { is_error, .. } => {
+                assert!(!is_error, "tool call unexpectedly failed");
+                finished_tools += 1;
+            }
+            AgentEvent::Error(e) => tool_errors.push(e),
+            _ => {}
+        }
+    }
+    assert!(
+        tool_errors.is_empty(),
+        "live tool-calling errors: {tool_errors:?}"
+    );
+    assert!(
+        tool_called.load(Ordering::SeqCst) && finished_tools >= 1,
+        "expected model to invoke get_release_codename tool"
+    );
+    assert!(
+        tool_reply.contains("ORION_RIG_47"),
+        "expected final answer to include tool output ORION_RIG_47, got: {tool_reply:?}"
+    );
 }

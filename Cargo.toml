@@ -135,6 +135,11 @@ regex = { version = "1.5", default-features = false, features = ["std", "perf"] 
 reqwest = { git = "https://github.com/zed-industries/reqwest.git", rev = "33bc764aa15ff7b200bf7c93bd96e24878d53e14", default-features = false, features = ["http2", "macos-system-configuration", "rustls-tls-native-roots", "socks", "stream"], package = "zed-reqwest", version = "0.12.15-zed" }
 reqwest_client = { path = "crates/reqwest_client" }
 resvg = { version = "0.46.0", default-features = false, features = ["text", "system-fonts", "memmap-fonts", "raster-images"] }
+rig-agent = { version = "0.47.0", default-features = false }
+rig-core = { version = "0.47.0", default-features = false, features = ["reqwest", "rustls"] }
+rig-reqwest = { version = "0.47.0", default-features = false, features = ["rustls"] }
+rig-rmcp = "0.47.0"
+rmcp = { version = "3.11.0", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"] }
 rustc-hash = "2.1.0"
 rustls = "0.23.26"
 rustls-platform-verifier = "0.7"
