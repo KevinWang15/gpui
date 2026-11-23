@@ -387,6 +387,198 @@ fn combobox_filtering_multiselect_and_custom_creation(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn combobox_runtime_mutators_and_custom_leading(cx: &mut TestAppContext) {
+    cx.update(init_components);
+    let changes: Rc<RefCell<Vec<Vec<&'static str>>>> = Rc::new(RefCell::new(Vec::new()));
+    let changes_clone = changes.clone();
+    let leading_renders = Rc::new(Cell::new(0usize));
+    let leading_counter = leading_renders.clone();
+
+    let make_option = move |value: &'static str, label: &'static str| {
+        let counter = leading_counter.clone();
+        ComboBoxOption::new(value, label).leading(move |_, _| {
+            counter.set(counter.get() + 1);
+            crate::div()
+                .size(px(10.))
+                .rounded_full()
+                .bg(palette::EMERALD_500)
+        })
+    };
+
+    let (cb, cx) = cx.add_window_view(|_, cx| {
+        ComboBoxState::new(
+            vec![
+                make_option("alpha", "Alpha"),
+                make_option("beta", "Beta"),
+            ],
+            cx,
+        )
+        .default_values(vec!["alpha"])
+        .placeholder("Initial placeholder")
+    });
+
+    cx.update(|_, cx| {
+        cx.subscribe(&cb, move |_, ev: &ComboBoxEvent<&'static str>, _| {
+            if let ComboBoxEvent::Change(vals) = ev {
+                changes_clone.borrow_mut().push(vals.clone());
+            }
+        })
+        .detach();
+    });
+
+    // Initial render invokes custom leading renderer for the selected trigger item.
+    cx.refresh().unwrap();
+    cx.run_until_parked();
+    assert!(leading_renders.get() >= 1);
+
+    // Opening the menu also invokes custom leading renderers for dropdown rows.
+    let before_open = leading_renders.get();
+    cb.update_in(cx, |state, window, cx| {
+        state.open_menu(window, cx);
+    });
+    cx.refresh().unwrap();
+    cx.run_until_parked();
+    assert!(state_open(&cb, cx));
+    assert!(leading_renders.get() > before_open);
+
+    // set_options preserves surviving selection and does not emit Change.
+    cb.update(cx, |state, cx| {
+        state.set_options(
+            vec![
+                make_option("alpha", "Alpha v2"),
+                make_option("gamma", "Gamma"),
+            ],
+            cx,
+        );
+        assert_eq!(state.options().len(), 2);
+        assert_eq!(state.selected_value(), Some(&"alpha"));
+        assert_eq!(
+            state.selected_option().map(|o| o.label.as_ref()),
+            Some("Alpha v2")
+        );
+    });
+    assert!(changes.borrow().is_empty());
+
+    // set_options drops selections absent from the new list without emitting Change.
+    cb.update(cx, |state, cx| {
+        state.set_options(vec![make_option("delta", "Delta")], cx);
+        assert!(state.selected_values().is_empty());
+    });
+    assert!(changes.borrow().is_empty());
+
+    // set_values_silent updates selection without emitting Change; set_values emits Change.
+    cb.update(cx, |state, cx| {
+        state.set_values_silent(["delta"], cx);
+        assert_eq!(state.selected_value(), Some(&"delta"));
+    });
+    assert!(changes.borrow().is_empty());
+
+    cb.update(cx, |state, cx| {
+        state.set_values(Vec::<&'static str>::new(), cx);
+        assert!(state.selected_values().is_empty());
+    });
+    assert_eq!(changes.borrow().len(), 1);
+
+    // set_disabled(true) closes an open menu and disables the embedded search input.
+    cb.update_in(cx, |state, window, cx| {
+        state.open_menu(window, cx);
+        assert!(state.is_open());
+        state.set_placeholder("Loading options...", cx);
+        state.set_empty_message("Nothing here", cx);
+        state.set_disabled(true, cx);
+        assert!(state.is_disabled());
+        assert!(!state.is_open());
+        assert!(state.search_input().read(cx).is_disabled());
+    });
+    cx.refresh().unwrap();
+    cx.run_until_parked();
+
+    // Re-enabling unlocks the search input again.
+    cb.update(cx, |state, cx| {
+        state.set_disabled(false, cx);
+        assert!(!state.is_disabled());
+        assert!(!state.search_input().read(cx).is_disabled());
+    });
+}
+
+fn state_open<T: Clone + PartialEq + 'static>(
+    cb: &Entity<ComboBoxState<T>>,
+    cx: &crate::VisualTestContext,
+) -> bool {
+    cb.read_with(cx, |s, _| s.is_open())
+}
+
+#[gpui::test]
+fn select_runtime_mutators_and_custom_leading(cx: &mut TestAppContext) {
+    cx.update(init_components);
+    let changes: Rc<RefCell<Vec<Option<&'static str>>>> = Rc::new(RefCell::new(Vec::new()));
+    let changes_clone = changes.clone();
+    let leading_renders = Rc::new(Cell::new(0usize));
+    let counter = leading_renders.clone();
+
+    let (sel, cx) = cx.add_window_view(|_, cx| {
+        let c1 = counter.clone();
+        let c2 = counter.clone();
+        SelectState::new(
+            vec![
+                SelectOption::new("prod", "Production").leading(move |_, _| {
+                    c1.set(c1.get() + 1);
+                    crate::div()
+                        .size(px(8.))
+                        .rounded_full()
+                        .bg(palette::EMERALD_500)
+                }),
+                SelectOption::new("staging", "Staging").leading(move |_, _| {
+                    c2.set(c2.get() + 1);
+                    crate::div()
+                        .size(px(8.))
+                        .rounded_full()
+                        .bg(palette::AMBER_500)
+                }),
+            ],
+            cx,
+        )
+        .default_value("prod")
+    });
+
+    cx.update(|_, cx| {
+        cx.subscribe(&sel, move |_, ev: &SelectEvent<&'static str>, _| {
+            if let SelectEvent::Change(val) = ev {
+                changes_clone.borrow_mut().push(*val);
+            }
+        })
+        .detach();
+    });
+
+    cx.refresh().unwrap();
+    cx.run_until_parked();
+    assert!(leading_renders.get() >= 1);
+
+    // set_value_silent changes selection without emitting Change.
+    let before_open_render = leading_renders.get();
+    sel.update(cx, |s, cx| {
+        s.set_value_silent(Some(&"staging"), cx);
+        assert_eq!(s.selected_value(), Some(&"staging"));
+        s.set_placeholder("Choose environment...", cx);
+        s.set_invalid(true, cx);
+        s.open_menu(cx);
+        assert!(s.is_open());
+    });
+    assert!(changes.borrow().is_empty());
+
+    cx.refresh().unwrap();
+    cx.run_until_parked();
+    assert!(leading_renders.get() >= before_open_render + 3);
+
+    // set_disabled(true) closes open menu.
+    sel.update(cx, |s, cx| {
+        s.set_disabled(true, cx);
+        assert!(s.is_disabled());
+        assert!(!s.is_open());
+    });
+}
+
+#[gpui::test]
 fn slider_value_clamping_and_keyboard_stepping(cx: &mut TestAppContext) {
     cx.update(init_components);
     let (sl, cx) = cx.add_window_view(|_, cx| {

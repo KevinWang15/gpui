@@ -92,7 +92,9 @@ impl Page {
                 "input textbox textarea autogrow auto grow resize expandable multiline form field password email validation ime"
             }
             Self::Controls => "toggle switch checkbox indeterminate radio cards slider range",
-            Self::Selection => "select listbox dropdown combobox autocomplete tags multiselect",
+            Self::Selection => {
+                "select listbox dropdown combobox autocomplete tags multiselect cascading dynamic leading swatch"
+            }
             Self::LayoutNavigation => {
                 "layout container grid stack scroll area scrollarea overflow scrollbar card divider tabs accordion disclosure breadcrumb pagination drag drop freeform canvas snap align resize palette studio"
             }
@@ -220,6 +222,10 @@ pub struct PlaygroundApp {
     pub country_select: Entity<SelectState<&'static str>>,
     pub single_combo: Entity<ComboBoxState<&'static str>>,
     pub multi_combo: Entity<ComboBoxState<String>>,
+    pub env_select: Entity<SelectState<&'static str>>,
+    pub region_combo: Entity<ComboBoxState<&'static str>>,
+    pub cluster_combo: Entity<ComboBoxState<&'static str>>,
+    pub cluster_reloading: bool,
 
     // Layout & Navigation state
     pub container_max: MaxWidth,
@@ -1327,6 +1333,93 @@ impl PlaygroundApp {
                         Some("Added to options and selected."),
                         cx,
                     );
+                }
+            },
+        )
+        .detach();
+
+        let env_select = cx.new(|cx| {
+            SelectState::new(
+                vec![
+                    SelectOption::new("prod", "Production")
+                        .description("Primary customer-facing environment")
+                        .leading(|_, _| status_dot(palette::EMERALD_500)),
+                    SelectOption::new("staging", "Staging")
+                        .description("Pre-release verification cluster")
+                        .leading(|_, _| status_dot(palette::AMBER_500)),
+                    SelectOption::new("preview", "Preview")
+                        .description("Ephemeral per-branch deployments")
+                        .leading(|_, _| status_dot(palette::INDIGO_500)),
+                    SelectOption::new("maintenance", "Maintenance")
+                        .description("Read-only drain window")
+                        .leading(|_, _| status_dot(palette::ROSE_500)),
+                ],
+                cx,
+            )
+            .placeholder("Choose environment...")
+            .default_value("prod")
+        });
+        cx.subscribe(
+            &env_select,
+            |this, _, ev: &SelectEvent<&'static str>, cx| {
+                if let SelectEvent::Change(val) = ev {
+                    this.log_event("Select(Env)", format!("selected -> {:?}", val), cx);
+                }
+            },
+        )
+        .detach();
+
+        let cluster_combo = cx.new(|cx| {
+            ComboBoxState::new(Self::cluster_options_for_region("us-east"), cx)
+                .placeholder("Search cluster...")
+                .empty_message("No matching clusters.")
+                .clearable(false)
+                .default_values(vec!["iad-primary"])
+        });
+        cx.subscribe(
+            &cluster_combo,
+            |this, _, ev: &ComboBoxEvent<&'static str>, cx| {
+                if let ComboBoxEvent::Change(vals) = ev {
+                    this.log_event("ComboBox(Cluster)", format!("selected -> {:?}", vals), cx);
+                }
+            },
+        )
+        .detach();
+
+        let region_combo = cx.new(|cx| {
+            ComboBoxState::new(
+                vec![
+                    ComboBoxOption::new("us-east", "US East (Virginia)")
+                        .description("3 active clusters · 14 ms")
+                        .leading(|_, _| region_badge("US", palette::INDIGO_500))
+                        .keywords(["virginia", "iad", "america"]),
+                    ComboBoxOption::new("eu-west", "EU West (Frankfurt)")
+                        .description("2 active clusters · 29 ms")
+                        .leading(|_, _| region_badge("EU", palette::EMERALD_500))
+                        .keywords(["frankfurt", "fra", "europe"]),
+                    ComboBoxOption::new("ap-east", "AP Northeast (Tokyo)")
+                        .description("2 active clusters · 41 ms")
+                        .leading(|_, _| region_badge("AP", palette::AMBER_500))
+                        .keywords(["tokyo", "hnd", "asia"]),
+                    ComboBoxOption::new("offline", "DR Standby (Empty)")
+                        .description("No provisioned clusters — disables dependent select")
+                        .leading(|_, _| region_badge("DR", palette::SLATE_500))
+                        .keywords(["empty", "disabled", "standby"]),
+                ],
+                cx,
+            )
+            .placeholder("Search region...")
+            .clearable(false)
+            .default_values(vec!["us-east"])
+        });
+        cx.subscribe(
+            &region_combo,
+            |this, _, ev: &ComboBoxEvent<&'static str>, cx| {
+                if let ComboBoxEvent::Change(vals) = ev
+                    && let Some(&region) = vals.first()
+                {
+                    this.log_event("ComboBox(Region)", format!("region -> {region}"), cx);
+                    this.sync_clusters_for_region(region, cx);
                 }
             },
         )
@@ -3225,6 +3318,10 @@ impl PlaygroundApp {
             country_select,
             single_combo,
             multi_combo,
+            env_select,
+            region_combo,
+            cluster_combo,
+            cluster_reloading: false,
 
             container_max: MaxWidth::SevenXl,
             grid_cols: 3,
@@ -4361,4 +4458,144 @@ impl PlaygroundApp {
             _ => CheckState::Indeterminate,
         }
     }
+
+    pub fn cluster_options_for_region(region: &'static str) -> Vec<ComboBoxOption<&'static str>> {
+        match region {
+            "us-east" => vec![
+                ComboBoxOption::new("iad-primary", "iad-prod-01")
+                    .description("Primary compute pool · 99.98% uptime")
+                    .group("Active")
+                    .leading(|_, _| status_dot(palette::EMERALD_500))
+                    .keywords(["primary", "us", "prod"]),
+                ComboBoxOption::new("iad-gpu", "iad-gpu-02")
+                    .description("GPU inference nodes · 8× H100")
+                    .group("Active")
+                    .leading(|_, _| status_dot(palette::INDIGO_500))
+                    .keywords(["gpu", "inference", "h100"]),
+                ComboBoxOption::new("iad-drain", "iad-legacy-03")
+                    .description("Scheduled maintenance")
+                    .group("Unavailable")
+                    .leading(|_, _| status_dot(palette::SLATE_400))
+                    .disabled(true),
+            ],
+            "eu-west" => vec![
+                ComboBoxOption::new("fra-primary", "fra-prod-01")
+                    .description("GDPR-compliant EU primary pool")
+                    .group("Active")
+                    .leading(|_, _| status_dot(palette::EMERALD_500))
+                    .keywords(["eu", "frankfurt", "gdpr"]),
+                ComboBoxOption::new("fra-edge", "fra-edge-02")
+                    .description("Low-latency edge cache")
+                    .group("Active")
+                    .leading(|_, _| status_dot(palette::AMBER_500))
+                    .keywords(["edge", "cache"]),
+            ],
+            "ap-east" => vec![
+                ComboBoxOption::new("hnd-primary", "hnd-prod-01")
+                    .description("Tokyo primary availability zone")
+                    .group("Active")
+                    .leading(|_, _| status_dot(palette::EMERALD_500))
+                    .keywords(["tokyo", "japan", "asia"]),
+                ComboBoxOption::new("hnd-batch", "hnd-batch-02")
+                    .description("Spot worker pool")
+                    .group("Active")
+                    .leading(|_, _| status_dot(palette::INDIGO_500))
+                    .keywords(["batch", "spot"]),
+            ],
+            _ => Vec::new(),
+        }
+    }
+
+    pub fn sync_clusters_for_region(&mut self, region: &'static str, cx: &mut Context<Self>) {
+        self.cluster_reloading = false;
+        let opts = Self::cluster_options_for_region(region);
+        let first = opts.iter().find(|o| !o.disabled).map(|o| o.value);
+        let empty = opts.is_empty();
+        self.cluster_combo.update(cx, |cb, cx| {
+            cb.set_options(opts, cx);
+            cb.set_values_silent(first, cx);
+            cb.set_placeholder(
+                if empty {
+                    "No clusters in this region"
+                } else {
+                    "Search cluster..."
+                },
+                cx,
+            );
+            cb.set_disabled(empty, cx);
+        });
+        cx.notify();
+    }
+
+    pub fn simulate_cluster_reload(&mut self, cx: &mut Context<Self>) {
+        if self.cluster_reloading {
+            return;
+        }
+        let region = self
+            .region_combo
+            .read(cx)
+            .selected_value()
+            .copied()
+            .unwrap_or("us-east");
+        self.cluster_reloading = true;
+        self.cluster_combo.update(cx, |cb, cx| {
+            cb.set_options(Vec::new(), cx);
+            cb.set_placeholder("Loading clusters...", cx);
+            cb.set_disabled(true, cx);
+        });
+        self.log_event(
+            "ComboBox(Reload)",
+            format!("reloading clusters for {region}..."),
+            cx,
+        );
+        cx.notify();
+
+        let bg = cx.background_executor().clone();
+        cx.spawn(async move |this, cx| {
+            bg.timer(Duration::from_millis(450)).await;
+            let _ = this.update(cx, |app, cx| {
+                let current_region = app
+                    .region_combo
+                    .read(cx)
+                    .selected_value()
+                    .copied()
+                    .unwrap_or("us-east");
+                app.sync_clusters_for_region(current_region, cx);
+                app.log_event(
+                    "ComboBox(Reload)",
+                    format!("loaded clusters for {current_region}"),
+                    cx,
+                );
+            });
+        })
+        .detach();
+    }
+}
+
+fn status_dot(color: impl Into<Hsla>) -> impl IntoElement {
+    let color = color.into();
+    gpui::div()
+        .size(px(9.))
+        .rounded_full()
+        .bg(color)
+        .border_1()
+        .border_color(color.opacity(0.35))
+}
+
+fn region_badge(code: &'static str, accent: impl Into<Hsla>) -> impl IntoElement {
+    let accent = accent.into();
+    gpui::div()
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(px(22.))
+        .h(px(16.))
+        .rounded(px(4.))
+        .bg(accent.opacity(0.16))
+        .border_1()
+        .border_color(accent.opacity(0.35))
+        .text_size(px(9.5))
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .text_color(accent)
+        .child(code)
 }

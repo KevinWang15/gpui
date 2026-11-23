@@ -4,14 +4,16 @@
 
 use std::cell::Cell;
 use std::collections::HashMap;
+use std::fmt;
 use std::rc::Rc;
 
 use crate::icons::{Icon, IconSize, LucideIcon};
 use crate::{
-    Anchor, Animation, AnimationExt, App, Bounds, Context, Entity, EventEmitter, FocusHandle,
-    Focusable, FontWeight, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Render,
-    RenderOnce, ScrollHandle, SharedString, StyleRefinement, Styled, Subscription, Window,
-    anchored, canvas, deferred, div, ease_out_quint, point, prelude::*, px, transparent_black,
+    Anchor, Animation, AnimationExt, AnyElement, App, Bounds, Context, Entity, EventEmitter,
+    FocusHandle, Focusable, FontWeight, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
+    Pixels, Render, RenderOnce, ScrollHandle, SharedString, StyleRefinement, Styled, Subscription,
+    Window, anchored, canvas, deferred, div, ease_out_quint, point, prelude::*, px,
+    transparent_black,
 };
 
 use super::completion::fuzzy_match_score_lower;
@@ -21,7 +23,7 @@ use super::layout::focus_ring_shadow;
 use super::theme::{ANIM_FAST, ActiveTheme, ComponentSize};
 
 /// An item in a [`ComboBox`].
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ComboBoxOption<T> {
     /// Underlying value.
     pub value: T,
@@ -31,12 +33,31 @@ pub struct ComboBoxOption<T> {
     pub description: Option<SharedString>,
     /// Optional leading [`LucideIcon`].
     pub icon: Option<LucideIcon>,
+    /// Optional custom leading visual element rendered in the trigger (single-select) and
+    /// dropdown option rows (e.g. brand icon, color swatch, status dot, or avatar).
+    /// Takes precedence over [`Self::icon`] when set.
+    pub leading: Option<Rc<dyn Fn(&mut Window, &mut App) -> AnyElement + 'static>>,
     /// Optional group heading.
     pub group: Option<SharedString>,
     /// Additional search keywords.
     pub keywords: Vec<SharedString>,
     /// Whether this option is disabled.
     pub disabled: bool,
+}
+
+impl<T: fmt::Debug> fmt::Debug for ComboBoxOption<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ComboBoxOption")
+            .field("value", &self.value)
+            .field("label", &self.label)
+            .field("description", &self.description)
+            .field("icon", &self.icon)
+            .field("leading", &self.leading.as_ref().map(|_| "<fn>"))
+            .field("group", &self.group)
+            .field("keywords", &self.keywords)
+            .field("disabled", &self.disabled)
+            .finish()
+    }
 }
 
 impl<T> ComboBoxOption<T> {
@@ -47,6 +68,7 @@ impl<T> ComboBoxOption<T> {
             label: label.into(),
             description: None,
             icon: None,
+            leading: None,
             group: None,
             keywords: Vec::new(),
             disabled: false,
@@ -62,6 +84,21 @@ impl<T> ComboBoxOption<T> {
     /// Sets a leading [`LucideIcon`].
     pub fn icon(mut self, icon: LucideIcon) -> Self {
         self.icon = Some(icon);
+        self
+    }
+
+    /// Sets a custom leading visual element rendered in the trigger (single-select) and
+    /// dropdown option rows (for example a brand SVG, raster image, color swatch, status dot,
+    /// or avatar).
+    ///
+    /// When set, this takes precedence over [`Self::icon`].
+    pub fn leading<E: IntoElement>(
+        mut self,
+        render: impl Fn(&mut Window, &mut App) -> E + 'static,
+    ) -> Self {
+        self.leading = Some(Rc::new(move |window, cx| {
+            render(window, cx).into_any_element()
+        }));
         self
     }
 
@@ -300,6 +337,18 @@ impl<T: Clone + PartialEq + 'static> ComboBoxState<T> {
         self
     }
 
+    /// Returns all options.
+    pub fn options(&self) -> &[ComboBoxOption<T>] {
+        &self.options
+    }
+
+    /// Returns the first selected option (convenient for single-select comboboxes).
+    pub fn selected_option(&self) -> Option<&ComboBoxOption<T>> {
+        self.selected
+            .first()
+            .and_then(|val| self.options.iter().find(|o| &o.value == val))
+    }
+
     /// Returns the currently selected values slice.
     pub fn selected_values(&self) -> &[T] {
         &self.selected
@@ -308,6 +357,133 @@ impl<T: Clone + PartialEq + 'static> ComboBoxState<T> {
     /// Returns the first selected value (convenient for single-select comboboxes).
     pub fn selected_value(&self) -> Option<&T> {
         self.selected.first()
+    }
+
+    /// Returns whether interaction is currently disabled.
+    pub fn is_disabled(&self) -> bool {
+        self.disabled
+    }
+
+    /// Replaces the option list in place and retains any selected values that still exist.
+    ///
+    /// Does not emit [`ComboBoxEvent::Change`].
+    pub fn set_options(&mut self, options: Vec<ComboBoxOption<T>>, cx: &mut Context<Self>) {
+        self.options = options;
+        self.selected
+            .retain(|val| self.options.iter().any(|o| &o.value == val));
+        self.highlighted_filtered_pos = self.first_enabled_filtered_pos_with_app(cx);
+        self.scroll_handle.scroll_to_item(0);
+        cx.notify();
+    }
+
+    fn normalize_values(&self, values: impl IntoIterator<Item = T>) -> Vec<T> {
+        let mut normalized = Vec::new();
+        for value in values {
+            if !normalized.contains(&value) {
+                normalized.push(value);
+                if !self.multiple {
+                    break;
+                }
+            }
+        }
+        normalized
+    }
+
+    /// Programmatically replaces the selected values and emits [`ComboBoxEvent::Change`] if
+    /// the selection changed.
+    ///
+    /// In single-select mode, at most the first value is kept and the menu is closed.
+    pub fn set_values(&mut self, values: impl IntoIterator<Item = T>, cx: &mut Context<Self>) {
+        let next = self.normalize_values(values);
+        if self.selected == next {
+            return;
+        }
+        self.selected = next;
+        if !self.multiple {
+            self.close_menu(cx);
+        }
+        cx.emit(ComboBoxEvent::Change(self.selected.clone()));
+        cx.notify();
+    }
+
+    /// Programmatically replaces the selected values without emitting [`ComboBoxEvent::Change`].
+    ///
+    /// Useful when a parent view synchronizes dependent comboboxes (for example after loading
+    /// asynchronous options) without triggering re-entrant change handlers.
+    pub fn set_values_silent(
+        &mut self,
+        values: impl IntoIterator<Item = T>,
+        cx: &mut Context<Self>,
+    ) {
+        let next = self.normalize_values(values);
+        if self.selected != next {
+            self.selected = next;
+            cx.notify();
+        }
+    }
+
+    /// Updates the disabled state dynamically, closing the menu if disabling.
+    pub fn set_disabled(&mut self, disabled: bool, cx: &mut Context<Self>) {
+        if self.disabled == disabled {
+            return;
+        }
+        self.disabled = disabled;
+        if disabled {
+            self.close_menu(cx);
+        }
+        self.search_input
+            .update(cx, |input, cx| input.set_disabled(disabled, cx));
+        cx.notify();
+    }
+
+    /// Updates the invalid error state dynamically.
+    pub fn set_invalid(&mut self, invalid: bool, cx: &mut Context<Self>) {
+        if self.invalid != invalid {
+            self.invalid = invalid;
+            cx.notify();
+        }
+    }
+
+    /// Updates the trigger placeholder text dynamically.
+    pub fn set_placeholder(
+        &mut self,
+        placeholder: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        let placeholder = placeholder.into();
+        if self.placeholder != placeholder {
+            self.placeholder = placeholder;
+            cx.notify();
+        }
+    }
+
+    /// Updates the empty-results message dynamically.
+    pub fn set_empty_message(
+        &mut self,
+        message: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        let message = message.into();
+        if self.empty_message != message {
+            self.empty_message = message;
+            cx.notify();
+        }
+    }
+
+    /// Updates whether the inline clear button is shown.
+    pub fn set_clearable(&mut self, clearable: bool, cx: &mut Context<Self>) {
+        if self.clearable != clearable {
+            self.clearable = clearable;
+            cx.notify();
+        }
+    }
+
+    /// Updates the control size dynamically.
+    pub fn set_size(&mut self, size: ComponentSize, cx: &mut Context<Self>) {
+        if self.size != size {
+            self.size = size;
+            cx.notify();
+        }
     }
 
     /// Returns the underlying inline search [`InputState`] entity.
@@ -617,13 +793,20 @@ impl<T: Clone + PartialEq + 'static> Render for ComboBoxState<T> {
         let focused = !self.disabled && (self.focus_handle.is_focused(window) || search_focused);
         let query_is_empty = self.search_input.read(cx).value().is_empty();
 
-        let selected_opt = (!self.multiple)
-            .then(|| {
-                self.selected
-                    .first()
-                    .and_then(|val| self.options.iter().find(|o| &o.value == val))
-            })
-            .flatten();
+        let (has_selected, selected_leading_fn, selected_icon, selected_label) = if !self.multiple {
+            let opt = self
+                .selected
+                .first()
+                .and_then(|val| self.options.iter().find(|o| &o.value == val));
+            (
+                opt.is_some(),
+                opt.and_then(|o| o.leading.clone()),
+                opt.and_then(|o| o.icon),
+                opt.map(|o| o.label.clone()),
+            )
+        } else {
+            (false, None, None, None)
+        };
 
         // Keep embedded input size and placeholder synchronized without triggering extra notifies.
         let desired_input_size = if self.multiple {
@@ -639,7 +822,7 @@ impl<T: Clone + PartialEq + 'static> Render for ComboBoxState<T> {
             } else {
                 SharedString::new_static("")
             }
-        } else if selected_opt.is_some() {
+        } else if has_selected {
             SharedString::new_static("")
         } else {
             self.placeholder.clone()
@@ -769,12 +952,15 @@ impl<T: Clone + PartialEq + 'static> Render for ComboBoxState<T> {
             chips.into_any_element()
         } else {
             let input_h = px((self.size.height().0 - 2.0).max(20.0));
-            let selected_icon = query_is_empty
-                .then(|| selected_opt.and_then(|o| o.icon))
+            let selected_leading = query_is_empty
+                .then_some(selected_leading_fn)
+                .flatten()
+                .map(|render| render(window, cx));
+            let has_selected_leading = selected_leading.is_some();
+            let selected_icon = (query_is_empty && !has_selected_leading)
+                .then_some(selected_icon)
                 .flatten();
-            let selected_label = query_is_empty
-                .then(|| selected_opt.map(|o| o.label.clone()))
-                .flatten();
+            let selected_label = query_is_empty.then_some(selected_label).flatten();
 
             div()
                 .flex()
@@ -783,6 +969,17 @@ impl<T: Clone + PartialEq + 'static> Render for ComboBoxState<T> {
                 .gap(px(8.))
                 .w_full()
                 .min_w_0()
+                .when_some(selected_leading, |el, leading| {
+                    el.child(
+                        div()
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .when(self.open, |el| el.opacity(0.6))
+                            .child(leading),
+                    )
+                })
                 .when_some(selected_icon, |el, icon| {
                     el.child(
                         Icon::new(icon)
@@ -835,7 +1032,7 @@ impl<T: Clone + PartialEq + 'static> Render for ComboBoxState<T> {
                                     .h(input_h),
                             )
                         })
-                        .when(self.disabled && selected_opt.is_none(), |el| {
+                        .when(self.disabled && !has_selected, |el| {
                             el.child(
                                 div()
                                     .truncate()
@@ -1045,9 +1242,28 @@ impl<T: Clone + PartialEq + 'static> Render for ComboBoxState<T> {
             } else {
                 let mut last_group: Option<SharedString> = None;
                 for (filtered_pos, opt_idx) in filtered.iter().copied().enumerate() {
-                    let option = &self.options[opt_idx];
-                    if option.group != last_group
-                        && let Some(group_name) = option.group.clone()
+                    let (
+                        opt_group,
+                        is_selected,
+                        opt_disabled,
+                        opt_leading,
+                        opt_icon,
+                        opt_label,
+                        opt_desc,
+                    ) = {
+                        let option = &self.options[opt_idx];
+                        (
+                            option.group.clone(),
+                            self.selected.contains(&option.value),
+                            option.disabled,
+                            option.leading.clone(),
+                            option.icon,
+                            option.label.clone(),
+                            option.description.clone(),
+                        )
+                    };
+                    if opt_group != last_group
+                        && let Some(group_name) = opt_group.clone()
                     {
                         list_body = list_body.child(
                             div()
@@ -1060,9 +1276,10 @@ impl<T: Clone + PartialEq + 'static> Render for ComboBoxState<T> {
                                 .child(group_name),
                         );
                     }
-                    last_group = option.group.clone();
+                    last_group = opt_group;
 
-                    let is_selected = self.selected.contains(&option.value);
+                    let leading_el = opt_leading.map(|render| render(window, cx));
+                    let opt_icon = leading_el.is_none().then_some(opt_icon).flatten();
                     let is_highlighted = self.highlighted_filtered_pos == Some(filtered_pos);
                     let entity_hover = entity.clone();
                     let entity_opt = entity.clone();
@@ -1080,7 +1297,7 @@ impl<T: Clone + PartialEq + 'static> Render for ComboBoxState<T> {
                             .py(px(7.))
                             .rounded(theme.radius_sm)
                             .when(is_highlighted, |el| el.bg(theme.primary_soft))
-                            .when(!option.disabled, |el| {
+                            .when(!opt_disabled, |el| {
                                 el.cursor_pointer()
                                     .when(!is_highlighted, |el| {
                                         el.hover(|s| s.bg(theme.surface_hover))
@@ -1100,7 +1317,7 @@ impl<T: Clone + PartialEq + 'static> Render for ComboBoxState<T> {
                                         });
                                     })
                             })
-                            .when(option.disabled, |el| {
+                            .when(opt_disabled, |el| {
                                 el.opacity(0.45).cursor_not_allowed()
                             })
                             .child(
@@ -1110,7 +1327,17 @@ impl<T: Clone + PartialEq + 'static> Render for ComboBoxState<T> {
                                     .items_center()
                                     .gap(px(8.))
                                     .min_w_0()
-                                    .when_some(option.icon, |el, icon| {
+                                    .when_some(leading_el, |el, leading| {
+                                        el.child(
+                                            div()
+                                                .flex_none()
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .child(leading),
+                                        )
+                                    })
+                                    .when_some(opt_icon, |el, icon| {
                                         el.child(
                                             Icon::new(icon)
                                                 .size(IconSize::Sm)
@@ -1142,9 +1369,9 @@ impl<T: Clone + PartialEq + 'static> Render for ComboBoxState<T> {
                                                     } else {
                                                         theme.popover_foreground
                                                     })
-                                                    .child(option.label.clone()),
+                                                    .child(opt_label),
                                             )
-                                            .when_some(option.description.clone(), |el, desc| {
+                                            .when_some(opt_desc, |el, desc| {
                                                 el.child(
                                                     div()
                                                         .truncate()

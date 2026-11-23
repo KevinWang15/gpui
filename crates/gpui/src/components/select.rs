@@ -2,13 +2,14 @@
 //! option groups, icons, descriptions, disabled options, clearable button, and anchored popover.
 
 use std::cell::Cell;
+use std::fmt;
 use std::rc::Rc;
 
 use crate::{
-    Anchor, Animation, AnimationExt, App, Bounds, Context, Entity, EventEmitter, FocusHandle,
-    Focusable, FontWeight, IntoElement, KeyDownEvent, MouseButton, Pixels, Render, RenderOnce,
-    ScrollHandle, SharedString, StyleRefinement, Styled, Window, anchored, canvas, deferred, div,
-    ease_out_quint, point, prelude::*, px,
+    Anchor, Animation, AnimationExt, AnyElement, App, Bounds, Context, Entity, EventEmitter,
+    FocusHandle, Focusable, FontWeight, IntoElement, KeyDownEvent, MouseButton, Pixels, Render,
+    RenderOnce, ScrollHandle, SharedString, StyleRefinement, Styled, Window, anchored, canvas,
+    deferred, div, ease_out_quint, point, prelude::*, px,
 };
 use crate::icons::{Icon, IconSize, LucideIcon};
 
@@ -16,7 +17,7 @@ use super::focus::{is_list_nav_key, list_step};
 use super::theme::{ANIM_FAST, ActiveTheme, ComponentSize};
 
 /// A selectable option inside a [`Select`] control.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct SelectOption<T> {
     /// Backing value for this option.
     pub value: T,
@@ -26,10 +27,28 @@ pub struct SelectOption<T> {
     pub description: Option<SharedString>,
     /// Optional leading [`LucideIcon`].
     pub icon: Option<LucideIcon>,
+    /// Optional custom leading visual element rendered in both the trigger and dropdown rows
+    /// (e.g. brand icon, color swatch, status dot, or avatar).
+    /// Takes precedence over [`Self::icon`] when set.
+    pub leading: Option<Rc<dyn Fn(&mut Window, &mut App) -> AnyElement + 'static>>,
     /// Optional section group header name.
     pub group: Option<SharedString>,
     /// Whether this option cannot be chosen.
     pub disabled: bool,
+}
+
+impl<T: fmt::Debug> fmt::Debug for SelectOption<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SelectOption")
+            .field("value", &self.value)
+            .field("label", &self.label)
+            .field("description", &self.description)
+            .field("icon", &self.icon)
+            .field("leading", &self.leading.as_ref().map(|_| "<fn>"))
+            .field("group", &self.group)
+            .field("disabled", &self.disabled)
+            .finish()
+    }
 }
 
 impl<T> SelectOption<T> {
@@ -40,6 +59,7 @@ impl<T> SelectOption<T> {
             label: label.into(),
             description: None,
             icon: None,
+            leading: None,
             group: None,
             disabled: false,
         }
@@ -54,6 +74,20 @@ impl<T> SelectOption<T> {
     /// Sets a leading [`LucideIcon`].
     pub fn icon(mut self, icon: LucideIcon) -> Self {
         self.icon = Some(icon);
+        self
+    }
+
+    /// Sets a custom leading visual element rendered in both the trigger and dropdown option
+    /// rows (for example a brand SVG, raster image, color swatch, status dot, or avatar).
+    ///
+    /// When set, this takes precedence over [`Self::icon`].
+    pub fn leading<E: IntoElement>(
+        mut self,
+        render: impl Fn(&mut Window, &mut App) -> E + 'static,
+    ) -> Self {
+        self.leading = Some(Rc::new(move |window, cx| {
+            render(window, cx).into_any_element()
+        }));
         self
     }
 
@@ -195,6 +229,11 @@ impl<T: Clone + PartialEq + 'static> SelectState<T> {
         self.open
     }
 
+    /// Returns `true` if interaction is currently disabled.
+    pub fn is_disabled(&self) -> bool {
+        self.disabled
+    }
+
     /// Returns all options.
     pub fn options(&self) -> &[SelectOption<T>] {
         &self.options
@@ -207,6 +246,68 @@ impl<T: Clone + PartialEq + 'static> SelectState<T> {
         self.selected_index = prev_val.and_then(|val| self.options.iter().position(|o| o.value == val));
         self.highlighted_index = self.selected_index;
         cx.notify();
+    }
+
+    /// Updates the selected value without emitting [`SelectEvent::Change`].
+    ///
+    /// Pass `None` to clear selection silently, or `Some(&value)` to select the first matching
+    /// option.
+    pub fn set_value_silent(&mut self, value: Option<&T>, cx: &mut Context<Self>) {
+        let next = value.and_then(|val| self.options.iter().position(|o| &o.value == val));
+        if self.selected_index != next {
+            self.selected_index = next;
+            self.highlighted_index = next;
+            cx.notify();
+        }
+    }
+
+    /// Updates the disabled state dynamically, closing the menu if disabling.
+    pub fn set_disabled(&mut self, disabled: bool, cx: &mut Context<Self>) {
+        if self.disabled == disabled {
+            return;
+        }
+        self.disabled = disabled;
+        if disabled {
+            self.close_menu(cx);
+        }
+        cx.notify();
+    }
+
+    /// Updates the invalid error state dynamically.
+    pub fn set_invalid(&mut self, invalid: bool, cx: &mut Context<Self>) {
+        if self.invalid != invalid {
+            self.invalid = invalid;
+            cx.notify();
+        }
+    }
+
+    /// Updates the placeholder text dynamically.
+    pub fn set_placeholder(
+        &mut self,
+        placeholder: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        let placeholder = placeholder.into();
+        if self.placeholder != placeholder {
+            self.placeholder = placeholder;
+            cx.notify();
+        }
+    }
+
+    /// Updates whether the inline clear button is shown.
+    pub fn set_clearable(&mut self, clearable: bool, cx: &mut Context<Self>) {
+        if self.clearable != clearable {
+            self.clearable = clearable;
+            cx.notify();
+        }
+    }
+
+    /// Updates the control size dynamically.
+    pub fn set_size(&mut self, size: ComponentSize, cx: &mut Context<Self>) {
+        if self.size != size {
+            self.size = size;
+            cx.notify();
+        }
     }
 
     /// Opens the dropdown menu.
@@ -419,6 +520,14 @@ impl<T: Clone + PartialEq + 'static> Render for SelectState<T> {
         };
 
         let selected = self.selected_option().cloned();
+        let selected_leading = selected
+            .as_ref()
+            .and_then(|s| s.leading.as_ref())
+            .map(|render| render(window, cx));
+        let selected_icon = selected_leading
+            .is_none()
+            .then(|| selected.as_ref().and_then(|s| s.icon))
+            .flatten();
         let show_clear = self.clearable && selected.is_some() && !self.disabled;
         let bounds_cell = self.trigger_bounds.clone();
         let captured_bounds = self.trigger_bounds.get();
@@ -491,7 +600,17 @@ impl<T: Clone + PartialEq + 'static> Render for SelectState<T> {
                     .gap(px(8.))
                     .flex_1()
                     .min_w_0()
-                    .when_some(selected.as_ref().and_then(|s| s.icon), |el, icon| {
+                    .when_some(selected_leading, |el, leading| {
+                        el.child(
+                            div()
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(leading),
+                        )
+                    })
+                    .when_some(selected_icon, |el, icon| {
                         el.child(
                             Icon::new(icon)
                                 .size(self.size.icon_size())
@@ -586,9 +705,20 @@ impl<T: Clone + PartialEq + 'static> Render for SelectState<T> {
                 }));
 
             let mut last_group: Option<SharedString> = None;
-            for (index, option) in self.options.iter().enumerate() {
-                if option.group != last_group
-                    && let Some(group_name) = option.group.clone()
+            for index in 0..self.options.len() {
+                let (opt_group, opt_disabled, opt_leading, opt_icon, opt_label, opt_desc) = {
+                    let option = &self.options[index];
+                    (
+                        option.group.clone(),
+                        option.disabled,
+                        option.leading.clone(),
+                        option.icon,
+                        option.label.clone(),
+                        option.description.clone(),
+                    )
+                };
+                if opt_group != last_group
+                    && let Some(group_name) = opt_group.clone()
                 {
                     list = list.child(
                         div()
@@ -601,8 +731,10 @@ impl<T: Clone + PartialEq + 'static> Render for SelectState<T> {
                             .child(group_name),
                     );
                 }
-                last_group = option.group.clone();
+                last_group = opt_group;
 
+                let leading_el = opt_leading.map(|render| render(window, cx));
+                let opt_icon = leading_el.is_none().then_some(opt_icon).flatten();
                 let is_selected = self.selected_index == Some(index);
                 let is_highlighted = self.highlighted_index == Some(index);
                 let row_bg = if is_highlighted {
@@ -626,7 +758,7 @@ impl<T: Clone + PartialEq + 'static> Render for SelectState<T> {
                         .py(px(7.))
                         .rounded(theme.radius_sm)
                         .bg(row_bg)
-                        .when(!option.disabled, |el| {
+                        .when(!opt_disabled, |el| {
                             el.cursor_pointer()
                                 .on_hover(move |hovered, _, cx| {
                                     entity_hover.update(cx, |state, cx| {
@@ -647,7 +779,7 @@ impl<T: Clone + PartialEq + 'static> Render for SelectState<T> {
                                     });
                                 })
                         })
-                        .when(option.disabled, |el| {
+                        .when(opt_disabled, |el| {
                             el.opacity(0.45).cursor_not_allowed()
                         })
                         .child(
@@ -657,7 +789,17 @@ impl<T: Clone + PartialEq + 'static> Render for SelectState<T> {
                                 .items_center()
                                 .gap(px(8.))
                                 .min_w_0()
-                                .when_some(option.icon, |el, icon| {
+                                .when_some(leading_el, |el, leading| {
+                                    el.child(
+                                        div()
+                                            .flex_none()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .child(leading),
+                                    )
+                                })
+                                .when_some(opt_icon, |el, icon| {
                                     el.child(
                                         Icon::new(icon)
                                             .size(IconSize::Sm)
@@ -683,9 +825,9 @@ impl<T: Clone + PartialEq + 'static> Render for SelectState<T> {
                                                     FontWeight::NORMAL
                                                 })
                                                 .text_color(theme.popover_foreground)
-                                                .child(option.label.clone()),
+                                                .child(opt_label),
                                         )
-                                        .when_some(option.description.clone(), |el, desc| {
+                                        .when_some(opt_desc, |el, desc| {
                                             el.child(
                                                 div()
                                                     .truncate()
