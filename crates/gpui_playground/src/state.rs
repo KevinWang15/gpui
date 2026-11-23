@@ -1,17 +1,30 @@
 //! Shared interactive state for the GPUI Playground application.
 
+use std::collections::HashMap;
+use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::components::*;
 use gpui::icons::{IconSize, LucideIcon};
-use gpui::{Context, DisplayId, Entity, SharedString, Window, WindowHandle, prelude::*};
+use gpui::window_placement::{
+    DockEdge, DockState, MonitorRects, ScreenRect, place_launcher_rect, resolve_dock_origin,
+};
+use gpui::{
+    AnyWindowHandle, AutostartOptions, Bounds, Context, DevicePixels, DisplayId, Entity,
+    GlobalHotKey, GlobalHotKeyManager, Hsla, SharedString, TrayEvent, TrayIconData,
+    TrayIconOptions, TrayMenuItem, Window, WindowBackgroundAppearance, WindowBounds,
+    WindowCornerPreference, WindowDecorations, WindowHandle, WindowKind, WindowOptions, point,
+    prelude::*, px, rgb, size,
+};
 
 use crate::accent::AccentPreset;
+use crate::pages::native_desktop::FloatingPaneDemoView;
 
 /// Sidebar pages available in the playground.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Page {
     Overview,
+    NativeDesktop,
     InteractiveBlur,
     DataTrees,
     PickersForms,
@@ -31,6 +44,7 @@ impl Page {
     pub const fn title(self) -> &'static str {
         match self {
             Self::Overview => "Overview",
+            Self::NativeDesktop => "Desktop & Windows",
             Self::InteractiveBlur => "Interactive & Blur",
             Self::DataTrees => "Trees, Lists & Tables",
             Self::PickersForms => "Pickers, Dropzone & Forms",
@@ -50,6 +64,9 @@ impl Page {
     pub const fn keywords(self) -> &'static str {
         match self {
             Self::Overview => "overview home welcome playground dashboard",
+            Self::NativeDesktop => {
+                "native windows desktop app builder spotlight alfred launcher floating frosted glass pane tray global hotkey shortcut recorder autostart launch login detached tooltip titlebar statusbar keyhint confirm button compact stepper status indicator trend badge string list swatch popover toolbar simulated backdrop"
+            }
             Self::InteractiveBlur => {
                 "blur container loading overlay spinner dots bars pulse progress ring command palette drawer sheet context menu right click split pane resizable number input stepper wizard rating stars copy clipboard pin otp"
             }
@@ -243,8 +260,43 @@ pub struct PlaygroundApp {
     pub analytics_metric: SharedString,
     pub analytics_refresh_seed: u64,
     pub analytics_drag_zoom_enabled: bool,
+    pub analytics_line_smooth: bool,
+    pub analytics_sparkline_hover: Option<(usize, f64)>,
+    pub analytics_grouped_stacked: bool,
+    pub analytics_breakdown_ratio_mode: bool,
     pub analytics_line_selection: Option<(f64, f64)>,
     pub analytics_hidden_models: Vec<SharedString>,
+
+    // Native Desktop & Windows App Builder showcase state
+    pub native_hotkey_recorder: Entity<ShortcutRecorderState>,
+    pub native_hotkey_manager: GlobalHotKeyManager,
+    pub native_hotkey_hits: usize,
+    pub native_tray_active: bool,
+    pub native_tray_clicks: usize,
+    pub native_autostart_enabled: bool,
+    pub native_autostart_status: SharedString,
+    pub native_last_dialog_result: SharedString,
+    pub native_last_context_action: SharedString,
+    pub native_last_capture_status: SharedString,
+    pub native_floating_window: Option<AnyWindowHandle>,
+    pub native_floating_view: Option<Entity<FloatingPaneDemoView>>,
+    pub native_floating_opacity: f32,
+    pub native_floating_blur: f32,
+    pub native_floating_radius: f32,
+    pub native_floating_docked: bool,
+    pub native_floating_click_through: bool,
+    pub native_launcher_window: Option<AnyWindowHandle>,
+    pub native_launcher_palette: Option<Entity<CommandPaletteState>>,
+    pub native_launcher_visible: bool,
+    pub native_tooltip_mgr: NativeTooltipManager,
+    pub native_confirm_reset: Entity<ConfirmButtonState>,
+    pub native_excluded_apps: Entity<StringListState>,
+    pub native_stepper_blur: f64,
+    pub native_stepper_opacity: f64,
+    pub native_swatch_color: Option<Hsla>,
+    pub native_backdrop_kind: SimulatedBackdropKind,
+    pub native_toolbar_tool: SharedString,
+    pub native_status_pulsing: bool,
 
     // Interactive & Blur showcase state
     pub command_palette: Entity<CommandPaletteState>,
@@ -359,20 +411,29 @@ impl PlaygroundApp {
 
     pub fn apply_freeform_event(&mut self, ev: &FreeformCanvasEvent, cx: &mut Context<Self>) {
         match ev {
-            FreeformCanvasEvent::Select(id) => {
-                if let Some(id) = id {
-                    self.log_event("FreeformCanvas", format!("Select({id})"), cx);
+            FreeformCanvasEvent::Select(ids) => {
+                if !ids.is_empty() {
+                    self.log_event("FreeformCanvas", format!("Select({} item(s))", ids.len()), cx);
                 }
             }
-            FreeformCanvasEvent::Move { id, rect } => {
-                if let Some(it) = self.freeform_items.iter_mut().find(|it| it.id == *id) {
-                    it.rect = *rect;
+            FreeformCanvasEvent::Move(moves) => {
+                for (id, rect) in moves {
+                    if let Some(it) = self.freeform_items.iter_mut().find(|it| it.id == *id) {
+                        it.rect = *rect;
+                    }
                 }
-                self.log_event(
-                    "FreeformCanvas",
-                    format!("Move {id} -> ({}, {})", rect.x as i32, rect.y as i32),
-                    cx,
-                );
+                if let Some((id, rect)) = moves.first() {
+                    self.log_event(
+                        "FreeformCanvas",
+                        format!(
+                            "Move {} item(s) ({id} -> {}, {})",
+                            moves.len(),
+                            rect.x as i32,
+                            rect.y as i32
+                        ),
+                        cx,
+                    );
+                }
             }
             FreeformCanvasEvent::Resize { id, rect, committed } => {
                 if let Some(it) = self.freeform_items.iter_mut().find(|it| it.id == *id) {
@@ -403,9 +464,9 @@ impl PlaygroundApp {
                     cx,
                 );
             }
-            FreeformCanvasEvent::Remove(id) => {
-                self.freeform_items.retain(|it| it.id != *id);
-                self.log_event("FreeformCanvas", format!("Remove({id})"), cx);
+            FreeformCanvasEvent::Remove(ids) => {
+                self.freeform_items.retain(|it| !ids.contains(&it.id));
+                self.log_event("FreeformCanvas", format!("Remove({} item(s))", ids.len()), cx);
             }
             FreeformCanvasEvent::ResizeCanvas { size, committed } => {
                 self.freeform_size = *size;
@@ -425,16 +486,53 @@ impl PlaygroundApp {
     }
 
     pub fn align_freeform_selected(&mut self, action: AlignAction, cx: &mut Context<Self>) {
-        let Some(id) = self.freeform_canvas.read(cx).selected().cloned() else {
+        let selected_ids: Vec<SharedString> = self.freeform_canvas.read(cx).selected_ids().to_vec();
+        if selected_ids.is_empty() {
             return;
-        };
+        }
         let snap = self.freeform_canvas.read(cx).current_snap();
         let canvas = self.freeform_size;
-        if let Some(it) = self.freeform_items.iter_mut().find(|it| it.id == id) {
-            it.rect = align_item(it.rect, canvas, snap.canvas_padding, snap.grid, action);
-            self.log_event("FreeformCanvas", format!("Align {id} -> {action:?}"), cx);
+        if selected_ids.len() == 1 {
+            let id = &selected_ids[0];
+            if let Some(it) = self.freeform_items.iter_mut().find(|it| it.id == *id) {
+                it.rect = align_item(it.rect, canvas, snap.canvas_padding, snap.grid, action);
+                self.log_event("FreeformCanvas", format!("Align {id} -> {action:?}"), cx);
+            }
+        } else {
+            let indices: Vec<usize> = self
+                .freeform_items
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, it)| selected_ids.contains(&it.id).then_some(idx))
+                .collect();
+            let rects: Vec<CanvasRect> = indices.iter().map(|&i| self.freeform_items[i].rect).collect();
+            let aligned = align_items(&rects, canvas, snap.canvas_padding, snap.grid, action);
+            for (idx, rect) in indices.into_iter().zip(aligned) {
+                self.freeform_items[idx].rect = rect;
+            }
+            self.log_event(
+                "FreeformCanvas",
+                format!("Align {} items -> {action:?}", selected_ids.len()),
+                cx,
+            );
         }
         cx.notify();
+    }
+
+    pub fn bring_freeform_forward(&mut self, cx: &mut Context<Self>) {
+        let selected_ids: Vec<SharedString> = self.freeform_canvas.read(cx).selected_ids().to_vec();
+        if bring_forward_many(&mut self.freeform_items, |it| selected_ids.contains(&it.id)) {
+            self.log_event("FreeformCanvas", "Bring selected forward", cx);
+            cx.notify();
+        }
+    }
+
+    pub fn send_freeform_backward(&mut self, cx: &mut Context<Self>) {
+        let selected_ids: Vec<SharedString> = self.freeform_canvas.read(cx).selected_ids().to_vec();
+        if send_backward_many(&mut self.freeform_items, |it| selected_ids.contains(&it.id)) {
+            self.log_event("FreeformCanvas", "Send selected backward", cx);
+            cx.notify();
+        }
     }
 
     pub fn reset_freeform_demo(&mut self, cx: &mut Context<Self>) {
@@ -927,6 +1025,14 @@ impl PlaygroundApp {
                 .icon(LucideIcon::Sparkles)
                 .shortcut(&["G", "I"])
                 .keywords("blur spin loading drawer split rating copy otp stepper"),
+            CommandItem::new("nav-native-desktop", "Desktop & Windows")
+                .group("Navigation")
+                .subtitle("Floating popups, standalone launcher, hotkeys, tray & window chrome")
+                .icon(LucideIcon::AppWindow)
+                .shortcut(&["G", "D"])
+                .keywords("desktop windows popup launcher tray hotkey autostart titlebar chrome")
+                .action(CommandAction::new("open-spotlight", "Open Quick Launcher"))
+                .action(CommandAction::new("toggle-tray", "Toggle System Tray Icon")),
             CommandItem::new("nav-data-trees", "Trees, Lists & Tables")
                 .group("Navigation")
                 .subtitle("Tree, VirtualTable, Expandable Rows, VirtualList, Descriptions & Timeline")
@@ -1001,6 +1107,7 @@ impl PlaygroundApp {
                 CommandPaletteEvent::Execute(id) => {
                     this.log_event("CommandPalette", format!("Execute(\"{id}\")"), cx);
                     match id.as_ref() {
+                        "nav-native-desktop" => this.page = Page::NativeDesktop,
                         "nav-interactive" => this.page = Page::InteractiveBlur,
                         "nav-data-trees" => this.page = Page::DataTrees,
                         "nav-pickers-forms" => this.page = Page::PickersForms,
@@ -1033,6 +1140,22 @@ impl PlaygroundApp {
                             let mode = cx.theme().mode;
                             this.apply_theme(mode, cx);
                         }
+                        _ => {}
+                    }
+                    cx.notify();
+                }
+                CommandPaletteEvent::ExecuteAction {
+                    command_id,
+                    action_id,
+                } => {
+                    this.log_event(
+                        "CommandPalette",
+                        format!("ExecuteAction({command_id}::{action_id})"),
+                        cx,
+                    );
+                    match action_id.as_ref() {
+                        "open-spotlight" => this.show_native_spotlight_launcher(cx),
+                        "toggle-tray" => this.toggle_native_tray(cx),
                         _ => {}
                     }
                     cx.notify();
@@ -1772,6 +1895,164 @@ impl PlaygroundApp {
         )
         .detach();
 
+        // --- Native Desktop & Windows App Builder state ---
+        let default_hotkey = GlobalHotKey::parse("Ctrl+Alt+Space").ok();
+        let mut native_hotkey_manager = GlobalHotKeyManager::new();
+        if let Some(ref hk) = default_hotkey {
+            let mut specs = HashMap::new();
+            specs.insert(SharedString::from("spotlight"), hk.clone());
+            let _ = native_hotkey_manager.apply(specs, cx);
+        }
+        let native_hotkey_recorder = cx.new(|cx| {
+            ShortcutRecorderState::new(default_hotkey, cx).validator(|hk, cx| {
+                if cx.is_global_hotkey_available(hk.clone()) {
+                    Ok(())
+                } else {
+                    Err(SharedString::from(format!(
+                        "{} is already claimed by another app.",
+                        hk.display_platform()
+                    )))
+                }
+            })
+        });
+        cx.subscribe(
+            &native_hotkey_recorder,
+            |this, rec, ev: &ShortcutRecorderEvent, cx| match ev {
+                ShortcutRecorderEvent::StartRecording => {
+                    this.native_hotkey_manager.suspend(cx);
+                    this.log_event("ShortcutRecorder", "recording (hotkeys suspended)", cx);
+                }
+                ShortcutRecorderEvent::CancelRecording => {
+                    let _ = this.native_hotkey_manager.resume(cx);
+                    this.log_event("ShortcutRecorder", "cancelled (hotkeys resumed)", cx);
+                }
+                ShortcutRecorderEvent::Change(next) => {
+                    let _ = this.native_hotkey_manager.resume(cx);
+                    let mut specs = HashMap::new();
+                    if let Some(hk) = next.clone() {
+                        specs.insert(SharedString::from("spotlight"), hk);
+                    }
+                    match this.native_hotkey_manager.apply(specs, cx) {
+                        Ok(()) => {
+                            let label = next
+                                .as_ref()
+                                .map(GlobalHotKey::display_platform)
+                                .unwrap_or_else(|| "Unbound".to_owned());
+                            this.log_event("GlobalHotKey", format!("bound -> {label}"), cx);
+                        }
+                        Err(err) => {
+                            let msg = SharedString::from(err.to_string());
+                            rec.update(cx, |r, cx| r.set_error(Some(msg.clone()), cx));
+                            this.log_event("GlobalHotKey", format!("bind failed: {msg}"), cx);
+                        }
+                    }
+                    cx.notify();
+                }
+            },
+        )
+        .detach();
+
+        {
+            let weak_app = cx.entity().downgrade();
+            cx.on_global_hotkey(move |id, cx| {
+                if let Some(app) = weak_app.upgrade() {
+                    app.update(cx, |this, cx| {
+                        this.native_hotkey_hits += 1;
+                        let name = this
+                            .native_hotkey_manager
+                            .name_for_id(id)
+                            .cloned()
+                            .unwrap_or_else(|| SharedString::from("hotkey"));
+                        this.log_event(
+                            "GlobalHotKey",
+                            format!("fired '{name}' (#{})", this.native_hotkey_hits),
+                            cx,
+                        );
+                        if name.as_ref() == "spotlight" {
+                            this.show_native_spotlight_launcher(cx);
+                        }
+                        cx.notify();
+                    });
+                }
+            });
+        }
+        {
+            let weak_app = cx.entity().downgrade();
+            cx.on_tray_event(move |ev, cx| {
+                if let Some(app) = weak_app.upgrade() {
+                    app.update(cx, |this, cx| {
+                        this.native_tray_clicks += 1;
+                        match ev {
+                            TrayEvent::LeftClick | TrayEvent::DoubleClick => {
+                                this.log_event("SystemTray", "clicked tray icon", cx);
+                                this.show_native_spotlight_launcher(cx);
+                            }
+                            TrayEvent::MenuItem(id) => {
+                                this.log_event("SystemTray", format!("menu -> '{id}'"), cx);
+                                match id.as_ref() {
+                                    "open-spotlight" => this.show_native_spotlight_launcher(cx),
+                                    "remove-tray" => this.toggle_native_tray(cx),
+                                    "quit" => cx.quit(),
+                                    _ => {}
+                                }
+                            }
+                            TrayEvent::RightClick => {
+                                this.log_event("SystemTray", "right-click", cx);
+                            }
+                        }
+                        cx.notify();
+                    });
+                }
+            });
+        }
+
+        let native_autostart_enabled = cx.is_launch_at_login("GPUIPlayground").unwrap_or(false);
+        let native_autostart_status: SharedString = if native_autostart_enabled {
+            "Registered in OS startup (HKCU\\...\\Run / LaunchAgent / XDG)".into()
+        } else {
+            "Not registered for startup (toggle to write OS autostart entry)".into()
+        };
+
+        let native_confirm_reset = cx.new(|cx| {
+            ConfirmButtonState::new("Reset Defaults", "Click again to confirm", cx)
+                .icon(LucideIcon::RotateCcw)
+                .size(ComponentSize::Sm)
+        });
+        cx.subscribe(&native_confirm_reset, |this, _, ev: &ConfirmButtonEvent, cx| {
+            match ev {
+                ConfirmButtonEvent::Armed => {
+                    this.log_event("ConfirmButton", "armed (auto-disarms in 4s)", cx);
+                }
+                ConfirmButtonEvent::Confirmed => {
+                    this.log_event("ConfirmButton", "confirmed reset", cx);
+                    this.push_toast(
+                        ToastVariant::Info,
+                        "Settings restored",
+                        Some("Two-click ConfirmButton executed."),
+                        cx,
+                    );
+                }
+                ConfirmButtonEvent::Disarmed => {
+                    this.log_event("ConfirmButton", "disarmed", cx);
+                }
+            }
+        })
+        .detach();
+
+        let native_excluded_apps = cx.new(|cx| {
+            StringListState::new(
+                ["docs.example.com", "api.example.com", "cdn.example.com"],
+                "Add domain (e.g. app.example.com)...",
+                cx,
+            )
+            .add_label("Add")
+        });
+        cx.subscribe(&native_excluded_apps, |this, _, ev: &StringListEvent, cx| {
+            let StringListEvent::Change(items) = ev;
+            this.log_event("StringList", format!("{} items", items.len()), cx);
+        })
+        .detach();
+
         let mut app = Self {
             page: Page::InteractiveBlur,
             accent: AccentPreset::Indigo,
@@ -1901,8 +2182,42 @@ impl PlaygroundApp {
             analytics_metric: "cost".into(),
             analytics_refresh_seed: 0,
             analytics_drag_zoom_enabled: true,
+            analytics_line_smooth: true,
+            analytics_sparkline_hover: None,
+            analytics_grouped_stacked: true,
+            analytics_breakdown_ratio_mode: false,
             analytics_line_selection: None,
             analytics_hidden_models: Vec::new(),
+
+            native_hotkey_recorder,
+            native_hotkey_manager,
+            native_hotkey_hits: 0,
+            native_tray_active: false,
+            native_tray_clicks: 0,
+            native_autostart_enabled,
+            native_autostart_status,
+            native_last_dialog_result: "No dialog run yet".into(),
+            native_last_context_action: "None yet".into(),
+            native_last_capture_status: "Not captured yet".into(),
+            native_floating_window: None,
+            native_floating_view: None,
+            native_floating_opacity: 0.72,
+            native_floating_blur: 16.0,
+            native_floating_radius: 14.0,
+            native_floating_docked: false,
+            native_floating_click_through: false,
+            native_launcher_window: None,
+            native_launcher_palette: None,
+            native_launcher_visible: false,
+            native_tooltip_mgr: NativeTooltipManager::new(),
+            native_confirm_reset,
+            native_excluded_apps,
+            native_stepper_blur: 16.0,
+            native_stepper_opacity: 72.0,
+            native_swatch_color: Some(rgb(0x6366F1).into()),
+            native_backdrop_kind: SimulatedBackdropKind::Wallpaper,
+            native_toolbar_tool: "heading".into(),
+            native_status_pulsing: true,
 
             command_palette,
             drawer_open: false,
@@ -2043,7 +2358,7 @@ impl PlaygroundApp {
                     cx,
                 );
             }
-            InputEvent::Focus | InputEvent::Blur => {}
+            InputEvent::Focus | InputEvent::Blur | InputEvent::CommittedChange(_) => {}
         })
         .detach();
         entity
@@ -2156,7 +2471,520 @@ impl PlaygroundApp {
         if let Some(handle) = self.active_native_dialog.take() {
             let _ = handle.update(cx, |_, window, _| window.remove_window());
         }
+        if let Some(handle) = self.native_floating_window.take() {
+            let _ = handle.update(cx, |_, window, _| window.remove_window());
+        }
+        self.native_floating_view = None;
+        if let Some(handle) = self.native_launcher_window.take() {
+            let _ = handle.update(cx, |_, window, _| window.remove_window());
+        }
+        self.native_launcher_palette = None;
+        self.native_launcher_visible = false;
+        self.native_tooltip_mgr.teardown(cx);
+        if self.native_tray_active {
+            cx.remove_tray_icon();
+            self.native_tray_active = false;
+        }
         self.native_toasts.dismiss_all(cx);
+    }
+
+    pub fn toggle_native_floating_window(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(handle) = self.native_floating_window.take() {
+            self.native_floating_view = None;
+            self.native_floating_docked = false;
+            self.native_floating_click_through = false;
+            self.native_tooltip_mgr.hide(cx);
+            let _ = handle.update(cx, |_, win, _| win.remove_window());
+            self.log_event("FloatingPane", "closed floating frosted window", cx);
+            cx.notify();
+            return;
+        }
+
+        let display = cx.display_at_cursor().or_else(|| cx.primary_display());
+        let scale = display.as_ref().map_or(1.0, |d| d.scale_factor());
+        let work = display.as_ref().map_or(
+            ScreenRect::from_xywh(0, 0, 1440, 900),
+            |d| {
+                let b = d.visible_desktop_bounds();
+                ScreenRect::from_xywh(
+                    f32::from(b.origin.x).round() as i32,
+                    f32::from(b.origin.y).round() as i32,
+                    f32::from(b.size.width).round() as i32,
+                    f32::from(b.size.height).round() as i32,
+                )
+            },
+        );
+        let w_logical = 320.0_f32;
+        let h_logical = 156.0_f32;
+        let x_logical = (work.right as f32 / scale) - w_logical - 28.0;
+        let y_logical = (work.top as f32 / scale) + 84.0;
+
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                point(px(x_logical.max(20.0)), px(y_logical.max(20.0))),
+                size(px(w_logical), px(h_logical)),
+            ))),
+            titlebar: None,
+            focus: false,
+            show: true,
+            kind: WindowKind::PopUp,
+            is_movable: true,
+            is_resizable: false,
+            is_minimizable: false,
+            display_id: display.as_ref().map(|d| d.id()),
+            window_background: WindowBackgroundAppearance::Blurred,
+            window_decorations: Some(WindowDecorations::Client),
+            always_on_top: true,
+            skip_taskbar: true,
+            non_activating: true,
+            click_through: self.native_floating_click_through,
+            window_corner_preference: WindowCornerPreference::Round,
+            hide_window_border: true,
+            backdrop_corner_radius: Some(px(self.native_floating_radius)),
+            backdrop_blur_radius: Some(px(self.native_floating_blur)),
+            ..Default::default()
+        };
+
+        let opacity = self.native_floating_opacity;
+        let blur = self.native_floating_blur;
+        let radius = self.native_floating_radius;
+        let tip_mgr = self.native_tooltip_mgr.clone();
+        let weak_dock = cx.entity().downgrade();
+        let weak_close = cx.entity().downgrade();
+        let mut created_view: Option<Entity<FloatingPaneDemoView>> = None;
+
+        match cx.open_window(options, |_win, cx| {
+            let view = cx.new(|_| FloatingPaneDemoView {
+                opacity,
+                blur_radius: blur,
+                corner_radius: radius,
+                tooltip_mgr: tip_mgr,
+                on_dock: Rc::new(move |cx| {
+                    if let Some(app) = weak_dock.upgrade() {
+                        app.update(cx, |this, cx| this.toggle_native_floating_dock(cx));
+                    }
+                }),
+                on_close: Rc::new(move |cx| {
+                    if let Some(app) = weak_close.upgrade() {
+                        app.update(cx, |this, cx| {
+                            this.native_floating_window = None;
+                            this.native_floating_view = None;
+                            this.native_floating_docked = false;
+                            this.native_tooltip_mgr.hide(cx);
+                            cx.notify();
+                        });
+                    }
+                }),
+            });
+            created_view = Some(view.clone());
+            view
+        }) {
+            Ok(handle) => {
+                self.native_floating_window = Some(handle.into());
+                self.native_floating_view = created_view;
+                self.log_event("FloatingPane", "opened always-on-top frosted floating window", cx);
+            }
+            Err(err) => {
+                self.log_event("FloatingPane", format!("open failed: {err}"), cx);
+            }
+        }
+        cx.notify();
+    }
+
+    pub fn set_native_floating_style(
+        &mut self,
+        opacity: f32,
+        blur: f32,
+        radius: f32,
+        cx: &mut Context<Self>,
+    ) {
+        self.native_floating_opacity = opacity;
+        self.native_floating_blur = blur;
+        self.native_floating_radius = radius;
+        if let Some(ref view) = self.native_floating_view {
+            view.update(cx, |v, cx| {
+                v.opacity = opacity;
+                v.blur_radius = blur;
+                v.corner_radius = radius;
+                cx.notify();
+            });
+        }
+        if let Some(win) = self.native_floating_window {
+            let _ = win.update(cx, |_, window, _| {
+                window.set_backdrop_blur_radius(px(blur));
+            });
+        }
+        cx.notify();
+    }
+
+    pub fn set_native_floating_click_through(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.native_floating_click_through = enabled;
+        if let Some(win) = self.native_floating_window {
+            let _ = win.update(cx, |_, window, _| {
+                window.set_click_through(enabled);
+            });
+        }
+        self.log_event("FloatingPane", format!("click_through -> {enabled}"), cx);
+        cx.notify();
+    }
+
+    pub fn toggle_native_floating_dock(&mut self, cx: &mut Context<Self>) {
+        let Some(win) = self.native_floating_window else {
+            return;
+        };
+        self.native_floating_docked = !self.native_floating_docked;
+        let display = cx.display_at_cursor().or_else(|| cx.primary_display());
+        let scale = display.as_ref().map_or(1.0, |d| d.scale_factor());
+        let work = display.as_ref().map_or(
+            ScreenRect::from_xywh(0, 0, 1440, 900),
+            |d| {
+                let b = d.visible_desktop_bounds();
+                ScreenRect::from_xywh(
+                    f32::from(b.origin.x).round() as i32,
+                    f32::from(b.origin.y).round() as i32,
+                    f32::from(b.size.width).round() as i32,
+                    f32::from(b.size.height).round() as i32,
+                )
+            },
+        );
+        let mon = MonitorRects::uniform(work);
+        let win_w = (320.0 * scale).round() as i32;
+        let win_h = (156.0 * scale).round() as i32;
+        let (tx, ty) = if self.native_floating_docked {
+            let dock = DockState {
+                edge: DockEdge::Right,
+                edge_coord: work.right,
+                center_along: work.top + (work.height() / 4),
+                restore_x: work.center_x() - win_w / 2,
+                restore_y: work.top + (80.0 * scale) as i32,
+            };
+            resolve_dock_origin(dock, win_w, win_h, &[mon])
+        } else {
+            (work.center_x() - win_w / 2, work.top + (80.0 * scale) as i32)
+        };
+        let _ = win.update(cx, |_, window, _| {
+            let phys = Bounds::new(
+                point(DevicePixels(tx), DevicePixels(ty)),
+                size(DevicePixels(win_w), DevicePixels(win_h)),
+            );
+            if !window.set_physical_bounds(phys, Some(true))
+                && let Some(ref disp) = display
+            {
+                window.set_bounds_on_display(
+                    disp.as_ref(),
+                    Bounds::new(
+                        point(px((tx - work.left) as f32 / scale), px((ty - work.top) as f32 / scale)),
+                        size(px(320.), px(156.)),
+                    ),
+                    false,
+                );
+            }
+        });
+        self.log_event(
+            "FloatingPane",
+            if self.native_floating_docked {
+                "docked to right screen edge via resolve_dock_origin"
+            } else {
+                "undocked to work-area center"
+            },
+            cx,
+        );
+        cx.notify();
+    }
+
+    pub fn show_native_spotlight_launcher(&mut self, cx: &mut Context<Self>) {
+        let display = cx.display_at_cursor().or_else(|| cx.primary_display());
+        let scale = display.as_ref().map_or(1.0, |d| d.scale_factor());
+        let work = display.as_ref().map_or(
+            ScreenRect::from_xywh(0, 0, 1440, 900),
+            |d| {
+                let b = d.visible_desktop_bounds();
+                ScreenRect::from_xywh(
+                    f32::from(b.origin.x).round() as i32,
+                    f32::from(b.origin.y).round() as i32,
+                    f32::from(b.size.width).round() as i32,
+                    f32::from(b.size.height).round() as i32,
+                )
+            },
+        );
+        let lw_logical = 600.0_f32;
+        let lh_logical = 400.0_f32;
+        let rect = place_launcher_rect(
+            work,
+            (lw_logical * scale).round() as i32,
+            (lh_logical * scale).round() as i32,
+        );
+
+        if let (Some(win), Some(palette)) =
+            (self.native_launcher_window, self.native_launcher_palette.clone())
+        {
+            let res = win.update(cx, |_, window, cx| {
+                let phys = Bounds::new(
+                    point(DevicePixels(rect.left), DevicePixels(rect.top)),
+                    size(DevicePixels(rect.width()), DevicePixels(rect.height())),
+                );
+                if !window.set_physical_bounds(phys, Some(true))
+                    && let Some(ref disp) = display
+                {
+                    window.set_bounds_on_display(
+                        disp.as_ref(),
+                        Bounds::new(
+                            point(
+                                px((rect.left - work.left) as f32 / scale),
+                                px((rect.top - work.top) as f32 / scale),
+                            ),
+                            size(px(lw_logical), px(lh_logical)),
+                        ),
+                        true,
+                    );
+                }
+                palette.update(cx, |p, cx| p.focus_search(window, cx));
+                window.set_cloaked(false);
+                window.paint_now();
+                window.show();
+                window.activate_window();
+            });
+            if res.is_ok() {
+                self.native_launcher_visible = true;
+                self.log_event("Spotlight", "revealed pre-created popup via place_launcher_rect", cx);
+                cx.notify();
+                return;
+            }
+            self.native_launcher_window = None;
+            self.native_launcher_palette = None;
+        }
+
+        let items = vec![
+            CommandItem::new("new-doc", "New Document")
+                .group("Workspace")
+                .subtitle("Acronym match: 'nd' · Press Tab for secondary actions")
+                .icon(LucideIcon::FilePlus)
+                .action(CommandAction::new("from-template", "From Template"))
+                .action(CommandAction::new("copy-link", "Copy Reference Link")),
+            CommandItem::new("open-ws", "Open Workspace")
+                .group("Workspace")
+                .subtitle("Acronym match: 'ow' · Ctrl/Cmd+2 quick slot")
+                .icon(LucideIcon::FolderOpen)
+                .action(CommandAction::new("new-window", "Open in New Window")),
+            CommandItem::new("proj-settings", "Project Settings")
+                .group("Preferences")
+                .subtitle("Acronym match: 'ps'")
+                .icon(LucideIcon::Settings),
+            CommandItem::new("export-report", "Export Report")
+                .group("Actions")
+                .subtitle("Acronym match: 'er'")
+                .icon(LucideIcon::Download),
+            CommandItem::new("pg-analytics", "Switch to Analytics & Charts")
+                .group("Playground")
+                .subtitle("Navigate the main playground window")
+                .icon(LucideIcon::ChartColumnStacked),
+            CommandItem::new("pg-theme-toggle", "Toggle Light / Dark Mode")
+                .group("Playground")
+                .subtitle("Update the global theme across windows")
+                .icon(LucideIcon::SunMoon),
+        ];
+
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                point(px(rect.left as f32 / scale), px(rect.top as f32 / scale)),
+                size(px(lw_logical), px(lh_logical)),
+            ))),
+            titlebar: None,
+            focus: true,
+            show: true,
+            kind: WindowKind::PopUp,
+            is_movable: true,
+            is_resizable: false,
+            is_minimizable: false,
+            display_id: display.as_ref().map(|d| d.id()),
+            window_background: WindowBackgroundAppearance::Blurred,
+            window_decorations: Some(WindowDecorations::Client),
+            always_on_top: true,
+            skip_taskbar: true,
+            window_corner_preference: WindowCornerPreference::Round,
+            hide_window_border: true,
+            backdrop_corner_radius: Some(px(14.)),
+            backdrop_blur_radius: Some(px(20.)),
+            ..Default::default()
+        };
+
+        let weak_app = cx.entity().downgrade();
+        let mut created_palette: Option<Entity<CommandPaletteState>> = None;
+
+        match cx.open_window(options, |window, cx| {
+            let weak_for_events = weak_app.clone();
+            let weak_for_blur = weak_app.clone();
+            let palette = cx.new(|cx| {
+                let p = CommandPaletteState::new(items, cx)
+                    .standalone(true)
+                    .quick_slots(true)
+                    .placeholder("Search commands (try 'nd', 'ow', Tab for actions)...", cx);
+                cx.observe_window_activation(window, move |_, win, cx| {
+                    if !win.is_window_active() {
+                        win.hide();
+                        if let Some(app) = weak_for_blur.upgrade() {
+                            app.update(cx, |this, cx| {
+                                this.native_launcher_visible = false;
+                                cx.notify();
+                            });
+                        }
+                    }
+                })
+                .detach();
+                p
+            });
+            cx.subscribe(&palette, move |_, ev: &CommandPaletteEvent, cx| {
+                if let Some(app) = weak_for_events.upgrade() {
+                    app.update(cx, |this, cx| match ev {
+                        CommandPaletteEvent::Execute(id) => {
+                            this.log_event("Launcher", format!("Execute('{id}')"), cx);
+                            match id.as_ref() {
+                                "pg-analytics" => this.page = Page::Analytics,
+                                "pg-theme-toggle" => Theme::toggle_mode(cx),
+                                _ => {}
+                            }
+                            this.hide_native_spotlight_launcher(cx);
+                            this.push_toast(
+                                ToastVariant::Success,
+                                format!("Executed '{id}'"),
+                                Some("Dispatched from standalone command popup."),
+                                cx,
+                            );
+                        }
+                        CommandPaletteEvent::ExecuteAction {
+                            command_id,
+                            action_id,
+                        } => {
+                            this.log_event(
+                                "Launcher",
+                                format!("ExecuteAction({command_id}::{action_id})"),
+                                cx,
+                            );
+                            this.hide_native_spotlight_launcher(cx);
+                            this.push_toast(
+                                ToastVariant::Info,
+                                format!("Action: {command_id} → {action_id}"),
+                                None,
+                                cx,
+                            );
+                        }
+                        CommandPaletteEvent::Close => {
+                            this.hide_native_spotlight_launcher(cx);
+                        }
+                        CommandPaletteEvent::Open => {}
+                    });
+                }
+            })
+            .detach();
+            palette.update(cx, |p, cx| p.focus_search(window, cx));
+            created_palette = Some(palette.clone());
+            palette
+        }) {
+            Ok(handle) => {
+                self.native_launcher_window = Some(handle.into());
+                self.native_launcher_palette = created_palette;
+                self.native_launcher_visible = true;
+                self.log_event("Launcher", "created standalone command popup", cx);
+            }
+            Err(err) => {
+                self.log_event("Launcher", format!("open failed: {err}"), cx);
+            }
+        }
+        cx.notify();
+    }
+
+    pub fn hide_native_spotlight_launcher(&mut self, cx: &mut Context<Self>) {
+        if let Some(win) = self.native_launcher_window {
+            let _ = win.update(cx, |_, window, _| window.hide());
+        }
+        self.native_launcher_visible = false;
+        cx.notify();
+    }
+
+    pub fn toggle_native_tray(&mut self, cx: &mut Context<Self>) {
+        if self.native_tray_active {
+            cx.remove_tray_icon();
+            self.native_tray_active = false;
+            self.log_event("SystemTray", "removed tray icon", cx);
+            cx.notify();
+            return;
+        }
+        let opts = TrayIconOptions {
+            icon: TrayIconData::solid_badge(32, 99, 102, 241),
+            tooltip: "GPUI Playground".into(),
+            menu: vec![
+                TrayMenuItem::action("open-spotlight", "Open Quick Launcher"),
+                TrayMenuItem::separator(),
+                TrayMenuItem::action("remove-tray", "Remove Tray Icon"),
+                TrayMenuItem::action("quit", "Quit Playground"),
+            ],
+            menu_on_left_click: false,
+        };
+        match cx.set_tray_icon(opts) {
+            Ok(()) => {
+                self.native_tray_active = true;
+                self.log_event("SystemTray", "installed live OS tray icon + popup menu", cx);
+            }
+            Err(err) => {
+                self.log_event("SystemTray", format!("unavailable on this platform: {err}"), cx);
+                self.push_toast(
+                    ToastVariant::Warning,
+                    "Tray icon unavailable",
+                    Some(&err.to_string()),
+                    cx,
+                );
+            }
+        }
+        cx.notify();
+    }
+
+    pub fn set_native_autostart(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        let opts = AutostartOptions::new("GPUIPlayground").args(["--minimized"]);
+        match cx.set_launch_at_login(opts, enabled) {
+            Ok(()) => {
+                self.native_autostart_enabled = enabled;
+                self.native_autostart_status = if enabled {
+                    "Enabled — registered in OS startup".into()
+                } else {
+                    "Disabled — removed from OS startup".into()
+                };
+                self.log_event("Autostart", self.native_autostart_status.clone(), cx);
+            }
+            Err(err) => {
+                self.native_autostart_status = format!("Error: {err}").into();
+                self.log_event("Autostart", self.native_autostart_status.clone(), cx);
+            }
+        }
+        cx.notify();
+    }
+
+    pub fn push_action_toast(&mut self, cx: &mut Context<Self>) {
+        let id = self.next_toast_id;
+        self.next_toast_id += 1;
+        let weak = cx.entity().downgrade();
+        let item = ToastItem::new(id, "Changes saved")
+            .success()
+            .description("Inline action buttons work in both in-window and native OS toasts.")
+            .action("Undo", move |_, cx| {
+                if let Some(app) = weak.upgrade() {
+                    app.update(cx, |this, cx| {
+                        this.log_event("ToastAction", "clicked Undo", cx);
+                    });
+                }
+            });
+        match self.toast_presentation {
+            OverlayPresentation::InWindow => {
+                self.toasts.push(item);
+                if self.toasts.len() > 4 {
+                    self.toasts.remove(0);
+                }
+            }
+            OverlayPresentation::NativeWindow => {
+                self.native_toasts.position(self.toast_position);
+                let _ = self.native_toasts.push(item, None, cx);
+            }
+        }
+        cx.notify();
     }
 
     pub fn open_dialog(&mut self, destructive: bool, window: &mut Window, cx: &mut Context<Self>) {

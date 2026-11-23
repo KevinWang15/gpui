@@ -59,6 +59,7 @@ impl Render for PlaygroundApp {
 
         let page_content = match self.page {
             Page::Overview => pages::overview::render(self, cx).into_any_element(),
+            Page::NativeDesktop => pages::native_desktop::render(self, cx).into_any_element(),
             Page::InteractiveBlur => pages::interactive_blur::render(self, cx).into_any_element(),
             Page::DataTrees => pages::data_trees::render(self, cx).into_any_element(),
             Page::PickersForms => pages::pickers_forms::render(self, cx).into_any_element(),
@@ -81,7 +82,8 @@ impl Render for PlaygroundApp {
             (Page::DataTrees, LucideIcon::FolderTree, Some("7")),
             (Page::PickersForms, LucideIcon::SlidersHorizontal, Some("10")),
             (Page::MediaExtras, LucideIcon::WandSparkles, Some("10")),
-            (Page::Analytics, LucideIcon::ChartColumnStacked, Some("8")),
+            (Page::Analytics, LucideIcon::ChartColumnStacked, Some("10")),
+            (Page::NativeDesktop, LucideIcon::AppWindow, Some("11")),
             (Page::Buttons, LucideIcon::MousePointerClick, Some("3")),
             (Page::Inputs, LucideIcon::TextCursorInput, Some("4")),
             (Page::Controls, LucideIcon::ToggleRight, Some("4")),
@@ -630,6 +632,7 @@ mod tests {
 
         let all_pages = [
             Page::Overview,
+            Page::NativeDesktop,
             Page::InteractiveBlur,
             Page::DataTrees,
             Page::PickersForms,

@@ -9,6 +9,7 @@ pub mod inputs;
 pub mod interactive_blur;
 pub mod layout_page;
 pub mod media_extras;
+pub mod native_desktop;
 pub mod overlays_data;
 pub mod overview;
 pub mod pickers_forms;

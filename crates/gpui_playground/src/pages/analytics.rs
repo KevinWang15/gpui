@@ -134,6 +134,9 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
     let metric_key = app.analytics_metric.clone();
     let seed = app.analytics_refresh_seed;
     let drag_zoom_enabled = app.analytics_drag_zoom_enabled;
+    let line_smooth = app.analytics_line_smooth;
+    let grouped_stacked = app.analytics_grouped_stacked;
+    let breakdown_ratio_mode = app.analytics_breakdown_ratio_mode;
     let line_selection = app.analytics_line_selection;
     let hidden_models = &app.analytics_hidden_models;
     let scope_mult = match app.analytics_scope_select.read(cx).selected_value() {
@@ -271,8 +274,33 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
         .iter()
         .enumerate()
         .map(|(i, &(orig_idx, m))| {
-            BreakdownItem::new(m.name, model_totals_metric[i])
+            let (val, subtitle, delta, delta_col) = if breakdown_ratio_mode {
+                let cache_rate = (48.0 + (orig_idx as f64) * 9.5 + ((seed % 5) as f64) * 1.1).min(96.0);
+                let pp = if orig_idx % 2 == 0 { 2.4 } else { -1.1 };
+                (
+                    cache_rate,
+                    format!("{} hits", m.facet_hits),
+                    format!("{:+.1} pp", pp),
+                    Some(if pp >= 0.0 { theme.success } else { theme.destructive }),
+                )
+            } else {
+                let delta_pct = match orig_idx {
+                    0 => 8.4,
+                    1 => -4.2,
+                    2 => 12.1,
+                    _ => -1.8,
+                };
+                (
+                    model_totals_metric[i],
+                    format!("{} · {}", m.provider, m.key_scope),
+                    format!("{:+.1}%", delta_pct),
+                    Some(if delta_pct <= 0.0 { theme.success } else { theme.warning }),
+                )
+            };
+            BreakdownItem::new(m.name, val)
                 .key(m.name)
+                .subtitle(subtitle)
+                .delta(delta, delta_col)
                 .color(palette.color(orig_idx))
         })
         .collect();
@@ -463,6 +491,15 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
                                 cx,
                             );
                         })),
+                )
+                .child(
+                    toggle("analytics-smooth-toggle", line_smooth)
+                        .size(ComponentSize::Sm)
+                        .label("Monotone smooth")
+                        .on_change(cx.listener(|this, enabled: &bool, _, cx| {
+                            this.analytics_line_smooth = *enabled;
+                            this.log_event("LineChart", format!("smooth -> {}", *enabled), cx);
+                        })),
                 ),
         )
         .child(
@@ -521,7 +558,7 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
         .content(
             stacked_bar_chart("analytics-stacked-bar")
                 .series(bar_series)
-                .points(bar_points)
+                .points(bar_points.clone())
                 .height(px(230.))
                 .value_format(value_format.clone())
                 .on_bar_click(cx.listener(|this, idx, _, cx| {
@@ -584,6 +621,7 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
         .content(
             line_chart("analytics-line-chart")
                 .series(line_series)
+                .smooth(line_smooth)
                 .x_domain(0.0, 24.0)
                 .x_ticks([
                     (0.0, "00:00".into()),
@@ -626,21 +664,154 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
         );
     }
 
-    let breakdown_card = chart_card("card-breakdown", format!("{metric_title} by model"))
-        .subtitle(format!("{span_days} days · click to narrow"))
-        .content(
-            breakdown_list("analytics-breakdown")
-                .items(breakdown_items)
-                .value_format(value_format)
-                .selected_key(selected_model_key)
-                .hint(if clauses.is_empty() {
-                    "Click any model to toggle a FilterBar chip."
-                } else {
-                    "Click the highlighted model again to clear the filter."
-                })
-                .on_select(move |key, _, cx| {
-                    filter_entity.update(cx, |s, cx| s.toggle_narrow("model", key.clone(), cx));
-                }),
+    let breakdown_format = if breakdown_ratio_mode {
+        ChartValueFormat::Percent
+    } else {
+        value_format.clone()
+    };
+    let mut breakdown_widget = breakdown_list("analytics-breakdown")
+        .items(breakdown_items)
+        .value_format(breakdown_format)
+        .selected_key(selected_model_key)
+        .hint(if clauses.is_empty() {
+            "Click any model to toggle a FilterBar chip."
+        } else {
+            "Click the highlighted model again to clear the filter."
+        })
+        .on_select(move |key, _, cx| {
+            filter_entity.update(cx, |s, cx| s.toggle_narrow("model", key.clone(), cx));
+        });
+    if breakdown_ratio_mode {
+        breakdown_widget = breakdown_widget.ratio_mode(Some(100.0));
+    }
+
+    let breakdown_card = chart_card(
+        "card-breakdown",
+        if breakdown_ratio_mode {
+            "Cache hit rate by model (Ratio Mode)".to_owned()
+        } else {
+            format!("{metric_title} by model")
+        },
+    )
+    .subtitle(format!("{span_days} days · click to narrow"))
+    .header_action(
+        toggle("analytics-ratio-mode", breakdown_ratio_mode)
+            .size(ComponentSize::Xs)
+            .label("Ratio %")
+            .on_change(cx.listener(|this, enabled: &bool, _, cx| {
+                this.analytics_breakdown_ratio_mode = *enabled;
+                this.log_event("BreakdownList", format!("ratio_mode -> {}", *enabled), cx);
+            })),
+    )
+    .content(breakdown_widget);
+
+    // Compact Sparkline & GroupedSparkline strip (ported from llm-usage-monitor)
+    let spark_today: Vec<f64> = bar_points.iter().rev().take(14).rev().map(|p| p.total()).collect();
+    let spark_baseline: Vec<f64> = spark_today
+        .iter()
+        .enumerate()
+        .map(|(i, v)| v * (0.92 + 0.14 * ((i as f64 * 0.7).sin())))
+        .collect();
+    let hover_caption = match app.analytics_sparkline_hover {
+        Some((idx, val)) => format!("Sample #{}: {}", idx + 1, value_format.format_detail(val)),
+        None => "Hover sparkline to scrub samples".to_owned(),
+    };
+    let grouped_series: Vec<GroupedSparklineSeries> = active_models
+        .iter()
+        .take(3)
+        .enumerate()
+        .map(|(i, &(orig_idx, m))| {
+            let vals: Vec<f64> = bar_points
+                .iter()
+                .rev()
+                .take(12)
+                .rev()
+                .map(|pt| pt.values.get(i).copied().unwrap_or(0.0))
+                .collect();
+            GroupedSparklineSeries::new(m.name, vals).color(palette.color(orig_idx))
+        })
+        .collect();
+
+    let app_for_spark = cx.entity();
+    let sparkline_strip = grid(3)
+        .spacing(px(14.))
+        .child(
+            card()
+                .p(px(14.))
+                .child(
+                    v_stack()
+                        .spacing(px(8.))
+                        .child(
+                            h_stack()
+                                .justify_between()
+                                .child(div().text_size(px(12.5)).font_weight(FontWeight::SEMIBOLD).child("Area Sparkline + Baseline"))
+                                .child(trend_badge(-8.4).polarity(TrendPolarity::LowerIsBetter)),
+                        )
+                        .child(
+                            sparkline("analytics-spark-area", spark_today.clone())
+                                .baseline(spark_baseline)
+                                .smooth(line_smooth)
+                                .height(px(52.))
+                                .on_hover_sample(move |sample, _, cx| {
+                                    app_for_spark.update(cx, |this, cx| {
+                                        this.analytics_sparkline_hover = sample.map(|s| (s.index, s.value));
+                                        cx.notify();
+                                    });
+                                }),
+                        )
+                        .child(div().text_size(px(11.)).text_color(theme.muted_foreground).child(hover_caption)),
+                ),
+        )
+        .child(
+            card()
+                .p(px(14.))
+                .child(
+                    v_stack()
+                        .spacing(px(8.))
+                        .child(
+                            h_stack()
+                                .justify_between()
+                                .child(div().text_size(px(12.5)).font_weight(FontWeight::SEMIBOLD).child("Bar Sparkline (14d)"))
+                                .child(TrendBadge::percentage_points(2.1)),
+                        )
+                        .child(
+                            sparkline("analytics-spark-bars", spark_today)
+                                .kind(SparklineKind::Bars)
+                                .color(palette.color(1))
+                                .height(px(52.)),
+                        )
+                        .child(div().text_size(px(11.)).text_color(theme.muted_foreground).child("Tight autoscaling + hover highlight")),
+                ),
+        )
+        .child(
+            card()
+                .p(px(14.))
+                .child(
+                    v_stack()
+                        .spacing(px(8.))
+                        .child(
+                            h_stack()
+                                .justify_between()
+                                .child(div().text_size(px(12.5)).font_weight(FontWeight::SEMIBOLD).child("GroupedSparkline"))
+                                .child(
+                                    button("analytics-grouped-toggle")
+                                        .ghost()
+                                        .size(ComponentSize::Xs)
+                                        .label(if grouped_stacked { "Stacked" } else { "Lines" })
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.analytics_grouped_stacked = !this.analytics_grouped_stacked;
+                                            cx.notify();
+                                        })),
+                                ),
+                        )
+                        .child(
+                            grouped_sparkline("analytics-spark-grouped", grouped_series)
+                                .stacked_bars(grouped_stacked)
+                                .smooth(line_smooth)
+                                .height(px(52.)),
+                        )
+                        .child(div().text_size(px(11.)).text_color(theme.muted_foreground).child("Click button to flip stacked bars ↔ lines")),
+                ),
         );
 
     let split_charts = div()
@@ -685,6 +856,7 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
         .child(filter_bar("analytics-filter-bar", &app.analytics_filter))
         .child(toolbar_row)
         .child(stats_strip)
+        .child(sparkline_strip)
         .child(stacked_card)
         .child(split_charts)
 }

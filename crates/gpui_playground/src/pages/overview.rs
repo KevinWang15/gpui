@@ -18,7 +18,13 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
             Page::Analytics,
             LucideIcon::ChartColumnStacked,
             "Analytics & Charts",
-            "StackedBarChart, LineChart, BreakdownList, FilterBar, TimeRangePicker, StatGroup & radial ThemeSwitcher.",
+            "StackedBarChart, LineChart, Sparkline, BreakdownList, FilterBar, TimeRangePicker, StatGroup & radial ThemeSwitcher.",
+        ),
+        (
+            Page::NativeDesktop,
+            LucideIcon::AppWindow,
+            "Desktop & Windows",
+            "Floating translucent windows, standalone launcher, ShortcutRecorder, WindowTitleBar, StatusBar, CompactStepper & OS hooks.",
         ),
         (
             Page::Buttons,

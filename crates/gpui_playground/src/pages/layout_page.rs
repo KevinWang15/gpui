@@ -241,7 +241,6 @@ fn freeform_canvas_demo(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) ->
     let snap_cfg = app.freeform_canvas.read(cx).current_snap();
     let show_grid = app.freeform_canvas.read(cx).is_grid_visible();
     let snap_on = snap_cfg.snap_to_guides || snap_cfg.snap_to_grid;
-    let selected = app.freeform_canvas.read(cx).selected().cloned();
 
     let palette_specs: [(&str, &str, LucideIcon, (f32, f32)); 5] = [
         ("metric", "KPI metric", LucideIcon::DollarSign, (148.0, 56.0)),
@@ -305,11 +304,14 @@ fn freeform_canvas_demo(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) ->
         );
     }
 
+    let selected_count = app.freeform_canvas.read(cx).selected_ids().len();
+    let has_selected = selected_count > 0;
+
     let align_btn = |id: &'static str, icon: LucideIcon, tip: &'static str, action: AlignAction| {
         button::Button::icon(id, icon)
             .ghost()
             .size(ComponentSize::Xs)
-            .disabled(selected.is_none())
+            .disabled(!has_selected)
             .tooltip_text(tip)
             .on_click(cx.listener(move |this, _, _, cx| this.align_freeform_selected(action, cx)))
     };
@@ -401,7 +403,24 @@ fn freeform_canvas_demo(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) ->
                                             .child(align_btn("pg-fc-al-cv", LucideIcon::AlignCenterHorizontal, "Center vertically", AlignAction::CenterVertical))
                                             .child(align_btn("pg-fc-al-b", LucideIcon::AlignEndHorizontal, "Align bottom", AlignAction::Bottom))
                                             .child(align_btn("pg-fc-al-w", LucideIcon::MoveHorizontal, "Fill width", AlignAction::FillWidth))
-                                            .child(align_btn("pg-fc-al-g", LucideIcon::Grid3x3, "Snap to grid", AlignAction::SnapToGrid)),
+                                            .child(align_btn("pg-fc-al-g", LucideIcon::Grid3x3, "Snap to grid", AlignAction::SnapToGrid))
+                                            .child(toolbar_separator(cx))
+                                            .child(
+                                                button::Button::icon("pg-fc-z-fwd", LucideIcon::BringToFront)
+                                                    .ghost()
+                                                    .size(ComponentSize::Xs)
+                                                    .disabled(!has_selected)
+                                                    .tooltip_text("Bring selected forward")
+                                                    .on_click(cx.listener(|this, _, _, cx| this.bring_freeform_forward(cx))),
+                                            )
+                                            .child(
+                                                button::Button::icon("pg-fc-z-bwd", LucideIcon::SendToBack)
+                                                    .ghost()
+                                                    .size(ComponentSize::Xs)
+                                                    .disabled(!has_selected)
+                                                    .tooltip_text("Send selected backward")
+                                                    .on_click(cx.listener(|this, _, _, cx| this.send_freeform_backward(cx))),
+                                            ),
                                     )
                                     .child(
                                         div()
@@ -409,10 +428,15 @@ fn freeform_canvas_demo(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) ->
                                             .text_color(theme.muted_foreground)
                                             .font_features(tabular_numerals())
                                             .child(format!(
-                                                "Canvas {}×{} px · {} items",
+                                                "Canvas {}×{} px · {} items{}",
                                                 app.freeform_size.width as i32,
                                                 app.freeform_size.height as i32,
                                                 app.freeform_items.len(),
+                                                if selected_count > 0 {
+                                                    format!(" · {selected_count} selected")
+                                                } else {
+                                                    String::new()
+                                                },
                                             )),
                                     ),
                             )
