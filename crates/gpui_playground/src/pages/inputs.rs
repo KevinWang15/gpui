@@ -485,6 +485,88 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
                     ),
                 ),
         )
+        // PathInput Autocomplete Showcase (Local FS & Remote Async)
+        .child(
+            card()
+                .child(
+                    card_header()
+                        .bordered()
+                        .child(card_title("Path Input Autocomplete (Local FS & Async Remote)"))
+                        .child(card_description(
+                            "Monospace path field with shell-style Tab completion (unique or longest common prefix), directory drill-down, local filesystem lookup, and async remote error + retry.",
+                        )),
+                )
+                .child(
+                    card_content()
+                        .child(
+                            grid(2)
+                                .spacing(px(16.))
+                                .child(
+                                    v_stack()
+                                        .spacing(px(10.))
+                                        .child(
+                                            field()
+                                                .label("Local Filesystem PathInput")
+                                                .description(
+                                                    "Focus or type ~/ (or an absolute path) to browse your real filesystem. Press Tab to complete!",
+                                                )
+                                                .child(path_input(&app.local_path_input)),
+                                        )
+                                        .child(prop_chip_row(
+                                            "Directories only (hide files)",
+                                            toggle("path-dirs-only", app.local_path_dirs_only)
+                                                .size(ComponentSize::Sm)
+                                                .on_change(cx.listener(|this, v, _, cx| {
+                                                    this.local_path_dirs_only = *v;
+                                                    let source = if *v {
+                                                        PathSource::local_directories()
+                                                    } else {
+                                                        PathSource::local_fs()
+                                                    };
+                                                    this.local_path_input.update(cx, |p, cx| {
+                                                        p.set_source(source, cx);
+                                                    });
+                                                })),
+                                            cx,
+                                        )),
+                                )
+                                .child(
+                                    field()
+                                        .label("Async Remote PathInput (POSIX + Retry)")
+                                        .description(
+                                            "Try ~/projects/ or /var/log/ with Tab/Enter drill-down, or type /error to preview inline error + Retry.",
+                                        )
+                                        .child(path_input(&app.remote_path_input)),
+                                ),
+                        )
+                        .child(code_snippet(
+                            "copy-path-input-code",
+                            "PathInputState Example",
+                            r#"// Built-in local directory autocomplete:
+let local = cx.new(|cx| PathInputState::new(PathSource::local_directories(), cx));
+
+// Async remote path provider with query filter & retry:
+let remote = cx.new(|cx| {
+    PathInputState::new(
+        PathSource::async_loader(|prefix, cx| fetch_remote_dirs(prefix, cx)),
+        cx,
+    )
+    .query_filter(|p| p.is_empty() || p == "~" || p.starts_with("~/") || p.starts_with('/'))
+});
+path_input(&remote)"#
+                                .to_string(),
+                            cx.listener(|this, _, _, cx| {
+                                this.push_toast(
+                                    ToastVariant::Success,
+                                    "Copied PathInput snippet",
+                                    None,
+                                    cx,
+                                );
+                            }),
+                            cx,
+                        )),
+                ),
+        )
         // Multi-line TextBox Workbench
         .child(
             grid(2)

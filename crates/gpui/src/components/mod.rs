@@ -59,6 +59,7 @@ pub mod menu;
 pub mod navigation;
 pub mod number_input;
 pub mod palette;
+pub mod path_input;
 pub mod popconfirm;
 pub mod popover;
 pub mod radio;
@@ -214,6 +215,10 @@ pub use loading_overlay::{BlurContainer, LoadingOverlay, blur_container, loading
 pub use menu::{Menu, MenuEvent, MenuMode, MenuNode, MenuState, nav_menu};
 pub use navigation::{Breadcrumb, BreadcrumbItem, Pagination, breadcrumb, pagination};
 pub use number_input::{NumberInput, NumberInputEvent, NumberInputState, number_input};
+pub use path_input::{
+    PathEntry, PathInput, PathInputEvent, PathInputState, PathSource, PathSuggestions,
+    longest_common_path_prefix, path_input,
+};
 pub use popconfirm::{Popconfirm, popconfirm};
 pub use popover::{DropdownMenu, MenuEntry, Popover, dropdown_menu, popover};
 pub use radio::{RadioGroup, RadioOption, RadioVariant, radio_group};

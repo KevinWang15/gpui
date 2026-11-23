@@ -89,7 +89,7 @@ impl Page {
             }
             Self::Buttons => "button group variant icon loading pill ghost link toggle group",
             Self::Inputs => {
-                "input textbox textarea autogrow auto grow resize expandable multiline form field password email validation ime"
+                "input textbox textarea autogrow auto grow resize expandable multiline path directory filesystem autocomplete suggestion form field password email validation ime"
             }
             Self::Controls => "toggle switch checkbox indeterminate radio cards slider range",
             Self::Selection => {
@@ -174,6 +174,9 @@ pub struct PlaygroundApp {
     pub sandbox_input: Entity<InputState>,
     pub sync_completion_input: Entity<InputState>,
     pub async_completion_input: Entity<InputState>,
+    pub local_path_input: Entity<PathInputState>,
+    pub local_path_dirs_only: bool,
+    pub remote_path_input: Entity<PathInputState>,
     pub input_size: ComponentSize,
     pub input_masked: bool,
     pub input_clearable: bool,
@@ -1124,6 +1127,94 @@ impl PlaygroundApp {
                 }
                 _ => {}
             }
+        })
+        .detach();
+
+        let local_path_input = cx.new(|cx| {
+            PathInputState::new(PathSource::local_directories(), cx)
+                .placeholder("~/ or /path/to/directory")
+                .clearable(true)
+        });
+        cx.subscribe(&local_path_input, |this, _, ev: &PathInputEvent, cx| match ev {
+            PathInputEvent::Accept(entry) => {
+                this.log_event("PathInput(Local)", format!("Accept(\"{}\")", entry.path), cx);
+            }
+            PathInputEvent::Submit(val) => {
+                this.log_event("PathInput(Local)", format!("Submit(\"{val}\")"), cx);
+            }
+            _ => {}
+        })
+        .detach();
+
+        let remote_path_input = cx.new(|cx| {
+            PathInputState::new(
+                PathSource::async_loader(|prefix, cx| {
+                    let q = prefix.to_owned();
+                    let bg = cx.background_executor().clone();
+                    cx.background_spawn(async move {
+                        bg.timer(Duration::from_millis(220)).await;
+                        if q.starts_with("/error") {
+                            return Err(SharedString::from(
+                                "Simulated remote lookup timeout — click Retry or edit the path",
+                            ));
+                        }
+                        let catalog = [
+                            ("~/projects/", true, "Workspace root"),
+                            ("~/projects/gpui/", true, "Rust UI framework"),
+                            ("~/projects/gpui/crates/", true, "Workspace crates"),
+                            ("~/projects/gpui/docs/", true, "Architecture docs"),
+                            ("~/projects/api-server/", true, "Backend service"),
+                            ("~/projects/web-app/", true, "Frontend client"),
+                            ("~/deployments/", true, "Cluster manifests"),
+                            ("~/deployments/prod/", true, "Production cluster"),
+                            ("~/deployments/staging/", true, "Staging cluster"),
+                            ("/var/log/", true, "System logs"),
+                            ("/var/log/nginx/", true, "HTTP access & error logs"),
+                            ("/etc/", true, "System configuration"),
+                        ];
+                        let effective = if q.is_empty() || q == "~" {
+                            "~/"
+                        } else {
+                            q.as_str()
+                        };
+                        let slash = effective.rfind('/').map(|i| i + 1).unwrap_or(0);
+                        let parent = &effective[..slash];
+                        let entries: Vec<PathEntry> = catalog
+                            .iter()
+                            .filter(|(p, _, _)| {
+                                if !p.starts_with(effective) || *p == effective {
+                                    return false;
+                                }
+                                let tail = &p[parent.len()..];
+                                let trimmed = tail.strip_suffix('/').unwrap_or(tail);
+                                !trimmed.contains('/')
+                            })
+                            .map(|(p, is_dir, desc)| {
+                                PathEntry::new(*p, *is_dir).description(*desc)
+                            })
+                            .collect();
+                        Ok(PathSuggestions::new(entries))
+                    })
+                })
+                .debounce(Duration::from_millis(160)),
+                cx,
+            )
+            .placeholder("~/projects/ or /var/log/ (type /error to test retry)")
+            .query_filter(|q| q.is_empty() || q == "~" || q.starts_with("~/") || q.starts_with('/'))
+            .clearable(true)
+        });
+        cx.subscribe(&remote_path_input, |this, _, ev: &PathInputEvent, cx| match ev {
+            PathInputEvent::Accept(entry) => {
+                this.log_event(
+                    "PathInput(Remote)",
+                    format!("Accept(\"{}\")", entry.path),
+                    cx,
+                );
+            }
+            PathInputEvent::Submit(val) => {
+                this.log_event("PathInput(Remote)", format!("Submit(\"{val}\")"), cx);
+            }
+            _ => {}
         })
         .detach();
 
@@ -3272,6 +3363,9 @@ impl PlaygroundApp {
             sandbox_input,
             sync_completion_input,
             async_completion_input,
+            local_path_input,
+            local_path_dirs_only: true,
+            remote_path_input,
             input_size: ComponentSize::Md,
             input_masked: false,
             input_clearable: true,
