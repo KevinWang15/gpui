@@ -13,6 +13,8 @@ use futures::future::BoxFuture;
 use http_client::{AsyncBody, HttpClient, HttpRequestExt as _, Method, Request, Url};
 use serde_json::{Value, json};
 
+use crate::BackgroundExecutor;
+
 use super::types::{
     AiTokenUsage, ProviderField, ProviderPreset, ProviderProtocol, ProviderValues, ToolDefinition,
     base64_encode,
@@ -1266,11 +1268,130 @@ impl LanguageModel for GeminiModel {
 // 4. Offline Simulated Streaming Model (for Playground & Unit Tests)
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
+struct SimulatedPacing {
+    executor: BackgroundExecutor,
+    thinking_delay: Duration,
+    chunk_delay: Duration,
+}
+
+impl std::fmt::Debug for SimulatedPacing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SimulatedPacing")
+            .field("thinking_delay", &self.thinking_delay)
+            .field("chunk_delay", &self.chunk_delay)
+            .finish()
+    }
+}
+
+async fn sleep_or_abort(
+    pacing: Option<&SimulatedPacing>,
+    duration: Duration,
+    abort: &AtomicBool,
+) -> bool {
+    if abort.load(Ordering::Relaxed) {
+        return false;
+    }
+    let Some(pacing) = pacing else {
+        return true;
+    };
+    if duration.is_zero() {
+        return true;
+    }
+    let mut remaining = duration;
+    let slice = Duration::from_millis(40);
+    while !remaining.is_zero() {
+        let wait = remaining.min(slice);
+        pacing.executor.timer(wait).await;
+        if abort.load(Ordering::Relaxed) {
+            return false;
+        }
+        remaining = remaining.saturating_sub(wait);
+    }
+    true
+}
+
+fn utf8_chunks(text: &str, max_chars: usize) -> Vec<String> {
+    let step = max_chars.max(1);
+    let mut out = Vec::new();
+    let mut buf = String::new();
+    let mut count = 0usize;
+    for ch in text.chars() {
+        buf.push(ch);
+        count += 1;
+        if count >= step {
+            out.push(std::mem::take(&mut buf));
+            count = 0;
+        }
+    }
+    if !buf.is_empty() {
+        out.push(buf);
+    }
+    out
+}
+
+async fn stream_reasoning(
+    text: &str,
+    pacing: Option<&SimulatedPacing>,
+    abort: &AtomicBool,
+    tx: &async_channel::Sender<ModelStreamEvent>,
+) -> bool {
+    if let Some(p) = pacing {
+        for chunk in utf8_chunks(text, 18) {
+            if !sleep_or_abort(Some(p), p.chunk_delay, abort).await {
+                return false;
+            }
+            let _ = tx.send(ModelStreamEvent::ReasoningDelta(chunk)).await;
+        }
+    } else {
+        if abort.load(Ordering::Relaxed) {
+            return false;
+        }
+        let _ = tx
+            .send(ModelStreamEvent::ReasoningDelta(text.to_owned()))
+            .await;
+    }
+    true
+}
+
 /// Offline deterministic streaming [`LanguageModel`] that demonstrates multi-step tool calling,
 /// workspace file operations, reasoning traces, Markdown rendering, and ```` ```component:* ````
 /// generative UI blocks with zero network requests.
+///
+/// Defaults to zero latency (`SimulatedModel::default()`) for deterministic unit tests; use
+/// [`SimulatedModel::interactive`] or [`SimulatedModel::with_pacing`] in interactive demos to
+/// showcase the thinking indicator, streamed reasoning, tool execution states, and token streaming.
 #[derive(Clone, Debug, Default)]
-pub struct SimulatedModel;
+pub struct SimulatedModel {
+    pacing: Option<SimulatedPacing>,
+}
+
+impl SimulatedModel {
+    /// Creates a [`SimulatedModel`] with realistic thinking and streaming latency suitable for
+    /// interactive UI demos.
+    pub fn interactive(executor: BackgroundExecutor) -> Self {
+        Self::with_pacing(
+            executor,
+            Duration::from_millis(550),
+            Duration::from_millis(24),
+        )
+    }
+
+    /// Creates a [`SimulatedModel`] with custom thinking pause and per-chunk streaming delay.
+    pub fn with_pacing(
+        executor: BackgroundExecutor,
+        thinking_delay: Duration,
+        chunk_delay: Duration,
+    ) -> Self {
+        Self {
+            pacing: Some(SimulatedPacing {
+                executor,
+                thinking_delay,
+                chunk_delay,
+            }),
+        }
+    }
+}
 
 impl LanguageModel for SimulatedModel {
     fn stream_step(
@@ -1280,6 +1401,7 @@ impl LanguageModel for SimulatedModel {
         abort: Arc<AtomicBool>,
         tx: async_channel::Sender<ModelStreamEvent>,
     ) -> BoxFuture<'static, Result<()>> {
+        let pacing = self.pacing.clone();
         Box::pin(async move {
             let last_user_text = request
                 .messages
@@ -1317,6 +1439,14 @@ impl LanguageModel for SimulatedModel {
             let lower = last_user_text.to_ascii_lowercase();
             let has_tool = |name: &str| request.tools.iter().any(|t| t.name == name);
 
+            // Initial thinking beat so the UI visibly displays "Thinking…" before deltas arrive.
+            if let Some(ref p) = pacing
+                && !sleep_or_abort(Some(p), p.thinking_delay, &abort).await
+            {
+                let _ = tx.send(ModelStreamEvent::Finish(FinishReason::Cancelled)).await;
+                return Ok(());
+            }
+
             // Step 1: exercise a relevant client / workspace tool before answering if tools are allowed.
             if !last_is_tool && request.tool_choice == ToolChoice::Auto {
                 if (lower.contains("tool") || lower.contains("search") || lower.contains("doc"))
@@ -1325,12 +1455,20 @@ impl LanguageModel for SimulatedModel {
                         .iter()
                         .find(|t| t.name.contains("search") || t.name.contains("list"))
                 {
-                    let _ = tx
-                        .send(ModelStreamEvent::ReasoningDelta(format!(
-                            "Checking available tool `{}` to answer accurately.\n",
-                            tool.name
-                        )))
-                        .await;
+                    let thought = format!(
+                        "Analyzing the request and checking registered tools…\nSelected `{}` to gather grounded data before composing the reply.\n",
+                        tool.name
+                    );
+                    if !stream_reasoning(&thought, pacing.as_ref(), &abort, &tx).await {
+                        let _ = tx.send(ModelStreamEvent::Finish(FinishReason::Cancelled)).await;
+                        return Ok(());
+                    }
+                    if let Some(ref p) = pacing
+                        && !sleep_or_abort(Some(p), Duration::from_millis(260), &abort).await
+                    {
+                        let _ = tx.send(ModelStreamEvent::Finish(FinishReason::Cancelled)).await;
+                        return Ok(());
+                    }
                     let args = if tool.name.contains("search") {
                         json!({ "query": last_user_text })
                     } else {
@@ -1350,12 +1488,17 @@ impl LanguageModel for SimulatedModel {
                 if (lower.contains("workspace") || lower.contains("file") || lower.contains("calc"))
                     && has_tool("workspace__write_file")
                 {
-                    let _ = tx
-                        .send(ModelStreamEvent::ReasoningDelta(
-                            "Saving structured notes into the per-conversation workspace.\n"
-                                .to_owned(),
-                        ))
-                        .await;
+                    let thought = "Planning workspace output…\nWriting structured metrics into `summary.json` so they remain inspectable in the conversation workspace.\n";
+                    if !stream_reasoning(thought, pacing.as_ref(), &abort, &tx).await {
+                        let _ = tx.send(ModelStreamEvent::Finish(FinishReason::Cancelled)).await;
+                        return Ok(());
+                    }
+                    if let Some(ref p) = pacing
+                        && !sleep_or_abort(Some(p), Duration::from_millis(260), &abort).await
+                    {
+                        let _ = tx.send(ModelStreamEvent::Finish(FinishReason::Cancelled)).await;
+                        return Ok(());
+                    }
                     let _ = tx
                         .send(ModelStreamEvent::ToolCall {
                             id: super::types::new_id(),
@@ -1380,12 +1523,29 @@ impl LanguageModel for SimulatedModel {
                 || lower.contains("chart")
                 || lower.contains("table");
 
-            let _ = tx
-                .send(ModelStreamEvent::ReasoningDelta(
-                    "Formatting structured Markdown and GPUI answer components for the prompt.\n"
-                        .to_owned(),
-                ))
-                .await;
+            let thought = if let Some((ref tool_name, _)) = last_tool_output {
+                format!(
+                    "Reviewing the output returned by `{tool_name}`…\nStructuring a concise summary with Markdown and native GPUI answer components.\n"
+                )
+            } else if is_chart_prompt {
+                "Organizing metrics into stat cards, a breakdown bar chart, a sparkline, and a structured table.\n"
+                    .to_owned()
+            } else {
+                format!(
+                    "Checking available capabilities ({} registered tools) and outlining the key features.\n",
+                    request.tools.len()
+                )
+            };
+            if !stream_reasoning(&thought, pacing.as_ref(), &abort, &tx).await {
+                let _ = tx.send(ModelStreamEvent::Finish(FinishReason::Cancelled)).await;
+                return Ok(());
+            }
+            if let Some(ref p) = pacing
+                && !sleep_or_abort(Some(p), Duration::from_millis(240), &abort).await
+            {
+                let _ = tx.send(ModelStreamEvent::Finish(FinishReason::Cancelled)).await;
+                return Ok(());
+            }
 
             let reply = if let Some((tool_name, output)) = last_tool_output {
                 format!(
@@ -1433,14 +1593,20 @@ Try asking me to **\"summarize with a chart\"** or **\"search tools\"** to see m
                 )
             };
 
-            // Stream in small chunks so the UI shows smooth streaming and honors cancellation.
-            for chunk in reply.as_bytes().chunks(28) {
+            // Stream in UTF-8-safe chunks so the UI shows smooth streaming and honors cancellation.
+            let chunk_size = if pacing.is_some() { 18 } else { 28 };
+            for chunk in utf8_chunks(&reply, chunk_size) {
+                if let Some(ref p) = pacing
+                    && !sleep_or_abort(Some(p), p.chunk_delay, &abort).await
+                {
+                    let _ = tx.send(ModelStreamEvent::Finish(FinishReason::Cancelled)).await;
+                    return Ok(());
+                }
                 if abort.load(Ordering::Relaxed) {
                     let _ = tx.send(ModelStreamEvent::Finish(FinishReason::Cancelled)).await;
                     return Ok(());
                 }
-                let text = String::from_utf8_lossy(chunk).into_owned();
-                let _ = tx.send(ModelStreamEvent::TextDelta(text)).await;
+                let _ = tx.send(ModelStreamEvent::TextDelta(chunk)).await;
             }
 
             let _ = tx

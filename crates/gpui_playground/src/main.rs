@@ -88,7 +88,7 @@ impl Render for PlaygroundApp {
             (Page::Analytics, LucideIcon::ChartColumnStacked, Some("10")),
             (Page::NativeDesktop, LucideIcon::AppWindow, Some("11")),
             (Page::Buttons, LucideIcon::MousePointerClick, Some("3")),
-            (Page::Inputs, LucideIcon::TextCursorInput, Some("4")),
+            (Page::Inputs, LucideIcon::TextCursorInput, Some("5")),
             (Page::Controls, LucideIcon::ToggleRight, Some("4")),
             (Page::Selection, LucideIcon::ListFilter, Some("2")),
             (Page::LayoutNavigation, LucideIcon::LayoutDashboard, Some("9")),

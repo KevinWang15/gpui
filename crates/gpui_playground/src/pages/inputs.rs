@@ -1,4 +1,4 @@
-//! Interactive single-line Input & multi-line TextBox workbenches + live validation form.
+//! Interactive single-line Input, Auto-Growing Input & multi-line TextBox workbenches + live validation form.
 
 use gpui::components::*;
 use gpui::icons::LucideIcon;
@@ -10,6 +10,11 @@ use crate::state::PlaygroundApp;
 pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl IntoElement {
     let current_val = app.sandbox_input.read(cx).value().to_owned();
     let sel = app.sandbox_input.read(cx).selected_range();
+    let ag = app.sandbox_autogrow.read(cx);
+    let ag_lines = ag.line_count();
+    let ag_rows = ag.effective_rows();
+    let ag_chars = ag.value().chars().count();
+    let ag_scrolling = ag_lines > app.autogrow_max_rows;
     let tb_val = app.sandbox_textbox.read(cx).value().to_owned();
     let tb_lines = app.sandbox_textbox.read(cx).line_count();
 
@@ -21,15 +26,22 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
         (ComponentSize::Xl, "Xl"),
     ];
 
+    let ag_sizes: &[(ComponentSize, &str)] = &[
+        (ComponentSize::Sm, "Sm"),
+        (ComponentSize::Md, "Md"),
+        (ComponentSize::Lg, "Lg"),
+    ];
+
     let input_code = build_input_code(app);
+    let autogrow_code = build_autogrow_code(app);
     let textbox_code = build_textbox_code(app);
 
     v_stack()
         .spacing(px(22.))
         .child(
-            page_header("Input & Multi-line TextBox")
+            page_header("Input, AutoGrowInput & TextBox")
                 .description(
-                    "Full UTF-16 IME, word navigation, selection, clipboard, undo/redo, password masking, addons, and multi-line editing.",
+                    "Single-line input, adjustable-height auto-growing input (1 line -> max rows -> scroll), autocomplete, and fixed-height multi-line editing.",
                 ),
         )
         // Single-line Input Workbench
@@ -166,6 +178,277 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
                                         .on_change(cx.listener(|this, v, _, cx| {
                                             this.input_disabled = *v;
                                             this.rebuild_sandbox_input(cx);
+                                        })),
+                                    cx,
+                                )),
+                        ),
+                ),
+        )
+        // Auto-Growing Input Workbench
+        .child(
+            grid(2)
+                .spacing(px(16.))
+                .child(
+                    card()
+                        .child(
+                            card_header()
+                                .bordered()
+                                .child(card_title("Auto-Growing Input (AutoGrowInput)"))
+                                .child(card_description(format!(
+                                    "Height: {ag_rows} / {} rows  ·  {ag_lines} lines  ·  {ag_chars} chars{}",
+                                    app.autogrow_max_rows,
+                                    if ag_scrolling { "  (scrolling)" } else { "" }
+                                ))),
+                        )
+                        .child(
+                            card_content()
+                                .child(preview_stage(
+                                    v_stack()
+                                        .w_full()
+                                        .max_w(px(460.))
+                                        .spacing(px(10.))
+                                        .child(
+                                            h_stack()
+                                                .w_full()
+                                                .items_end()
+                                                .spacing(px(8.))
+                                                .child(
+                                                    div()
+                                                        .flex_1()
+                                                        .min_w_0()
+                                                        .child(auto_grow_input(&app.sandbox_autogrow)),
+                                                )
+                                                .when(app.autogrow_submit_on_enter, |el| {
+                                                    el.child(
+                                                        div().mb(px(3.)).child(
+                                                            Button::icon("ag-send", LucideIcon::ArrowUp)
+                                                                .primary()
+                                                                .size(ComponentSize::Sm)
+                                                                .tooltip_text("Send message")
+                                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                                    let val = this
+                                                                        .sandbox_autogrow
+                                                                        .read(cx)
+                                                                        .value()
+                                                                        .to_owned();
+                                                                    if !val.trim().is_empty() {
+                                                                        let lines = val.split('\n').count();
+                                                                        this.autogrow_last_submitted =
+                                                                            Some(val.replace('\n', " ↵ ").into());
+                                                                        this.sandbox_autogrow.update(cx, |s, cx| {
+                                                                            s.set_value_silent(String::new(), cx);
+                                                                        });
+                                                                        this.log_event(
+                                                                            "AutoGrowInput",
+                                                                            format!(
+                                                                                "Submit({lines} lines, {} chars)",
+                                                                                val.chars().count()
+                                                                            ),
+                                                                            cx,
+                                                                        );
+                                                                        this.push_toast(
+                                                                            ToastVariant::Success,
+                                                                            "AutoGrowInput submitted",
+                                                                            Some(&format!(
+                                                                                "{lines} lines · {} chars",
+                                                                                val.chars().count()
+                                                                            )),
+                                                                            cx,
+                                                                        );
+                                                                    }
+                                                                })),
+                                                        ),
+                                                    )
+                                                }),
+                                        )
+                                        .child(
+                                            h_stack()
+                                                .justify_between()
+                                                .spacing(px(8.))
+                                                .child(
+                                                    h_stack()
+                                                        .spacing(px(6.))
+                                                        .child(
+                                                            button("ag-fill")
+                                                                .outline()
+                                                                .size(ComponentSize::Xs)
+                                                                .label("Insert 7 lines")
+                                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                                    this.sandbox_autogrow.update(cx, |s, cx| {
+                                                                        s.set_value(
+                                                                            "Line 1: starts at 1-line height\nLine 2: expands on each newline\nLine 3: keeps growing cleanly\nLine 4: tracks caret & selection\nLine 5: reaches max_rows cap\nLine 6: vertical scroll activates\nLine 7: overlay scrollbar appears",
+                                                                            cx,
+                                                                        );
+                                                                    });
+                                                                })),
+                                                        )
+                                                        .child(
+                                                            button("ag-clear")
+                                                                .ghost()
+                                                                .size(ComponentSize::Xs)
+                                                                .label("Clear")
+                                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                                    this.sandbox_autogrow.update(cx, |s, cx| {
+                                                                        s.clear(cx);
+                                                                    });
+                                                                })),
+                                                        ),
+                                                )
+                                                .when_some(
+                                                    app.autogrow_last_submitted.clone(),
+                                                    |el, last| {
+                                                        el.child(
+                                                            badge(format!("Sent: {last}"))
+                                                                .color(BadgeColor::Indigo),
+                                                        )
+                                                    },
+                                                ),
+                                        ),
+                                    cx,
+                                ))
+                                .child(code_snippet(
+                                    "copy-autogrow-code",
+                                    "Generated AutoGrowInputState",
+                                    autogrow_code,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.push_toast(
+                                            ToastVariant::Success,
+                                            "Copied AutoGrowInputState code",
+                                            None,
+                                            cx,
+                                        );
+                                    }),
+                                    cx,
+                                )),
+                        ),
+                )
+                .child(
+                    card()
+                        .child(
+                            card_header()
+                                .bordered()
+                                .child(card_title("AutoGrowInput Props Inspector")),
+                        )
+                        .child(
+                            card_content()
+                                .child(
+                                    h_stack()
+                                        .justify_between()
+                                        .child(label("Min rows"))
+                                        .child(
+                                            h_stack().spacing(px(6.)).children(
+                                                [1usize, 2, 3].into_iter().map(|r| {
+                                                    button(("ag-min", r))
+                                                        .size(ComponentSize::Xs)
+                                                        .outline()
+                                                        .selected(app.autogrow_min_rows == r)
+                                                        .label(format!("{r}"))
+                                                        .on_click(cx.listener(
+                                                            move |this, _, _, cx| {
+                                                                this.autogrow_min_rows = r;
+                                                                if this.autogrow_max_rows < r {
+                                                                    this.autogrow_max_rows = r;
+                                                                }
+                                                                this.rebuild_sandbox_autogrow(cx);
+                                                            },
+                                                        ))
+                                                }),
+                                            ),
+                                        ),
+                                )
+                                .child(
+                                    h_stack()
+                                        .justify_between()
+                                        .child(label("Max rows"))
+                                        .child(
+                                            h_stack().spacing(px(6.)).children(
+                                                [3usize, 4, 5, 6, 8].into_iter().map(|r| {
+                                                    button(("ag-max", r))
+                                                        .size(ComponentSize::Xs)
+                                                        .outline()
+                                                        .selected(app.autogrow_max_rows == r)
+                                                        .label(format!("{r}"))
+                                                        .on_click(cx.listener(
+                                                            move |this, _, _, cx| {
+                                                                this.autogrow_max_rows =
+                                                                    r.max(this.autogrow_min_rows);
+                                                                this.rebuild_sandbox_autogrow(cx);
+                                                            },
+                                                        ))
+                                                }),
+                                            ),
+                                        ),
+                                )
+                                .child(
+                                    h_stack()
+                                        .justify_between()
+                                        .child(label("Size"))
+                                        .child(
+                                            h_stack().spacing(px(6.)).children(
+                                                ag_sizes.iter().enumerate().map(|(i, &(s, name))| {
+                                                    button(("ag-sz", i))
+                                                        .size(ComponentSize::Xs)
+                                                        .outline()
+                                                        .selected(app.autogrow_size == s)
+                                                        .label(name)
+                                                        .on_click(cx.listener(
+                                                            move |this, _, _, cx| {
+                                                                this.autogrow_size = s;
+                                                                this.rebuild_sandbox_autogrow(cx);
+                                                            },
+                                                        ))
+                                                }),
+                                            ),
+                                        ),
+                                )
+                                .child(divider())
+                                .child(prop_chip_row(
+                                    "Enter submits (Shift+Enter = newline)",
+                                    toggle("ag-sub", app.autogrow_submit_on_enter)
+                                        .size(ComponentSize::Sm)
+                                        .on_change(cx.listener(|this, v, _, cx| {
+                                            this.autogrow_submit_on_enter = *v;
+                                            this.rebuild_sandbox_autogrow(cx);
+                                        })),
+                                    cx,
+                                ))
+                                .child(prop_chip_row(
+                                    "Line / character counter",
+                                    toggle("ag-cnt", app.autogrow_show_counter)
+                                        .size(ComponentSize::Sm)
+                                        .on_change(cx.listener(|this, v, _, cx| {
+                                            this.autogrow_show_counter = *v;
+                                            this.rebuild_sandbox_autogrow(cx);
+                                        })),
+                                    cx,
+                                ))
+                                .child(prop_chip_row(
+                                    "Invalid error ring",
+                                    toggle("ag-inv", app.autogrow_invalid)
+                                        .size(ComponentSize::Sm)
+                                        .on_change(cx.listener(|this, v, _, cx| {
+                                            this.autogrow_invalid = *v;
+                                            this.rebuild_sandbox_autogrow(cx);
+                                        })),
+                                    cx,
+                                ))
+                                .child(prop_chip_row(
+                                    "Read-only",
+                                    toggle("ag-ro", app.autogrow_read_only)
+                                        .size(ComponentSize::Sm)
+                                        .on_change(cx.listener(|this, v, _, cx| {
+                                            this.autogrow_read_only = *v;
+                                            this.rebuild_sandbox_autogrow(cx);
+                                        })),
+                                    cx,
+                                ))
+                                .child(prop_chip_row(
+                                    "Disabled",
+                                    toggle("ag-dis", app.autogrow_disabled)
+                                        .size(ComponentSize::Sm)
+                                        .on_change(cx.listener(|this, v, _, cx| {
+                                            this.autogrow_disabled = *v;
+                                            this.rebuild_sandbox_autogrow(cx);
                                         })),
                                     cx,
                                 )),
@@ -435,6 +718,39 @@ fn build_input_code(app: &PlaygroundApp) -> String {
     }
     lines.push("});".to_string());
     lines.push("input(&state)".to_string());
+    lines.join("\n")
+}
+
+fn build_autogrow_code(app: &PlaygroundApp) -> String {
+    let mut lines = vec!["let composer = cx.new(|cx| {".to_string()];
+    lines.push("    AutoGrowInputState::new(cx)".to_string());
+    lines.push("        .placeholder(\"Type a message…\")".to_string());
+    if app.autogrow_min_rows != 1 {
+        lines.push(format!("        .min_rows({})", app.autogrow_min_rows));
+    }
+    if app.autogrow_max_rows != 6 {
+        lines.push(format!("        .max_rows({})", app.autogrow_max_rows));
+    }
+    if app.autogrow_size != ComponentSize::Md {
+        lines.push(format!("        .size(ComponentSize::{:?})", app.autogrow_size));
+    }
+    if app.autogrow_submit_on_enter {
+        lines.push("        .submit_on_enter(true)".to_string());
+    }
+    if app.autogrow_show_counter {
+        lines.push("        .show_counter(true)".to_string());
+    }
+    if app.autogrow_invalid {
+        lines.push("        .invalid(true)".to_string());
+    }
+    if app.autogrow_read_only {
+        lines.push("        .read_only(true)".to_string());
+    }
+    if app.autogrow_disabled {
+        lines.push("        .disabled(true)".to_string());
+    }
+    lines.push("});".to_string());
+    lines.push("auto_grow_input(&composer)".to_string());
     lines.join("\n")
 }
 

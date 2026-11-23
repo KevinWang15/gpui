@@ -155,6 +155,122 @@ fn textbox_multiline_editing_navigation_and_undo(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn autogrow_input_grows_caps_shrinks_and_handles_enter_vs_shift_enter(cx: &mut TestAppContext) {
+    cx.update(init_components);
+    let submitted: Rc<RefCell<Vec<SharedString>>> = Rc::new(RefCell::new(Vec::new()));
+    let submitted_clone = submitted.clone();
+
+    let (ag, cx) = cx.add_window_view(|_, cx| {
+        AutoGrowInputState::new(cx)
+            .placeholder("Ask a question…")
+            .min_rows(1)
+            .max_rows(4)
+            .submit_on_enter(true)
+    });
+
+    cx.update(|_, cx| {
+        cx.subscribe(&ag, move |_, ev: &AutoGrowInputEvent, _| {
+            if let AutoGrowInputEvent::Submit(val) = ev {
+                submitted_clone.borrow_mut().push(val.clone());
+            }
+        })
+        .detach();
+    });
+
+    // Starts at 1-line height
+    cx.refresh().unwrap();
+    cx.run_until_parked();
+    let h1 = ag.read_with(cx, |s, _| {
+        assert_eq!(s.line_count(), 1);
+        assert_eq!(s.effective_rows(), 1);
+        assert_eq!(s.scroll_extent_value().1, px(0.));
+        s.last_bounds().expect("painted bounds").size.height
+    });
+
+    // Focus and type on line 1
+    ag.update_in(cx, |state, window, cx| {
+        window.focus(&state.focus_handle(cx), cx);
+        state.replace_text_in_range(None, "hello", window, cx);
+    });
+    cx.refresh().unwrap();
+    cx.run_until_parked();
+
+    // Shift+Enter (Newline) inserts a linebreak and grows height to 2 rows
+    cx.dispatch_action(textbox::textbox_actions::Newline);
+    cx.refresh().unwrap();
+    cx.run_until_parked();
+    let h2 = ag.read_with(cx, |s, _| {
+        assert_eq!(s.value(), "hello\n");
+        assert_eq!(s.line_count(), 2);
+        assert_eq!(s.effective_rows(), 2);
+        assert_eq!(s.scroll_extent_value().1, px(0.));
+        s.last_bounds().expect("painted bounds").size.height
+    });
+    assert_eq!(h2, h1 * 2.0);
+
+    // Grow past max_rows (7 lines total -> capped at 4 visible rows + vertical scroll enabled)
+    ag.update_in(cx, |state, window, cx| {
+        state.replace_text_in_range(None, "line 2\nline 3\nline 4\nline 5\nline 6\nline 7", window, cx);
+    });
+    cx.refresh().unwrap();
+    cx.run_until_parked();
+    let h_capped = ag.read_with(cx, |s, _| {
+        assert_eq!(s.line_count(), 7);
+        assert_eq!(s.effective_rows(), 4);
+        let (_scroll_y, max_scroll) = s.scroll_extent_value();
+        assert!(max_scroll > px(0.), "expected vertical scroll once past max_rows");
+        s.last_bounds().expect("painted bounds").size.height
+    });
+    assert_eq!(h_capped, h1 * 4.0);
+
+    // Plain Enter submits instead of inserting a newline when submit_on_enter(true)
+    cx.dispatch_action(textbox::textbox_actions::Enter);
+    cx.run_until_parked();
+    assert_eq!(submitted.borrow().len(), 1);
+    assert_eq!(ag.read_with(cx, |s, _| s.line_count()), 7);
+
+    // Clearing via set_value_silent shrinks cleanly back to 1 row and resets scroll
+    ag.update(cx, |state, cx| state.set_value_silent(String::new(), cx));
+    cx.refresh().unwrap();
+    cx.run_until_parked();
+    let h_reset = ag.read_with(cx, |s, _| {
+        assert_eq!(s.value(), "");
+        assert_eq!(s.line_count(), 1);
+        assert_eq!(s.effective_rows(), 1);
+        assert_eq!(s.scroll_extent_value(), (px(0.), px(0.)));
+        s.last_bounds().expect("painted bounds").size.height
+    });
+    assert_eq!(h_reset, h1);
+
+    // Default AutoGrowInputState (submit_on_enter = false): plain Enter inserts newline & grows
+    let (ag_default, cx2) = cx.add_window_view(|_, cx| AutoGrowInputState::new(cx).max_rows(3));
+    let submitted_default: Rc<RefCell<usize>> = Rc::new(RefCell::new(0));
+    let submitted_default_clone = submitted_default.clone();
+    cx2.update(|_, cx| {
+        cx.subscribe(&ag_default, move |_, ev: &AutoGrowInputEvent, _| {
+            if matches!(ev, AutoGrowInputEvent::Submit(_)) {
+                *submitted_default_clone.borrow_mut() += 1;
+            }
+        })
+        .detach();
+    });
+    ag_default.update_in(cx2, |state, window, cx| {
+        window.focus(&state.focus_handle(cx), cx);
+        state.replace_text_in_range(None, "row 1", window, cx);
+    });
+    cx2.refresh().unwrap();
+    cx2.dispatch_action(textbox::textbox_actions::Enter);
+    cx2.refresh().unwrap();
+    cx2.run_until_parked();
+    assert_eq!(*submitted_default.borrow(), 0);
+    assert_eq!(ag_default.read_with(cx2, |s, _| s.effective_rows()), 2);
+
+    cx2.dispatch_action(textbox::textbox_actions::Submit);
+    cx2.run_until_parked();
+    assert_eq!(*submitted_default.borrow(), 1);
+}
+
+#[gpui::test]
 fn select_keyboard_navigation_and_disabled_skip(cx: &mut TestAppContext) {
     cx.update(init_components);
     let changes: Rc<RefCell<Vec<Option<String>>>> = Rc::new(RefCell::new(Vec::new()));

@@ -228,8 +228,8 @@ pub use table::{
 };
 pub use tabs::{TabItem, Tabs, TabsVariant, tabs};
 pub use textbox::{
-    TextArea, TextAreaState, TextBox, TextBoxEvent, TextBoxState, bind_textbox_keys, text_area,
-    text_box,
+    AutoGrowInput, AutoGrowInputEvent, AutoGrowInputState, TextArea, TextAreaState, TextBox,
+    TextBoxEvent, TextBoxState, auto_grow_input, bind_textbox_keys, text_area, text_box,
 };
 pub use theme::{
     ANIM_FAST, ANIM_NORMAL, ActiveTheme, ComponentSize, GlobalTheme, SPRING_SMOOTH, SPRING_SNAPPY,

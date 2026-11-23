@@ -54,6 +54,7 @@ use crate::components::badge::{BadgeColor, badge};
 use crate::components::button::{Button, ButtonVariant, button};
 use crate::components::input::{Input, InputEvent, InputState};
 use crate::components::layout::{divider, h_stack, v_stack};
+use crate::components::textbox::{AutoGrowInputEvent, AutoGrowInputState, auto_grow_input};
 use crate::components::theme::{ActiveTheme, ComponentSize, tabular_numerals};
 use crate::components::toggle::toggle;
 
@@ -175,11 +176,11 @@ pub struct AskAiState {
     // Conversation tree & history
     conversations: Vec<Conversation>,
     active_conversation_id: String,
-    composer_input: Entity<InputState>,
+    composer_input: Entity<AutoGrowInputState>,
     history_search: Entity<InputState>,
     pending_images: Vec<PreparedImage>,
     editing_message_id: Option<String>,
-    edit_input: Entity<InputState>,
+    edit_input: Entity<AutoGrowInputState>,
     confirm_delete_conv_id: Option<String>,
 
     // Expand/collapse UI state
@@ -235,17 +236,20 @@ impl AskAiState {
 
     fn new_with_placeholder(placeholder: &'static str, cx: &mut Context<Self>) -> Self {
         let composer_input = cx.new(|cx| {
-            InputState::new(cx)
+            AutoGrowInputState::new(cx)
                 .placeholder(placeholder)
+                .min_rows(1)
+                .max_rows(6)
                 .size(ComponentSize::Md)
+                .submit_on_enter(true)
         });
-        cx.subscribe(&composer_input, |this, inp, ev: &InputEvent, cx| match ev {
-            InputEvent::Change(val) => {
+        cx.subscribe(&composer_input, |this, inp, ev: &AutoGrowInputEvent, cx| match ev {
+            AutoGrowInputEvent::Change(val) => {
                 if let Some(conv) = this.active_conversation_mut() {
                     conv.draft = val.to_string();
                 }
             }
-            InputEvent::Submit(val) => {
+            AutoGrowInputEvent::Submit(val) => {
                 let text = val.trim().to_owned();
                 if !text.is_empty() || !this.pending_images.is_empty() {
                     inp.update(cx, |s, cx| s.set_value_silent(String::new(), cx));
@@ -267,12 +271,15 @@ impl AskAiState {
             .detach();
 
         let edit_input = cx.new(|cx| {
-            InputState::new(cx)
+            AutoGrowInputState::new(cx)
                 .placeholder("Edit message…")
+                .min_rows(1)
+                .max_rows(5)
                 .size(ComponentSize::Sm)
+                .submit_on_enter(true)
         });
-        cx.subscribe(&edit_input, |this, _, ev: &InputEvent, cx| {
-            if let InputEvent::Submit(_) = ev {
+        cx.subscribe(&edit_input, |this, _, ev: &AutoGrowInputEvent, cx| {
+            if let AutoGrowInputEvent::Submit(_) = ev {
                 this.submit_edit_message(cx);
             }
         })
@@ -2947,40 +2954,45 @@ impl AskAiState {
             .child(
                 h_stack()
                     .w_full()
+                    .items_end()
                     .p(px(10.))
                     .spacing(px(8.))
                     .when(can_attach_images, |el| {
                         el.child(
-                            Button::icon(("ask-add-img", eid), LucideIcon::ImagePlus)
-                                .outline()
-                                .size(ComponentSize::Sm)
-                                .disabled(self.busy)
-                                .tooltip_text("Attach image")
-                                .on_click(cx.listener(|this, _, _, cx| this.pick_images(cx))),
+                            div().mb(px(3.)).child(
+                                Button::icon(("ask-add-img", eid), LucideIcon::ImagePlus)
+                                    .outline()
+                                    .size(ComponentSize::Sm)
+                                    .disabled(self.busy)
+                                    .tooltip_text("Attach image")
+                                    .on_click(cx.listener(|this, _, _, cx| this.pick_images(cx))),
+                            ),
                         )
                     })
-                    .child(div().flex_1().min_w_0().child(Input::new(&self.composer_input)))
-                    .child(if self.busy {
-                        Button::icon(("ask-stop", eid), LucideIcon::Square)
-                            .destructive()
-                            .size(ComponentSize::Sm)
-                            .tooltip_text("Stop response")
-                            .on_click(cx.listener(|this, _, _, cx| this.cancel_run(cx)))
-                    } else {
-                        Button::icon(("ask-send", eid), LucideIcon::ArrowUp)
-                            .primary()
-                            .size(ComponentSize::Sm)
-                            .tooltip_text("Send message")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                let txt = this.composer_input.read(cx).value().to_owned();
-                                if !txt.trim().is_empty() || !this.pending_images.is_empty() {
-                                    this.composer_input.update(cx, |i, cx| {
-                                        i.set_value_silent(String::new(), cx)
-                                    });
-                                    this.send_message(txt, cx);
-                                }
-                            }))
-                    }),
+                    .child(div().flex_1().min_w_0().child(auto_grow_input(&self.composer_input)))
+                    .child(
+                        div().mb(px(3.)).child(if self.busy {
+                            Button::icon(("ask-stop", eid), LucideIcon::Square)
+                                .destructive()
+                                .size(ComponentSize::Sm)
+                                .tooltip_text("Stop response")
+                                .on_click(cx.listener(|this, _, _, cx| this.cancel_run(cx)))
+                        } else {
+                            Button::icon(("ask-send", eid), LucideIcon::ArrowUp)
+                                .primary()
+                                .size(ComponentSize::Sm)
+                                .tooltip_text("Send message (Enter · Shift+Enter for new line)")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    let txt = this.composer_input.read(cx).value().to_owned();
+                                    if !txt.trim().is_empty() || !this.pending_images.is_empty() {
+                                        this.composer_input.update(cx, |i, cx| {
+                                            i.set_value_silent(String::new(), cx)
+                                        });
+                                        this.send_message(txt, cx);
+                                    }
+                                }))
+                        }),
+                    ),
             );
 
         let show_jump_bottom = !self.chat_stick_to_bottom
@@ -3145,29 +3157,43 @@ impl AskAiState {
                         .bg(theme.surface)
                         .border_1()
                         .border_color(theme.primary)
-                        .child(Input::new(&self.edit_input))
+                        .child(auto_grow_input(&self.edit_input))
                         .child(
                             h_stack()
-                                .justify_end()
+                                .justify_between()
                                 .spacing(px(6.))
                                 .child(
-                                    button(SharedString::from(format!("edit-cancel-{m_idx}")))
-                                        .ghost()
-                                        .size(ComponentSize::Xs)
-                                        .label("Cancel")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.editing_message_id = None;
-                                            cx.notify();
-                                        })),
+                                    div()
+                                        .text_size(px(11.))
+                                        .text_color(theme.muted_foreground)
+                                        .child("Shift+Enter for new line"),
                                 )
                                 .child(
-                                    button(SharedString::from(format!("edit-send-{m_idx}")))
-                                        .primary()
-                                        .size(ComponentSize::Xs)
-                                        .label("Send")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.submit_edit_message(cx);
-                                        })),
+                                    h_stack()
+                                        .spacing(px(6.))
+                                        .child(
+                                            button(SharedString::from(format!(
+                                                "edit-cancel-{m_idx}"
+                                            )))
+                                            .ghost()
+                                            .size(ComponentSize::Xs)
+                                            .label("Cancel")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.editing_message_id = None;
+                                                cx.notify();
+                                            })),
+                                        )
+                                        .child(
+                                            button(SharedString::from(format!(
+                                                "edit-send-{m_idx}"
+                                            )))
+                                            .primary()
+                                            .size(ComponentSize::Xs)
+                                            .label("Send")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.submit_edit_message(cx);
+                                            })),
+                                        ),
                                 ),
                         )
                         .into_any_element()
@@ -3213,7 +3239,8 @@ impl AskAiState {
             match &parts[idx] {
                 AiMessagePart::Reasoning { text } => {
                     let rkey = format!("{}-r-{idx}", msg.id);
-                    let expanded = self.expanded_reasoning.contains(&rkey);
+                    let actively_thinking = is_streaming && idx + 1 == parts.len();
+                    let expanded = actively_thinking || self.expanded_reasoning.contains(&rkey);
                     let rkey_click = rkey.clone();
                     let preview = text.trim().to_owned();
                     content_col = content_col.child(
@@ -3222,7 +3249,11 @@ impl AskAiState {
                             .rounded(theme.radius_md)
                             .bg(theme.surface_muted.opacity(0.5))
                             .border_1()
-                            .border_color(theme.border)
+                            .border_color(if actively_thinking {
+                                theme.primary.opacity(0.35)
+                            } else {
+                                theme.border
+                            })
                             .child(
                                 div()
                                     .id(SharedString::from(format!("reason-hdr-{m_idx}-{idx}")))
@@ -3243,17 +3274,30 @@ impl AskAiState {
                                     .child(
                                         h_stack()
                                             .spacing(px(6.))
-                                            .child(
+                                            .child(if actively_thinking {
+                                                Icon::new(LucideIcon::LoaderCircle)
+                                                    .size(IconSize::Xs)
+                                                    .color(theme.primary)
+                                                    .spin()
+                                            } else {
                                                 Icon::new(LucideIcon::Brain)
                                                     .size(IconSize::Xs)
-                                                    .color(theme.muted_foreground),
-                                            )
+                                                    .color(theme.muted_foreground)
+                                            })
                                             .child(
                                                 div()
                                                     .text_size(px(11.5))
                                                     .font_weight(FontWeight::MEDIUM)
-                                                    .text_color(theme.muted_foreground)
-                                                    .child("Reasoning"),
+                                                    .text_color(if actively_thinking {
+                                                        theme.foreground
+                                                    } else {
+                                                        theme.muted_foreground
+                                                    })
+                                                    .child(if actively_thinking {
+                                                        "Thinking…"
+                                                    } else {
+                                                        "Reasoning"
+                                                    }),
                                             ),
                                     )
                                     .child(

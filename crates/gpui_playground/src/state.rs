@@ -88,7 +88,9 @@ impl Page {
                 "analytics charts stacked bar line breakdown filter bar time date range picker calendar kpi stat segmented theme switcher radial"
             }
             Self::Buttons => "button group variant icon loading pill ghost link toggle group",
-            Self::Inputs => "input textbox textarea form field password email validation ime",
+            Self::Inputs => {
+                "input textbox textarea autogrow auto grow resize expandable multiline form field password email validation ime"
+            }
             Self::Controls => "toggle switch checkbox indeterminate radio cards slider range",
             Self::Selection => "select listbox dropdown combobox autocomplete tags multiselect",
             Self::LayoutNavigation => {
@@ -174,6 +176,17 @@ pub struct PlaygroundApp {
     pub form_email: Entity<InputState>,
     pub form_password: Entity<InputState>,
     pub form_email_error: Option<SharedString>,
+
+    pub sandbox_autogrow: Entity<AutoGrowInputState>,
+    pub autogrow_min_rows: usize,
+    pub autogrow_max_rows: usize,
+    pub autogrow_size: ComponentSize,
+    pub autogrow_submit_on_enter: bool,
+    pub autogrow_show_counter: bool,
+    pub autogrow_invalid: bool,
+    pub autogrow_disabled: bool,
+    pub autogrow_read_only: bool,
+    pub autogrow_last_submitted: Option<SharedString>,
 
     pub sandbox_textbox: Entity<TextBoxState>,
     pub textbox_rows: usize,
@@ -775,6 +788,19 @@ impl PlaygroundApp {
                 .leading_icon(LucideIcon::Lock)
                 .masked(true)
         });
+
+        let sandbox_autogrow = Self::build_sandbox_autogrow(
+            String::new(),
+            1,
+            5,
+            ComponentSize::Md,
+            false,
+            false,
+            false,
+            false,
+            false,
+            cx,
+        );
 
         let sandbox_textbox = Self::build_sandbox_textbox(
             "GPUI renders UI at 120 FPS on the GPU.\nTry selecting across lines, pressing Up/Down,\nUndo (Ctrl/Cmd+Z), or Submit (Ctrl/Cmd+Enter)!".to_owned(),
@@ -2067,7 +2093,9 @@ impl PlaygroundApp {
 
         // BYOK AI Components (shared connection_key across AskAi, AskAiOverlay, and Build with AI)
         let ai_conn_key = "playground:ai";
-        let search_components_tool = ClientTool::sync(
+        let ai_bg = cx.background_executor().clone();
+        let search_bg = ai_bg.clone();
+        let search_components_tool = ClientTool::async_fn(
             "search_components",
             "Search GPUI components by keyword and return matching module names and summaries.",
             serde_json::json!({
@@ -2076,56 +2104,71 @@ impl PlaygroundApp {
                     "query": { "type": "string", "description": "Search keyword" }
                 }
             }),
-            |args| {
-                let q = args
-                    .get("query")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_ascii_lowercase();
-                let catalog = [
-                    ("AskAi", "BYOK chat assistant with provider settings, MCP, tools, and branching"),
-                    ("AppTool", "Foreground GPUI tool bridge letting Build with AI read and mutate live editors"),
-                    ("Markdown", "Pure-GPUI GFM renderer with code copy and generative Answer Components"),
-                    ("FreeformCanvas", "2D drag, 8-way resize, and auto-align canvas editor"),
-                    ("CommandPalette", "Fuzzy searchable command launcher with keyboard slots"),
-                    ("VirtualTable", "Virtualized multi-column data table with sorting and sticky headers"),
-                    ("Sparkline", "Compact inline trend chart with hover tooltips"),
-                ];
-                let hits: Vec<_> = catalog
-                    .iter()
-                    .filter(|(n, d)| {
-                        q.is_empty()
-                            || n.to_ascii_lowercase().contains(&q)
-                            || d.to_ascii_lowercase().contains(&q)
-                    })
-                    .map(|(n, d)| serde_json::json!({ "name": n, "summary": d }))
-                    .collect();
-                Ok(serde_json::json!({ "count": hits.len(), "matches": hits }))
+            move |args| {
+                let exec = search_bg.clone();
+                async move {
+                    exec.timer(Duration::from_millis(380)).await;
+                    let q = args
+                        .get("query")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_ascii_lowercase();
+                    let catalog = [
+                        ("AskAi", "BYOK chat assistant with provider settings, MCP, tools, and branching"),
+                        ("AppTool", "Foreground GPUI tool bridge letting Build with AI read and mutate live editors"),
+                        ("AutoGrowInput", "Adjustable-height input starting at 1 line and expanding on linebreaks up to max_rows"),
+                        ("Markdown", "Pure-GPUI GFM renderer with code copy and generative Answer Components"),
+                        ("FreeformCanvas", "2D drag, 8-way resize, and auto-align canvas editor"),
+                        ("CommandPalette", "Fuzzy searchable command launcher with keyboard slots"),
+                        ("VirtualTable", "Virtualized multi-column data table with sorting and sticky headers"),
+                        ("Sparkline", "Compact inline trend chart with hover tooltips"),
+                    ];
+                    let hits: Vec<_> = catalog
+                        .iter()
+                        .filter(|(n, d)| {
+                            q.is_empty()
+                                || n.to_ascii_lowercase().contains(&q)
+                                || d.to_ascii_lowercase().contains(&q)
+                        })
+                        .map(|(n, d)| serde_json::json!({ "name": n, "summary": d }))
+                        .collect();
+                    Ok(serde_json::json!({ "count": hits.len(), "matches": hits }))
+                }
             },
         );
-        let list_categories_tool = ClientTool::sync(
+        let list_bg = ai_bg.clone();
+        let list_categories_tool = ClientTool::async_fn(
             "list_categories",
             "Return component categories and counts in the GPUI library.",
             serde_json::json!({ "type": "object", "properties": {} }),
-            |_| {
-                Ok(serde_json::json!({
-                    "categories": [
-                        { "name": "Core Controls", "count": 13 },
-                        { "name": "Layout & Navigation", "count": 9 },
-                        { "name": "Data & Charts", "count": 17 },
-                        { "name": "Desktop & Windows", "count": 11 },
-                        { "name": "AI Components", "count": 6 }
-                    ]
-                }))
+            move |_| {
+                let exec = list_bg.clone();
+                async move {
+                    exec.timer(Duration::from_millis(340)).await;
+                    Ok(serde_json::json!({
+                        "categories": [
+                            { "name": "Core Controls", "count": 14 },
+                            { "name": "Layout & Navigation", "count": 9 },
+                            { "name": "Data & Charts", "count": 17 },
+                            { "name": "Desktop & Windows", "count": 11 },
+                            { "name": "AI Components", "count": 6 }
+                        ]
+                    }))
+                }
             },
         );
         let demo_tools = vec![search_components_tool, list_categories_tool];
+
+        let mut ask_providers = default_providers();
+        ask_providers.push(crate::pages::ai_assistant::ask_demo_simulated_provider(
+            ai_bg.clone(),
+        ));
 
         let ai_ask = cx.new(|cx| {
             let mut state = AskAiState::new(cx)
                 .title("Ask AI")
                 .connection_key(ai_conn_key)
-                .with_simulated_provider()
+                .providers(ask_providers.clone())
                 .client_tools(demo_tools.clone())
                 .workspace(true)
                 .images(true)
@@ -2169,7 +2212,7 @@ impl PlaygroundApp {
             AskAiState::new(cx)
                 .title("Ask AI")
                 .connection_key(ai_conn_key)
-                .with_simulated_provider()
+                .providers(ask_providers)
                 .client_tools(demo_tools.clone())
                 .workspace(true)
                 .images(true)
@@ -2643,7 +2686,9 @@ impl PlaygroundApp {
         ];
 
         let mut canvas_providers = default_providers();
-        canvas_providers.push(crate::pages::ai_assistant::canvas_demo_simulated_provider());
+        canvas_providers.push(crate::pages::ai_assistant::canvas_demo_simulated_provider(
+            ai_bg,
+        ));
 
         let ai_canvas_builder = cx.new(|cx| {
             AskAiState::build_with_ai(cx)
@@ -2744,6 +2789,17 @@ impl PlaygroundApp {
             form_email,
             form_password,
             form_email_error: None,
+
+            sandbox_autogrow,
+            autogrow_min_rows: 1,
+            autogrow_max_rows: 5,
+            autogrow_size: ComponentSize::Md,
+            autogrow_submit_on_enter: false,
+            autogrow_show_counter: false,
+            autogrow_invalid: false,
+            autogrow_disabled: false,
+            autogrow_read_only: false,
+            autogrow_last_submitted: None,
 
             sandbox_textbox,
             textbox_rows: 4,
@@ -3028,6 +3084,96 @@ impl PlaygroundApp {
             self.input_invalid,
             self.input_has_icon,
             self.input_has_addons,
+            cx,
+        );
+        cx.notify();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_sandbox_autogrow(
+        value: String,
+        min_rows: usize,
+        max_rows: usize,
+        size: ComponentSize,
+        submit_on_enter: bool,
+        show_counter: bool,
+        invalid: bool,
+        disabled: bool,
+        read_only: bool,
+        cx: &mut Context<Self>,
+    ) -> Entity<AutoGrowInputState> {
+        let placeholder = if submit_on_enter {
+            "Type a message… (Enter submits, Shift+Enter adds a line)"
+        } else {
+            "Starts at 1 line — press Enter to grow automatically…"
+        };
+        let entity = cx.new(|cx| {
+            AutoGrowInputState::new(cx)
+                .default_value(value)
+                .placeholder(placeholder)
+                .min_rows(min_rows)
+                .max_rows(max_rows)
+                .size(size)
+                .submit_on_enter(submit_on_enter)
+                .show_counter(show_counter)
+                .invalid(invalid)
+                .disabled(disabled)
+                .read_only(read_only)
+        });
+        cx.subscribe(&entity, move |this, inp, ev: &AutoGrowInputEvent, cx| match ev {
+            AutoGrowInputEvent::Change(val) => {
+                let lines = val.split('\n').count();
+                this.log_event(
+                    "AutoGrowInput",
+                    format!("Change({lines} lines, {} chars)", val.chars().count()),
+                    cx,
+                );
+            }
+            AutoGrowInputEvent::Submit(val) => {
+                let lines = val.split('\n').count();
+                let preview = if val.trim().is_empty() {
+                    "(empty)".to_owned()
+                } else {
+                    val.replace('\n', " ↵ ")
+                };
+                this.autogrow_last_submitted = Some(preview.clone().into());
+                if submit_on_enter && !val.trim().is_empty() {
+                    inp.update(cx, |s, cx| s.set_value_silent(String::new(), cx));
+                }
+                this.log_event(
+                    "AutoGrowInput",
+                    format!("Submit({lines} lines, {} chars)", val.chars().count()),
+                    cx,
+                );
+                this.push_toast(
+                    ToastVariant::Success,
+                    if submit_on_enter {
+                        "AutoGrowInput submitted (Enter)"
+                    } else {
+                        "AutoGrowInput submitted (Cmd/Ctrl+Enter)"
+                    },
+                    Some(&format!("{lines} lines · {} chars", val.chars().count())),
+                    cx,
+                );
+            }
+            AutoGrowInputEvent::Focus | AutoGrowInputEvent::Blur => {}
+        })
+        .detach();
+        entity
+    }
+
+    pub fn rebuild_sandbox_autogrow(&mut self, cx: &mut Context<Self>) {
+        let prev = self.sandbox_autogrow.read(cx).value().to_owned();
+        self.sandbox_autogrow = Self::build_sandbox_autogrow(
+            prev,
+            self.autogrow_min_rows,
+            self.autogrow_max_rows,
+            self.autogrow_size,
+            self.autogrow_submit_on_enter,
+            self.autogrow_show_counter,
+            self.autogrow_invalid,
+            self.autogrow_disabled,
+            self.autogrow_read_only,
             cx,
         );
         cx.notify();

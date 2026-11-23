@@ -9,25 +9,79 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use gpui::components::ai::{
     AiTokenUsage, FinishReason, LanguageModel, ModelContentPart, ModelMessage, ModelRequest,
-    ModelStreamEvent, ProviderPreset, ToolChoice, new_id, simulated_provider,
+    ModelStreamEvent, ProviderPreset, SimulatedModel, ToolChoice, new_id, simulated_provider,
 };
 use gpui::components::*;
 use gpui::icons::LucideIcon;
-use gpui::{Context, IntoElement, div, prelude::*, px};
+use gpui::{BackgroundExecutor, Context, IntoElement, div, prelude::*, px};
 use serde_json::{Value, json};
 
 use crate::code_box::code_snippet;
 use crate::pages::layout_page::freeform_canvas_demo;
 use crate::state::PlaygroundApp;
 
+async fn demo_sleep(executor: &BackgroundExecutor, duration: Duration, abort: &AtomicBool) -> bool {
+    if abort.load(Ordering::Relaxed) {
+        return false;
+    }
+    let mut remaining = duration;
+    let slice = Duration::from_millis(40);
+    while !remaining.is_zero() {
+        let wait = remaining.min(slice);
+        executor.timer(wait).await;
+        if abort.load(Ordering::Relaxed) {
+            return false;
+        }
+        remaining = remaining.saturating_sub(wait);
+    }
+    true
+}
+
+fn demo_chunks(text: &str, max_chars: usize) -> Vec<String> {
+    let step = max_chars.max(1);
+    let mut out = Vec::new();
+    let mut buf = String::new();
+    let mut count = 0usize;
+    for ch in text.chars() {
+        buf.push(ch);
+        count += 1;
+        if count >= step {
+            out.push(std::mem::take(&mut buf));
+            count = 0;
+        }
+    }
+    if !buf.is_empty() {
+        out.push(buf);
+    }
+    out
+}
+
+async fn demo_stream_reasoning(
+    executor: &BackgroundExecutor,
+    text: &str,
+    abort: &AtomicBool,
+    tx: &async_channel::Sender<ModelStreamEvent>,
+) -> bool {
+    for chunk in demo_chunks(text, 18) {
+        if !demo_sleep(executor, Duration::from_millis(24), abort).await {
+            return false;
+        }
+        let _ = tx.send(ModelStreamEvent::ReasoningDelta(chunk)).await;
+    }
+    demo_sleep(executor, Duration::from_millis(260), abort).await
+}
+
 /// Offline playground demo [`LanguageModel`] wired via `ProviderPreset.custom_model` so visitors
 /// can test live **Build with AI** edits on the Freeform 2D Canvas without entering an API key.
 /// Switching to OpenAI, Anthropic, Gemini, or any OpenAI-compatible endpoint in Settings replaces
 /// this model immediately while keeping all 7 live canvas `AppTool`s intact.
-struct DemoCanvasModel;
+struct DemoCanvasModel {
+    executor: BackgroundExecutor,
+}
 
 impl LanguageModel for DemoCanvasModel {
     fn stream_step(
@@ -37,6 +91,7 @@ impl LanguageModel for DemoCanvasModel {
         abort: Arc<AtomicBool>,
         tx: async_channel::Sender<ModelStreamEvent>,
     ) -> futures::future::BoxFuture<'static, anyhow::Result<()>> {
+        let executor = self.executor.clone();
         Box::pin(async move {
             let last_user_text = request
                 .messages
@@ -70,14 +125,24 @@ impl LanguageModel for DemoCanvasModel {
             let lower = last_user_text.to_ascii_lowercase();
             let has_tool = |name: &str| request.tools.iter().any(|t| t.name == name);
 
+            if !demo_sleep(&executor, Duration::from_millis(500), &abort).await {
+                let _ = tx.send(ModelStreamEvent::Finish(FinishReason::Cancelled)).await;
+                return Ok(());
+            }
+
             if has_tool("canvas_get_state") && request.tool_choice == ToolChoice::Auto {
                 if !last_is_tool {
-                    let _ = tx
-                        .send(ModelStreamEvent::ReasoningDelta(
-                            "Reading the live 2D canvas state before planning changes.\n"
-                                .to_owned(),
-                        ))
-                        .await;
+                    if !demo_stream_reasoning(
+                        &executor,
+                        "Reading the live Freeform 2D Canvas bounds and placed widgets before planning edits.\n",
+                        &abort,
+                        &tx,
+                    )
+                    .await
+                    {
+                        let _ = tx.send(ModelStreamEvent::Finish(FinishReason::Cancelled)).await;
+                        return Ok(());
+                    }
                     let _ = tx
                         .send(ModelStreamEvent::ToolCall {
                             id: new_id(),
@@ -135,12 +200,14 @@ impl LanguageModel for DemoCanvasModel {
                                 target_ids.push(last_id.to_owned());
                             }
                             if !target_ids.is_empty() {
-                                let _ = tx
-                                    .send(ModelStreamEvent::ReasoningDelta(format!(
-                                        "Removing {} widget(s) from the live canvas.\n",
-                                        target_ids.len()
-                                    )))
-                                    .await;
+                                let thought = format!(
+                                    "Found {} matching widget(s) on the canvas. Removing them cleanly.\n",
+                                    target_ids.len()
+                                );
+                                if !demo_stream_reasoning(&executor, &thought, &abort, &tx).await {
+                                    let _ = tx.send(ModelStreamEvent::Finish(FinishReason::Cancelled)).await;
+                                    return Ok(());
+                                }
                                 let _ = tx
                                     .send(ModelStreamEvent::ToolCall {
                                         id: new_id(),
@@ -174,12 +241,15 @@ impl LanguageModel for DemoCanvasModel {
                             if kinds.is_empty() {
                                 kinds.push("metric");
                             }
-                            let _ = tx
-                                .send(ModelStreamEvent::ReasoningDelta(format!(
-                                    "Adding {} widget(s) onto the live 2D canvas.\n",
-                                    kinds.len()
-                                )))
-                                .await;
+                            let thought = format!(
+                                "Canvas currently has {} widget(s). Placing {} new widget(s) directly onto the canvas.\n",
+                                items.len(),
+                                kinds.len()
+                            );
+                            if !demo_stream_reasoning(&executor, &thought, &abort, &tx).await {
+                                let _ = tx.send(ModelStreamEvent::Finish(FinishReason::Cancelled)).await;
+                                return Ok(());
+                            }
                             for kind in kinds {
                                 let _ = tx
                                     .send(ModelStreamEvent::ToolCall {
@@ -207,11 +277,14 @@ impl LanguageModel for DemoCanvasModel {
                             } else {
                                 "center_horizontal"
                             };
-                            let _ = tx
-                                .send(ModelStreamEvent::ReasoningDelta(format!(
-                                    "Aligning widgets ({action}).\n"
-                                )))
-                                .await;
+                            let thought = format!(
+                                "Aligning all {} canvas widgets ({action}).\n",
+                                items.len()
+                            );
+                            if !demo_stream_reasoning(&executor, &thought, &abort, &tx).await {
+                                let _ = tx.send(ModelStreamEvent::Finish(FinishReason::Cancelled)).await;
+                                return Ok(());
+                            }
                             let _ = tx
                                 .send(ModelStreamEvent::ToolCall {
                                     id: new_id(),
@@ -232,11 +305,13 @@ impl LanguageModel for DemoCanvasModel {
                             } else {
                                 (480.0, 220.0)
                             };
-                            let _ = tx
-                                .send(ModelStreamEvent::ReasoningDelta(format!(
-                                    "Resizing the live canvas frame to {tw}×{th} px.\n"
-                                )))
-                                .await;
+                            let thought = format!(
+                                "Resizing the live canvas frame from {cw}×{ch} px to {tw}×{th} px.\n"
+                            );
+                            if !demo_stream_reasoning(&executor, &thought, &abort, &tx).await {
+                                let _ = tx.send(ModelStreamEvent::Finish(FinishReason::Cancelled)).await;
+                                return Ok(());
+                            }
                             let _ = tx
                                 .send(ModelStreamEvent::ToolCall {
                                     id: new_id(),
@@ -286,12 +361,14 @@ impl LanguageModel for DemoCanvasModel {
                                     })
                                     .collect()
                             };
-                            let _ = tx
-                                .send(ModelStreamEvent::ReasoningDelta(
-                                    "Arranging the live 2D canvas items into a 2-column grid.\n"
-                                        .to_owned(),
-                                ))
-                                .await;
+                            let thought = format!(
+                                "Computing balanced 2-column coordinates for {} widget(s) inside {target_w}×{target_h} px.\n",
+                                layout_items.len()
+                            );
+                            if !demo_stream_reasoning(&executor, &thought, &abort, &tx).await {
+                                let _ = tx.send(ModelStreamEvent::Finish(FinishReason::Cancelled)).await;
+                                return Ok(());
+                            }
                             let _ = tx
                                 .send(ModelStreamEvent::ToolCall {
                                     id: new_id(),
@@ -314,6 +391,18 @@ impl LanguageModel for DemoCanvasModel {
                 }
             }
 
+            if !demo_stream_reasoning(
+                &executor,
+                "Summarizing the updated live canvas state for the user.\n",
+                &abort,
+                &tx,
+            )
+            .await
+            {
+                let _ = tx.send(ModelStreamEvent::Finish(FinishReason::Cancelled)).await;
+                return Ok(());
+            }
+
             let reply = if let Some((tool_name, output)) = last_tool_output {
                 if tool_name == "canvas_get_state" {
                     format!(
@@ -330,16 +419,12 @@ impl LanguageModel for DemoCanvasModel {
                 "Ready to inspect or edit the live 2D canvas directly. Try asking me to arrange the widgets into a grid, add a mini chart, resize the canvas, or remove an item.".to_owned()
             };
 
-            for chunk in reply.as_bytes().chunks(28) {
-                if abort.load(Ordering::Relaxed) {
+            for chunk in demo_chunks(&reply, 18) {
+                if !demo_sleep(&executor, Duration::from_millis(22), &abort).await {
                     let _ = tx.send(ModelStreamEvent::Finish(FinishReason::Cancelled)).await;
                     return Ok(());
                 }
-                let _ = tx
-                    .send(ModelStreamEvent::TextDelta(
-                        String::from_utf8_lossy(chunk).into_owned(),
-                    ))
-                    .await;
+                let _ = tx.send(ModelStreamEvent::TextDelta(chunk)).await;
             }
             let _ = tx
                 .send(ModelStreamEvent::Usage(AiTokenUsage {
@@ -353,12 +438,27 @@ impl LanguageModel for DemoCanvasModel {
     }
 }
 
-/// Returns the playground's offline Demo preset backed by [`DemoCanvasModel`] via
+/// Returns the playground's offline Ask AI demo preset backed by an interactively paced
+/// [`SimulatedModel`] so visitors clearly see thinking, reasoning streaming, tool execution, and
+/// token-by-token streaming (while keeping the `"simulated"` ID for shared `connection_key` sync).
+pub fn ask_demo_simulated_provider(executor: BackgroundExecutor) -> ProviderPreset {
+    let mut preset = simulated_provider();
+    preset.custom_model = Some(Arc::new(move |_| {
+        Ok(Arc::new(SimulatedModel::interactive(executor.clone())))
+    }));
+    preset
+}
+
+/// Returns the playground's offline Build with AI demo preset backed by [`DemoCanvasModel`] via
 /// `ProviderPreset.custom_model` (keeps the same `"simulated"` ID so it shares `connection_key`
 /// seamlessly with `AskAi`).
-pub fn canvas_demo_simulated_provider() -> ProviderPreset {
+pub fn canvas_demo_simulated_provider(executor: BackgroundExecutor) -> ProviderPreset {
     let mut preset = simulated_provider();
-    preset.custom_model = Some(Arc::new(|_| Ok(Arc::new(DemoCanvasModel))));
+    preset.custom_model = Some(Arc::new(move |_| {
+        Ok(Arc::new(DemoCanvasModel {
+            executor: executor.clone(),
+        }))
+    }));
     preset
 }
 
