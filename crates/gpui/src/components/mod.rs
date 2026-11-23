@@ -10,6 +10,7 @@
 
 pub mod accordion;
 pub mod alert;
+pub mod app_controls;
 pub mod avatar;
 pub mod badge;
 pub mod button;
@@ -24,6 +25,7 @@ pub mod context_menu;
 pub(crate) mod cursor_blink;
 pub mod date_time_picker;
 pub mod descriptions;
+pub mod detached_tooltip;
 pub mod dialog;
 pub mod drag_drop;
 pub mod drawer;
@@ -34,11 +36,11 @@ pub(crate) mod focus;
 #[cfg(test)]
 mod keyboard_tests;
 #[cfg(test)]
+mod keyboard_tests_arrows;
+#[cfg(test)]
 mod keyboard_tests_controls;
 #[cfg(test)]
 mod keyboard_tests_fields;
-#[cfg(test)]
-mod keyboard_tests_arrows;
 pub mod file_dropzone;
 pub mod filter_bar;
 pub mod form;
@@ -61,6 +63,7 @@ pub mod radio;
 pub mod result;
 pub mod segmented;
 pub mod select;
+pub mod shortcut_recorder;
 pub mod slider;
 pub mod split_pane;
 pub mod stat;
@@ -80,18 +83,28 @@ pub mod transfer_tags;
 pub mod transition_view;
 pub mod tree;
 pub mod typography;
+pub mod window_chrome;
 
 pub use accordion::{Accordion, Disclosure, accordion, disclosure};
 pub use alert::{Alert, AlertVariant, alert};
+pub use app_controls::{
+    ColorSwatchPopover, CompactStepper, ConfirmButton, ConfirmButtonEvent, ConfirmButtonState,
+    FloatingToolbar, LazyElement, SimulatedBackdrop, SimulatedBackdropKind, StatusIndicator,
+    StatusTone, StringList, StringListEvent, StringListState, TrendBadge, color_swatch_popover,
+    compact_stepper, confirm_button, floating_toolbar, lazy, simulated_backdrop, status_indicator,
+    string_list, toolbar_separator, trend_badge,
+};
 pub use avatar::{Avatar, AvatarGroup, AvatarStatus, avatar, avatar_group};
 pub use badge::{Badge, BadgeColor, BadgeVariant, badge};
 pub use button::{Button, ButtonGroup, ButtonVariant, button, button_group};
 pub use carousel::{Carousel, CarouselEvent, CarouselState, carousel};
 pub use charts::{
     BandScale, BreakdownItem, BreakdownList, ChartCard, ChartLegendItem, ChartPalette,
-    ChartValueFormat, LegendSwatch, LineChart, LineSeries, LineStyle, LinearScale, StackedBarChart,
-    StackedBarPoint, StackedBarSeries, breakdown_list, chart_card, format_compact, line_chart,
-    nice_ticks, stacked_bar_chart,
+    ChartValueFormat, CubicSegment, GroupedSparkline, GroupedSparklineSeries, LegendSwatch,
+    LineChart, LineSeries, LineStyle, LinearScale, Sparkline, SparklineHover, SparklineKind,
+    StackedBarChart, StackedBarPoint, StackedBarSeries, breakdown_list, chart_card,
+    compute_sparkline_y_range, format_compact, grouped_sparkline, line_chart, monotone, nice_ticks,
+    sample_monotone, sparkline, stacked_bar_chart,
 };
 pub use checkbox::{CheckState, Checkbox, CheckboxGroup, checkbox, checkbox_group};
 pub use color_picker::{
@@ -99,10 +112,12 @@ pub use color_picker::{
 };
 pub use combobox::{ComboBox, ComboBoxEvent, ComboBoxOption, ComboBoxState, combo_box};
 pub use command_palette::{
-    CommandItem, CommandPalette, CommandPaletteEvent, CommandPaletteState, command_palette,
+    CommandAction, CommandItem, CommandPalette, CommandPaletteEvent, CommandPaletteState,
+    command_palette,
 };
 pub use completion::{
-    CompletionConfig, SuggestionItem, SuggestionSource, filter_suggestions, fuzzy_match_score,
+    CompletionConfig, FuzzyMatch, MatchTier, SuggestionItem, SuggestionSource, filter_suggestions,
+    fuzzy_match_detailed, fuzzy_match_score,
 };
 pub use context_menu::{ContextMenu, context_menu};
 pub use date_time_picker::{
@@ -110,6 +125,9 @@ pub use date_time_picker::{
     TimeValue, date_picker, time_picker,
 };
 pub use descriptions::{DescriptionItem, Descriptions, descriptions};
+pub use detached_tooltip::{
+    DETACHED_TOOLTIP_SHADOW_PAD, DetachedTooltipContent, DetachedTooltipRow, NativeTooltipManager,
+};
 pub use dialog::{
     Dialog, DialogSize, DialogWindow, DialogWindowAction, DialogWindowView, OverlayPresentation,
     dialog, dialog_window,
@@ -140,8 +158,9 @@ pub use form::{FormRule, FormState};
 pub use freeform_canvas::{
     AlignAction, CanvasItemSpec, CanvasPaletteItem, CanvasRect, CanvasSize, FreeformCanvas,
     FreeformCanvasEvent, FreeformCanvasState, GuideAxis, GuideKind, ResizeHandle, SnapConfig,
-    SnapGuide, align_item, align_items, bounding_rect, canvas_palette_item, freeform_canvas,
-    snap_canvas_resize, snap_move, snap_resize,
+    SnapGuide, align_item, align_items, bounding_rect, bring_forward_many, canvas_palette_item,
+    duplicate_rects, freeform_canvas, nudge_rects, send_backward_many, snap_canvas_resize,
+    snap_move, snap_resize,
 };
 pub use hierarchical_select::{
     Cascader, CascaderEvent, CascaderOption, CascaderState, TreeSelect, TreeSelectEvent,
@@ -150,7 +169,10 @@ pub use hierarchical_select::{
 pub use image_preview::{
     ImagePreview, ImagePreviewItem, ImagePreviewState, PreviewMedia, image_preview,
 };
-pub use input::{Input, InputEvent, InputState, bind_input_keys, input};
+pub use input::{
+    Input, InputEvent, InputState, bind_input_keys, clamp_char_boundary, input,
+    utf8_offset_to_utf16, utf16_offset_to_utf8,
+};
 pub use interactive::{
     CopyButton, PinInput, PinInputEvent, PinInputState, Rating, copy_button, pin_input, rating,
 };
@@ -177,6 +199,9 @@ pub use radio::{RadioGroup, RadioOption, RadioVariant, radio_group};
 pub use result::{ResultStatus, ResultView, result_view};
 pub use segmented::{SegmentedControl, SegmentedItem, segmented_control};
 pub use select::{Select, SelectEvent, SelectOption, SelectState, select};
+pub use shortcut_recorder::{
+    ShortcutRecorder, ShortcutRecorderEvent, ShortcutRecorderState, shortcut_recorder,
+};
 pub use slider::{
     RangeSlider, RangeSliderEvent, RangeSliderState, Slider, SliderEvent, SliderMark, SliderState,
     range_slider, slider,
@@ -204,8 +229,8 @@ pub use time_range::{
 };
 pub use timeline::{Timeline, TimelineItem, TimelineMode, TimelineTone, timeline};
 pub use toast::{
-    NativeToastManager, Toast, ToastHost, ToastItem, ToastPosition, ToastVariant, ToastWindowView,
-    toast_host,
+    NativeToastManager, Toast, ToastAction, ToastHost, ToastItem, ToastPosition, ToastVariant,
+    ToastWindowView, toast_host,
 };
 pub use toggle::{Switch, Toggle, ToggleButton, ToggleGroup, switch, toggle, toggle_group};
 pub use tooltip::Tooltip;
@@ -220,6 +245,7 @@ pub use typography::{
     CodeBlock, EditableText, EditableTextEvent, EditableTextState, Heading, HeadingLevel, Text,
     TextTone, TruncatedText, code_block, editable_text, heading, truncated_text, ui_text,
 };
+pub use window_chrome::{KeyHint, StatusBar, WindowTitleBar, key_hint, status_bar, window_title_bar};
 
 #[cfg(test)]
 mod perf_tests;

@@ -3518,3 +3518,263 @@ fn text_keeps_its_full_width_after_a_min_content_pass(cx: &mut TestAppContext) {
     });
     assert_eq!(nested.size.width, alone.size.width);
 }
+
+#[test]
+fn fuzzy_match_detailed_tiers_acronyms_and_highlights() {
+    use crate::components::completion::{MatchTier, fuzzy_match_detailed};
+
+    let exact = fuzzy_match_detailed("VSCode", "VSCode").expect("exact");
+    let prefix = fuzzy_match_detailed("VSC", "VSCode Insiders").expect("prefix");
+    let word_prefix = fuzzy_match_detailed("term", "Windows Terminal").expect("word prefix");
+    let substring = fuzzy_match_detailed("udio", "Visual Studio Code").expect("substring");
+    let acronym_camel = fuzzy_match_detailed("vc", "VSCode").expect("camelCase acronym");
+    let acronym_words = fuzzy_match_detailed("vsc", "Visual Studio Code").expect("word acronym");
+    let fuzzy = fuzzy_match_detailed("vde", "VSCode").expect("fuzzy");
+
+    assert_eq!(exact.tier, MatchTier::Exact);
+    assert_eq!(prefix.tier, MatchTier::Prefix);
+    assert_eq!(word_prefix.tier, MatchTier::WordPrefix);
+    assert_eq!(substring.tier, MatchTier::Substring);
+    assert_eq!(acronym_camel.tier, MatchTier::Acronym);
+    assert_eq!(acronym_words.tier, MatchTier::Acronym);
+    assert_eq!(fuzzy.tier, MatchTier::Fuzzy);
+
+    assert!(exact.score > prefix.score);
+    assert!(prefix.score > word_prefix.score);
+    assert!(word_prefix.score > substring.score);
+    assert!(substring.score > acronym_words.score);
+    assert!(acronym_words.score > fuzzy.score);
+
+    // Highlight byte ranges are valid char boundaries inside the source text.
+    for (m, text) in [
+        (&exact, "VSCode"),
+        (&word_prefix, "Windows Terminal"),
+        (&acronym_camel, "VSCode"),
+        (&acronym_words, "Visual Studio Code"),
+        (&fuzzy, "VSCode"),
+    ] {
+        assert!(!m.ranges.is_empty());
+        for r in &m.ranges {
+            assert!(r.start < r.end && r.end <= text.len());
+            assert!(text.is_char_boundary(r.start) && text.is_char_boundary(r.end));
+        }
+    }
+    assert!(fuzzy_match_detailed("zzz", "Visual Studio Code").is_none());
+}
+
+#[test]
+fn freeform_canvas_z_order_nudge_and_duplicate() {
+    let mut items = vec!["a", "b", "c", "d"];
+    assert!(bring_forward_many(&mut items, |x| *x == "a" || *x == "c"));
+    assert_eq!(items, vec!["b", "a", "d", "c"]);
+    assert!(bring_forward_many(&mut items, |x| *x == "a" || *x == "c"));
+    assert_eq!(items, vec!["b", "d", "a", "c"]);
+    // Already at front — no-op.
+    assert!(!bring_forward_many(&mut items, |x| *x == "a" || *x == "c"));
+
+    assert!(send_backward_many(&mut items, |x| *x == "a" || *x == "c"));
+    assert_eq!(items, vec!["b", "a", "c", "d"]);
+    assert!(send_backward_many(&mut items, |x| *x == "a" || *x == "c"));
+    assert_eq!(items, vec!["a", "c", "b", "d"]);
+    assert!(!send_backward_many(&mut items, |x| *x == "a" || *x == "c"));
+
+    let canvas = CanvasSize::new(200.0, 100.0);
+    let group = [
+        CanvasRect::new(10.0, 10.0, 40.0, 20.0),
+        CanvasRect::new(60.0, 20.0, 40.0, 20.0),
+    ];
+    // Nudging past the right edge clamps rigidly so the 50px x-offset between items is preserved!
+    let nudged = nudge_rects(&group, 500.0, 0.0, canvas);
+    assert_eq!(nudged[0].x, 110.0);
+    assert_eq!(nudged[1].x, 160.0);
+    assert_eq!(nudged[1].x - nudged[0].x, 50.0);
+
+    let duped = duplicate_rects(&group, 12.0, 12.0, canvas);
+    assert_eq!(duped[0].x, 22.0);
+    assert_eq!(duped[0].y, 22.0);
+    assert_eq!(duped[1].x, 72.0);
+    assert_eq!(duped[1].y, 32.0);
+}
+
+#[test]
+fn input_utf16_and_theme_glass_helpers() {
+    let text = "Hi 👋世界";
+    assert_eq!(clamp_char_boundary(text, 4), 3); // mid-emoji clamps back to byte 3
+    assert_eq!(clamp_char_boundary(text, 999), text.len());
+    // "Hi " = 3 UTF-16 units; "👋" = 2 UTF-16 units (4 UTF-8 bytes)
+    assert_eq!(utf16_offset_to_utf8(text, 3), 3);
+    assert_eq!(utf16_offset_to_utf8(text, 5), 7);
+    assert_eq!(utf8_offset_to_utf16(text, 7), 5);
+
+    let dark = Theme::dark_glass();
+    let light = Theme::light_glass();
+    assert_eq!(dark.mode, ThemeMode::Dark);
+    assert_eq!(light.mode, ThemeMode::Light);
+    assert!(dark.surface.a < 0.80 && dark.input_bg.a > 0.85);
+    assert!(light.surface.a < 0.85 && light.popover.a > 0.90);
+
+    let sheer_edge = Theme::edge_for_opacity(dark.border, 0.25, true);
+    let solid_edge = Theme::edge_for_opacity(dark.border, 0.95, true);
+    assert!(sheer_edge.a > solid_edge.a);
+    assert!((dark.surface_with_opacity(0.42).a - 0.42).abs() < 1e-4);
+}
+
+#[gpui::test]
+fn input_committed_change_ignores_uncommitted_ime_marked_text(cx: &mut TestAppContext) {
+    cx.update(init_components);
+    let committed_events: Rc<RefCell<Vec<SharedString>>> = Rc::new(RefCell::new(Vec::new()));
+    let committed_clone = committed_events.clone();
+
+    let (input_entity, cx) = cx.add_window_view(|_, cx| InputState::new(cx));
+    cx.update(|_, cx| {
+        cx.subscribe(&input_entity, move |_, ev: &InputEvent, _| {
+            if let InputEvent::CommittedChange(val) = ev {
+                committed_clone.borrow_mut().push(val.clone());
+            }
+        })
+        .detach();
+    });
+
+    input_entity.update_in(cx, |inp, window, cx| {
+        inp.replace_text_in_range(None, "hello ", window, cx);
+        assert_eq!(inp.committed_value(), "hello ");
+        assert!(!inp.has_marked_text());
+
+        // Start IME composition ("nihao" marked text) — must NOT emit CommittedChange!
+        inp.replace_and_mark_text_in_range(None, "nihao", None, window, cx);
+        assert!(inp.has_marked_text());
+        assert_eq!(inp.value(), "hello nihao");
+        assert_eq!(inp.committed_value(), "hello ");
+
+        // Commit Chinese characters — now CommittedChange fires!
+        inp.replace_text_in_range(None, "你好", window, cx);
+        assert!(!inp.has_marked_text());
+        assert_eq!(inp.committed_value(), "hello 你好");
+    });
+    cx.run_until_parked();
+
+    assert_eq!(
+        committed_events.borrow().as_slice(),
+        &[
+            SharedString::from("hello "),
+            SharedString::from("hello 你好"),
+        ]
+    );
+}
+
+#[gpui::test]
+fn shortcut_recorder_confirm_button_string_list_and_standalone_palette(cx: &mut TestAppContext) {
+    use crate::{GlobalHotKey, KeyDownEvent};
+    cx.update(init_components);
+
+    // 1. ConfirmButtonState arms on first click, confirms on second click.
+    let events: Rc<RefCell<Vec<ConfirmButtonEvent>>> = Rc::new(RefCell::new(Vec::new()));
+    let ev_clone = events.clone();
+    let (confirm, cx) = cx.add_window_view(|_, cx| {
+        ConfirmButtonState::new("Delete", "Confirm Delete", cx)
+    });
+    cx.update(|_, cx| {
+        cx.subscribe(&confirm, move |_, ev: &ConfirmButtonEvent, _| {
+            ev_clone.borrow_mut().push(*ev);
+        })
+        .detach();
+    });
+    assert!(!confirm.read_with(cx, |s, _| s.is_armed()));
+    confirm.update(cx, |s, cx| {
+        s.disarm(cx); // idle disarm is no-op
+    });
+    assert!(events.borrow().is_empty());
+
+    // 2. StringListState adds, deduplicates (case-insensitive), and removes cleanly.
+    let (list, cx) = cx.add_window_view(|_, cx| {
+        StringListState::new(["1Password.exe", "KeePass.exe"], "Add process...", cx)
+    });
+    list.update(cx, |s, cx| {
+        assert_eq!(s.items().len(), 2);
+        s.remove_at(0, cx);
+        assert_eq!(s.items(), &[SharedString::from("KeePass.exe")]);
+        s.set_items(["Bitwarden.exe"], cx);
+        assert_eq!(s.items(), &[SharedString::from("Bitwarden.exe")]);
+    });
+
+    // 3. ShortcutRecorderState captures valid chord and ignores bare typing key.
+    let recorded: Rc<RefCell<Vec<Option<GlobalHotKey>>>> = Rc::new(RefCell::new(Vec::new()));
+    let rec_clone = recorded.clone();
+    let (recorder, cx) = cx.add_window_view(|_, cx| {
+        ShortcutRecorderState::new(GlobalHotKey::parse("Ctrl+Alt+Space").ok(), cx)
+    });
+    cx.update(|_, cx| {
+        cx.subscribe(&recorder, move |_, ev: &ShortcutRecorderEvent, _| {
+            if let ShortcutRecorderEvent::Change(hk) = ev {
+                rec_clone.borrow_mut().push(hk.clone());
+            }
+        })
+        .detach();
+    });
+    recorder.update_in(cx, |r, window, cx| {
+        r.start_recording(window, cx);
+        assert!(r.is_recording());
+    });
+    cx.run_until_parked();
+    cx.simulate_event(KeyDownEvent {
+        keystroke: Keystroke::parse("ctrl-shift-k").unwrap(),
+        is_held: false,
+        prefer_character_input: false,
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        recorder.read_with(cx, |r, _| r.shortcut().map(GlobalHotKey::to_spec)),
+        Some("Ctrl+Shift+K".to_owned())
+    );
+    assert_eq!(recorded.borrow().len(), 1);
+
+    // 4. CommandPaletteState standalone mode stays open after executing and supports quick slots & actions.
+    let executed: Rc<RefCell<Vec<SharedString>>> = Rc::new(RefCell::new(Vec::new()));
+    let exec_clone = executed.clone();
+    let (palette, cx) = cx.add_window_view(|_, cx| {
+        CommandPaletteState::new(
+            vec![
+                CommandItem::new("vscode", "Visual Studio Code")
+                    .group("Apps")
+                    .action(CommandAction::new("new-window", "New Window")),
+                CommandItem::new("wt", "Windows Terminal").group("Apps"),
+            ],
+            cx,
+        )
+        .standalone(true)
+        .quick_slots(true)
+    });
+    cx.update(|_, cx| {
+        cx.subscribe(&palette, move |_, ev: &CommandPaletteEvent, _| match ev {
+            CommandPaletteEvent::Execute(id) => exec_clone.borrow_mut().push(id.clone()),
+            CommandPaletteEvent::ExecuteAction {
+                command_id,
+                action_id,
+            } => exec_clone
+                .borrow_mut()
+                .push(format!("{command_id}:{action_id}").into()),
+            _ => {}
+        })
+        .detach();
+    });
+    assert!(palette.read_with(cx, |p, _| p.is_open()));
+    palette.update_in(cx, |p, window, cx| p.focus_search(window, cx));
+    cx.run_until_parked();
+    // Tab opens action panel on item 0 ("Visual Studio Code"), Enter executes "new-window".
+    cx.simulate_event(KeyDownEvent {
+        keystroke: Keystroke::parse("tab").unwrap(),
+        is_held: false,
+        prefer_character_input: false,
+    });
+    cx.simulate_event(KeyDownEvent {
+        keystroke: Keystroke::parse("enter").unwrap(),
+        is_held: false,
+        prefer_character_input: false,
+    });
+    cx.run_until_parked();
+    assert!(palette.read_with(cx, |p, _| p.is_open()));
+    assert_eq!(
+        executed.borrow().as_slice(),
+        &[SharedString::from("vscode:new-window")]
+    );
+}

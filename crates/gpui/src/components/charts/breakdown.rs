@@ -21,6 +21,12 @@ pub struct BreakdownItem {
     pub label: SharedString,
     /// Raw numeric value (used to compute relative share & bar fill width).
     pub value: f64,
+    /// Optional muted subtitle or denominator caption (e.g. `"1.2k reqs"`).
+    pub subtitle: Option<SharedString>,
+    /// Optional inline delta caption (e.g. `"+4.2%"` or `"-0.8 pp"`).
+    pub delta: Option<SharedString>,
+    /// Optional explicit color for the inline delta caption.
+    pub delta_color: Option<Hsla>,
     /// Optional explicit color override; defaults to [`ChartPalette`].
     pub color: Option<Hsla>,
 }
@@ -33,6 +39,9 @@ impl BreakdownItem {
             key: label.clone(),
             label,
             value: value.max(0.0),
+            subtitle: None,
+            delta: None,
+            delta_color: None,
             color: None,
         }
     }
@@ -40,6 +49,19 @@ impl BreakdownItem {
     /// Overrides the programmatic `key` passed to `on_select`.
     pub fn key(mut self, key: impl Into<SharedString>) -> Self {
         self.key = key.into();
+        self
+    }
+
+    /// Sets an optional muted subtitle / sample-count caption beside or under the label.
+    pub fn subtitle(mut self, subtitle: impl Into<SharedString>) -> Self {
+        self.subtitle = Some(subtitle.into());
+        self
+    }
+
+    /// Sets an optional inline delta string and semantic color.
+    pub fn delta(mut self, delta: impl Into<SharedString>, color: Option<Hsla>) -> Self {
+        self.delta = Some(delta.into());
+        self.delta_color = color;
         self
     }
 
@@ -51,12 +73,14 @@ impl BreakdownItem {
 }
 
 /// Ranked proportional breakdown list (e.g. `Cost by model`) with colored dot, label,
-/// tabular value + share %, animated horizontal bar, and interactive click-to-narrow filtering.
+/// tabular value + share % (or non-summing ratio scale), animated horizontal bar, and
+/// interactive click-to-narrow filtering.
 #[derive(IntoElement)]
 pub struct BreakdownList {
     id: ElementId,
     items: Vec<BreakdownItem>,
     format: ChartValueFormat,
+    ratio_max: Option<f64>,
     palette: Option<ChartPalette>,
     selected_key: Option<SharedString>,
     hint_text: Option<SharedString>,
@@ -76,12 +100,20 @@ impl BreakdownList {
             id: id.into(),
             items: Vec::new(),
             format: ChartValueFormat::Currency,
+            ratio_max: None,
             palette: None,
             selected_key: None,
             hint_text: None,
             style: StyleRefinement::default(),
             on_select: None,
         }
+    }
+
+    /// Switches from additive share-of-total mode to non-summing ratio/rate mode (for example
+    /// cache hit rates with `Some(100.0)` or latencies scaled against the highest row with `None`).
+    pub fn ratio_mode(mut self, domain_max: Option<f64>) -> Self {
+        self.ratio_max = Some(domain_max.unwrap_or(0.0));
+        self
     }
 
     /// Sets the breakdown rows.
@@ -137,15 +169,20 @@ impl RenderOnce for BreakdownList {
             .palette
             .unwrap_or_else(|| ChartPalette::from_theme(&theme));
         let tnum = tabular_numerals();
+        let ratio_mode = self.ratio_max.is_some();
         let total: f64 = self.items.iter().map(|i| i.value).sum();
-        let max_val = self
+        let data_max = self
             .items
             .iter()
             .map(|i| i.value)
             .fold(0.0_f64, f64::max)
             .max(f64::EPSILON);
+        let bar_denom = match self.ratio_max {
+            Some(explicit) if explicit > 0.0 => explicit,
+            _ => data_max,
+        };
 
-        let mut list = div().id(self.id).w_full().flex().flex_col().gap(px(12.));
+        let mut list = div().id(self.id).w_full().flex().flex_col().gap(px(8.));
 
         for (index, item) in self.items.into_iter().enumerate() {
             let color = item.color.unwrap_or_else(|| palette.color(index));
@@ -154,7 +191,7 @@ impl RenderOnce for BreakdownList {
             } else {
                 0.0
             };
-            let bar_fraction = (item.value / max_val).clamp(0.0, 1.0) as f32;
+            let bar_fraction = (item.value / bar_denom).clamp(0.0, 1.0) as f32;
             let is_selected = self
                 .selected_key
                 .as_ref()
@@ -180,7 +217,6 @@ impl RenderOnce for BreakdownList {
                 .w_full()
                 .px(px(8.))
                 .py(px(6.))
-                .mx(px(-8.))
                 .rounded(theme.radius_md)
                 .flex()
                 .flex_col()
@@ -223,7 +259,16 @@ impl RenderOnce for BreakdownList {
                                         .text_color(theme.foreground)
                                         .truncate()
                                         .child(item.label),
-                                ),
+                                )
+                                .when_some(item.subtitle, |el, sub| {
+                                    el.child(
+                                        div()
+                                            .text_size(px(11.5))
+                                            .text_color(theme.muted_foreground)
+                                            .truncate()
+                                            .child(sub),
+                                    )
+                                }),
                         )
                         .child(
                             div()
@@ -232,6 +277,17 @@ impl RenderOnce for BreakdownList {
                                 .gap(px(8.))
                                 .flex_shrink_0()
                                 .font_features(tnum.clone())
+                                .when_some(item.delta, |el, delta| {
+                                    el.child(
+                                        div()
+                                            .text_size(px(11.5))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(
+                                                item.delta_color.unwrap_or(theme.muted_foreground),
+                                            )
+                                            .child(delta),
+                                    )
+                                })
                                 .child(
                                     div()
                                         .text_size(px(13.))
@@ -239,14 +295,16 @@ impl RenderOnce for BreakdownList {
                                         .text_color(theme.foreground)
                                         .child(self.format.format_detail(item.value)),
                                 )
-                                .child(
-                                    div()
-                                        .w(px(40.))
-                                        .text_right()
-                                        .text_size(px(12.))
-                                        .text_color(theme.muted_foreground)
-                                        .child(format!("{share_pct:.1}%")),
-                                ),
+                                .when(!ratio_mode, |el| {
+                                    el.child(
+                                        div()
+                                            .w(px(40.))
+                                            .text_right()
+                                            .text_size(px(12.))
+                                            .text_color(theme.muted_foreground)
+                                            .child(format!("{share_pct:.1}%")),
+                                    )
+                                }),
                         ),
                 )
                 .child(

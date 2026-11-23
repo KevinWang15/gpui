@@ -106,11 +106,41 @@ pub fn bind_input_keys(cx: &mut App) {
     ]);
 }
 
+/// Clamps byte offset `idx` downward to a valid UTF-8 character boundary within `text`.
+pub fn clamp_char_boundary(text: &str, idx: usize) -> usize {
+    let mut i = idx.min(text.len());
+    while i > 0 && !text.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// Converts a UTF-16 code-unit offset into a clamped UTF-8 byte offset inside `text`.
+pub fn utf16_offset_to_utf8(text: &str, utf16_offset: usize) -> usize {
+    let mut utf16 = 0usize;
+    for (byte_idx, ch) in text.char_indices() {
+        if utf16 >= utf16_offset {
+            return byte_idx;
+        }
+        utf16 += ch.len_utf16();
+    }
+    text.len()
+}
+
+/// Converts a UTF-8 byte offset (clamped to a char boundary) into a UTF-16 code-unit offset.
+pub fn utf8_offset_to_utf16(text: &str, utf8_offset: usize) -> usize {
+    let clamped = clamp_char_boundary(text, utf8_offset);
+    text[..clamped].encode_utf16().count()
+}
+
 /// Events emitted by [`InputState`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InputEvent {
-    /// Emitted whenever the input text changes.
+    /// Emitted whenever the input text changes (including active IME pre-edit text).
     Change(SharedString),
+    /// Emitted only when committed text changes (excluding uncommitted IME composition strokes —
+    /// ideal for live search & Spotlight launchers so CJK/Japanese IME typing never flickers).
+    CommittedChange(SharedString),
     /// Emitted when the user presses Enter inside the input.
     Submit(SharedString),
     /// Emitted when the user accepts a completion suggestion via `Enter`, `Tab`, or mouse click.
@@ -498,14 +528,35 @@ impl InputState {
                 self.refresh_completions(true, cx);
             }
         }
-        cx.emit(InputEvent::Change(SharedString::from(self.content.clone())));
+        let updated = SharedString::from(self.content.clone());
+        cx.emit(InputEvent::Change(updated.clone()));
+        cx.emit(InputEvent::CommittedChange(updated));
         cx.emit(InputEvent::AcceptSuggestion(item));
         cx.notify();
     }
 
-    /// Returns the current text value.
+    /// Returns the current text value (including any uncommitted IME marked text).
     pub fn value(&self) -> &str {
         &self.content
+    }
+
+    /// Returns the committed text value with any active uncommitted IME composition range stripped.
+    /// Ideal for live search and Spotlight launchers so CJK/Japanese IME typing does not flicker.
+    pub fn committed_value(&self) -> String {
+        match &self.marked_range {
+            Some(range) if range.start <= range.end && range.end <= self.content.len() => {
+                let mut out = String::with_capacity(self.content.len() - (range.end - range.start));
+                out.push_str(&self.content[..range.start]);
+                out.push_str(&self.content[range.end..]);
+                out
+            }
+            _ => self.content.clone(),
+        }
+    }
+
+    /// Returns whether an OS IME composition session is currently active.
+    pub fn has_marked_text(&self) -> bool {
+        self.marked_range.is_some()
     }
 
     /// Returns the current selection byte range within [`Self::value`].
@@ -513,10 +564,13 @@ impl InputState {
         self.selected_range.clone()
     }
 
-    /// Programmatically replaces the value and emits [`InputEvent::Change`].
+    /// Programmatically replaces the value and emits [`InputEvent::Change`] and
+    /// [`InputEvent::CommittedChange`].
     pub fn set_value(&mut self, value: impl Into<String>, cx: &mut Context<Self>) {
         self.set_value_silent(value, cx);
-        cx.emit(InputEvent::Change(SharedString::from(self.content.clone())));
+        let updated = SharedString::from(self.content.clone());
+        cx.emit(InputEvent::Change(updated.clone()));
+        cx.emit(InputEvent::CommittedChange(updated));
     }
 
     /// Programmatically replaces the value without emitting [`InputEvent::Change`].
@@ -978,6 +1032,9 @@ impl InputState {
             cx.write_to_clipboard(ClipboardItem::new_string(
                 self.content[self.selected_range.clone()].to_string(),
             ));
+        } else {
+            // Propagate empty-selection Copy so launcher/list hosts can copy the selected result.
+            cx.propagate();
         }
     }
 
@@ -1010,7 +1067,9 @@ impl InputState {
             self.blink.reset(cx);
             self.refresh_completions(true, cx);
             window.notify_text_input_changed(&self.focus_handle);
-            cx.emit(InputEvent::Change(SharedString::from(self.content.clone())));
+            let updated = SharedString::from(self.content.clone());
+            cx.emit(InputEvent::Change(updated.clone()));
+            cx.emit(InputEvent::CommittedChange(updated));
             cx.notify();
         }
     }
@@ -1032,7 +1091,9 @@ impl InputState {
             self.blink.reset(cx);
             self.refresh_completions(true, cx);
             window.notify_text_input_changed(&self.focus_handle);
-            cx.emit(InputEvent::Change(SharedString::from(self.content.clone())));
+            let updated = SharedString::from(self.content.clone());
+            cx.emit(InputEvent::Change(updated.clone()));
+            cx.emit(InputEvent::CommittedChange(updated));
             cx.notify();
         }
     }
@@ -1196,9 +1257,14 @@ impl EntityInputHandler for InputState {
     }
 
     fn unmark_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.marked_range = None;
+        let had_marked = self.marked_range.take().is_some();
         self.blink.reset(cx);
         window.notify_text_input_changed(&self.focus_handle);
+        if had_marked {
+            cx.emit(InputEvent::CommittedChange(SharedString::from(
+                self.content.clone(),
+            )));
+        }
         cx.notify();
     }
 
@@ -1240,7 +1306,9 @@ impl EntityInputHandler for InputState {
         self.blink.reset(cx);
         self.refresh_completions(true, cx);
         window.notify_text_input_changed(&self.focus_handle);
-        cx.emit(InputEvent::Change(SharedString::from(self.content.clone())));
+        let updated = SharedString::from(self.content.clone());
+        cx.emit(InputEvent::Change(updated.clone()));
+        cx.emit(InputEvent::CommittedChange(updated));
         cx.notify();
     }
 
@@ -1927,14 +1995,4 @@ impl RenderOnce for Input {
 
 pub(crate) fn is_word_char(ch: char) -> bool {
     ch.is_alphanumeric() || ch == '_'
-}
-
-pub(crate) fn clamp_char_boundary(s: &str, mut index: usize) -> usize {
-    if index >= s.len() {
-        return s.len();
-    }
-    while index > 0 && !s.is_char_boundary(index) {
-        index -= 1;
-    }
-    index
 }

@@ -1061,6 +1061,73 @@ pub fn align_items(
     out
 }
 
+/// Moves every item whose index is selected by `is_selected` one step toward the front (higher
+/// index) while preserving relative z-order among the selected items. Returns `true` if any item
+/// moved.
+pub fn bring_forward_many<T>(items: &mut [T], is_selected: impl Fn(&T) -> bool) -> bool {
+    if items.len() < 2 {
+        return false;
+    }
+    let mut moved = false;
+    for i in (0..items.len() - 1).rev() {
+        if is_selected(&items[i]) && !is_selected(&items[i + 1]) {
+            items.swap(i, i + 1);
+            moved = true;
+        }
+    }
+    moved
+}
+
+/// Moves every item whose index is selected by `is_selected` one step toward the back (lower
+/// index) while preserving relative z-order among the selected items. Returns `true` if any item
+/// moved.
+pub fn send_backward_many<T>(items: &mut [T], is_selected: impl Fn(&T) -> bool) -> bool {
+    if items.len() < 2 {
+        return false;
+    }
+    let mut moved = false;
+    for i in 1..items.len() {
+        if is_selected(&items[i]) && !is_selected(&items[i - 1]) {
+            items.swap(i - 1, i);
+            moved = true;
+        }
+    }
+    moved
+}
+
+/// Rigidly translates a group of `rects` by `(dx, dy)` while clamping the group's bounding box
+/// inside `canvas` so relative spacing between items never collapses at canvas edges.
+pub fn nudge_rects(rects: &[CanvasRect], dx: f32, dy: f32, canvas: CanvasSize) -> Vec<CanvasRect> {
+    let Some(bounds) = bounding_rect(rects) else {
+        return Vec::new();
+    };
+    let clamped_dx = dx.clamp(-bounds.x, (canvas.width - bounds.right()).max(-bounds.x));
+    let clamped_dy = dy.clamp(-bounds.y, (canvas.height - bounds.bottom()).max(-bounds.y));
+    rects
+        .iter()
+        .map(|r| {
+            CanvasRect::new(
+                (r.x + clamped_dx).round(),
+                (r.y + clamped_dy).round(),
+                r.width,
+                r.height,
+            )
+            .clamped_in(canvas)
+        })
+        .collect()
+}
+
+/// Duplicates a group of `rects` as a rigid cluster offset by `(offset_x, offset_y)`, clamped cleanly
+/// inside `canvas` without collapsing relative item spacing.
+pub fn duplicate_rects(
+    rects: &[CanvasRect],
+    offset_x: f32,
+    offset_y: f32,
+    canvas: CanvasSize,
+) -> Vec<CanvasRect> {
+    nudge_rects(rects, offset_x, offset_y, canvas)
+}
+
 /// Events emitted by [`FreeformCanvasState`].
 #[derive(Clone, Debug, PartialEq)]
 pub enum FreeformCanvasEvent {

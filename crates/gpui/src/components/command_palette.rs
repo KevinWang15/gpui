@@ -13,13 +13,51 @@ use crate::{
     ease_out_quint, prelude::*, px, uniform_list,
 };
 
-use super::completion::fuzzy_match_score_lower;
+use super::completion::{fuzzy_match_detailed, fuzzy_match_score_lower};
 use super::field::kbd;
 use super::focus::{is_list_nav_key, list_step, step_enabled};
 use super::input::{Input, InputEvent, InputState};
 use super::theme::{ANIM_FAST, ActiveTheme, ComponentSize};
 
 const CMD_ROW_HEIGHT: f32 = 44.0;
+
+/// Secondary action available in the [`CommandPalette`] action panel (`Tab` / `Ctrl+K`) for a
+/// selected [`CommandItem`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommandAction {
+    /// Action identifier emitted in [`CommandPaletteEvent::ExecuteAction`].
+    pub id: SharedString,
+    /// Human-readable label (e.g. `"Reveal in Explorer"`, `"Copy Path"`).
+    pub label: SharedString,
+    /// Optional leading [`LucideIcon`].
+    pub icon: Option<LucideIcon>,
+    /// Optional shortcut keycaps shown on the right.
+    pub shortcut: Vec<SharedString>,
+}
+
+impl CommandAction {
+    /// Creates a new [`CommandAction`].
+    pub fn new(id: impl Into<SharedString>, label: impl Into<SharedString>) -> Self {
+        Self {
+            id: id.into(),
+            label: label.into(),
+            icon: None,
+            shortcut: Vec::new(),
+        }
+    }
+
+    /// Sets an optional leading icon.
+    pub fn icon(mut self, icon: LucideIcon) -> Self {
+        self.icon = Some(icon);
+        self
+    }
+
+    /// Sets shortcut hint keycaps.
+    pub fn shortcut(mut self, keys: &[&str]) -> Self {
+        self.shortcut = keys.iter().map(|k| SharedString::from(*k)).collect();
+        self
+    }
+}
 
 /// Single actionable command listed inside a [`CommandPalette`].
 #[derive(Clone)]
@@ -38,6 +76,8 @@ pub struct CommandItem {
     pub shortcut: Vec<SharedString>,
     /// Extra search keywords matched by fuzzy filtering (not rendered visibly).
     pub keywords: SharedString,
+    /// Optional secondary actions shown in the `Tab` / `Ctrl+K` action panel.
+    pub actions: Vec<CommandAction>,
     /// Disables selection and execution.
     pub disabled: bool,
 }
@@ -53,6 +93,7 @@ impl CommandItem {
             icon: None,
             shortcut: Vec::new(),
             keywords: "".into(),
+            actions: Vec::new(),
             disabled: false,
         }
     }
@@ -87,6 +128,18 @@ impl CommandItem {
         self
     }
 
+    /// Appends a single secondary action revealed via `Tab` / `Ctrl+K` in the action panel.
+    pub fn action(mut self, action: CommandAction) -> Self {
+        self.actions.push(action);
+        self
+    }
+
+    /// Attaches secondary actions revealed via `Tab` / `Ctrl+K` in the action panel.
+    pub fn actions(mut self, actions: impl IntoIterator<Item = CommandAction>) -> Self {
+        self.actions = actions.into_iter().collect();
+        self
+    }
+
     /// Marks this command disabled.
     pub fn disabled(mut self, disabled: bool) -> Self {
         self.disabled = disabled;
@@ -96,7 +149,6 @@ impl CommandItem {
 
 struct IndexedCommand {
     item: CommandItem,
-    title_low: String,
     subtitle_low: Option<String>,
     keywords_low: String,
     group_low: String,
@@ -104,13 +156,11 @@ struct IndexedCommand {
 
 impl IndexedCommand {
     fn new(item: CommandItem) -> Self {
-        let title_low = item.title.to_lowercase();
         let subtitle_low = item.subtitle.as_deref().map(str::to_lowercase);
         let keywords_low = item.keywords.to_lowercase();
         let group_low = item.group.to_lowercase();
         Self {
             item,
-            title_low,
             subtitle_low,
             keywords_low,
             group_low,
@@ -127,8 +177,15 @@ enum PaletteRow {
 /// Events emitted by [`CommandPaletteState`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CommandPaletteEvent {
-    /// Emitted when the user executes a command via `Enter` or mouse click.
+    /// Emitted when the user executes a command via `Enter`, `Ctrl/Cmd 1..9`, or mouse click.
     Execute(SharedString),
+    /// Emitted when the user invokes a secondary [`CommandAction`] from the `Tab` / `Ctrl+K` action panel.
+    ExecuteAction {
+        /// Parent command ID.
+        command_id: SharedString,
+        /// Secondary action ID.
+        action_id: SharedString,
+    },
     /// Emitted when the palette opens.
     Open,
     /// Emitted when the palette closes.
@@ -142,6 +199,10 @@ pub struct CommandPaletteState {
     search_input: Entity<InputState>,
     scroll_handle: UniformListScrollHandle,
     open: bool,
+    standalone: bool,
+    quick_slots: bool,
+    action_panel_open: bool,
+    action_selected_idx: usize,
     items: Rc<Vec<IndexedCommand>>,
     selected_idx: usize,
     cached_query: SharedString,
@@ -183,16 +244,21 @@ impl CommandPaletteState {
                 .size(ComponentSize::Lg)
         });
         cx.subscribe(&search_input, |this, _, ev: &InputEvent, cx| match ev {
-            InputEvent::Change(_) => {
+            InputEvent::CommittedChange(_) => {
+                this.action_panel_open = false;
                 this.cache_dirty = true;
-                let query = this.search_input.read(cx).value().to_string();
+                let query = this.search_input.read(cx).committed_value();
                 this.ensure_cache(&query);
                 this.selected_idx = this.first_enabled_visual_idx();
                 this.scroll_handle.scroll_to_item(0, ScrollStrategy::Top);
                 cx.notify();
             }
             InputEvent::Submit(_) => {
-                this.execute_selected(cx);
+                if this.action_panel_open {
+                    this.execute_selected_action(None, cx);
+                } else {
+                    this.execute_selected(cx);
+                }
             }
             _ => {}
         })
@@ -206,6 +272,10 @@ impl CommandPaletteState {
             search_input,
             scroll_handle: UniformListScrollHandle::new(),
             open: false,
+            standalone: false,
+            quick_slots: true,
+            action_panel_open: false,
+            action_selected_idx: 0,
             items: Rc::new(indexed),
             selected_idx: 0,
             cached_query: SharedString::default(),
@@ -218,6 +288,37 @@ impl CommandPaletteState {
             max_width: px(580.),
             panel_style: StyleRefinement::default(),
         }
+    }
+
+    /// Configures standalone Spotlight / Alfred window mode (`true` renders the palette directly
+    /// without a fullscreen modal backdrop scrim and keeps it open by default).
+    pub fn standalone(mut self, standalone: bool) -> Self {
+        self.standalone = standalone;
+        if standalone {
+            self.open = true;
+        }
+        self
+    }
+
+    /// Enables or disables quick-run slot shortcuts (`Ctrl 1..9` / `⌘1..9`) and active-row `↵`
+    /// hints (enabled by default).
+    pub fn quick_slots(mut self, enabled: bool) -> Self {
+        self.quick_slots = enabled;
+        self
+    }
+
+    /// Focuses the embedded search input (useful when showing a pre-created Spotlight popup window).
+    pub fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.action_panel_open = false;
+        self.search_input
+            .update(cx, |inp, cx| inp.set_value_silent(String::new(), cx));
+        self.cache_dirty = true;
+        self.ensure_cache("");
+        self.selected_idx = self.first_enabled_visual_idx();
+        self.scroll_handle.scroll_to_item(0, ScrollStrategy::Top);
+        let input_focus = self.search_input.read(cx).focus_handle(cx);
+        window.focus(&input_focus, cx);
+        cx.notify();
     }
 
     /// Sets the search input placeholder.
@@ -335,7 +436,8 @@ impl CommandPaletteState {
                 .iter()
                 .enumerate()
                 .filter_map(|(idx, indexed)| {
-                    let title_score = fuzzy_match_score_lower(&q, &indexed.title_low);
+                    let title_score = fuzzy_match_detailed(query, indexed.item.title.as_ref())
+                        .map(|m| m.score);
                     let sub_score = indexed
                         .subtitle_low
                         .as_deref()
@@ -466,23 +568,67 @@ impl CommandPaletteState {
             return;
         }
         let id = item.id.clone();
-        self.open = false;
-        if let Some(window) = window {
-            if let Some(prev) = self.previous_focus.take() {
-                window.focus(&prev, cx);
+        self.action_panel_open = false;
+        if !self.standalone {
+            self.open = false;
+            if let Some(window) = window {
+                if let Some(prev) = self.previous_focus.take() {
+                    window.focus(&prev, cx);
+                } else {
+                    window.blur(cx);
+                }
             } else {
-                window.blur(cx);
+                self.previous_focus = None;
             }
-        } else {
-            self.previous_focus = None;
         }
         cx.emit(CommandPaletteEvent::Execute(id));
-        cx.emit(CommandPaletteEvent::Close);
+        if !self.standalone {
+            cx.emit(CommandPaletteEvent::Close);
+        }
         cx.notify();
     }
 
     fn execute_selected(&mut self, cx: &mut Context<Self>) {
         self.execute_at(self.selected_idx, None, cx);
+    }
+
+    fn selected_command_item(&self) -> Option<&CommandItem> {
+        let &item_idx = self.cached_visual_items.get(self.selected_idx)?;
+        Some(&self.items[item_idx].item)
+    }
+
+    fn execute_selected_action(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
+        let Some(item) = self.selected_command_item() else {
+            self.action_panel_open = false;
+            return;
+        };
+        let Some(action) = item.actions.get(self.action_selected_idx) else {
+            self.action_panel_open = false;
+            return;
+        };
+        let command_id = item.id.clone();
+        let action_id = action.id.clone();
+        self.action_panel_open = false;
+        if !self.standalone {
+            self.open = false;
+            if let Some(window) = window {
+                if let Some(prev) = self.previous_focus.take() {
+                    window.focus(&prev, cx);
+                } else {
+                    window.blur(cx);
+                }
+            } else {
+                self.previous_focus = None;
+            }
+        }
+        cx.emit(CommandPaletteEvent::ExecuteAction {
+            command_id,
+            action_id,
+        });
+        if !self.standalone {
+            cx.emit(CommandPaletteEvent::Close);
+        }
+        cx.notify();
     }
 
     fn on_key_down(
@@ -495,24 +641,108 @@ impl CommandPaletteState {
             return;
         }
         let key = event.keystroke.key.as_str();
-        if !event.keystroke.modifiers.modified() && is_list_nav_key(key, false) {
+        let mods = &event.keystroke.modifiers;
+        let primary_mod = if cfg!(target_os = "macos") {
+            mods.platform && !mods.control
+        } else {
+            mods.control && !mods.platform
+        };
+
+        // Secondary action panel keyboard handling when open.
+        if self.action_panel_open {
+            let action_count = self
+                .selected_command_item()
+                .map_or(0, |it| it.actions.len());
+            match key {
+                "escape" | "tab" => {
+                    self.action_panel_open = false;
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
+                "up" if action_count > 0 => {
+                    self.action_selected_idx = if self.action_selected_idx == 0 {
+                        action_count - 1
+                    } else {
+                        self.action_selected_idx - 1
+                    };
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
+                "down" if action_count > 0 => {
+                    self.action_selected_idx = (self.action_selected_idx + 1) % action_count;
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
+                "enter" => {
+                    self.execute_selected_action(Some(window), cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        // Ctrl+K / Cmd+K toggles the secondary action panel if the selected item has actions.
+        if primary_mod && !mods.alt && !mods.shift && key == "k" {
+            let has_actions = self
+                .selected_command_item()
+                .is_some_and(|it| !it.actions.is_empty());
+            if has_actions {
+                self.action_panel_open = !self.action_panel_open;
+                self.action_selected_idx = 0;
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
+        }
+
+        // Quick-run slot shortcuts: Ctrl 1..9 (Windows/Linux) or Cmd 1..9 (macOS).
+        if self.quick_slots && primary_mod && !mods.alt && !mods.shift && key.len() == 1 {
+            let b = key.as_bytes()[0];
+            if (b'1'..=b'9').contains(&b) {
+                let slot = (b - b'1') as usize;
+                if slot < self.cached_visual_items.len() {
+                    self.execute_at(slot, Some(window), cx);
+                    cx.stop_propagation();
+                    return;
+                }
+            }
+        }
+
+        if !mods.modified() && is_list_nav_key(key, false) {
             self.step_selection_key(key, cx);
             cx.stop_propagation();
             return;
         }
         match key {
             "escape" => {
-                self.close_in(window, cx);
+                if self.standalone {
+                    cx.emit(CommandPaletteEvent::Close);
+                } else {
+                    self.close_in(window, cx);
+                }
                 cx.stop_propagation();
             }
             "enter" => {
                 self.execute_at(self.selected_idx, Some(window), cx);
                 cx.stop_propagation();
             }
-            // Trap Tab inside modal palette so focus never escapes behind the backdrop.
             "tab" => {
-                let delta = if event.keystroke.modifiers.shift { -1 } else { 1 };
-                self.move_selection(delta, cx);
+                let has_actions = !mods.shift
+                    && self
+                        .selected_command_item()
+                        .is_some_and(|it| !it.actions.is_empty());
+                if has_actions {
+                    self.action_panel_open = true;
+                    self.action_selected_idx = 0;
+                    cx.notify();
+                } else {
+                    let delta = if mods.shift { -1 } else { 1 };
+                    self.move_selection(delta, cx);
+                }
                 cx.stop_propagation();
             }
             _ => {}
@@ -542,6 +772,18 @@ impl Render for CommandPaletteState {
         let items_rc = Rc::clone(&self.items);
         let row_count = rows_rc.len();
         let selected_idx = self.selected_idx;
+        let quick_slots = self.quick_slots;
+        let selected_has_actions = self
+            .selected_command_item()
+            .is_some_and(|it| !it.actions.is_empty());
+        let action_panel_items: Vec<CommandAction> = if self.action_panel_open {
+            self.selected_command_item()
+                .map(|it| it.actions.clone())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let action_selected_idx = self.action_selected_idx;
 
         let list_body = if row_count == 0 {
             div()
@@ -699,6 +941,25 @@ impl Render for CommandPaletteState {
                                                 .children(item.shortcut.iter().cloned().map(kbd)),
                                         )
                                     })
+                                    .when(item.shortcut.is_empty() && quick_slots && !disabled, |el| {
+                                        if is_selected {
+                                            el.child(kbd("↵"))
+                                        } else if visual_pos < 9 {
+                                            let prefix = if cfg!(target_os = "macos") { "⌘" } else { "Ctrl" };
+                                            el.child(
+                                                div()
+                                                    .flex()
+                                                    .flex_row()
+                                                    .items_center()
+                                                    .gap(px(2.))
+                                                    .opacity(0.65)
+                                                    .child(kbd(prefix))
+                                                    .child(kbd(format!("{}", visual_pos + 1))),
+                                            )
+                                        } else {
+                                            el
+                                        }
+                                    })
                                     .into_any_element()
                             }
                         })
@@ -738,8 +999,13 @@ impl Render for CommandPaletteState {
             .border_color(theme.border)
             .when(theme.elevation_shadows, |el| el.shadow_2xl())
             .overflow_hidden()
-            .on_any_mouse_down(|_, _, cx| cx.stop_propagation())
+            // Focus-preserving click handling so clicking rows/margins never blurs the search input.
+            .on_any_mouse_down(|_, window, cx| {
+                window.prevent_default();
+                cx.stop_propagation();
+            })
             .on_click(|_, _, cx| cx.stop_propagation())
+            .relative()
             // Search header
             .child(
                 div()
@@ -751,6 +1017,99 @@ impl Render for CommandPaletteState {
             )
             // Virtualized grouped results
             .child(div().flex_1().min_h_0().child(list_body))
+            // Secondary Action Panel popover (Tab / Ctrl+K)
+            .when(!action_panel_items.is_empty(), |el| {
+                let entity_act = cx.entity();
+                el.child(
+                    div()
+                        .id(("cmd-action-panel", entity_id))
+                        .occlude()
+                        .absolute()
+                        .right(px(10.))
+                        .bottom(px(40.))
+                        .w(px(230.))
+                        .p(px(6.))
+                        .rounded(theme.radius_lg)
+                        .bg(theme.popover)
+                        .border_1()
+                        .border_color(theme.border)
+                        .when(theme.elevation_shadows, |d| d.shadow_xl())
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .child(
+                            div()
+                                .px(px(8.))
+                                .py(px(4.))
+                                .text_size(px(10.5))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(theme.muted_foreground)
+                                .child("ACTIONS"),
+                        )
+                        .children(action_panel_items.into_iter().enumerate().map(|(a_idx, act)| {
+                            let sel = a_idx == action_selected_idx;
+                            let ent = entity_act.clone();
+                            let hover_bg = theme.surface_hover;
+                            div()
+                                .id(("cmd-act-row", a_idx))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .justify_between()
+                                .gap(px(8.))
+                                .px(px(8.))
+                                .py(px(6.))
+                                .rounded(theme.radius_md)
+                                .cursor_pointer()
+                                .bg(if sel {
+                                    theme.primary_soft
+                                } else {
+                                    crate::transparent_black()
+                                })
+                                .when(!sel, |d| d.hover(move |s| s.bg(hover_bg)))
+                                .on_click(move |_, window, cx| {
+                                    ent.update(cx, |this, cx| {
+                                        this.action_selected_idx = a_idx;
+                                        this.execute_selected_action(Some(window), cx);
+                                    });
+                                })
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap(px(8.))
+                                        .when_some(act.icon, |d, ic| {
+                                            d.child(Icon::new(ic).size(IconSize::Sm).color(if sel {
+                                                theme.primary_soft_foreground
+                                            } else {
+                                                theme.muted_foreground
+                                            }))
+                                        })
+                                        .child(
+                                            div()
+                                                .text_size(px(12.5))
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .text_color(if sel {
+                                                    theme.primary_soft_foreground
+                                                } else {
+                                                    theme.popover_foreground
+                                                })
+                                                .child(act.label),
+                                        ),
+                                )
+                                .when(!act.shortcut.is_empty(), |d| {
+                                    d.child(
+                                        div()
+                                            .flex()
+                                            .flex_row()
+                                            .gap(px(2.))
+                                            .children(act.shortcut.into_iter().map(kbd)),
+                                    )
+                                })
+                        })),
+                )
+            })
             // Keyboard hint footer
             .child(
                 div()
@@ -789,6 +1148,16 @@ impl Render for CommandPaletteState {
                                     .child(kbd("↵"))
                                     .child("Run"),
                             )
+                            .when(selected_has_actions, |d| {
+                                d.child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(4.))
+                                        .child(kbd("Tab"))
+                                        .child("Actions"),
+                                )
+                            })
                             .child(
                                 div()
                                     .flex()
@@ -802,6 +1171,11 @@ impl Render for CommandPaletteState {
             );
 
         crate::Refineable::refine(panel.style(), &self.panel_style);
+
+        // Standalone Spotlight / Alfred window mode: render the panel directly without modal scrim.
+        if self.standalone {
+            return panel.max_w_full().size_full().into_any_element();
+        }
 
         let animated_panel = if reduce_motion {
             panel.into_any_element()

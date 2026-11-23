@@ -757,6 +757,55 @@ impl Theme {
         self
     }
 
+    /// Translucent matte-glass dark theme designed for Windows 11 `MicaBackdrop` or `Blurred`
+    /// frosted floating panes and Spotlight launchers (keeps inputs and popovers highly legible).
+    pub fn dark_glass() -> Self {
+        Self::dark().with_vibrancy(0.68)
+    }
+
+    /// Translucent frosted-porcelain light theme designed for Windows 11 `MicaBackdrop` or
+    /// `Blurred` floating panes and Spotlight launchers.
+    pub fn light_glass() -> Self {
+        Self::light().with_vibrancy(0.76)
+    }
+
+    /// Applies layered surface translucency onto `self` so OS backdrop blur/Mica shines through
+    /// while keeping text inputs, dropdowns, and popovers crisp and legible.
+    pub fn with_vibrancy(mut self, surface_alpha: f32) -> Self {
+        let a = surface_alpha.clamp(0.15, 0.98);
+        self.background.a = (a * 0.82).clamp(0.15, 0.95);
+        self.sidebar_bg.a = (a * 0.65).clamp(0.15, 0.92);
+        self.surface.a = a;
+        self.surface_muted.a = (a * 0.85).clamp(0.20, 0.92);
+        self.input_bg.a = 0.92;
+        self.popover.a = 0.95;
+        self.border = Self::edge_for_opacity(self.border, a, self.mode == ThemeMode::Dark);
+        self
+    }
+
+    /// Returns a translucent surface color with absolute alpha `opacity` clamped to `[0.05, 1.0]`.
+    pub fn surface_with_opacity(&self, opacity: f32) -> Hsla {
+        Hsla {
+            a: opacity.clamp(0.05, 1.0),
+            ..self.surface
+        }
+    }
+
+    /// Computes an opacity-adaptive border color that subtly boosts rim contrast as glass opacity
+    /// decreases so sheer floating panes stay crisp over both bright and dark wallpapers.
+    pub fn edge_for_opacity(base_border: Hsla, glass_opacity: f32, dark_mode: bool) -> Hsla {
+        let sheer = (1.0 - glass_opacity.clamp(0.1, 1.0)).clamp(0.0, 0.9);
+        let target_alpha = if dark_mode {
+            (0.14 + sheer * 0.14).clamp(0.10, 0.34)
+        } else {
+            (0.16 + sheer * 0.12).clamp(0.12, 0.34)
+        };
+        Hsla {
+            a: target_alpha,
+            ..base_border
+        }
+    }
+
     /// Resolves `preference` into a concrete [`ThemeMode`] for the current `window`.
     pub fn resolve_mode(preference: ThemePreference, window: &Window) -> ThemeMode {
         preference.resolve(window.appearance())

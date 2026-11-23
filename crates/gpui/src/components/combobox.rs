@@ -208,7 +208,7 @@ impl<T: Clone + PartialEq + 'static> ComboBoxState<T> {
                     this.close_menu(cx);
                     cx.notify();
                 }
-                InputEvent::AcceptSuggestion(_) => {}
+                InputEvent::AcceptSuggestion(_) | InputEvent::CommittedChange(_) => {}
             }
         });
 

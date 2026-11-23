@@ -853,7 +853,7 @@ impl TagInputState {
                 }
                 cx.notify();
             }
-            InputEvent::AcceptSuggestion(_) => {}
+            InputEvent::AcceptSuggestion(_) | InputEvent::CommittedChange(_) => {}
         })
         .detach();
 

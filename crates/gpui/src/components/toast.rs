@@ -9,8 +9,9 @@ use std::time::Duration;
 use crate::{
     Animation, AnimationExt, AnyWindowHandle, App, Bounds, ClickEvent, Context, DisplayId,
     ElementId, FontWeight, Hsla, IntoElement, Pixels, Render, RenderOnce, SharedString,
-    StyleRefinement, Styled, Window, WindowBackgroundAppearance, WindowBounds, WindowDecorations,
-    WindowKind, WindowOptions, deferred, div, ease_out_quint, point, prelude::*, px, size,
+    StyleRefinement, Styled, Window, WindowBackgroundAppearance, WindowBounds,
+    WindowCornerPreference, WindowDecorations, WindowKind, WindowOptions, deferred, div,
+    ease_out_quint, point, prelude::*, px, size, transparent_black,
 };
 use crate::icons::{Icon, IconSize, LucideIcon};
 
@@ -54,6 +55,25 @@ pub enum ToastVariant {
     Warning,
     /// Red error toast.
     Destructive,
+    /// In-progress busy toast with an animated spinning loader (never auto-dismissed until replaced).
+    Busy,
+}
+
+/// Optional inline action button rendered inside a [`Toast`] or native OS toast popup.
+#[derive(Clone)]
+pub struct ToastAction {
+    /// Action button label (e.g. `"Undo"` or `"Open Settings"`).
+    pub label: SharedString,
+    /// Callback invoked when the user clicks the action button.
+    pub on_click: Rc<dyn Fn(&mut Window, &mut App) + 'static>,
+}
+
+impl std::fmt::Debug for ToastAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToastAction")
+            .field("label", &self.label)
+            .finish()
+    }
 }
 
 /// Data model for a single toast notification.
@@ -67,6 +87,8 @@ pub struct ToastItem {
     pub title: SharedString,
     /// Optional detail body text.
     pub description: Option<SharedString>,
+    /// Optional inline action button.
+    pub action: Option<ToastAction>,
 }
 
 impl ToastItem {
@@ -77,6 +99,7 @@ impl ToastItem {
             variant: ToastVariant::Info,
             title: title.into(),
             description: None,
+            action: None,
         }
     }
 
@@ -106,19 +129,38 @@ impl ToastItem {
         self.variant(ToastVariant::Destructive)
     }
 
+    /// Sets the variant to [`ToastVariant::Busy`] (spinning progress indicator).
+    pub fn busy(self) -> Self {
+        self.variant(ToastVariant::Busy)
+    }
+
     /// Sets optional description text.
     pub fn description(mut self, description: impl Into<SharedString>) -> Self {
         self.description = Some(description.into());
         self
     }
+
+    /// Attaches an inline action button (e.g. `"Undo"` or `"Settings…"`).
+    pub fn action(
+        mut self,
+        label: impl Into<SharedString>,
+        on_click: impl Fn(&mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.action = Some(ToastAction {
+            label: label.into(),
+            on_click: Rc::new(on_click),
+        });
+        self
+    }
 }
 
-fn toast_accent(variant: ToastVariant, theme: &Theme) -> (Hsla, LucideIcon) {
+fn toast_accent(variant: ToastVariant, theme: &Theme) -> (Hsla, LucideIcon, bool) {
     match variant {
-        ToastVariant::Info => (theme.info, LucideIcon::Info),
-        ToastVariant::Success => (theme.success, LucideIcon::CircleCheck),
-        ToastVariant::Warning => (theme.warning, LucideIcon::TriangleExclamationPoint),
-        ToastVariant::Destructive => (theme.destructive, LucideIcon::CircleX),
+        ToastVariant::Info => (theme.info, LucideIcon::Info, false),
+        ToastVariant::Success => (theme.success, LucideIcon::CircleCheck, false),
+        ToastVariant::Warning => (theme.warning, LucideIcon::TriangleExclamationPoint, false),
+        ToastVariant::Destructive => (theme.destructive, LucideIcon::CircleX, false),
+        ToastVariant::Busy => (theme.primary, LucideIcon::LoaderCircle, true),
     }
 }
 
@@ -161,9 +203,14 @@ impl Styled for Toast {
 impl RenderOnce for Toast {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
-        let (accent, icon) = toast_accent(self.item.variant, &theme);
+        let (accent, icon, spinning) = toast_accent(self.item.variant, &theme);
 
         let anim_id = (self.id.clone(), "toast-enter");
+        let icon_el = if spinning {
+            Icon::new(icon).size(IconSize::Lg).color(accent).spin()
+        } else {
+            Icon::new(icon).size(IconSize::Lg).color(accent)
+        };
         let mut el = div()
             .id(self.id.clone())
             .occlude()
@@ -178,11 +225,7 @@ impl RenderOnce for Toast {
             .border_1()
             .border_color(theme.border)
             .when(theme.elevation_shadows, |el| el.shadow_lg())
-            .child(
-                div()
-                    .pt(px(1.))
-                    .child(Icon::new(icon).size(IconSize::Lg).color(accent)),
-            )
+            .child(div().pt(px(1.)).child(icon_el))
             .child(
                 div()
                     .flex()
@@ -203,6 +246,30 @@ impl RenderOnce for Toast {
                                 .text_size(px(12.5))
                                 .text_color(theme.muted_foreground)
                                 .child(desc),
+                        )
+                    })
+                    .when_some(self.item.action, |el, action| {
+                        let hover_bg = theme.primary_soft;
+                        let action_fg = theme.primary;
+                        let cb = action.on_click;
+                        el.child(
+                            div().pt(px(4.)).child(
+                                div()
+                                    .id((self.id.clone(), "toast-action"))
+                                    .flex()
+                                    .items_center()
+                                    .px(px(8.))
+                                    .py(px(3.))
+                                    .rounded(theme.radius_sm)
+                                    .bg(theme.primary_soft.opacity(0.75))
+                                    .text_size(px(12.))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(action_fg)
+                                    .cursor_pointer()
+                                    .hover(move |s| s.bg(hover_bg))
+                                    .on_click(move |_, window, cx| cb(window, cx))
+                                    .child(action.label),
+                            ),
                         )
                     }),
             )
@@ -462,10 +529,12 @@ impl NativeToastManager {
             .map(|display| display.visible_bounds())
             .unwrap_or_else(|| Bounds::new(point(px(0.), px(0.)), size(px(1280.), px(800.))));
 
-        let toast_w = px(NATIVE_TOAST_WIDTH);
-        let toast_h = px(NATIVE_TOAST_SLOT_HEIGHT);
+        let toast_w = px(NATIVE_TOAST_WIDTH + 16.0);
+        let extra_h = if item.action.is_some() { 26.0 } else { 0.0 };
+        let toast_h = px(NATIVE_TOAST_SLOT_HEIGHT + 16.0 + extra_h);
         let step = toast_h + gap;
         let offset = step * (slot as f32);
+        let is_busy = item.variant == ToastVariant::Busy;
 
         let origin = match position {
             ToastPosition::BottomRight => point(
@@ -499,8 +568,13 @@ impl NativeToastManager {
             is_resizable: false,
             is_minimizable: false,
             display_id,
-            window_background: WindowBackgroundAppearance::Opaque,
+            window_background: WindowBackgroundAppearance::Transparent,
             window_decorations: Some(WindowDecorations::Client),
+            always_on_top: true,
+            skip_taskbar: true,
+            non_activating: true,
+            window_corner_preference: WindowCornerPreference::DoNotRound,
+            hide_window_border: true,
             ..Default::default()
         };
 
@@ -523,7 +597,8 @@ impl NativeToastManager {
             window: handle.into(),
         });
 
-        if let Some(delay) = auto_dismiss {
+        // Busy toasts remain open until explicitly dismissed or replaced.
+        if !is_busy && let Some(delay) = auto_dismiss {
             let manager_timer = self.clone();
             cx.spawn(async move |cx| {
                 cx.background_executor().timer(delay).await;
@@ -597,75 +672,112 @@ pub struct ToastWindowView {
 impl Render for ToastWindowView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let (accent, icon) = toast_accent(self.item.variant, &theme);
+        let (accent, icon, spinning) = toast_accent(self.item.variant, &theme);
         let toast_id = self.item.id;
         let manager = self.manager.clone();
         let hover_bg = theme.surface_hover;
+        let icon_el = if spinning {
+            Icon::new(icon).size(IconSize::Lg).color(accent).spin()
+        } else {
+            Icon::new(icon).size(IconSize::Lg).color(accent)
+        };
 
         div()
             .id(("native-toast-win", toast_id as usize))
             .size_full()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(12.))
-            .p(px(14.))
-            .bg(theme.popover)
-            .border_1()
-            .border_color(theme.input_border)
+            .p(px(8.))
+            .bg(transparent_black())
             .child(
-                // Left semantic accent stripe + icon
                 div()
+                    .size_full()
                     .flex()
+                    .flex_row()
                     .items_center()
-                    .gap(px(10.))
-                    .child(div().w(px(3.)).h(px(46.)).rounded_full().bg(accent))
-                    .child(Icon::new(icon).size(IconSize::Lg).color(accent)),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(3.))
-                    .flex_1()
-                    .min_w_0()
+                    .gap(px(12.))
+                    .p(px(14.))
+                    .rounded(theme.radius_lg)
+                    .bg(theme.popover)
+                    .border_1()
+                    .border_color(theme.input_border)
+                    .when(theme.elevation_shadows, |d| d.shadow_md())
+                    .child(
+                        // Left semantic accent stripe + icon
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(10.))
+                            .child(div().w(px(3.)).h(px(46.)).rounded_full().bg(accent))
+                            .child(icon_el),
+                    )
                     .child(
                         div()
-                            .text_size(px(13.5))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.popover_foreground)
-                            .truncate()
-                            .child(self.item.title.clone()),
+                            .flex()
+                            .flex_col()
+                            .gap(px(3.))
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .text_size(px(13.5))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme.popover_foreground)
+                                    .truncate()
+                                    .child(self.item.title.clone()),
+                            )
+                            .when_some(self.item.description.clone(), |el, desc| {
+                                el.child(
+                                    div()
+                                        .text_size(px(12.5))
+                                        .text_color(theme.muted_foreground)
+                                        .truncate()
+                                        .child(desc),
+                                )
+                            })
+                            .when_some(self.item.action.clone(), |el, action| {
+                                let act_hover = theme.primary_soft;
+                                let act_fg = theme.primary;
+                                let cb = action.on_click;
+                                el.child(
+                                    div().pt(px(3.)).child(
+                                        div()
+                                            .id(("native-toast-action", toast_id as usize))
+                                            .flex()
+                                            .items_center()
+                                            .px(px(8.))
+                                            .py(px(2.))
+                                            .rounded(theme.radius_sm)
+                                            .bg(theme.primary_soft.opacity(0.75))
+                                            .text_size(px(11.5))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(act_fg)
+                                            .cursor_pointer()
+                                            .hover(move |s| s.bg(act_hover))
+                                            .on_click(move |_, window, cx| cb(window, cx))
+                                            .child(action.label),
+                                    ),
+                                )
+                            }),
                     )
-                    .when_some(self.item.description.clone(), |el, desc| {
-                        el.child(
-                            div()
-                                .text_size(px(12.5))
-                                .text_color(theme.muted_foreground)
-                                .truncate()
-                                .child(desc),
-                        )
-                    }),
-            )
-            .child(
-                super::focus::tab_stop(div().id("native-toast-close"), true, &theme)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .p(px(4.))
-                    .rounded(theme.radius_sm)
-                    .cursor_pointer()
-                    .hover(move |s| s.bg(hover_bg))
-                    .on_click(move |_, window, cx| {
-                        // Detach tracking first, then close `window` directly to avoid
-                        // re-entrantly borrowing this window handle through `cx`.
-                        manager.detach_entry(toast_id, cx);
-                        window.remove_window();
-                    })
                     .child(
-                        Icon::new(LucideIcon::X)
-                            .size(IconSize::Sm)
-                            .color(theme.muted_foreground),
+                        super::focus::tab_stop(div().id("native-toast-close"), true, &theme)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .p(px(4.))
+                            .rounded(theme.radius_sm)
+                            .cursor_pointer()
+                            .hover(move |s| s.bg(hover_bg))
+                            .on_click(move |_, window, cx| {
+                                // Detach tracking first, then close `window` directly to avoid
+                                // re-entrantly borrowing this window handle through `cx`.
+                                manager.detach_entry(toast_id, cx);
+                                window.remove_window();
+                            })
+                            .child(
+                                Icon::new(LucideIcon::X)
+                                    .size(IconSize::Sm)
+                                    .color(theme.muted_foreground),
+                            ),
                     ),
             )
             .with_animation(

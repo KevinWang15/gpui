@@ -198,20 +198,208 @@ impl IndexedSuggestion {
     }
 }
 
+/// Fast 64-bit ASCII character presence bitmask for O(1) pre-filtering before fuzzy scoring.
+#[inline]
+pub(crate) fn ascii_char_mask(s: &str) -> u64 {
+    let mut mask = 0u64;
+    for b in s.bytes() {
+        let lower = b.to_ascii_lowercase();
+        let bit = match lower {
+            b'a'..=b'z' => Some((lower - b'a') as u32),
+            b'0'..=b'9' => Some(26 + (lower - b'0') as u32),
+            b' ' | b'-' | b'_' | b'.' | b'/' | b':' => Some(36),
+            _ => None,
+        };
+        if let Some(bit) = bit {
+            mask |= 1u64 << bit;
+        }
+    }
+    mask
+}
+
+/// Extracts word-start initial letters (supporting whitespace/punctuation boundaries AND
+/// camelCase transitions like `"VSCode"` -> `"vc"` and `"Visual Studio Code"` -> `"vsc"`).
+fn extract_acronym_lower(text: &str) -> String {
+    let mut out = String::new();
+    let mut prev: Option<char> = None;
+    let chars: Vec<char> = text.chars().collect();
+    for (i, &ch) in chars.iter().enumerate() {
+        let is_sep = |c: char| matches!(c, ' ' | '-' | '_' | '/' | '.' | ':' | '\\');
+        let starts_word = match prev {
+            None => !is_sep(ch),
+            Some(p) if is_sep(p) => !is_sep(ch),
+            Some(p) if p.is_lowercase() && ch.is_uppercase() => true,
+            Some(p)
+                if p.is_uppercase()
+                    && ch.is_uppercase()
+                    && chars.get(i + 1).is_some_and(|n| n.is_lowercase()) =>
+            {
+                true
+            }
+            _ => false,
+        };
+        if starts_word {
+            for lc in ch.to_lowercase() {
+                out.push(lc);
+            }
+        }
+        prev = Some(ch);
+    }
+    out
+}
+
+/// Strict literal-first match tier returned by [`fuzzy_match_detailed`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum MatchTier {
+    /// Ordered fuzzy character subsequence.
+    Fuzzy = 1,
+    /// CamelCase / word-initial acronym match (e.g. `"vsc"` matching `"Visual Studio Code"`).
+    Acronym = 2,
+    /// Contiguous substring match inside the target.
+    Substring = 3,
+    /// Contiguous word-start prefix match inside the target.
+    WordPrefix = 4,
+    /// Prefix match from index 0.
+    Prefix = 5,
+    /// Exact full-string match.
+    Exact = 6,
+}
+
+/// Detailed fuzzy match result with strict tier, score, and highlighted UTF-8 byte ranges.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FuzzyMatch {
+    /// Strict literal-first match tier.
+    pub tier: MatchTier,
+    /// Comparable score where higher is better (`Exact > Prefix > WordPrefix > Substring > Acronym > Fuzzy`).
+    pub score: i32,
+    /// UTF-8 byte ranges in the original text that matched `query` (for [`crate::StyledText`] highlights).
+    pub ranges: Vec<Range<usize>>,
+}
+
+/// Scores a case-insensitive literal-first fuzzy / camelCase acronym match and returns matched
+/// byte ranges in `text` for highlight rendering.
+pub fn fuzzy_match_detailed(query: &str, text: &str) -> Option<FuzzyMatch> {
+    let q_low = query.trim().to_lowercase();
+    if q_low.is_empty() {
+        return Some(FuzzyMatch {
+            tier: MatchTier::Exact,
+            score: 0,
+            ranges: Vec::new(),
+        });
+    }
+    if (ascii_char_mask(&q_low) & !ascii_char_mask(text)) != 0 {
+        return None;
+    }
+
+    let hay_low = text.to_lowercase();
+    if hay_low == q_low {
+        return Some(FuzzyMatch {
+            tier: MatchTier::Exact,
+            score: 1000,
+            ranges: vec![0..text.len()],
+        });
+    }
+
+    if let Some(pos) = hay_low.find(&q_low) {
+        let is_prefix = pos == 0;
+        let is_word_prefix = !is_prefix
+            && hay_low[..pos]
+                .chars()
+                .next_back()
+                .is_some_and(|c| matches!(c, ' ' | '-' | '_' | '/' | '.' | ':'));
+        let (tier, base) = if is_prefix {
+            (MatchTier::Prefix, 700)
+        } else if is_word_prefix {
+            (MatchTier::WordPrefix, 550)
+        } else {
+            (MatchTier::Substring, 400)
+        };
+        let ranges = if hay_low.len() == text.len() && text.is_char_boundary(pos) && text.is_char_boundary(pos + q_low.len()) {
+            vec![pos..pos + q_low.len()]
+        } else {
+            Vec::new()
+        };
+        return Some(FuzzyMatch {
+            tier,
+            score: base - (pos as i32).min(80),
+            ranges,
+        });
+    }
+
+    // CamelCase / word-initial acronym prefix match (e.g. "vsc" -> "Visual Studio Code", "vc" -> "VSCode").
+    let acronym = extract_acronym_lower(text);
+    if !acronym.is_empty() && acronym.starts_with(&q_low) {
+        let bonus = if acronym == q_low { 40 } else { 0 };
+        let ranges = collect_subsequence_ranges(&q_low, text);
+        return Some(FuzzyMatch {
+            tier: MatchTier::Acronym,
+            score: 300 + bonus - (acronym.len() as i32).min(40),
+            ranges,
+        });
+    }
+
+    let score = fuzzy_match_score_lower(&q_low, &hay_low)?;
+    let ranges = collect_subsequence_ranges(&q_low, text);
+    Some(FuzzyMatch {
+        tier: MatchTier::Fuzzy,
+        score,
+        ranges,
+    })
+}
+
+fn collect_subsequence_ranges(q_low: &str, text: &str) -> Vec<Range<usize>> {
+    let mut q_chars = q_low.chars().peekable();
+    let mut ranges: Vec<Range<usize>> = Vec::new();
+    for (byte_idx, ch) in text.char_indices() {
+        let Some(&target) = q_chars.peek() else {
+            break;
+        };
+        if ch.to_lowercase().next() == Some(target) {
+            q_chars.next();
+            let end = byte_idx + ch.len_utf8();
+            if let Some(last) = ranges.last_mut()
+                && last.end == byte_idx
+            {
+                last.end = end;
+            } else {
+                ranges.push(byte_idx..end);
+            }
+        }
+    }
+    if q_chars.peek().is_none() {
+        ranges
+    } else {
+        Vec::new()
+    }
+}
+
 /// Scores a fuzzy subsequence / substring match where `q_low` and `hay_low` are already lowercased.
 ///
-/// Exact matches rank highest (`1000`), followed by prefix matches (`600`), substring matches
-/// (`350`), and ordered character subsequences with word-boundary and adjacency bonuses (capped
-/// at `240` so contiguous matches always outrank scattered ones).
+/// Exact matches rank highest (`1000`), followed by prefix (`700`), word-prefix (`550`),
+/// substring (`400`), and ordered character subsequences with word-boundary and adjacency bonuses
+/// (capped at `240` so contiguous matches always outrank scattered ones).
 pub(crate) fn fuzzy_match_score_lower(q_low: &str, hay_low: &str) -> Option<i32> {
     if q_low.is_empty() {
         return Some(0);
+    }
+    if (ascii_char_mask(q_low) & !ascii_char_mask(hay_low)) != 0 {
+        return None;
     }
     if hay_low == q_low {
         return Some(1000);
     }
     if let Some(pos) = hay_low.find(q_low) {
-        let base = if pos == 0 { 600 } else { 350 };
+        let base = if pos == 0 {
+            700
+        } else if hay_low[..pos]
+            .chars()
+            .next_back()
+            .is_some_and(|c| matches!(c, ' ' | '-' | '_' | '/' | '.' | ':'))
+        {
+            550
+        } else {
+            400
+        };
         return Some(base - (pos as i32).min(80));
     }
     let mut score = 0i32;
@@ -243,17 +431,12 @@ pub(crate) fn fuzzy_match_score_lower(q_low: &str, hay_low: &str) -> Option<i32>
     }
 }
 
-/// Scores a case-insensitive fuzzy match of `query` against `text`.
+/// Scores a case-insensitive literal-first fuzzy / camelCase acronym match of `query` against `text`.
 ///
 /// Returns `None` if `query` does not match `text`. Higher scores indicate stronger matches
-/// (exact > prefix > substring > ordered subsequence).
+/// (`Exact > Prefix > WordPrefix > Substring > Acronym > Fuzzy`).
 pub fn fuzzy_match_score(query: &str, text: &str) -> Option<i32> {
-    let q = query.trim().to_lowercase();
-    if q.is_empty() {
-        return Some(0);
-    }
-    let hay = text.to_lowercase();
-    fuzzy_match_score_lower(&q, &hay)
+    fuzzy_match_detailed(query, text).map(|m| m.score)
 }
 
 /// Filters and ranks `items` against `query` using [`fuzzy_match_score`] across each item's

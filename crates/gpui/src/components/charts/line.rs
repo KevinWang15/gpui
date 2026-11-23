@@ -181,6 +181,7 @@ fn compute_geometry_key(
     x_min: f64,
     x_max: f64,
     nice_max: f64,
+    smooth: bool,
     series: &[LineSeries],
 ) -> u64 {
     let mut hasher = FxHasher::default();
@@ -191,6 +192,7 @@ fn compute_geometry_key(
     x_min.to_bits().hash(&mut hasher);
     x_max.to_bits().hash(&mut hasher);
     nice_max.to_bits().hash(&mut hasher);
+    smooth.hash(&mut hasher);
     series.len().hash(&mut hasher);
     for s in series {
         s.style.hash(&mut hasher);
@@ -269,6 +271,7 @@ fn build_line_geometry(
     x_scale: LinearScale,
     y_scale: LinearScale,
     plot: PlotRect,
+    smooth: bool,
 ) -> CachedLineGeometry {
     let max_buckets = (plot.width().ceil() as usize).clamp(128, 1200);
     let mut areas = Vec::new();
@@ -280,14 +283,17 @@ fn build_line_geometry(
             continue;
         }
         let pts = decimate_monotonic_points(&s.points, max_buckets);
-        let first = pts[0];
-        let last = pts[pts.len() - 1];
+        let mapped: Vec<(f32, f32)> = pts
+            .iter()
+            .map(|&(x, y)| (x_scale.map(x), y_scale.map(y)))
+            .collect();
+        let first = mapped[0];
+        let last = mapped[mapped.len() - 1];
         let mut pb = PathBuilder::fill();
-        pb.move_to(point(px(x_scale.map(first.0)), px(plot.bottom)));
-        for &(x, y) in pts.iter() {
-            pb.line_to(point(px(x_scale.map(x)), px(y_scale.map(y))));
-        }
-        pb.line_to(point(px(x_scale.map(last.0)), px(plot.bottom)));
+        pb.move_to(point(px(first.0), px(plot.bottom)));
+        pb.line_to(point(px(first.0), px(first.1)));
+        super::sparkline::push_curve_points(&mut pb, &mapped, smooth, true);
+        pb.line_to(point(px(last.0), px(plot.bottom)));
         pb.close();
         if let Ok(path) = pb.build() {
             areas.push((idx, path));
@@ -302,19 +308,16 @@ fn build_line_geometry(
                 continue;
             }
             let pts = decimate_monotonic_points(&s.points, max_buckets);
+            let mapped: Vec<(f32, f32)> = pts
+                .iter()
+                .map(|&(x, y)| (x_scale.map(x), y_scale.map(y)))
+                .collect();
             let width = s.stroke_width.unwrap_or(if is_dashed { 1.75 } else { 2.25 });
             let mut pb = PathBuilder::stroke(px(width));
             if is_dashed {
                 pb = pb.dash_array(&[px(5.0), px(4.0)]);
             }
-            for (p_idx, &(x, y)) in pts.iter().enumerate() {
-                let pt = point(px(x_scale.map(x)), px(y_scale.map(y)));
-                if p_idx == 0 {
-                    pb.move_to(pt);
-                } else {
-                    pb.line_to(pt);
-                }
-            }
+            super::sparkline::push_curve_points(&mut pb, &mapped, smooth, false);
             if let Ok(path) = pb.build() {
                 strokes.push((idx, path));
             }
@@ -328,8 +331,9 @@ fn build_line_geometry(
     }
 }
 
-/// GPU-native multi-series line chart with solid/dashed strokes, inline endpoint callout,
-/// interactive vertical crosshair scrubber, and optional horizontal drag-to-select brushing.
+/// GPU-native multi-series line chart with solid/dashed strokes, optional Fritsch–Carlson monotone
+/// cubic Bezier smoothing (`.smooth(true)`), inline endpoint callout, interactive vertical
+/// crosshair scrubber, and optional horizontal drag-to-select brushing.
 #[derive(IntoElement)]
 pub struct LineChart {
     id: ElementId,
@@ -339,6 +343,7 @@ pub struct LineChart {
     height: Pixels,
     value_format: ChartValueFormat,
     palette: Option<ChartPalette>,
+    smooth: bool,
     selectable: bool,
     selected_range: Option<(f64, f64)>,
     x_formatter: Option<Rc<dyn Fn(f64) -> String>>,
@@ -363,6 +368,7 @@ impl LineChart {
             height: px(220.),
             value_format: ChartValueFormat::Currency,
             palette: None,
+            smooth: false,
             selectable: false,
             selected_range: None,
             x_formatter: None,
@@ -411,6 +417,12 @@ impl LineChart {
     /// Overrides the chart color palette (defaults to [`ChartPalette::from_theme`]).
     pub fn palette(mut self, palette: ChartPalette) -> Self {
         self.palette = Some(palette);
+        self
+    }
+
+    /// Enables Fritsch–Carlson monotone cubic Bezier curve smoothing (zero overshoot).
+    pub fn smooth(mut self, smooth: bool) -> Self {
+        self.smooth = smooth;
         self
     }
 
@@ -562,6 +574,7 @@ impl RenderOnce for LineChart {
         let interaction_prepaint = interaction_rc.clone();
         let interaction_paint = interaction_rc.clone();
         let is_live_brushing = live_brush.is_some();
+        let smooth_paint = self.smooth;
 
         let plot_canvas = canvas(
             move |bounds, _, _| {
@@ -613,7 +626,8 @@ impl RenderOnce for LineChart {
                 }
 
                 // 4. Cached tessellated area & stroke paths (O(1) Arc clone on hover/brush frames)
-                let geom_key = compute_geometry_key(plot, x_min, x_max, nice_max, &series_paint);
+                let geom_key =
+                    compute_geometry_key(plot, x_min, x_max, nice_max, smooth_paint, &series_paint);
                 {
                     let mut state = interaction_paint.borrow_mut();
                     let cache_hit = state
@@ -627,6 +641,7 @@ impl RenderOnce for LineChart {
                             x_scale,
                             y_scale,
                             plot,
+                            smooth_paint,
                         ));
                     }
                     if let Some(geom) = &state.cached_geometry {
