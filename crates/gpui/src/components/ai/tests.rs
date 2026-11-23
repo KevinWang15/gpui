@@ -1154,6 +1154,110 @@ fn ask_ai_scrollbar_auto_scrolls_to_bottom_and_respects_manual_scroll_up(cx: &mu
     });
 }
 
+#[gpui::test]
+fn ask_ai_overlay_trigger_click_opens_on_screen_and_resizes_in_flex_column(cx: &mut TestAppContext) {
+    cx.update(init_components);
+    let ask_entity = cx.new(|cx| AskAiState::new(cx).with_simulated_provider());
+
+    // Mirror PlaygroundApp::render: a flex-column root whose first child is `flex_1`
+    // and whose trailing child is `AskAiOverlay` (zero height in normal flex flow).
+    struct FlexHost {
+        ask: crate::Entity<AskAiState>,
+    }
+    impl crate::Render for FlexHost {
+        fn render(
+            &mut self,
+            _window: &mut crate::Window,
+            _cx: &mut crate::Context<Self>,
+        ) -> impl crate::IntoElement {
+            crate::div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .child(crate::div().flex_1().w_full().child("App content"))
+                .child(AskAiOverlay::new("test-flex-overlay", &self.ask))
+        }
+    }
+
+    let ask_clone = ask_entity.clone();
+    let window = cx.open_window(size(px(1200.), px(800.)), |_, _| FlexHost {
+        ask: ask_clone,
+    });
+    cx.run_until_parked();
+
+    assert!(!ask_entity.read_with(cx, |a, _| a.is_open()));
+
+    // Click the bottom-right Ask AI trigger pill (`right: 24, bottom: 20`).
+    let trigger_pt = crate::point(px(1140.), px(762.));
+    {
+        let mut vcx = crate::VisualTestContext::from_window(window.into(), cx);
+        vcx.simulate_event(crate::MouseDownEvent {
+            position: trigger_pt,
+            button: crate::MouseButton::Left,
+            modifiers: crate::Modifiers::none(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        vcx.simulate_event(crate::MouseUpEvent {
+            position: trigger_pt,
+            button: crate::MouseButton::Left,
+            modifiers: crate::Modifiers::none(),
+            click_count: 1,
+        });
+        vcx.run_until_parked();
+    }
+
+    assert!(
+        ask_entity.read_with(cx, |a, _| a.is_open()),
+        "clicking bottom-right Ask AI trigger must open the floating panel"
+    );
+
+    // Verify the opened panel is actually positioned on-screen and responds to an edge resize!
+    // Default AskAiOverlay size: 460x600 anchored BottomRight { right: 24, bottom: 76 } on 1200x800
+    // => origin = (716, 124), right = 1176, bottom = 724.
+    let initial = ask_entity.read_with(cx, |a, cx| {
+        a.floating_window()
+            .read(cx)
+            .resolve_bounds(size(px(1200.), px(800.)))
+    });
+    assert_eq!(initial.origin, crate::point(px(716.), px(124.)));
+    assert_eq!(initial.size, size(px(460.), px(600.)));
+
+    // Drag the West edge leftward by 50px (`x = 715 -> 665`).
+    {
+        let mut vcx = crate::VisualTestContext::from_window(window.into(), cx);
+        vcx.simulate_event(crate::MouseDownEvent {
+            position: crate::point(px(715.), px(400.)),
+            button: crate::MouseButton::Left,
+            modifiers: crate::Modifiers::none(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        vcx.run_until_parked();
+        vcx.simulate_event(crate::MouseMoveEvent {
+            position: crate::point(px(665.), px(400.)),
+            pressed_button: Some(crate::MouseButton::Left),
+            modifiers: crate::Modifiers::none(),
+        });
+        vcx.run_until_parked();
+        vcx.simulate_event(crate::MouseUpEvent {
+            position: crate::point(px(665.), px(400.)),
+            button: crate::MouseButton::Left,
+            modifiers: crate::Modifiers::none(),
+            click_count: 1,
+        });
+        vcx.run_until_parked();
+    }
+
+    let resized = ask_entity.read_with(cx, |a, cx| {
+        a.floating_window()
+            .read(cx)
+            .resolve_bounds(size(px(1200.), px(800.)))
+    });
+    assert_eq!(resized.size, size(px(510.), px(600.)));
+    assert_eq!(resized.origin, crate::point(px(666.), px(124.)));
+}
+
 /// Optional env-driven live integration test against any OpenAI-compatible endpoint.
 ///
 /// Run explicitly via:

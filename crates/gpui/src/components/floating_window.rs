@@ -19,7 +19,7 @@ use crate::{
     AnyElement, App, Bounds, Context, CursorStyle, ElementId, Entity, EventEmitter, FontWeight,
     IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     ParentElement, Pixels, Point, RenderOnce, SharedString, Size, StyleRefinement, Styled, Window,
-    deferred, div, point, prelude::*, px, size,
+    anchored, deferred, div, point, prelude::*, px, size,
 };
 
 use super::button::Button;
@@ -803,6 +803,7 @@ impl RenderOnce for FloatingWindow {
                             let vp = window.viewport_size();
                             state_drag.update(cx, |s, cx| s.begin_drag(ev.position, vp, cx));
                         }
+                        window.refresh();
                     })
                 });
 
@@ -858,8 +859,9 @@ impl RenderOnce for FloatingWindow {
                     .ghost()
                     .size(ComponentSize::Xs)
                     .tooltip_text(if is_max { "Restore size" } else { "Maximize" })
-                    .on_click(move |_, _, cx| {
+                    .on_click(move |_, window, cx| {
                         state_max.update(cx, |s, cx| s.toggle_maximized(cx));
+                        window.refresh();
                     }),
                 );
             }
@@ -874,6 +876,7 @@ impl RenderOnce for FloatingWindow {
                             if let Some(ref cb) = on_close_btn {
                                 cb(window, cx);
                             }
+                            window.refresh();
                         }),
                 );
             }
@@ -957,6 +960,7 @@ impl RenderOnce for FloatingWindow {
                         cx.stop_propagation();
                         let vp = window.viewport_size();
                         state_edge.update(cx, |s, cx| s.begin_resize(edge, ev.position, vp, cx));
+                        window.refresh();
                     });
                 strip = match edge {
                     FloatingWindowEdge::North => strip
@@ -999,6 +1003,7 @@ impl RenderOnce for FloatingWindow {
                         let vp = window.viewport_size();
                         state_corner
                             .update(cx, |s, cx| s.begin_resize(corner, ev.position, vp, cx));
+                        window.refresh();
                     });
                 grip = match corner {
                     FloatingWindowEdge::NorthWest => grip.top(-corner_outer).left(-corner_outer),
@@ -1014,62 +1019,83 @@ impl RenderOnce for FloatingWindow {
         }
 
         deferred(
-            div()
-                .absolute()
-                .inset_0()
-                .when(close_on_escape, |el| {
-                    el.on_key_down(move |ev: &KeyDownEvent, window, cx| {
-                        if ev.keystroke.key.as_str() == "escape" {
-                            state_esc.update(cx, |s, cx| s.set_open(false, cx));
-                            if let Some(ref cb) = on_close_esc {
-                                cb(window, cx);
-                            }
-                        }
-                    })
-                })
-                .when(is_modal, |el| {
-                    el.child(
-                        div()
-                            .id((id.clone(), "scrim"))
-                            .occlude()
-                            .absolute()
-                            .inset_0()
-                            .bg(theme.backdrop)
-                            .when(dismiss_on_backdrop, |el| {
-                                el.on_mouse_down(MouseButton::Left, move |_, window, cx| {
-                                    state_backdrop.update(cx, |s, cx| s.set_open(false, cx));
-                                    if let Some(ref cb) = on_close_backdrop {
+            anchored()
+                .position(point(px(0.), px(0.)))
+                .child(
+                    div()
+                        .w(viewport.width)
+                        .h(viewport.height)
+                        .relative()
+                        .when(close_on_escape, |el| {
+                            el.on_key_down(move |ev: &KeyDownEvent, window, cx| {
+                                if ev.keystroke.key.as_str() == "escape" {
+                                    state_esc.update(cx, |s, cx| s.set_open(false, cx));
+                                    if let Some(ref cb) = on_close_esc {
                                         cb(window, cx);
                                     }
-                                })
-                            }),
-                    )
-                })
-                .child(window_shell)
-                // Full-viewport pointer capture layer while actively dragging or resizing so
-                // fast cursor motion never drops the gesture or flickers the active cursor.
-                .when(is_interacting, |el| {
-                    el.child(
-                        div()
-                            .id((id.clone(), "pointer-capture"))
-                            .occlude()
-                            .absolute()
-                            .inset_0()
-                            .when_some(active_cursor, |d, c| d.cursor(c))
-                            .on_mouse_move(move |ev: &MouseMoveEvent, window, cx| {
-                                let vp = window.viewport_size();
-                                state_move.update(cx, |s, cx| {
-                                    s.update_pointer(ev.position, vp, cx);
-                                });
+                                    window.refresh();
+                                }
                             })
-                            .on_mouse_up(MouseButton::Left, move |_: &MouseUpEvent, _, cx| {
-                                state_up.update(cx, |s, cx| s.end_interaction(cx));
-                            })
-                            .on_mouse_up_out(MouseButton::Left, move |_: &MouseUpEvent, _, cx| {
-                                state_up_out.update(cx, |s, cx| s.end_interaction(cx));
-                            }),
-                    )
-                }),
+                        })
+                        .when(is_modal, |el| {
+                            el.child(
+                                div()
+                                    .id((id.clone(), "scrim"))
+                                    .occlude()
+                                    .absolute()
+                                    .inset_0()
+                                    .bg(theme.backdrop)
+                                    .when(dismiss_on_backdrop, |el| {
+                                        el.on_mouse_down(
+                                            MouseButton::Left,
+                                            move |_, window, cx| {
+                                                state_backdrop
+                                                    .update(cx, |s, cx| s.set_open(false, cx));
+                                                if let Some(ref cb) = on_close_backdrop {
+                                                    cb(window, cx);
+                                                }
+                                                window.refresh();
+                                            },
+                                        )
+                                    }),
+                            )
+                        })
+                        .child(window_shell)
+                        // Full-viewport pointer capture layer while actively dragging or resizing so
+                        // fast cursor motion never drops the gesture or flickers the active cursor.
+                        .when(is_interacting, |el| {
+                            el.child(
+                                div()
+                                    .id((id.clone(), "pointer-capture"))
+                                    .occlude()
+                                    .absolute()
+                                    .inset_0()
+                                    .when_some(active_cursor, |d, c| d.cursor(c))
+                                    .on_mouse_move(move |ev: &MouseMoveEvent, window, cx| {
+                                        let vp = window.viewport_size();
+                                        state_move.update(cx, |s, cx| {
+                                            s.update_pointer(ev.position, vp, cx);
+                                        });
+                                        window.refresh();
+                                    })
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        move |_: &MouseUpEvent, window, cx| {
+                                            state_up.update(cx, |s, cx| s.end_interaction(cx));
+                                            window.refresh();
+                                        },
+                                    )
+                                    .on_mouse_up_out(
+                                        MouseButton::Left,
+                                        move |_: &MouseUpEvent, window, cx| {
+                                            state_up_out
+                                                .update(cx, |s, cx| s.end_interaction(cx));
+                                            window.refresh();
+                                        },
+                                    ),
+                            )
+                        }),
+                ),
         )
         .with_priority(self.priority)
         .into_any_element()

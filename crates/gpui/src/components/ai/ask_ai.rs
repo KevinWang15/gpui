@@ -23,7 +23,7 @@ use crate::{
     AnyElement, App, ClipboardItem, Context, CursorStyle, ElementId, Entity, EventEmitter,
     FileFilter, FontWeight, IntoElement, MouseButton, MouseDownEvent, OpenPromptOptions, Pixels,
     Render, RenderOnce, ScrollEvent, ScrollHandle, ScrollbarVisibility, SharedString,
-    StyleRefinement, Styled, Task, Window, deferred, div, point, prelude::*, px, size,
+    StyleRefinement, Styled, Task, Window, anchored, deferred, div, point, prelude::*, px, size,
 };
 
 use super::agent::{
@@ -1697,9 +1697,10 @@ impl AskAiState {
                     } else {
                         "Maximize"
                     })
-                    .on_click(cx.listener(|this, _, _, cx| {
+                    .on_click(cx.listener(|this, _, window, cx| {
                         this.floating_window
                             .update(cx, |w, cx| w.toggle_maximized(cx));
+                        window.refresh();
                     })),
                 )
                 .child(
@@ -1707,7 +1708,10 @@ impl AskAiState {
                         .ghost()
                         .size(ComponentSize::Xs)
                         .tooltip_text("Close")
-                        .on_click(cx.listener(|this, _, _, cx| this.set_open(false, cx))),
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.set_open(false, cx);
+                            window.refresh();
+                        })),
                 );
         }
 
@@ -1759,6 +1763,7 @@ impl AskAiState {
                                             this.floating_window
                                                 .update(cx, |w, cx| w.begin_drag(ev.position, vp, cx));
                                         }
+                                        window.refresh();
                                     }),
                                 )
                             })
@@ -3926,8 +3931,9 @@ impl AskAiOverlay {
 }
 
 impl RenderOnce for AskAiOverlay {
-    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
+        let viewport = window.viewport_size();
         let (mode, floating_win) = {
             let s = self.state.read(cx);
             (s.mode, s.floating_window.clone())
@@ -3970,8 +3976,9 @@ impl RenderOnce for AskAiOverlay {
                 .font_weight(FontWeight::SEMIBOLD)
                 .cursor_pointer()
                 .shadow_lg()
-                .on_click(move |_, _, cx| {
+                .on_click(move |_, window, cx| {
                     state_trigger.update(cx, |s, cx| s.set_open(!s.open, cx));
+                    window.refresh();
                 });
             if mode == AiAssistantMode::Build {
                 base.bg(theme.surface)
@@ -4015,12 +4022,18 @@ impl RenderOnce for AskAiOverlay {
             .when(show_trigger, |el| {
                 el.child(
                     deferred(
-                        div().absolute().inset_0().child(
+                        anchored().position(point(px(0.), px(0.))).child(
                             div()
-                                .absolute()
-                                .right(trigger_right)
-                                .bottom(trigger_bottom)
-                                .child(trigger),
+                                .w(viewport.width)
+                                .h(viewport.height)
+                                .relative()
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .right(trigger_right)
+                                        .bottom(trigger_bottom)
+                                        .child(trigger),
+                                ),
                         ),
                     )
                     .with_priority(priority),
