@@ -10,8 +10,8 @@ use gpui::window_placement::{
     DockEdge, DockState, MonitorRects, ScreenRect, place_launcher_rect, resolve_dock_origin,
 };
 use gpui::{
-    AnyWindowHandle, AutostartOptions, Bounds, Context, DevicePixels, DisplayId, Entity,
-    GlobalHotKey, GlobalHotKeyManager, Hsla, SharedString, TrayEvent, TrayIconData,
+    AnyWindowHandle, AutostartOptions, Bounds, ClipboardItem, Context, DevicePixels, DisplayId,
+    Entity, GlobalHotKey, GlobalHotKeyManager, Hsla, SharedString, TrayEvent, TrayIconData,
     TrayIconOptions, TrayMenuItem, Window, WindowBackgroundAppearance, WindowBounds,
     WindowCornerPreference, WindowDecorations, WindowHandle, WindowKind, WindowOptions, point,
     prelude::*, px, rgb, size,
@@ -114,11 +114,18 @@ pub struct EventLogEntry {
 }
 
 /// One placed widget inside the playground's [`FreeformCanvas`] showcase.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct FreeformDemoItem {
     pub id: SharedString,
     pub kind: SharedString,
     pub rect: CanvasRect,
+}
+
+/// Undoable snapshot of the playground's [`FreeformCanvas`] items and frame size.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FreeformSnapshot {
+    pub items: Vec<FreeformDemoItem>,
+    pub size: CanvasSize,
 }
 
 /// Sort column for the interactive Data Table page.
@@ -396,6 +403,9 @@ pub struct PlaygroundApp {
     pub freeform_items: Vec<FreeformDemoItem>,
     pub freeform_size: CanvasSize,
     pub freeform_next_seq: usize,
+    pub freeform_history: CanvasHistory<FreeformSnapshot>,
+    pub freeform_clipboard: Vec<FreeformDemoItem>,
+    pub freeform_paste_count: usize,
 
     // BYOK AI Components showcase
     pub ai_ask: Entity<AskAiState>,
@@ -436,6 +446,248 @@ impl PlaygroundApp {
         ]
     }
 
+    pub fn freeform_snapshot(&self) -> FreeformSnapshot {
+        FreeformSnapshot {
+            items: self.freeform_items.clone(),
+            size: self.freeform_size,
+        }
+    }
+
+    fn restore_freeform_snapshot(&mut self, snap: FreeformSnapshot, cx: &mut Context<Self>) {
+        self.freeform_items = snap.items;
+        self.freeform_size = snap.size;
+        let valid_selected: Vec<SharedString> = self
+            .freeform_canvas
+            .read(cx)
+            .selected_ids()
+            .iter()
+            .filter(|id| self.freeform_items.iter().any(|it| it.id == **id))
+            .cloned()
+            .collect();
+        self.freeform_canvas
+            .update(cx, |s, cx| s.set_selection(valid_selected, cx));
+    }
+
+    pub fn undo_freeform(&mut self, cx: &mut Context<Self>) {
+        let current = self.freeform_snapshot();
+        if let Some(prev) = self.freeform_history.undo(current) {
+            self.restore_freeform_snapshot(prev, cx);
+            self.log_event(
+                "FreeformCanvas",
+                format!(
+                    "Undo ({} undo / {} redo left)",
+                    self.freeform_history.undo_len(),
+                    self.freeform_history.redo_len()
+                ),
+                cx,
+            );
+            cx.notify();
+        }
+    }
+
+    pub fn redo_freeform(&mut self, cx: &mut Context<Self>) {
+        let current = self.freeform_snapshot();
+        if let Some(next) = self.freeform_history.redo(current) {
+            self.restore_freeform_snapshot(next, cx);
+            self.log_event(
+                "FreeformCanvas",
+                format!(
+                    "Redo ({} undo / {} redo left)",
+                    self.freeform_history.undo_len(),
+                    self.freeform_history.redo_len()
+                ),
+                cx,
+            );
+            cx.notify();
+        }
+    }
+
+    fn write_freeform_clipboard_json(items: &[FreeformDemoItem], cx: &mut Context<Self>) {
+        let payload = serde_json::json!({
+            "gpui_freeform_items": items.iter().map(|it| serde_json::json!({
+                "kind": it.kind.as_ref(),
+                "x": it.rect.x,
+                "y": it.rect.y,
+                "width": it.rect.width,
+                "height": it.rect.height,
+            })).collect::<Vec<_>>()
+        });
+        if let Ok(text) = serde_json::to_string(&payload) {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+    }
+
+    fn read_freeform_clipboard_json(cx: &Context<Self>) -> Vec<FreeformDemoItem> {
+        let Some(text) = cx.read_from_clipboard().and_then(|c| c.text()) else {
+            return Vec::new();
+        };
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) else {
+            return Vec::new();
+        };
+        let Some(arr) = val.get("gpui_freeform_items").and_then(|v| v.as_array()) else {
+            return Vec::new();
+        };
+        arr.iter()
+            .filter_map(|entry| {
+                let kind = entry.get("kind")?.as_str()?;
+                let x = entry.get("x")?.as_f64()? as f32;
+                let y = entry.get("y")?.as_f64()? as f32;
+                let w = entry.get("width")?.as_f64()? as f32;
+                let h = entry.get("height")?.as_f64()? as f32;
+                Some(FreeformDemoItem {
+                    id: SharedString::default(),
+                    kind: kind.to_owned().into(),
+                    rect: CanvasRect::new(x, y, w.max(64.0), h.max(22.0)),
+                })
+            })
+            .collect()
+    }
+
+    pub fn copy_freeform_ids(&mut self, ids: &[SharedString], cx: &mut Context<Self>) {
+        let copied: Vec<FreeformDemoItem> = self
+            .freeform_items
+            .iter()
+            .filter(|it| ids.contains(&it.id))
+            .cloned()
+            .collect();
+        if copied.is_empty() {
+            return;
+        }
+        let count = copied.len();
+        Self::write_freeform_clipboard_json(&copied, cx);
+        self.freeform_clipboard = copied;
+        self.freeform_paste_count = 0;
+        self.log_event("FreeformCanvas", format!("Copy {count} item(s)"), cx);
+        cx.notify();
+    }
+
+    pub fn copy_freeform_selected(&mut self, cx: &mut Context<Self>) {
+        let ids = self.freeform_canvas.read(cx).selected_ids().to_vec();
+        self.copy_freeform_ids(&ids, cx);
+    }
+
+    pub fn cut_freeform_ids(&mut self, ids: &[SharedString], cx: &mut Context<Self>) {
+        let cut_items: Vec<FreeformDemoItem> = self
+            .freeform_items
+            .iter()
+            .filter(|it| ids.contains(&it.id))
+            .cloned()
+            .collect();
+        if cut_items.is_empty() {
+            return;
+        }
+        let count = cut_items.len();
+        Self::write_freeform_clipboard_json(&cut_items, cx);
+        self.freeform_clipboard = cut_items;
+        self.freeform_paste_count = 0;
+
+        let before = self.freeform_snapshot();
+        self.freeform_items.retain(|it| !ids.contains(&it.id));
+        self.freeform_history
+            .record_if_changed(before, &self.freeform_snapshot());
+        let remaining_sel: Vec<SharedString> = self
+            .freeform_canvas
+            .read(cx)
+            .selected_ids()
+            .iter()
+            .filter(|id| !ids.contains(id))
+            .cloned()
+            .collect();
+        self.freeform_canvas
+            .update(cx, |s, cx| s.set_selection(remaining_sel, cx));
+        self.log_event("FreeformCanvas", format!("Cut {count} item(s)"), cx);
+        cx.notify();
+    }
+
+    pub fn cut_freeform_selected(&mut self, cx: &mut Context<Self>) {
+        let ids = self.freeform_canvas.read(cx).selected_ids().to_vec();
+        self.cut_freeform_ids(&ids, cx);
+    }
+
+    pub fn paste_freeform(&mut self, at: Option<(f32, f32)>, cx: &mut Context<Self>) {
+        let source = if !self.freeform_clipboard.is_empty() {
+            self.freeform_clipboard.clone()
+        } else {
+            Self::read_freeform_clipboard_json(cx)
+        };
+        if source.is_empty() {
+            return;
+        }
+        let offset = if at.is_some() {
+            0.0
+        } else {
+            self.freeform_paste_count += 1;
+            16.0 * self.freeform_paste_count as f32
+        };
+        let rects: Vec<CanvasRect> = source.iter().map(|it| it.rect).collect();
+        let placed = paste_rects(&rects, at, offset, self.freeform_size);
+
+        let before = self.freeform_snapshot();
+        let mut new_ids = Vec::with_capacity(source.len());
+        for (tpl, rect) in source.into_iter().zip(placed) {
+            let seq = self.freeform_next_seq;
+            self.freeform_next_seq += 1;
+            let id: SharedString = format!("{}-{seq}", tpl.kind).into();
+            new_ids.push(id.clone());
+            self.freeform_items.push(FreeformDemoItem {
+                id,
+                kind: tpl.kind,
+                rect,
+            });
+        }
+        self.freeform_history
+            .record_if_changed(before, &self.freeform_snapshot());
+        let count = new_ids.len();
+        self.freeform_canvas
+            .update(cx, |s, cx| s.set_selection(new_ids, cx));
+        let detail = match at {
+            Some((x, y)) => format!("Paste {count} item(s) at ({}, {})", x as i32, y as i32),
+            None => format!("Paste {count} item(s)"),
+        };
+        self.log_event("FreeformCanvas", detail, cx);
+        cx.notify();
+    }
+
+    pub fn duplicate_freeform_ids(&mut self, ids: &[SharedString], cx: &mut Context<Self>) {
+        let source: Vec<FreeformDemoItem> = self
+            .freeform_items
+            .iter()
+            .filter(|it| ids.contains(&it.id))
+            .cloned()
+            .collect();
+        if source.is_empty() {
+            return;
+        }
+        let rects: Vec<CanvasRect> = source.iter().map(|it| it.rect).collect();
+        let dup_rects = duplicate_rects(&rects, 16.0, 16.0, self.freeform_size);
+
+        let before = self.freeform_snapshot();
+        let mut new_ids = Vec::with_capacity(source.len());
+        for (tpl, rect) in source.into_iter().zip(dup_rects) {
+            let seq = self.freeform_next_seq;
+            self.freeform_next_seq += 1;
+            let id: SharedString = format!("{}-{seq}", tpl.kind).into();
+            new_ids.push(id.clone());
+            self.freeform_items.push(FreeformDemoItem {
+                id,
+                kind: tpl.kind,
+                rect,
+            });
+        }
+        self.freeform_history
+            .record_if_changed(before, &self.freeform_snapshot());
+        let count = new_ids.len();
+        self.freeform_canvas
+            .update(cx, |s, cx| s.set_selection(new_ids, cx));
+        self.log_event("FreeformCanvas", format!("Duplicate {count} item(s)"), cx);
+        cx.notify();
+    }
+
+    pub fn duplicate_freeform_selected(&mut self, cx: &mut Context<Self>) {
+        let ids = self.freeform_canvas.read(cx).selected_ids().to_vec();
+        self.duplicate_freeform_ids(&ids, cx);
+    }
+
     pub fn apply_freeform_event(&mut self, ev: &FreeformCanvasEvent, cx: &mut Context<Self>) {
         match ev {
             FreeformCanvasEvent::Select(ids) => {
@@ -444,11 +696,14 @@ impl PlaygroundApp {
                 }
             }
             FreeformCanvasEvent::Move(moves) => {
+                let before = self.freeform_snapshot();
                 for (id, rect) in moves {
                     if let Some(it) = self.freeform_items.iter_mut().find(|it| it.id == *id) {
                         it.rect = *rect;
                     }
                 }
+                self.freeform_history
+                    .record_if_changed(before, &self.freeform_snapshot());
                 if let Some((id, rect)) = moves.first() {
                     self.log_event(
                         "FreeformCanvas",
@@ -463,10 +718,14 @@ impl PlaygroundApp {
                 }
             }
             FreeformCanvasEvent::Resize { id, rect, committed } => {
+                self.freeform_history
+                    .begin_transaction(self.freeform_snapshot());
                 if let Some(it) = self.freeform_items.iter_mut().find(|it| it.id == *id) {
                     it.rect = *rect;
                 }
                 if *committed {
+                    self.freeform_history
+                        .commit_transaction(&self.freeform_snapshot());
                     self.log_event(
                         "FreeformCanvas",
                         format!("Resize {id} -> {}×{}", rect.width as i32, rect.height as i32),
@@ -475,6 +734,7 @@ impl PlaygroundApp {
                 }
             }
             FreeformCanvasEvent::DropNew { kind, rect } => {
+                let before = self.freeform_snapshot();
                 let seq = self.freeform_next_seq;
                 self.freeform_next_seq += 1;
                 let id: SharedString = format!("{kind}-{seq}").into();
@@ -483,6 +743,8 @@ impl PlaygroundApp {
                     kind: kind.clone(),
                     rect: *rect,
                 });
+                self.freeform_history
+                    .record_if_changed(before, &self.freeform_snapshot());
                 let sel = id.clone();
                 self.freeform_canvas.update(cx, |s, cx| s.select(Some(sel), cx));
                 self.log_event(
@@ -492,15 +754,22 @@ impl PlaygroundApp {
                 );
             }
             FreeformCanvasEvent::Remove(ids) => {
+                let before = self.freeform_snapshot();
                 self.freeform_items.retain(|it| !ids.contains(&it.id));
+                self.freeform_history
+                    .record_if_changed(before, &self.freeform_snapshot());
                 self.log_event("FreeformCanvas", format!("Remove({} item(s))", ids.len()), cx);
             }
             FreeformCanvasEvent::ResizeCanvas { size, committed } => {
+                self.freeform_history
+                    .begin_transaction(self.freeform_snapshot());
                 self.freeform_size = *size;
                 for it in &mut self.freeform_items {
                     it.rect = it.rect.clamped_in(*size);
                 }
                 if *committed {
+                    self.freeform_history
+                        .commit_transaction(&self.freeform_snapshot());
                     self.log_event(
                         "FreeformCanvas",
                         format!("ResizeCanvas -> {}×{}", size.width as i32, size.height as i32),
@@ -508,15 +777,64 @@ impl PlaygroundApp {
                     );
                 }
             }
+            FreeformCanvasEvent::Undo => {
+                self.undo_freeform(cx);
+                return;
+            }
+            FreeformCanvasEvent::Redo => {
+                self.redo_freeform(cx);
+                return;
+            }
+            FreeformCanvasEvent::Copy(ids) => {
+                self.copy_freeform_ids(ids, cx);
+                return;
+            }
+            FreeformCanvasEvent::Cut(ids) => {
+                self.cut_freeform_ids(ids, cx);
+                return;
+            }
+            FreeformCanvasEvent::Paste { at } => {
+                self.paste_freeform(*at, cx);
+                return;
+            }
+            FreeformCanvasEvent::Duplicate(ids) => {
+                self.duplicate_freeform_ids(ids, cx);
+                return;
+            }
+            FreeformCanvasEvent::Align { ids, action } => {
+                self.align_freeform_ids(ids, *action, cx);
+                return;
+            }
+            FreeformCanvasEvent::BringForward(ids) => {
+                self.bring_freeform_forward_ids(ids, cx);
+                return;
+            }
+            FreeformCanvasEvent::SendBackward(ids) => {
+                self.send_freeform_backward_ids(ids, cx);
+                return;
+            }
+            FreeformCanvasEvent::BringToFront(ids) => {
+                self.bring_freeform_to_front_ids(ids, cx);
+                return;
+            }
+            FreeformCanvasEvent::SendToBack(ids) => {
+                self.send_freeform_to_back_ids(ids, cx);
+                return;
+            }
         }
         cx.notify();
     }
 
-    pub fn align_freeform_selected(&mut self, action: AlignAction, cx: &mut Context<Self>) {
-        let selected_ids: Vec<SharedString> = self.freeform_canvas.read(cx).selected_ids().to_vec();
+    pub fn align_freeform_ids(
+        &mut self,
+        selected_ids: &[SharedString],
+        action: AlignAction,
+        cx: &mut Context<Self>,
+    ) {
         if selected_ids.is_empty() {
             return;
         }
+        let before = self.freeform_snapshot();
         let snap = self.freeform_canvas.read(cx).current_snap();
         let canvas = self.freeform_size;
         if selected_ids.len() == 1 {
@@ -543,28 +861,72 @@ impl PlaygroundApp {
                 cx,
             );
         }
+        self.freeform_history
+            .record_if_changed(before, &self.freeform_snapshot());
         cx.notify();
+    }
+
+    pub fn align_freeform_selected(&mut self, action: AlignAction, cx: &mut Context<Self>) {
+        let selected_ids: Vec<SharedString> = self.freeform_canvas.read(cx).selected_ids().to_vec();
+        self.align_freeform_ids(&selected_ids, action, cx);
+    }
+
+    pub fn bring_freeform_forward_ids(&mut self, selected_ids: &[SharedString], cx: &mut Context<Self>) {
+        let before = self.freeform_snapshot();
+        if bring_forward_many(&mut self.freeform_items, |it| selected_ids.contains(&it.id)) {
+            self.freeform_history
+                .record_if_changed(before, &self.freeform_snapshot());
+            self.log_event("FreeformCanvas", "Bring selected forward", cx);
+            cx.notify();
+        }
     }
 
     pub fn bring_freeform_forward(&mut self, cx: &mut Context<Self>) {
         let selected_ids: Vec<SharedString> = self.freeform_canvas.read(cx).selected_ids().to_vec();
-        if bring_forward_many(&mut self.freeform_items, |it| selected_ids.contains(&it.id)) {
-            self.log_event("FreeformCanvas", "Bring selected forward", cx);
+        self.bring_freeform_forward_ids(&selected_ids, cx);
+    }
+
+    pub fn send_freeform_backward_ids(&mut self, selected_ids: &[SharedString], cx: &mut Context<Self>) {
+        let before = self.freeform_snapshot();
+        if send_backward_many(&mut self.freeform_items, |it| selected_ids.contains(&it.id)) {
+            self.freeform_history
+                .record_if_changed(before, &self.freeform_snapshot());
+            self.log_event("FreeformCanvas", "Send selected backward", cx);
             cx.notify();
         }
     }
 
     pub fn send_freeform_backward(&mut self, cx: &mut Context<Self>) {
         let selected_ids: Vec<SharedString> = self.freeform_canvas.read(cx).selected_ids().to_vec();
-        if send_backward_many(&mut self.freeform_items, |it| selected_ids.contains(&it.id)) {
-            self.log_event("FreeformCanvas", "Send selected backward", cx);
+        self.send_freeform_backward_ids(&selected_ids, cx);
+    }
+
+    pub fn bring_freeform_to_front_ids(&mut self, selected_ids: &[SharedString], cx: &mut Context<Self>) {
+        let before = self.freeform_snapshot();
+        if bring_to_front_many(&mut self.freeform_items, |it| selected_ids.contains(&it.id)) {
+            self.freeform_history
+                .record_if_changed(before, &self.freeform_snapshot());
+            self.log_event("FreeformCanvas", "Bring selected to front", cx);
+            cx.notify();
+        }
+    }
+
+    pub fn send_freeform_to_back_ids(&mut self, selected_ids: &[SharedString], cx: &mut Context<Self>) {
+        let before = self.freeform_snapshot();
+        if send_to_back_many(&mut self.freeform_items, |it| selected_ids.contains(&it.id)) {
+            self.freeform_history
+                .record_if_changed(before, &self.freeform_snapshot());
+            self.log_event("FreeformCanvas", "Send selected to back", cx);
             cx.notify();
         }
     }
 
     pub fn reset_freeform_demo(&mut self, cx: &mut Context<Self>) {
+        let before = self.freeform_snapshot();
         self.freeform_size = CanvasSize::new(360.0, 152.0);
         self.freeform_items = Self::default_freeform_items();
+        self.freeform_history
+            .record_if_changed(before, &self.freeform_snapshot());
         self.freeform_canvas.update(cx, |s, cx| s.select(None, cx));
         self.log_event("FreeformCanvas", "Reset canvas layout", cx);
         cx.notify();
@@ -2348,6 +2710,7 @@ impl PlaygroundApp {
                         .map(|n| n as f32)
                         .unwrap_or(12.0 + offset);
                     let rect = CanvasRect::new(x, y, w, h).clamped_in(this.freeform_size);
+                    let before = this.freeform_snapshot();
                     let seq = this.freeform_next_seq;
                     this.freeform_next_seq += 1;
                     let id: SharedString = format!("{kind}-{seq}").into();
@@ -2356,6 +2719,8 @@ impl PlaygroundApp {
                         kind: kind.to_owned().into(),
                         rect,
                     });
+                    this.freeform_history
+                        .record_if_changed(before, &this.freeform_snapshot());
                     let sel = id.clone();
                     this.freeform_canvas
                         .update(cx, |s, cx| s.select(Some(sel), cx));
@@ -2398,6 +2763,7 @@ impl PlaygroundApp {
                         .get("id")
                         .and_then(|v| v.as_str())
                         .ok_or_else(|| anyhow::anyhow!("missing required field 'id'"))?;
+                    let before = this.freeform_snapshot();
                     let canvas_sz = this.freeform_size;
                     let Some(it) = this
                         .freeform_items
@@ -2421,6 +2787,8 @@ impl PlaygroundApp {
                     }
                     it.rect = r.clamped_in(canvas_sz);
                     let updated = it.rect;
+                    this.freeform_history
+                        .record_if_changed(before, &this.freeform_snapshot());
                     this.log_event(
                         "BuildWithAI",
                         format!("canvas_update_widget {target_id} -> ({}, {}, {}×{})", updated.x as i32, updated.y as i32, updated.width as i32, updated.height as i32),
@@ -2459,10 +2827,13 @@ impl PlaygroundApp {
                                 .collect()
                         })
                         .unwrap_or_default();
+                    let before_snap = this.freeform_snapshot();
                     let before = this.freeform_items.len();
                     this.freeform_items
                         .retain(|it| !ids.iter().any(|id| id == it.id.as_ref()));
                     let removed = before - this.freeform_items.len();
+                    this.freeform_history
+                        .record_if_changed(before_snap, &this.freeform_snapshot());
                     this.freeform_canvas.update(cx, |s, cx| s.select(None, cx));
                     this.log_event(
                         "BuildWithAI",
@@ -2499,11 +2870,14 @@ impl PlaygroundApp {
                         .and_then(|v| v.as_f64())
                         .unwrap_or(this.freeform_size.height as f64)
                         .clamp(72.0, 260.0) as f32;
+                    let before = this.freeform_snapshot();
                     let sz = CanvasSize::new(w, h);
                     this.freeform_size = sz;
                     for it in &mut this.freeform_items {
                         it.rect = it.rect.clamped_in(sz);
                     }
+                    this.freeform_history
+                        .record_if_changed(before, &this.freeform_snapshot());
                     this.log_event(
                         "BuildWithAI",
                         format!("canvas_resize_canvas -> {}×{}", w as i32, h as i32),
@@ -2554,6 +2928,7 @@ impl PlaygroundApp {
                             .filter_map(|(i, it)| selected.contains(&it.id).then_some(i))
                             .collect()
                     };
+                    let before = this.freeform_snapshot();
                     if target_indices.len() == 1 {
                         let idx = target_indices[0];
                         this.freeform_items[idx].rect = align_item(
@@ -2579,6 +2954,8 @@ impl PlaygroundApp {
                             this.freeform_items[idx].rect = rect;
                         }
                     }
+                    this.freeform_history
+                        .record_if_changed(before, &this.freeform_snapshot());
                     this.log_event(
                         "BuildWithAI",
                         format!("canvas_align_widgets({action_str}, {} items)", target_indices.len()),
@@ -2665,8 +3042,11 @@ impl PlaygroundApp {
                             rect,
                         });
                     }
+                    let before = this.freeform_snapshot();
                     this.freeform_size = new_sz;
                     this.freeform_items = next_items;
+                    this.freeform_history
+                        .record_if_changed(before, &this.freeform_snapshot());
                     this.freeform_canvas.update(cx, |s, cx| s.select(None, cx));
                     this.log_event(
                         "BuildWithAI",
@@ -3024,6 +3404,9 @@ impl PlaygroundApp {
             freeform_items: Self::default_freeform_items(),
             freeform_size: CanvasSize::new(360.0, 152.0),
             freeform_next_seq: 2,
+            freeform_history: CanvasHistory::default(),
+            freeform_clipboard: Vec::new(),
+            freeform_paste_count: 0,
 
             ai_ask,
             ai_overlay_ask,

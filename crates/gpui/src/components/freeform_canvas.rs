@@ -13,12 +13,16 @@
 //! - **8-direction component resize handles** (`N`, `S`, `E`, `W`, `NE`, `NW`, `SE`, `SW`)
 //!   with live snap guides and per-item min/max bounds.
 //! - **Canvas resize handles** (`East`, `South`, `SouthEast`) for live canvas resizing.
-//! - **One-click alignment helpers** ([`align_item`]) and keyboard nudge (`Arrow` / `Shift+Arrow`
-//!   / `Delete` / `Escape`).
+//! - **One-click alignment helpers** ([`align_item`], [`align_items`]), **undo/redo history**
+//!   ([`CanvasHistory`]), **focus-scoped keyboard shortcuts** (`Ctrl/Cmd+Z`, `Ctrl/Cmd+Shift+Z`,
+//!   `Ctrl/Cmd+Y`, `Ctrl/Cmd+C`, `Ctrl/Cmd+X`, `Ctrl/Cmd+V`, `Ctrl/Cmd+D`, `Ctrl/Cmd+A`,
+//!   `Arrow` / `Shift+Arrow`, `Delete`, `Escape`), and a built-in **right-click context menu**.
 
 use std::cell::Cell;
+use std::collections::VecDeque;
 use std::rc::Rc;
 
+use crate::icons::LucideIcon;
 use crate::{
     AnyElement, App, AppContext as _, Bounds, Context, CursorStyle, DispatchPhase, DragMoveEvent,
     ElementId, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Hsla, IntoElement,
@@ -28,6 +32,8 @@ use crate::{
     transparent_black,
 };
 
+use super::context_menu::popup_menu;
+use super::popover::MenuEntry;
 use super::theme::{ActiveTheme, tabular_numerals};
 
 /// Logical rectangle of a component on a [`FreeformCanvas`], in canvas-local pixels.
@@ -1095,6 +1101,34 @@ pub fn send_backward_many<T>(items: &mut [T], is_selected: impl Fn(&T) -> bool) 
     moved
 }
 
+/// Moves every item matching `is_selected` all the way to the front (highest z-order indices)
+/// while preserving relative z-order among both selected and unselected items. Returns `true` if
+/// the order changed.
+pub fn bring_to_front_many<T>(items: &mut [T], is_selected: impl Fn(&T) -> bool) -> bool {
+    if items.len() < 2 {
+        return false;
+    }
+    let mut moved = false;
+    while bring_forward_many(items, &is_selected) {
+        moved = true;
+    }
+    moved
+}
+
+/// Moves every item matching `is_selected` all the way to the back (lowest z-order indices)
+/// while preserving relative z-order among both selected and unselected items. Returns `true` if
+/// the order changed.
+pub fn send_to_back_many<T>(items: &mut [T], is_selected: impl Fn(&T) -> bool) -> bool {
+    if items.len() < 2 {
+        return false;
+    }
+    let mut moved = false;
+    while send_backward_many(items, &is_selected) {
+        moved = true;
+    }
+    moved
+}
+
 /// Rigidly translates a group of `rects` by `(dx, dy)` while clamping the group's bounding box
 /// inside `canvas` so relative spacing between items never collapses at canvas edges.
 pub fn nudge_rects(rects: &[CanvasRect], dx: f32, dy: f32, canvas: CanvasSize) -> Vec<CanvasRect> {
@@ -1128,6 +1162,187 @@ pub fn duplicate_rects(
     nudge_rects(rects, offset_x, offset_y, canvas)
 }
 
+/// Places a copied cluster of `rects` onto `canvas`, preserving relative item spacing.
+///
+/// - When `target_center` is `Some((cx, cy))` (e.g. "Paste Here" from the right-click context
+///   menu), the cluster's bounding box is centered at `(cx, cy)` and clamped inside `canvas`.
+/// - When `target_center` is `None` (e.g. `Ctrl+V` / `Cmd+V`), the cluster is rigidly offset by
+///   `(offset, offset)` from its copied coordinates and clamped inside `canvas`.
+pub fn paste_rects(
+    rects: &[CanvasRect],
+    target_center: Option<(f32, f32)>,
+    offset: f32,
+    canvas: CanvasSize,
+) -> Vec<CanvasRect> {
+    let Some(bounds) = bounding_rect(rects) else {
+        return Vec::new();
+    };
+    let (dx, dy) = match target_center {
+        Some((cx, cy)) => (cx - bounds.center_x(), cy - bounds.center_y()),
+        None => (offset, offset),
+    };
+    nudge_rects(rects, dx, dy, canvas)
+}
+
+/// Bounded undo/redo history stack with transactional coalescing for continuous canvas gestures
+/// (such as dragging a resize handle or resizing the canvas frame).
+///
+/// Store your document snapshot type `T` (e.g. a struct holding placed items and [`CanvasSize`]):
+/// - Call [`CanvasHistory::record`] or [`CanvasHistory::record_if_changed`] around discrete edits
+///   (`Move`, `DropNew`, `Remove`, `Cut`, `Paste`, `Duplicate`, `Align`, z-order changes).
+/// - Call [`CanvasHistory::begin_transaction`] on continuous drag updates (`committed: false`)
+///   and [`CanvasHistory::commit_transaction`] when the gesture finishes (`committed: true`), so
+///   an entire drag-resize collapses into a single undo step.
+#[derive(Clone, Debug)]
+pub struct CanvasHistory<T> {
+    undo_stack: VecDeque<T>,
+    redo_stack: Vec<T>,
+    pending_transaction: Option<T>,
+    max_entries: usize,
+}
+
+impl<T> Default for CanvasHistory<T> {
+    fn default() -> Self {
+        Self::new(100)
+    }
+}
+
+impl<T> CanvasHistory<T> {
+    /// Creates a new [`CanvasHistory`] retaining up to `max_entries` undo snapshots (minimum `1`).
+    pub fn new(max_entries: usize) -> Self {
+        Self {
+            undo_stack: VecDeque::new(),
+            redo_stack: Vec::new(),
+            pending_transaction: None,
+            max_entries: max_entries.max(1),
+        }
+    }
+
+    /// Maximum number of undo steps retained.
+    pub fn max_entries(&self) -> usize {
+        self.max_entries
+    }
+
+    /// Returns `true` if there is at least one snapshot available to undo.
+    pub fn can_undo(&self) -> bool {
+        !self.undo_stack.is_empty()
+    }
+
+    /// Returns `true` if there is at least one snapshot available to redo.
+    pub fn can_redo(&self) -> bool {
+        !self.redo_stack.is_empty()
+    }
+
+    /// Number of snapshots currently on the undo stack.
+    pub fn undo_len(&self) -> usize {
+        self.undo_stack.len()
+    }
+
+    /// Number of snapshots currently on the redo stack.
+    pub fn redo_len(&self) -> usize {
+        self.redo_stack.len()
+    }
+
+    /// Returns `true` while a continuous gesture transaction is in progress.
+    pub fn has_pending_transaction(&self) -> bool {
+        self.pending_transaction.is_some()
+    }
+
+    /// Drops any in-progress transaction without recording it.
+    pub fn cancel_transaction(&mut self) {
+        self.pending_transaction = None;
+    }
+
+    /// Clears all undo, redo, and pending transaction state.
+    pub fn clear(&mut self) {
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.pending_transaction = None;
+    }
+
+    fn push_undo(&mut self, snapshot: T) {
+        self.undo_stack.push_back(snapshot);
+        while self.undo_stack.len() > self.max_entries {
+            self.undo_stack.pop_front();
+        }
+    }
+}
+
+impl<T: Clone + PartialEq> CanvasHistory<T> {
+    /// Records `before` as an undo checkpoint and clears the redo stack.
+    pub fn record(&mut self, before: T) {
+        self.pending_transaction = None;
+        self.push_undo(before);
+        self.redo_stack.clear();
+    }
+
+    /// Records `before` only if it differs from `after`, returning `true` when recorded.
+    pub fn record_if_changed(&mut self, before: T, after: &T) -> bool {
+        self.pending_transaction = None;
+        if &before == after {
+            return false;
+        }
+        self.push_undo(before);
+        self.redo_stack.clear();
+        true
+    }
+
+    /// Captures `before` at the start of a continuous gesture if no transaction is active yet.
+    pub fn begin_transaction(&mut self, before: T) {
+        if self.pending_transaction.is_none() {
+            self.pending_transaction = Some(before);
+        }
+    }
+
+    /// Commits the pending transaction onto the undo stack if the document changed relative to
+    /// `current`. Returns `true` when an undo step was recorded.
+    pub fn commit_transaction(&mut self, current: &T) -> bool {
+        let Some(before) = self.pending_transaction.take() else {
+            return false;
+        };
+        if &before == current {
+            return false;
+        }
+        self.push_undo(before);
+        self.redo_stack.clear();
+        true
+    }
+
+    /// Pops the previous snapshot from the undo stack and pushes `current` onto the redo stack.
+    pub fn undo(&mut self, current: T) -> Option<T> {
+        self.pending_transaction = None;
+        let prev = self.undo_stack.pop_back()?;
+        self.redo_stack.push(current);
+        Some(prev)
+    }
+
+    /// Pops the next snapshot from the redo stack and pushes `current` onto the undo stack.
+    pub fn redo(&mut self, current: T) -> Option<T> {
+        self.pending_transaction = None;
+        let next = self.redo_stack.pop()?;
+        self.push_undo(current);
+        Some(next)
+    }
+}
+
+/// Target metadata describing where a [`FreeformCanvas`] right-click context menu was triggered.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CanvasContextMenuTarget {
+    /// Window-space pointer position where the floating menu is anchored.
+    pub window_position: Point<Pixels>,
+    /// Canvas-local `(x, y)` coordinates where the user right-clicked, if inside the canvas frame.
+    pub canvas_position: Option<(f32, f32)>,
+    /// Placed component ID under the cursor, or `None` when right-clicking empty canvas space.
+    pub item_id: Option<SharedString>,
+}
+
+/// Optional host callback to customize or replace the entries shown in a [`FreeformCanvas`]
+/// right-click context menu.
+pub type CanvasContextMenuBuilder = Rc<
+    dyn Fn(&CanvasContextMenuTarget, &[SharedString], &mut Window, &mut App) -> Vec<MenuEntry>
+        + 'static,
+>;
+
 /// Events emitted by [`FreeformCanvasState`].
 #[derive(Clone, Debug, PartialEq)]
 pub enum FreeformCanvasEvent {
@@ -1154,7 +1369,8 @@ pub enum FreeformCanvasEvent {
         /// Snapped drop rectangle on the canvas.
         rect: CanvasRect,
     },
-    /// One or more components were removed (via `Delete`/`Backspace` or dragging outside the canvas).
+    /// One or more components were removed (via `Delete`/`Backspace`, context menu, or dragging
+    /// outside the canvas).
     Remove(Vec<SharedString>),
     /// The canvas frame itself was resized to `size`.
     ///
@@ -1166,6 +1382,42 @@ pub enum FreeformCanvasEvent {
         /// `false` during live pointer drag, `true` when the resize completes on mouse-up.
         committed: bool,
     },
+    /// Undo requested via focused keyboard shortcut (`Ctrl+Z` / `Cmd+Z`) or the context menu.
+    Undo,
+    /// Redo requested via focused keyboard shortcut (`Ctrl+Shift+Z` / `Cmd+Shift+Z` / `Ctrl+Y`)
+    /// or the context menu.
+    Redo,
+    /// Copy the specified component IDs (`Ctrl+C` / `Cmd+C` or the context menu).
+    Copy(Vec<SharedString>),
+    /// Cut the specified component IDs (`Ctrl+X` / `Cmd+X` or the context menu).
+    ///
+    /// Hosts typically copy these components, remove them from the canvas, and clear selection.
+    Cut(Vec<SharedString>),
+    /// Paste previously copied components (`Ctrl+V` / `Cmd+V` or the context menu).
+    ///
+    /// `at` holds the canvas-local `(x, y)` click point when invoked via "Paste Here" from the
+    /// right-click context menu, or `None` when invoked via keyboard shortcut.
+    Paste {
+        /// Optional canvas-local `(x, y)` center for placing the pasted cluster.
+        at: Option<(f32, f32)>,
+    },
+    /// Duplicate the specified component IDs (`Ctrl+D` / `Cmd+D` or the context menu).
+    Duplicate(Vec<SharedString>),
+    /// Alignment or distribution operation requested from the context menu.
+    Align {
+        /// Component IDs to align.
+        ids: Vec<SharedString>,
+        /// Alignment operation to apply.
+        action: AlignAction,
+    },
+    /// Move the specified components one z-order step toward the front.
+    BringForward(Vec<SharedString>),
+    /// Move the specified components one z-order step toward the back.
+    SendBackward(Vec<SharedString>),
+    /// Move the specified components all the way to the front (highest z-order).
+    BringToFront(Vec<SharedString>),
+    /// Move the specified components all the way to the back (lowest z-order).
+    SendToBack(Vec<SharedString>),
 }
 
 #[derive(Clone)]
@@ -1336,6 +1588,7 @@ pub struct FreeformCanvasState {
     active_resize: Option<ActiveResize>,
     active_canvas_resize: Option<ActiveCanvasResize>,
     active_marquee: Option<ActiveMarquee>,
+    context_menu: Option<CanvasContextMenuTarget>,
 }
 
 impl EventEmitter<FreeformCanvasEvent> for FreeformCanvasState {}
@@ -1362,6 +1615,7 @@ impl FreeformCanvasState {
             active_resize: None,
             active_canvas_resize: None,
             active_marquee: None,
+            context_menu: None,
         }
     }
 
@@ -1468,6 +1722,29 @@ impl FreeformCanvasState {
             || self.active_marquee.as_ref().is_some_and(|m| m.dragging)
     }
 
+    /// Returns the active right-click context menu target, if open.
+    pub fn context_menu_target(&self) -> Option<&CanvasContextMenuTarget> {
+        self.context_menu.as_ref()
+    }
+
+    /// Returns `true` while the built-in right-click context menu is open.
+    pub fn is_context_menu_open(&self) -> bool {
+        self.context_menu.is_some()
+    }
+
+    /// Programmatically opens the right-click context menu at `target`.
+    pub fn open_context_menu(&mut self, target: CanvasContextMenuTarget, cx: &mut Context<Self>) {
+        self.context_menu = Some(target);
+        cx.notify();
+    }
+
+    /// Closes the right-click context menu if open.
+    pub fn close_context_menu(&mut self, cx: &mut Context<Self>) {
+        if self.context_menu.take().is_some() {
+            cx.notify();
+        }
+    }
+
     fn start_marquee(
         &mut self,
         mouse: Point<Pixels>,
@@ -1475,6 +1752,7 @@ impl FreeformCanvasState {
         items: Vec<(SharedString, CanvasRect)>,
         cx: &mut Context<Self>,
     ) {
+        self.context_menu = None;
         self.pending_narrow_click = None;
         let base_selection = if additive {
             self.selected.clone()
@@ -1571,6 +1849,7 @@ impl FreeformCanvasState {
         canvas_size: CanvasSize,
         cx: &mut Context<Self>,
     ) {
+        self.context_menu = None;
         self.pending_narrow_click = None;
         self.set_selection(vec![id.clone()], cx);
         self.active_resize = Some(ActiveResize {
@@ -1642,6 +1921,7 @@ impl FreeformCanvasState {
         max_size: CanvasSize,
         cx: &mut Context<Self>,
     ) {
+        self.context_menu = None;
         self.active_canvas_resize = Some(ActiveCanvasResize {
             handle,
             start_mouse: mouse,
@@ -1754,6 +2034,7 @@ impl RenderOnce for CanvasPaletteItem {
                         .bounds()
                         .map_or_else(|| size(px(default_size.0), px(default_size.1)), |b| b.size);
                     payload.state.update(cx, |s, cx| {
+                        s.context_menu = None;
                         s.active_drag = Some(ActiveDrag {
                             kind: DragKind::New {
                                 kind: kind.clone(),
@@ -1851,6 +2132,11 @@ pub fn freeform_canvas(
         canvas_backdrop_blur: px(0.),
         items: Vec::new(),
         empty: None,
+        can_undo: None,
+        can_redo: None,
+        can_paste: None,
+        context_menu_enabled: true,
+        context_menu_builder: None,
         style: StyleRefinement::default(),
     }
 }
@@ -1869,6 +2155,11 @@ pub struct FreeformCanvas {
     canvas_backdrop_blur: Pixels,
     items: Vec<CanvasItemSpec>,
     empty: Option<AnyElement>,
+    can_undo: Option<bool>,
+    can_redo: Option<bool>,
+    can_paste: Option<bool>,
+    context_menu_enabled: bool,
+    context_menu_builder: Option<CanvasContextMenuBuilder>,
     style: StyleRefinement,
 }
 
@@ -1928,6 +2219,40 @@ impl FreeformCanvas {
         self.empty = Some(empty.into_any_element());
         self
     }
+
+    /// Controls whether the Undo item in the built-in context menu is enabled.
+    pub fn can_undo(mut self, can_undo: bool) -> Self {
+        self.can_undo = Some(can_undo);
+        self
+    }
+
+    /// Controls whether the Redo item in the built-in context menu is enabled.
+    pub fn can_redo(mut self, can_redo: bool) -> Self {
+        self.can_redo = Some(can_redo);
+        self
+    }
+
+    /// Controls whether the Paste / Paste Here item in the built-in context menu is enabled.
+    pub fn can_paste(mut self, can_paste: bool) -> Self {
+        self.can_paste = Some(can_paste);
+        self
+    }
+
+    /// Enables or disables the built-in right-click context menu (default `true`).
+    pub fn context_menu_enabled(mut self, enabled: bool) -> Self {
+        self.context_menu_enabled = enabled;
+        self
+    }
+
+    /// Supplies a custom builder that replaces the default right-click context menu entries.
+    pub fn context_menu_builder(
+        mut self,
+        builder: impl Fn(&CanvasContextMenuTarget, &[SharedString], &mut Window, &mut App) -> Vec<MenuEntry>
+            + 'static,
+    ) -> Self {
+        self.context_menu_builder = Some(Rc::new(builder));
+        self
+    }
 }
 
 impl Styled for FreeformCanvas {
@@ -1951,6 +2276,7 @@ impl RenderOnce for FreeformCanvas {
             active_resize,
             active_canvas_resize,
             active_marquee,
+            context_menu_target,
         ) = {
             let s = self.state.read(cx);
             (
@@ -1965,8 +2291,10 @@ impl RenderOnce for FreeformCanvas {
                 s.active_resize.clone(),
                 s.active_canvas_resize.clone(),
                 s.active_marquee.clone(),
+                s.context_menu.clone(),
             )
         };
+        let is_focused = focus_handle.is_focused(window);
 
         let canvas_size = active_canvas_resize
             .as_ref()
@@ -2100,6 +2428,11 @@ impl RenderOnce for FreeformCanvas {
             let hover_border = theme.primary.opacity(0.45);
             let sel_border = theme.primary;
             let focus_on_click = focus_handle.clone();
+            let focus_on_rclick = focus_handle.clone();
+            let rclick_state = self.state.clone();
+            let rclick_id = item_id.clone();
+            let rclick_bounds = canvas_bounds_cell.clone();
+            let rclick_menu_enabled = self.context_menu_enabled;
 
             let mut item_box = div()
                 .id(ElementId::Name(format!("fc-item-{}", item_id).into()))
@@ -2119,6 +2452,7 @@ impl RenderOnce for FreeformCanvas {
                     let additive =
                         ev.modifiers.shift || ev.modifiers.control || ev.modifiers.platform;
                     select_state.update(cx, |s, cx| {
+                        s.close_context_menu(cx);
                         if additive {
                             s.pending_narrow_click = None;
                             s.toggle_select(select_id.clone(), cx);
@@ -2133,6 +2467,33 @@ impl RenderOnce for FreeformCanvas {
                             s.select(Some(select_id.clone()), cx);
                         }
                     });
+                    cx.stop_propagation();
+                })
+                .on_mouse_down(MouseButton::Right, move |ev, window, cx| {
+                    window.focus(&focus_on_rclick, cx);
+                    let canvas_position = rclick_bounds.get().map(|cb| {
+                        (
+                            ((ev.position.x - cb.origin.x).0).clamp(0.0, cw),
+                            ((ev.position.y - cb.origin.y).0).clamp(0.0, ch),
+                        )
+                    });
+                    rclick_state.update(cx, |s, cx| {
+                        s.pending_narrow_click = None;
+                        if !s.is_selected(rclick_id.as_ref()) {
+                            s.set_selection(vec![rclick_id.clone()], cx);
+                        }
+                        if rclick_menu_enabled {
+                            s.open_context_menu(
+                                CanvasContextMenuTarget {
+                                    window_position: ev.position,
+                                    canvas_position,
+                                    item_id: Some(rclick_id.clone()),
+                                },
+                                cx,
+                            );
+                        }
+                    });
+                    window.refresh();
                     cx.stop_propagation();
                 })
                 .on_mouse_up(MouseButton::Left, move |_, _, cx| {
@@ -2153,6 +2514,7 @@ impl RenderOnce for FreeformCanvas {
                         let snapshot = source_for_drag.snapshot(window);
                         let snap_size = size(px(rect.width), px(rect.height));
                         payload.state.update(cx, |s, cx| {
+                            s.context_menu = None;
                             s.pending_narrow_click = None;
                             if !s.is_selected(drag_id.as_ref()) {
                                 s.set_selection(vec![drag_id.clone()], cx);
@@ -2279,6 +2641,7 @@ impl RenderOnce for FreeformCanvas {
                         }
                     }
                     let st_resize = self.state.clone();
+                    let resize_focus = focus_handle.clone();
                     let r_id = item_id.clone();
                     let r_sibs = siblings.clone();
                     let r_min = item.min_size;
@@ -2301,7 +2664,8 @@ impl RenderOnce for FreeformCanvas {
                             .border_color(theme.primary)
                             .hover(move |s| s.bg(hover_bg))
                             .cursor(cursor)
-                            .on_mouse_down(MouseButton::Left, move |ev, _, cx| {
+                            .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
+                                window.focus(&resize_focus, cx);
                                 st_resize.update(cx, |s, cx| {
                                     s.start_item_resize(
                                         r_id.clone(),
@@ -2380,6 +2744,8 @@ impl RenderOnce for FreeformCanvas {
             .border_1()
             .border_color(if active_canvas_resize.is_some() {
                 theme.primary
+            } else if is_focused {
+                theme.primary.opacity(0.6)
             } else {
                 canvas_border
             })
@@ -2441,6 +2807,7 @@ impl RenderOnce for FreeformCanvas {
         let canvas_handles = build_canvas_resize_handles(
             &self.id,
             &self.state,
+            &focus_handle,
             canvas_size,
             self.min_canvas_size,
             self.max_canvas_size,
@@ -2469,8 +2836,52 @@ impl RenderOnce for FreeformCanvas {
         // Outer workbench container hosting the canvas, canvas resize grips, HUD readout, and DnD listeners
         let dnd_move_state = self.state.clone();
         let dnd_drop_state = self.state.clone();
-        let dnd_bounds = canvas_bounds_cell;
+        let dnd_drop_focus = focus_handle.clone();
+        let dnd_bounds = canvas_bounds_cell.clone();
+        let root_rclick_bounds = canvas_bounds_cell;
+        let root_rclick_state = self.state.clone();
+        let root_rclick_focus = focus_handle.clone();
+        let root_rclick_menu_enabled = self.context_menu_enabled;
         let dnd_all_rects: Vec<CanvasRect> = all_rects.iter().map(|(_, r)| *r).collect();
+
+        // Build context menu popup (always rendered so open -> closed restores canvas focus)
+        let menu_id = (self.id.clone(), "context-menu");
+        let menu_position = context_menu_target
+            .as_ref()
+            .filter(|_| self.context_menu_enabled)
+            .map(|t| t.window_position);
+        let menu_entries: Vec<MenuEntry> = match (&context_menu_target, self.context_menu_enabled) {
+            (Some(target), true) => {
+                if let Some(builder) = &self.context_menu_builder {
+                    builder(target, &selected, window, cx)
+                } else {
+                    let all_ids: Vec<SharedString> =
+                        all_rects.iter().map(|(id, _)| id.clone()).collect();
+                    build_default_context_menu_entries(
+                        &self.state,
+                        target,
+                        &selected,
+                        &all_ids,
+                        show_grid,
+                        snap_cfg,
+                        self.can_undo.unwrap_or(true),
+                        self.can_redo.unwrap_or(true),
+                        self.can_paste.unwrap_or(true),
+                    )
+                }
+            }
+            _ => Vec::new(),
+        };
+        let close_menu_state = self.state.clone();
+        let context_popup = popup_menu(menu_id, menu_position)
+            .min_width(px(216.))
+            .entries(menu_entries)
+            .on_close(move |_, window, cx| {
+                close_menu_state.update(cx, |s, cx| s.close_context_menu(cx));
+                window.refresh();
+            });
+
+        let key_focus = focus_handle.clone();
 
         let frame_wrapper = div()
             .relative()
@@ -2512,14 +2923,124 @@ impl RenderOnce for FreeformCanvas {
                     s.start_marquee(ev.position, additive, marquee_items.clone(), cx);
                 });
             })
-            .on_key_down(move |ev: &KeyDownEvent, _, cx| {
+            .on_mouse_down(MouseButton::Right, move |ev, window, cx| {
+                window.focus(&root_rclick_focus, cx);
+                if root_rclick_menu_enabled {
+                    let canvas_position = root_rclick_bounds.get().and_then(|cb| {
+                        let rx = (ev.position.x - cb.origin.x).0;
+                        let ry = (ev.position.y - cb.origin.y).0;
+                        (rx >= 0.0 && rx <= cw && ry >= 0.0 && ry <= ch).then_some((rx, ry))
+                    });
+                    root_rclick_state.update(cx, |s, cx| {
+                        s.pending_narrow_click = None;
+                        s.open_context_menu(
+                            CanvasContextMenuTarget {
+                                window_position: ev.position,
+                                canvas_position,
+                                item_id: None,
+                            },
+                            cx,
+                        );
+                    });
+                    window.refresh();
+                    cx.stop_propagation();
+                }
+            })
+            .on_key_down(move |ev: &KeyDownEvent, window, cx| {
+                // Only handle canvas shortcuts when this FreeformCanvas itself is active/focused,
+                // never intercepting text inputs, overlays, or sibling panes.
+                if !key_focus.is_focused(window) {
+                    return;
+                }
                 let mods = &ev.keystroke.modifiers;
                 let key = ev.keystroke.key.as_str();
-                if (mods.control || mods.platform) && !mods.alt && !mods.shift && key == "a" {
-                    let all_ids: Vec<SharedString> =
-                        key_rects.iter().map(|(id, _)| id.clone()).collect();
-                    key_state.update(cx, |s, cx| s.set_selection(all_ids, cx));
-                    cx.stop_propagation();
+                let primary = (mods.control || mods.platform) && !mods.alt;
+                if primary {
+                    if key.eq_ignore_ascii_case("z") {
+                        let event = if mods.shift {
+                            FreeformCanvasEvent::Redo
+                        } else {
+                            FreeformCanvasEvent::Undo
+                        };
+                        key_state.update(cx, |s, cx| {
+                            s.close_context_menu(cx);
+                            cx.emit(event);
+                            cx.notify();
+                        });
+                        window.prevent_default();
+                        cx.stop_propagation();
+                        return;
+                    }
+                    if !mods.shift && key.eq_ignore_ascii_case("y") {
+                        key_state.update(cx, |s, cx| {
+                            s.close_context_menu(cx);
+                            cx.emit(FreeformCanvasEvent::Redo);
+                            cx.notify();
+                        });
+                        window.prevent_default();
+                        cx.stop_propagation();
+                        return;
+                    }
+                    if !mods.shift && key.eq_ignore_ascii_case("a") {
+                        let all_ids: Vec<SharedString> =
+                            key_rects.iter().map(|(id, _)| id.clone()).collect();
+                        key_state.update(cx, |s, cx| {
+                            s.close_context_menu(cx);
+                            s.set_selection(all_ids, cx);
+                        });
+                        window.prevent_default();
+                        cx.stop_propagation();
+                        return;
+                    }
+                    if !mods.shift && key.eq_ignore_ascii_case("c") {
+                        if !key_selected.is_empty() {
+                            let ids = key_selected.clone();
+                            key_state.update(cx, |s, cx| {
+                                s.close_context_menu(cx);
+                                cx.emit(FreeformCanvasEvent::Copy(ids));
+                                cx.notify();
+                            });
+                            window.prevent_default();
+                            cx.stop_propagation();
+                        }
+                        return;
+                    }
+                    if !mods.shift && key.eq_ignore_ascii_case("x") {
+                        if !key_selected.is_empty() {
+                            let ids = key_selected.clone();
+                            key_state.update(cx, |s, cx| {
+                                s.close_context_menu(cx);
+                                cx.emit(FreeformCanvasEvent::Cut(ids));
+                                cx.notify();
+                            });
+                            window.prevent_default();
+                            cx.stop_propagation();
+                        }
+                        return;
+                    }
+                    if !mods.shift && key.eq_ignore_ascii_case("v") {
+                        key_state.update(cx, |s, cx| {
+                            s.close_context_menu(cx);
+                            cx.emit(FreeformCanvasEvent::Paste { at: None });
+                            cx.notify();
+                        });
+                        window.prevent_default();
+                        cx.stop_propagation();
+                        return;
+                    }
+                    if !mods.shift && key.eq_ignore_ascii_case("d") {
+                        if !key_selected.is_empty() {
+                            let ids = key_selected.clone();
+                            key_state.update(cx, |s, cx| {
+                                s.close_context_menu(cx);
+                                cx.emit(FreeformCanvasEvent::Duplicate(ids));
+                                cx.notify();
+                            });
+                            window.prevent_default();
+                            cx.stop_propagation();
+                        }
+                        return;
+                    }
                     return;
                 }
                 if mods.control || mods.alt || mods.platform {
@@ -2527,13 +3048,20 @@ impl RenderOnce for FreeformCanvas {
                 }
                 match key {
                     "escape" => {
-                        key_state.update(cx, |s, cx| s.clear_selection(cx));
+                        key_state.update(cx, |s, cx| {
+                            if s.is_context_menu_open() {
+                                s.close_context_menu(cx);
+                            } else {
+                                s.clear_selection(cx);
+                            }
+                        });
                         cx.stop_propagation();
                     }
                     "delete" | "backspace" => {
                         if !key_selected.is_empty() {
                             let removed = key_selected.clone();
                             key_state.update(cx, |s, cx| {
+                                s.close_context_menu(cx);
                                 s.clear_selection(cx);
                                 cx.emit(FreeformCanvasEvent::Remove(removed));
                             });
@@ -2671,6 +3199,7 @@ impl RenderOnce for FreeformCanvas {
                 let Some(drag) = dnd_drop_state.update(cx, |s, _| s.active_drag.take()) else {
                     return;
                 };
+                window.focus(&dnd_drop_focus, cx);
                 window.refresh();
                 match drag.kind {
                     DragKind::New { kind, .. } => {
@@ -2728,6 +3257,7 @@ impl RenderOnce for FreeformCanvas {
                 }
             })
             .child(frame_wrapper)
+            .child(context_popup)
             // Window-level pointer capture + top-most marquee rubber-band overlay
             .child(
                 canvas(
@@ -3025,6 +3555,7 @@ fn build_guide_badges(guides: &[SnapGuide], cw: f32, ch: f32, gap_color: Hsla) -
 fn build_canvas_resize_handles(
     id: &ElementId,
     state: &Entity<FreeformCanvasState>,
+    focus_handle: &FocusHandle,
     canvas_size: CanvasSize,
     min_c: CanvasSize,
     max_c: CanvasSize,
@@ -3048,6 +3579,7 @@ fn build_canvas_resize_handles(
                        h: f32,
                        grip: crate::Div| {
         let st = state.clone();
+        let fh = focus_handle.clone();
         div()
             .id((id.clone(), suffix))
             .absolute()
@@ -3059,7 +3591,8 @@ fn build_canvas_resize_handles(
             .items_center()
             .justify_center()
             .cursor(handle.cursor())
-            .on_mouse_down(MouseButton::Left, move |ev, _, cx| {
+            .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
+                window.focus(&fh, cx);
                 st.update(cx, |s, cx| {
                     s.start_canvas_resize(handle, ev.position, canvas_size, min_c, max_c, cx);
                 });
@@ -3112,6 +3645,399 @@ fn build_canvas_resize_handles(
                 .border_color(color_for(CanvasResizeHandle::SouthEast)),
         ),
     ]
+}
+
+fn shortcut_hint(mac: &'static str, other: &'static str) -> &'static str {
+    if cfg!(target_os = "macos") {
+        mac
+    } else {
+        other
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_default_context_menu_entries(
+    state: &Entity<FreeformCanvasState>,
+    target: &CanvasContextMenuTarget,
+    selected: &[SharedString],
+    all_ids: &[SharedString],
+    show_grid: bool,
+    snap_cfg: SnapConfig,
+    can_undo: bool,
+    can_redo: bool,
+    can_paste: bool,
+) -> Vec<MenuEntry> {
+    let paste_label = if target.canvas_position.is_some() {
+        "Paste Here"
+    } else {
+        "Paste"
+    };
+    let paste_at = target.canvas_position;
+
+    if let Some(ref clicked_id) = target.item_id {
+        let active_ids: Vec<SharedString> = if selected.is_empty() {
+            vec![clicked_id.clone()]
+        } else {
+            selected.to_vec()
+        };
+        let multi = active_ids.len() > 1;
+        let mut entries = Vec::with_capacity(18);
+
+        // Clipboard actions
+        {
+            let st = state.clone();
+            let ids = active_ids.clone();
+            entries.push(
+                MenuEntry::item_with_icon("Cut", LucideIcon::Scissors, move |_, _, cx| {
+                    st.update(cx, |_, cx| {
+                        cx.emit(FreeformCanvasEvent::Cut(ids.clone()));
+                        cx.notify();
+                    });
+                })
+                .with_shortcut(shortcut_hint("⌘X", "Ctrl+X")),
+            );
+        }
+        {
+            let st = state.clone();
+            let ids = active_ids.clone();
+            entries.push(
+                MenuEntry::item_with_icon("Copy", LucideIcon::Copy, move |_, _, cx| {
+                    st.update(cx, |_, cx| {
+                        cx.emit(FreeformCanvasEvent::Copy(ids.clone()));
+                        cx.notify();
+                    });
+                })
+                .with_shortcut(shortcut_hint("⌘C", "Ctrl+C")),
+            );
+        }
+        {
+            let st = state.clone();
+            entries.push(
+                MenuEntry::item_with_icon(paste_label, LucideIcon::ClipboardPaste, move |_, _, cx| {
+                    st.update(cx, |_, cx| {
+                        cx.emit(FreeformCanvasEvent::Paste { at: paste_at });
+                        cx.notify();
+                    });
+                })
+                .with_shortcut(shortcut_hint("⌘V", "Ctrl+V"))
+                .with_disabled(!can_paste),
+            );
+        }
+        {
+            let st = state.clone();
+            let ids = active_ids.clone();
+            entries.push(
+                MenuEntry::item_with_icon("Duplicate", LucideIcon::CopyPlus, move |_, _, cx| {
+                    st.update(cx, |_, cx| {
+                        cx.emit(FreeformCanvasEvent::Duplicate(ids.clone()));
+                        cx.notify();
+                    });
+                })
+                .with_shortcut(shortcut_hint("⌘D", "Ctrl+D")),
+            );
+        }
+
+        entries.push(MenuEntry::Separator);
+
+        // Layer / z-order actions
+        {
+            let st = state.clone();
+            let ids = active_ids.clone();
+            entries.push(MenuEntry::item_with_icon(
+                "Bring Forward",
+                LucideIcon::BringToFront,
+                move |_, _, cx| {
+                    st.update(cx, |_, cx| {
+                        cx.emit(FreeformCanvasEvent::BringForward(ids.clone()));
+                        cx.notify();
+                    });
+                },
+            ));
+        }
+        {
+            let st = state.clone();
+            let ids = active_ids.clone();
+            entries.push(MenuEntry::item_with_icon(
+                "Send Backward",
+                LucideIcon::SendToBack,
+                move |_, _, cx| {
+                    st.update(cx, |_, cx| {
+                        cx.emit(FreeformCanvasEvent::SendBackward(ids.clone()));
+                        cx.notify();
+                    });
+                },
+            ));
+        }
+        {
+            let st = state.clone();
+            let ids = active_ids.clone();
+            entries.push(MenuEntry::item_with_icon(
+                "Bring to Front",
+                LucideIcon::ArrowUpToLine,
+                move |_, _, cx| {
+                    st.update(cx, |_, cx| {
+                        cx.emit(FreeformCanvasEvent::BringToFront(ids.clone()));
+                        cx.notify();
+                    });
+                },
+            ));
+        }
+        {
+            let st = state.clone();
+            let ids = active_ids.clone();
+            entries.push(MenuEntry::item_with_icon(
+                "Send to Back",
+                LucideIcon::ArrowDownToLine,
+                move |_, _, cx| {
+                    st.update(cx, |_, cx| {
+                        cx.emit(FreeformCanvasEvent::SendToBack(ids.clone()));
+                        cx.notify();
+                    });
+                },
+            ));
+        }
+
+        entries.push(MenuEntry::Separator);
+
+        // Quick alignment actions
+        {
+            let st = state.clone();
+            let ids = active_ids.clone();
+            entries.push(MenuEntry::item_with_icon(
+                "Align Left",
+                LucideIcon::AlignStartVertical,
+                move |_, _, cx| {
+                    st.update(cx, |_, cx| {
+                        cx.emit(FreeformCanvasEvent::Align {
+                            ids: ids.clone(),
+                            action: AlignAction::Left,
+                        });
+                        cx.notify();
+                    });
+                },
+            ));
+        }
+        {
+            let st = state.clone();
+            let ids = active_ids.clone();
+            entries.push(MenuEntry::item_with_icon(
+                "Center Horizontally",
+                LucideIcon::AlignCenterVertical,
+                move |_, _, cx| {
+                    st.update(cx, |_, cx| {
+                        cx.emit(FreeformCanvasEvent::Align {
+                            ids: ids.clone(),
+                            action: AlignAction::CenterHorizontal,
+                        });
+                        cx.notify();
+                    });
+                },
+            ));
+        }
+        {
+            let st = state.clone();
+            let ids = active_ids.clone();
+            entries.push(MenuEntry::item_with_icon(
+                "Center in Canvas",
+                LucideIcon::LayoutGrid,
+                move |_, _, cx| {
+                    st.update(cx, |_, cx| {
+                        cx.emit(FreeformCanvasEvent::Align {
+                            ids: ids.clone(),
+                            action: AlignAction::CenterInCanvas,
+                        });
+                        cx.notify();
+                    });
+                },
+            ));
+        }
+        if active_ids.len() >= 3 {
+            let st_h = state.clone();
+            let ids_h = active_ids.clone();
+            entries.push(MenuEntry::item_with_icon(
+                "Distribute Horizontally",
+                LucideIcon::AlignCenterVertical,
+                move |_, _, cx| {
+                    st_h.update(cx, |_, cx| {
+                        cx.emit(FreeformCanvasEvent::Align {
+                            ids: ids_h.clone(),
+                            action: AlignAction::DistributeHorizontal,
+                        });
+                        cx.notify();
+                    });
+                },
+            ));
+            let st_v = state.clone();
+            let ids_v = active_ids.clone();
+            entries.push(MenuEntry::item_with_icon(
+                "Distribute Vertically",
+                LucideIcon::AlignCenterHorizontal,
+                move |_, _, cx| {
+                    st_v.update(cx, |_, cx| {
+                        cx.emit(FreeformCanvasEvent::Align {
+                            ids: ids_v.clone(),
+                            action: AlignAction::DistributeVertical,
+                        });
+                        cx.notify();
+                    });
+                },
+            ));
+        }
+
+        entries.push(MenuEntry::Separator);
+
+        // Undo / Redo
+        {
+            let st = state.clone();
+            entries.push(
+                MenuEntry::item_with_icon("Undo", LucideIcon::Undo2, move |_, _, cx| {
+                    st.update(cx, |_, cx| {
+                        cx.emit(FreeformCanvasEvent::Undo);
+                        cx.notify();
+                    });
+                })
+                .with_shortcut(shortcut_hint("⌘Z", "Ctrl+Z"))
+                .with_disabled(!can_undo),
+            );
+        }
+        {
+            let st = state.clone();
+            entries.push(
+                MenuEntry::item_with_icon("Redo", LucideIcon::Redo2, move |_, _, cx| {
+                    st.update(cx, |_, cx| {
+                        cx.emit(FreeformCanvasEvent::Redo);
+                        cx.notify();
+                    });
+                })
+                .with_shortcut(shortcut_hint("⇧⌘Z", "Ctrl+Shift+Z"))
+                .with_disabled(!can_redo),
+            );
+        }
+
+        entries.push(MenuEntry::Separator);
+
+        // Destructive delete
+        {
+            let st = state.clone();
+            let ids = active_ids.clone();
+            let del_label: SharedString = if multi {
+                format!("Delete {} items", active_ids.len()).into()
+            } else {
+                "Delete".into()
+            };
+            entries.push(
+                MenuEntry::destructive_item(del_label, Some(LucideIcon::Trash), move |_, _, cx| {
+                    st.update(cx, |s, cx| {
+                        let remaining: Vec<SharedString> = s
+                            .selected
+                            .iter()
+                            .filter(|id| !ids.contains(id))
+                            .cloned()
+                            .collect();
+                        s.set_selection(remaining, cx);
+                        cx.emit(FreeformCanvasEvent::Remove(ids.clone()));
+                        cx.notify();
+                    });
+                })
+                .with_shortcut(shortcut_hint("⌫", "Del")),
+            );
+        }
+
+        entries
+    } else {
+        // Empty canvas background context menu
+        let snap_on = snap_cfg.snap_to_guides || snap_cfg.snap_to_grid;
+        let mut entries = Vec::with_capacity(9);
+
+        {
+            let st = state.clone();
+            entries.push(
+                MenuEntry::item_with_icon(paste_label, LucideIcon::ClipboardPaste, move |_, _, cx| {
+                    st.update(cx, |_, cx| {
+                        cx.emit(FreeformCanvasEvent::Paste { at: paste_at });
+                        cx.notify();
+                    });
+                })
+                .with_shortcut(shortcut_hint("⌘V", "Ctrl+V"))
+                .with_disabled(!can_paste),
+            );
+        }
+        {
+            let st = state.clone();
+            let all = all_ids.to_vec();
+            entries.push(
+                MenuEntry::item_with_icon(
+                    "Select All",
+                    LucideIcon::SquareDashedMousePointer,
+                    move |_, _, cx| {
+                        st.update(cx, |s, cx| {
+                            s.set_selection(all.clone(), cx);
+                        });
+                    },
+                )
+                .with_shortcut(shortcut_hint("⌘A", "Ctrl+A"))
+                .with_disabled(all_ids.is_empty()),
+            );
+        }
+
+        entries.push(MenuEntry::Separator);
+
+        {
+            let st = state.clone();
+            entries.push(
+                MenuEntry::item_with_icon("Undo", LucideIcon::Undo2, move |_, _, cx| {
+                    st.update(cx, |_, cx| {
+                        cx.emit(FreeformCanvasEvent::Undo);
+                        cx.notify();
+                    });
+                })
+                .with_shortcut(shortcut_hint("⌘Z", "Ctrl+Z"))
+                .with_disabled(!can_undo),
+            );
+        }
+        {
+            let st = state.clone();
+            entries.push(
+                MenuEntry::item_with_icon("Redo", LucideIcon::Redo2, move |_, _, cx| {
+                    st.update(cx, |_, cx| {
+                        cx.emit(FreeformCanvasEvent::Redo);
+                        cx.notify();
+                    });
+                })
+                .with_shortcut(shortcut_hint("⇧⌘Z", "Ctrl+Shift+Z"))
+                .with_disabled(!can_redo),
+            );
+        }
+
+        entries.push(MenuEntry::Separator);
+
+        {
+            let st = state.clone();
+            entries.push(MenuEntry::checkbox_item("Show Grid", show_grid, move |_, _, cx| {
+                st.update(cx, |s, cx| {
+                    s.set_grid_visible(!show_grid, cx);
+                });
+            }));
+        }
+        {
+            let st = state.clone();
+            entries.push(MenuEntry::checkbox_item(
+                "Snap to Guides & Grid",
+                snap_on,
+                move |_, _, cx| {
+                    st.update(cx, |s, cx| {
+                        let mut cfg = s.current_snap();
+                        let next = !snap_on;
+                        cfg.snap_to_guides = next;
+                        cfg.snap_to_grid = next;
+                        s.set_snap(cfg, cx);
+                    });
+                },
+            ));
+        }
+
+        entries
+    }
 }
 
 #[cfg(test)]
@@ -3288,7 +4214,7 @@ mod tests {
                     FreeformCanvasEvent::ResizeCanvas { size, .. } => {
                         this.size = *size;
                     }
-                    FreeformCanvasEvent::Select(_) => {}
+                    _ => {}
                 }
                 cx.notify();
             });
@@ -3781,5 +4707,323 @@ mod tests {
             CanvasResizeHandle::SouthEast.cursor(),
             CursorStyle::ResizeUpLeftDownRight
         );
+    }
+
+    #[test]
+    fn canvas_history_undo_redo_transactions_and_bounds() {
+        let mut hist = CanvasHistory::new(3);
+        assert!(!hist.can_undo());
+        assert!(!hist.can_redo());
+
+        // Discrete edits push undo snapshots and clear redo on new branch
+        hist.record("s0");
+        hist.record("s1");
+        hist.record("s2");
+        assert_eq!(hist.undo_len(), 3);
+        // Bounded capacity drops oldest ("s0")
+        hist.record("s3");
+        assert_eq!(hist.undo_len(), 3);
+
+        assert_eq!(hist.undo("s4"), Some("s3"));
+        assert_eq!(hist.undo("s3"), Some("s2"));
+        assert_eq!(hist.undo("s2"), Some("s1"));
+        assert_eq!(hist.undo("s1"), None);
+        assert_eq!(hist.redo_len(), 3);
+
+        assert_eq!(hist.redo("s1"), Some("s2"));
+        // New edit clears remaining redo entries
+        hist.record("s2");
+        assert!(!hist.can_redo());
+        assert_eq!(hist.redo_len(), 0);
+
+        // No-op record_if_changed does not pollute stack
+        let before_len = hist.undo_len();
+        assert!(!hist.record_if_changed("same", &"same"));
+        assert_eq!(hist.undo_len(), before_len);
+
+        // Transactional coalescing: multiple drag frames collapse to 1 undo step
+        hist.clear();
+        hist.begin_transaction("start");
+        hist.begin_transaction("mid-1");
+        hist.begin_transaction("mid-2");
+        assert!(hist.has_pending_transaction());
+        assert!(hist.commit_transaction(&"end"));
+        assert!(!hist.has_pending_transaction());
+        assert_eq!(hist.undo_len(), 1);
+        assert_eq!(hist.undo("end"), Some("start"));
+
+        // Transaction that ends back at start records nothing
+        hist.clear();
+        hist.begin_transaction("same");
+        assert!(!hist.commit_transaction(&"same"));
+        assert!(!hist.can_undo());
+    }
+
+    #[test]
+    fn paste_rects_and_z_order_helpers() {
+        let canvas = CanvasSize::new(300.0, 200.0);
+        let cluster = vec![
+            CanvasRect::new(10.0, 20.0, 40.0, 20.0),
+            CanvasRect::new(60.0, 20.0, 40.0, 20.0),
+        ];
+
+        // Offset paste (Ctrl+V) preserves relative layout
+        let pasted_offset = paste_rects(&cluster, None, 16.0, canvas);
+        assert_eq!(pasted_offset[0], CanvasRect::new(26.0, 36.0, 40.0, 20.0));
+        assert_eq!(pasted_offset[1], CanvasRect::new(76.0, 36.0, 40.0, 20.0));
+
+        // Centered paste ("Paste Here") centers bounding box at cursor and clamps inside canvas
+        let pasted_here = paste_rects(&cluster, Some((200.0, 100.0)), 16.0, canvas);
+        let gb = bounding_rect(&pasted_here).unwrap();
+        assert_eq!((gb.center_x(), gb.center_y()), (200.0, 100.0));
+        assert_eq!(pasted_here[1].x - pasted_here[0].x, 50.0);
+
+        // Clamping near right edge keeps relative spacing intact
+        let pasted_edge = paste_rects(&cluster, Some((295.0, 195.0)), 16.0, canvas);
+        assert_eq!(pasted_edge[1].right(), 300.0);
+        assert_eq!(pasted_edge[1].x - pasted_edge[0].x, 50.0);
+
+        // Z-order helpers preserve relative order among selected and unselected items
+        let mut order = vec!["a", "b", "c", "d"];
+        assert!(bring_to_front_many(&mut order, |x| *x == "a" || *x == "c"));
+        assert_eq!(order, vec!["b", "d", "a", "c"]);
+        assert!(!bring_to_front_many(&mut order, |x| *x == "a" || *x == "c"));
+
+        assert!(send_to_back_many(&mut order, |x| *x == "d" || *x == "c"));
+        assert_eq!(order, vec!["d", "c", "b", "a"]);
+        assert!(!send_to_back_many(&mut order, |x| *x == "d" || *x == "c"));
+    }
+
+    #[crate::test]
+    fn shortcuts_undo_redo_copy_cut_paste_duplicate_only_fire_when_focused(
+        cx: &mut crate::TestAppContext,
+    ) {
+        use crate::{Modifiers, MouseDownEvent, MouseUpEvent};
+        cx.update(super::super::init_components);
+
+        struct ShortcutHost {
+            canvas: Entity<FreeformCanvasState>,
+            other_focus: FocusHandle,
+            events: Vec<FreeformCanvasEvent>,
+            _sub: crate::Subscription,
+        }
+
+        impl Render for ShortcutHost {
+            fn render(&mut self, _: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+                let other_fh = self.other_focus.clone();
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(12.))
+                    .child(
+                        div()
+                            .id("other-pane")
+                            .track_focus(&self.other_focus)
+                            .w(px(120.))
+                            .h(px(32.))
+                            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                                window.focus(&other_fh, cx);
+                            }),
+                    )
+                    .child(
+                        freeform_canvas("shortcut-canvas", &self.canvas)
+                            .canvas_size(240.0, 120.0)
+                            .item(CanvasItemSpec::new(
+                                "item-1",
+                                CanvasRect::new(20.0, 20.0, 60.0, 30.0),
+                                div().size_full().bg(rgb(0x3b82f6)),
+                            )),
+                    )
+            }
+        }
+
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let canvas = cx.new(FreeformCanvasState::new);
+            let other_focus = cx.focus_handle();
+            let sub = cx.subscribe(&canvas, |this: &mut ShortcutHost, _, ev: &FreeformCanvasEvent, _| {
+                this.events.push(ev.clone());
+            });
+            ShortcutHost {
+                canvas,
+                other_focus,
+                events: Vec::new(),
+                _sub: sub,
+            }
+        });
+        cx.run_until_parked();
+
+        // Select item programmatically, but focus the OTHER pane (NOT the canvas).
+        view.update(cx, |v, cx| {
+            v.canvas.update(cx, |s, cx| s.select(Some("item-1".into()), cx));
+        });
+        cx.update_window(cx.window_handle(), |_, window, cx| {
+            let fh = view.read(cx).other_focus.clone();
+            window.focus(&fh, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        view.update(cx, |v, _| v.events.clear());
+
+        // None of the canvas shortcuts may fire while the sibling pane is focused!
+        for stroke in [
+            "ctrl-z",
+            "ctrl-shift-z",
+            "ctrl-y",
+            "ctrl-c",
+            "ctrl-x",
+            "ctrl-v",
+            "ctrl-d",
+            "ctrl-a",
+            "delete",
+        ] {
+            cx.simulate_keystrokes(stroke);
+            cx.run_until_parked();
+        }
+        assert!(
+            view.read_with(cx, |v, _| v.events.is_empty()),
+            "canvas shortcuts must NOT fire when another element is focused, got {:?}",
+            view.read_with(cx, |v, _| v.events.clone())
+        );
+
+        // Now click on item-1 to activate/focus the FreeformCanvas
+        let cb = view
+            .read_with(cx, |v, cx| v.canvas.read(cx).canvas_bounds.get())
+            .unwrap();
+        let item_pt = point(cb.origin.x + px(40.), cb.origin.y + px(35.));
+        cx.simulate_event(MouseDownEvent {
+            position: item_pt,
+            button: MouseButton::Left,
+            modifiers: Modifiers::none(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        cx.simulate_event(MouseUpEvent {
+            position: item_pt,
+            button: MouseButton::Left,
+            modifiers: Modifiers::none(),
+            click_count: 1,
+        });
+        cx.run_until_parked();
+        view.update(cx, |v, _| v.events.clear());
+
+        cx.simulate_keystrokes("ctrl-z");
+        cx.simulate_keystrokes("ctrl-shift-z");
+        cx.simulate_keystrokes("ctrl-y");
+        cx.simulate_keystrokes("ctrl-c");
+        cx.simulate_keystrokes("ctrl-x");
+        cx.simulate_keystrokes("ctrl-v");
+        cx.simulate_keystrokes("ctrl-d");
+        cx.run_until_parked();
+
+        let events = view.read_with(cx, |v, _| v.events.clone());
+        assert_eq!(
+            events,
+            vec![
+                FreeformCanvasEvent::Undo,
+                FreeformCanvasEvent::Redo,
+                FreeformCanvasEvent::Redo,
+                FreeformCanvasEvent::Copy(vec!["item-1".into()]),
+                FreeformCanvasEvent::Cut(vec!["item-1".into()]),
+                FreeformCanvasEvent::Paste { at: None },
+                FreeformCanvasEvent::Duplicate(vec!["item-1".into()]),
+            ]
+        );
+    }
+
+    #[crate::test]
+    fn context_menu_right_click_item_and_canvas(cx: &mut crate::TestAppContext) {
+        use crate::{Modifiers, MouseDownEvent, MouseUpEvent};
+        cx.update(super::super::init_components);
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let canvas = cx.new(FreeformCanvasState::new);
+            let sub = cx.subscribe(&canvas, |_: &mut StudioView, _, _: &FreeformCanvasEvent, cx| {
+                cx.notify();
+            });
+            StudioView {
+                canvas,
+                items: vec![
+                    ("a".into(), CanvasRect::new(16.0, 16.0, 50.0, 24.0)),
+                    ("b".into(), CanvasRect::new(90.0, 16.0, 50.0, 24.0)),
+                ],
+                size: CanvasSize::new(240.0, 120.0),
+                committed_resizes: 0,
+                committed_canvas_resizes: 0,
+                _sub: sub,
+            }
+        });
+        cx.run_until_parked();
+
+        let cb = view
+            .read_with(cx, |v, cx| v.canvas.read(cx).canvas_bounds.get())
+            .unwrap();
+
+        // 1. Right-click unselected item "a" -> selects "a" and opens item context menu
+        let a_pt = point(cb.origin.x + px(36.), cb.origin.y + px(28.));
+        cx.simulate_event(MouseDownEvent {
+            position: a_pt,
+            button: MouseButton::Right,
+            modifiers: Modifiers::none(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        cx.simulate_event(MouseUpEvent {
+            position: a_pt,
+            button: MouseButton::Right,
+            modifiers: Modifiers::none(),
+            click_count: 1,
+        });
+        cx.run_until_parked();
+
+        let (sel, target) = view.read_with(cx, |v, cx| {
+            let s = v.canvas.read(cx);
+            (s.selected_ids().to_vec(), s.context_menu_target().cloned())
+        });
+        assert_eq!(sel, vec![SharedString::from("a")]);
+        assert_eq!(target.as_ref().and_then(|t| t.item_id.clone()), Some("a".into()));
+        assert!(target.as_ref().and_then(|t| t.canvas_position).is_some());
+
+        // Escape dismisses the context menu and restores focus to the canvas
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(!view.read_with(cx, |v, cx| v.canvas.read(cx).is_context_menu_open()));
+
+        // 2. Select both "a" and "b", then right-click "b" -> preserves multi-selection!
+        view.update(cx, |v, cx| {
+            v.canvas
+                .update(cx, |s, cx| s.set_selection(vec!["a".into(), "b".into()], cx));
+        });
+        let b_pt = point(cb.origin.x + px(110.), cb.origin.y + px(28.));
+        cx.simulate_event(MouseDownEvent {
+            position: b_pt,
+            button: MouseButton::Right,
+            modifiers: Modifiers::none(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        cx.run_until_parked();
+        let (sel, target) = view.read_with(cx, |v, cx| {
+            let s = v.canvas.read(cx);
+            (s.selected_ids().to_vec(), s.context_menu_target().cloned())
+        });
+        assert_eq!(sel, vec![SharedString::from("a"), SharedString::from("b")]);
+        assert_eq!(target.as_ref().and_then(|t| t.item_id.clone()), Some("b".into()));
+
+        // 3. Right-click empty canvas -> opens canvas background context menu with exact canvas coords
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        let empty_pt = point(cb.origin.x + px(180.), cb.origin.y + px(90.));
+        cx.simulate_event(MouseDownEvent {
+            position: empty_pt,
+            button: MouseButton::Right,
+            modifiers: Modifiers::none(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        cx.run_until_parked();
+        let target = view.read_with(cx, |v, cx| v.canvas.read(cx).context_menu_target().cloned());
+        assert!(target.is_some());
+        assert_eq!(target.as_ref().unwrap().item_id, None);
+        let cpos = target.unwrap().canvas_position.unwrap();
+        assert!((cpos.0 - 180.0).abs() < 1.0 && (cpos.1 - 90.0).abs() < 1.0);
     }
 }

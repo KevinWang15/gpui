@@ -176,11 +176,12 @@ pub use floating_window::{
 };
 pub use form::{FormRule, FormState};
 pub use freeform_canvas::{
-    AlignAction, CanvasItemSpec, CanvasPaletteItem, CanvasRect, CanvasSize, FreeformCanvas,
-    FreeformCanvasEvent, FreeformCanvasState, GuideAxis, GuideKind, ResizeHandle, SnapConfig,
-    SnapGuide, align_item, align_items, bounding_rect, bring_forward_many, canvas_palette_item,
-    duplicate_rects, freeform_canvas, nudge_rects, send_backward_many, snap_canvas_resize,
-    snap_move, snap_resize,
+    AlignAction, CanvasContextMenuBuilder, CanvasContextMenuTarget, CanvasHistory, CanvasItemSpec,
+    CanvasPaletteItem, CanvasRect, CanvasSize, FreeformCanvas, FreeformCanvasEvent,
+    FreeformCanvasState, GuideAxis, GuideKind, ResizeHandle, SnapConfig, SnapGuide, align_item,
+    align_items, bounding_rect, bring_forward_many, bring_to_front_many, canvas_palette_item,
+    duplicate_rects, freeform_canvas, nudge_rects, paste_rects, send_backward_many,
+    send_to_back_many, snap_canvas_resize, snap_move, snap_resize,
 };
 pub use hierarchical_select::{
     Cascader, CascaderEvent, CascaderOption, CascaderState, TreeSelect, TreeSelectEvent,

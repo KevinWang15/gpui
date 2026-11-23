@@ -3,7 +3,7 @@
 
 use gpui::components::*;
 use gpui::icons::LucideIcon;
-use gpui::{Context, FontWeight, IntoElement, div, prelude::*, px};
+use gpui::{Context, Focusable, FontWeight, IntoElement, div, prelude::*, px};
 
 use crate::state::PlaygroundApp;
 
@@ -281,12 +281,19 @@ pub fn freeform_canvas_demo(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>
         );
     }
 
+    let can_undo = app.freeform_history.can_undo();
+    let can_redo = app.freeform_history.can_redo();
+    let can_paste = !app.freeform_clipboard.is_empty();
+
     let mut fc = freeform_canvas("pg-freeform-canvas", &app.freeform_canvas)
         .w_full()
         .min_h(px(270.))
         .canvas_size(app.freeform_size.width, app.freeform_size.height)
         .canvas_limits(CanvasSize::new(160.0, 72.0), CanvasSize::new(520.0, 260.0))
         .canvas_radius(theme.radius_lg)
+        .can_undo(can_undo)
+        .can_redo(can_redo)
+        .can_paste(can_paste)
         .empty(
             div()
                 .text_size(px(12.))
@@ -314,7 +321,11 @@ pub fn freeform_canvas_demo(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>
             .size(ComponentSize::Xs)
             .disabled(!has_selected)
             .tooltip_text(tip)
-            .on_click(cx.listener(move |this, _, _, cx| this.align_freeform_selected(action, cx)))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.align_freeform_selected(action, cx);
+                let fh = this.freeform_canvas.read(cx).focus_handle(cx);
+                window.focus(&fh, cx);
+            }))
     };
 
     card()
@@ -329,7 +340,7 @@ pub fn freeform_canvas_demo(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>
                             .spacing(px(2.))
                             .child(card_title("Freeform 2D Canvas (Drag, Resize & Auto-Align)"))
                             .child(card_description(
-                                "Drag components from the palette, resize items (8 handles) or the canvas frame itself, and snap to sibling edges, centers, and uniform gaps. Hold Alt to move freely.",
+                                "Drag from the palette, resize (8 handles), right-click for the context menu, and use Ctrl+Z / Ctrl+Shift+Z (undo/redo) or Ctrl+C / X / V / D (clipboard) while the canvas is active.",
                             )),
                     )
                     .child(
@@ -404,6 +415,8 @@ pub fn freeform_canvas_demo(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>
                             .child(
                                 h_stack()
                                     .justify_between()
+                                    .flex_wrap()
+                                    .gap(px(6.))
                                     .px(px(10.))
                                     .py(px(6.))
                                     .rounded(theme.radius_md)
@@ -412,7 +425,82 @@ pub fn freeform_canvas_demo(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>
                                     .border_color(theme.border)
                                     .child(
                                         h_stack()
+                                            .flex_wrap()
                                             .spacing(px(4.))
+                                            .child(
+                                                button::Button::icon("pg-fc-undo", LucideIcon::Undo2)
+                                                    .ghost()
+                                                    .size(ComponentSize::Xs)
+                                                    .disabled(!can_undo)
+                                                    .tooltip_text("Undo (Ctrl+Z)")
+                                                    .on_click(cx.listener(|this, _, window, cx| {
+                                                        this.undo_freeform(cx);
+                                                        let fh = this.freeform_canvas.read(cx).focus_handle(cx);
+                                                        window.focus(&fh, cx);
+                                                    })),
+                                            )
+                                            .child(
+                                                button::Button::icon("pg-fc-redo", LucideIcon::Redo2)
+                                                    .ghost()
+                                                    .size(ComponentSize::Xs)
+                                                    .disabled(!can_redo)
+                                                    .tooltip_text("Redo (Ctrl+Shift+Z)")
+                                                    .on_click(cx.listener(|this, _, window, cx| {
+                                                        this.redo_freeform(cx);
+                                                        let fh = this.freeform_canvas.read(cx).focus_handle(cx);
+                                                        window.focus(&fh, cx);
+                                                    })),
+                                            )
+                                            .child(toolbar_separator(cx))
+                                            .child(
+                                                button::Button::icon("pg-fc-cut", LucideIcon::Scissors)
+                                                    .ghost()
+                                                    .size(ComponentSize::Xs)
+                                                    .disabled(!has_selected)
+                                                    .tooltip_text("Cut (Ctrl+X)")
+                                                    .on_click(cx.listener(|this, _, window, cx| {
+                                                        this.cut_freeform_selected(cx);
+                                                        let fh = this.freeform_canvas.read(cx).focus_handle(cx);
+                                                        window.focus(&fh, cx);
+                                                    })),
+                                            )
+                                            .child(
+                                                button::Button::icon("pg-fc-copy", LucideIcon::Copy)
+                                                    .ghost()
+                                                    .size(ComponentSize::Xs)
+                                                    .disabled(!has_selected)
+                                                    .tooltip_text("Copy (Ctrl+C)")
+                                                    .on_click(cx.listener(|this, _, window, cx| {
+                                                        this.copy_freeform_selected(cx);
+                                                        let fh = this.freeform_canvas.read(cx).focus_handle(cx);
+                                                        window.focus(&fh, cx);
+                                                    })),
+                                            )
+                                            .child(
+                                                button::Button::icon("pg-fc-paste", LucideIcon::ClipboardPaste)
+                                                    .ghost()
+                                                    .size(ComponentSize::Xs)
+                                                    .disabled(!can_paste)
+                                                    .tooltip_text("Paste (Ctrl+V)")
+                                                    .on_click(cx.listener(|this, _, window, cx| {
+                                                        this.paste_freeform(None, cx);
+                                                        let fh = this.freeform_canvas.read(cx).focus_handle(cx);
+                                                        window.focus(&fh, cx);
+                                                    })),
+                                            )
+                                            .child(
+                                                button::Button::icon("pg-fc-dup", LucideIcon::CopyPlus)
+                                                    .ghost()
+                                                    .size(ComponentSize::Xs)
+                                                    .disabled(!has_selected)
+                                                    .tooltip_text("Duplicate (Ctrl+D)")
+                                                    .on_click(cx.listener(|this, _, window, cx| {
+                                                        this.duplicate_freeform_selected(cx);
+                                                        let fh = this.freeform_canvas.read(cx).focus_handle(cx);
+                                                        window.focus(&fh, cx);
+                                                    })),
+                                            )
+                                            .child(toolbar_separator(cx))
                                             .child(align_btn("pg-fc-al-l", LucideIcon::AlignStartVertical, "Align left", AlignAction::Left))
                                             .child(align_btn("pg-fc-al-ch", LucideIcon::AlignCenterVertical, "Center horizontally", AlignAction::CenterHorizontal))
                                             .child(align_btn("pg-fc-al-r", LucideIcon::AlignEndVertical, "Align right", AlignAction::Right))
@@ -428,7 +516,11 @@ pub fn freeform_canvas_demo(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>
                                                     .size(ComponentSize::Xs)
                                                     .disabled(!has_selected)
                                                     .tooltip_text("Bring selected forward")
-                                                    .on_click(cx.listener(|this, _, _, cx| this.bring_freeform_forward(cx))),
+                                                    .on_click(cx.listener(|this, _, window, cx| {
+                                                        this.bring_freeform_forward(cx);
+                                                        let fh = this.freeform_canvas.read(cx).focus_handle(cx);
+                                                        window.focus(&fh, cx);
+                                                    })),
                                             )
                                             .child(
                                                 button::Button::icon("pg-fc-z-bwd", LucideIcon::SendToBack)
@@ -436,7 +528,11 @@ pub fn freeform_canvas_demo(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>
                                                     .size(ComponentSize::Xs)
                                                     .disabled(!has_selected)
                                                     .tooltip_text("Send selected backward")
-                                                    .on_click(cx.listener(|this, _, _, cx| this.send_freeform_backward(cx))),
+                                                    .on_click(cx.listener(|this, _, window, cx| {
+                                                        this.send_freeform_backward(cx);
+                                                        let fh = this.freeform_canvas.read(cx).focus_handle(cx);
+                                                        window.focus(&fh, cx);
+                                                    })),
                                             ),
                                     )
                                     .child(
