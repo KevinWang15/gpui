@@ -7,7 +7,7 @@
 //! `CompositionRoundedRectangleGeometry` clips the live desktop blur to any arbitrary corner
 //! radius with hardware anti-aliasing and zero window-drag lag.
 
-use std::cell::{OnceCell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 
 use anyhow::{Context, Result};
 use windows::Foundation::{IPropertyValue, PropertyValue};
@@ -35,8 +35,8 @@ use windows::Win32::System::WinRT::{
 use windows_core::{GUID, HSTRING, Interface, PCWSTR, Result as WinResult, implement};
 use windows_numerics::Vector2;
 
-/// Gaussian standard deviation (physical px) matching Windows 11 Acrylic's frosted softness.
-const HOST_BLUR_SIGMA: f32 = 22.0;
+/// Default Gaussian standard deviation (physical px) matching Windows 11 Acrylic's frosted softness.
+pub(crate) const DEFAULT_HOST_BLUR_SIGMA: f32 = 22.0;
 
 thread_local! {
     /// Kept alive for the lifetime of the UI thread so `Compositor::new()` can commit updates.
@@ -143,9 +143,30 @@ pub(crate) struct WinRtComposition {
     backdrop_visual: SpriteVisual,
     backdrop_geom: CompositionRoundedRectangleGeometry,
     content_visual: SpriteVisual,
+    blur_sigma: Cell<f32>,
 }
 
 impl WinRtComposition {
+    fn build_blur_brush(compositor: &Compositor, sigma: f32) -> Result<windows::UI::Composition::CompositionEffectBrush> {
+        let source_param: IGraphicsEffectSource =
+            CompositionEffectSourceParameter::Create(&HSTRING::from("source"))?.cast()?;
+        let blur_effect: IGraphicsEffect = GaussianBlurEffect {
+            name: RefCell::new(HSTRING::from("HostBlur")),
+            blur_amount: sigma.clamp(0.0, 128.0),
+            source: source_param,
+        }
+        .into();
+        let factory = compositor
+            .CreateEffectFactory(&blur_effect)
+            .context("Creating GaussianBlur effect factory")?;
+        let effect_brush = factory.CreateBrush()?;
+        let host_backdrop = compositor
+            .CreateHostBackdropBrush()
+            .context("Creating HostBackdropBrush")?;
+        effect_brush.SetSourceParameter(&HSTRING::from("source"), &host_backdrop)?;
+        Ok(effect_brush)
+    }
+
     pub(crate) fn new(hwnd: HWND) -> Result<Self> {
         anyhow::ensure!(
             ensure_dispatcher_queue(),
@@ -163,22 +184,7 @@ impl WinRtComposition {
 
         // Bottom child: Gaussian-blurred HostBackdropBrush clipped to exact rounded-rect geometry.
         let backdrop_visual = compositor.CreateSpriteVisual()?;
-        let source_param: IGraphicsEffectSource =
-            CompositionEffectSourceParameter::Create(&HSTRING::from("source"))?.cast()?;
-        let blur_effect: IGraphicsEffect = GaussianBlurEffect {
-            name: RefCell::new(HSTRING::from("HostBlur")),
-            blur_amount: HOST_BLUR_SIGMA,
-            source: source_param,
-        }
-        .into();
-        let factory = compositor
-            .CreateEffectFactory(&blur_effect)
-            .context("Creating GaussianBlur effect factory")?;
-        let effect_brush = factory.CreateBrush()?;
-        let host_backdrop = compositor
-            .CreateHostBackdropBrush()
-            .context("Creating HostBackdropBrush")?;
-        effect_brush.SetSourceParameter(&HSTRING::from("source"), &host_backdrop)?;
+        let effect_brush = Self::build_blur_brush(&compositor, DEFAULT_HOST_BLUR_SIGMA)?;
         backdrop_visual.SetBrush(&effect_brush)?;
 
         let backdrop_geom = compositor.CreateRoundedRectangleGeometry()?;
@@ -200,7 +206,20 @@ impl WinRtComposition {
             backdrop_visual,
             backdrop_geom,
             content_visual,
+            blur_sigma: Cell::new(DEFAULT_HOST_BLUR_SIGMA),
         })
+    }
+
+    pub(crate) fn set_blur_sigma(&self, sigma: f32) {
+        let clamped = sigma.clamp(0.0, 128.0);
+        if (self.blur_sigma.get() - clamped).abs() <= 0.25 {
+            return;
+        }
+        if let Ok(brush) = Self::build_blur_brush(&self.compositor, clamped) {
+            if self.backdrop_visual.SetBrush(&brush).is_ok() {
+                self.blur_sigma.set(clamped);
+            }
+        }
     }
 
     pub(crate) fn set_swap_chain(&self, swap_chain: &IDXGISwapChain1) -> Result<()> {

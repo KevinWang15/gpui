@@ -71,6 +71,7 @@ mod util;
 mod view;
 mod view_transition;
 mod window;
+pub mod window_placement;
 
 #[cfg(feature = "profiler")]
 mod debug_overlay;
@@ -164,6 +165,7 @@ pub use util::{FutureExt, Timeout};
 pub use view::*;
 pub use view_transition::*;
 pub use window::*;
+pub use window_placement::*;
 
 #[cfg(not(target_family = "wasm"))]
 pub use pollster::block_on;

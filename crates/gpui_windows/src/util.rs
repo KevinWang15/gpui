@@ -103,7 +103,7 @@ pub(crate) fn load_cursor(style: CursorStyle) -> Option<HCURSOR> {
     static SIZEALL: OnceLock<SafeCursor> = OnceLock::new();
     let (lock, name) = match style {
         // Windows has no grabbing hand; its move cursor is the closest.
-        CursorStyle::ClosedHand => (&SIZEALL, IDC_SIZEALL),
+        CursorStyle::ClosedHand | CursorStyle::Move => (&SIZEALL, IDC_SIZEALL),
         CursorStyle::IBeam | CursorStyle::IBeamCursorForVerticalLayout => (&IBEAM, IDC_IBEAM),
         CursorStyle::Crosshair => (&CROSS, IDC_CROSS),
         CursorStyle::PointingHand | CursorStyle::DragLink => (&HAND, IDC_HAND),

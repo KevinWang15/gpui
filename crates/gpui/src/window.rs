@@ -1762,6 +1762,14 @@ impl Window {
             tabbing_identifier,
             #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
             use_display_p3,
+            always_on_top,
+            skip_taskbar,
+            non_activating,
+            click_through,
+            window_corner_preference,
+            hide_window_border,
+            backdrop_corner_radius,
+            backdrop_blur_radius,
         } = options;
 
         let initial_window_title = titlebar
@@ -1807,8 +1815,20 @@ impl Window {
                 tabbing_identifier,
                 #[cfg(target_os = "macos")]
                 use_display_p3,
+                always_on_top,
+                skip_taskbar,
+                non_activating,
+                click_through,
+                window_corner_preference,
+                hide_window_border,
             },
         )?;
+        if let Some(radius) = backdrop_corner_radius {
+            platform_window.set_backdrop_corner_radius(radius);
+        }
+        if let Some(blur_radius) = backdrop_blur_radius {
+            platform_window.set_backdrop_blur_radius(blur_radius);
+        }
 
         let tab_bar_visible = platform_window.tab_bar_visible();
         SystemWindowTabController::init_visible(cx, tab_bar_visible);
@@ -3741,6 +3761,116 @@ impl Window {
         offset: Point<Pixels>,
     ) -> bool {
         self.platform_window.move_on_display(display, offset)
+    }
+
+    /// Atomically moves and resizes this window on `display` (in `display`-local logical pixels)
+    /// without stealing focus when `activate` is `false`. Handles cross-DPI monitor transitions
+    /// cleanly on Windows.
+    pub fn set_bounds_on_display(
+        &mut self,
+        display: &dyn PlatformDisplay,
+        bounds: Bounds<Pixels>,
+        activate: bool,
+    ) -> bool {
+        self.platform_window
+            .set_bounds_on_display(display, bounds, activate)
+    }
+
+    /// Atomically moves and resizes this window in unified physical virtual-desktop pixels,
+    /// optionally re-asserting or clearing always-on-top, without stealing focus.
+    pub fn set_physical_bounds(
+        &mut self,
+        bounds: Bounds<DevicePixels>,
+        always_on_top: Option<bool>,
+    ) -> bool {
+        self.platform_window
+            .set_physical_bounds(bounds, always_on_top)
+    }
+
+    /// Shows this window and activates it.
+    pub fn show(&self) {
+        self.platform_window.set_visible(true, true);
+    }
+
+    /// Shows this window without stealing OS keyboard focus from the current foreground app.
+    pub fn show_no_activate(&self) {
+        self.platform_window.set_visible(true, false);
+    }
+
+    /// Hides this window without destroying its GPU swapchain or view state.
+    pub fn hide(&self) {
+        self.platform_window.set_visible(false, false);
+    }
+
+    /// Hides this window immediately, suppressing OS hide fade animations where supported
+    /// (such as Windows DWM transitions before a screen capture).
+    pub fn hide_immediately(&self) {
+        self.platform_window.hide_immediately();
+    }
+
+    /// Shows or hides this window without destroying its GPU surface.
+    pub fn set_visible(&self, visible: bool, activate: bool) {
+        self.platform_window.set_visible(visible, activate);
+    }
+
+    /// Cloaks or uncloaks this window in the OS compositor (`DWMWA_CLOAK` on Windows) so a reused
+    /// popup can reposition and repaint off-compositor before atomic reveal.
+    pub fn set_cloaked(&self, cloaked: bool) {
+        self.platform_window.set_cloaked(cloaked);
+    }
+
+    /// Requests an immediate synchronous paint/present pass bypassing the next vsync tick.
+    /// Useful for ultra-low-latency Spotlight/Alfred launchers and instant reveals.
+    pub fn paint_now(&self) {
+        self.platform_window.paint_now();
+    }
+
+    /// Toggles whether this window floats above normal windows (`HWND_TOPMOST` on Windows).
+    pub fn set_always_on_top(&self, always_on_top: bool) {
+        self.platform_window.set_always_on_top(always_on_top);
+    }
+
+    /// Toggles whether mouse/pointer events pass straight through this window to apps below it.
+    pub fn set_click_through(&self, click_through: bool) {
+        self.platform_window.set_click_through(click_through);
+    }
+
+    /// Toggles whether clicking this window avoids stealing OS keyboard focus (`WS_EX_NOACTIVATE`).
+    pub fn set_non_activating(&self, non_activating: bool) {
+        self.platform_window.set_non_activating(non_activating);
+    }
+
+    /// Updates the OS rounded-corner preference (e.g. Windows 11 `DWMWA_WINDOW_CORNER_PREFERENCE`).
+    pub fn set_window_corner_preference(&self, preference: crate::WindowCornerPreference) {
+        self.platform_window
+            .set_window_corner_preference(preference);
+    }
+
+    /// Sets the OS window frame border color (`None` disables Windows 11's default 1 px border).
+    pub fn set_border_color(&self, color: Option<crate::Rgba>) {
+        self.platform_window.set_border_color(color);
+    }
+
+    /// Sets the Gaussian blur radius (logical px) for the platform frosted backdrop (`Blurred`).
+    pub fn set_backdrop_blur_radius(&self, radius: Pixels) {
+        self.platform_window.set_backdrop_blur_radius(radius);
+    }
+
+    /// Captures this window's rendered pixels as an RGBA8 image (works even when off-screen on
+    /// Windows via `PrintWindow(PW_RENDERFULLCONTENT)`).
+    pub fn capture_image(&self) -> Result<image::RgbaImage> {
+        self.platform_window.capture_image()
+    }
+
+    /// Displays a native OS context menu at the current cursor position and invokes `on_select`
+    /// asynchronously on the main thread with the selected item's ID.
+    pub fn show_native_context_menu(
+        &self,
+        items: Vec<crate::TrayMenuItem>,
+        on_select: impl FnOnce(SharedString) + 'static,
+    ) {
+        self.platform_window
+            .show_native_context_menu(items, Box::new(on_select));
     }
 
     /// Set the content size of the window.

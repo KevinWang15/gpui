@@ -318,6 +318,12 @@ impl DirectXRenderer {
         }
     }
 
+    pub(crate) fn set_backdrop_blur_sigma(&self, sigma_px: f32) {
+        if let Some(DirectComposition::WinRt(winrt)) = &self.direct_composition {
+            winrt.set_blur_sigma(sigma_px);
+        }
+    }
+
     pub(crate) fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         self.atlas.clone()
     }

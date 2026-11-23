@@ -27,6 +27,7 @@ use windows::{
             LibraryLoader::*,
             Ole::*,
             Power::*,
+            RemoteDesktop::*,
             SystemInformation::*,
             SystemServices::{GUID_POWER_SAVING_STATUS, POWER_REQUEST_CONTEXT_VERSION},
             Threading::{POWER_REQUEST_CONTEXT_SIMPLE_STRING, REASON_CONTEXT, REASON_CONTEXT_0},
@@ -75,6 +76,7 @@ pub struct WindowsPlatform {
     has_package_identity: bool,
     app_identity: RefCell<Option<(String, String)>>,
     system_notifications: RefCell<SystemNotificationState>,
+    session_notification_registered: Cell<bool>,
 }
 
 struct WindowsPlatformInner {
@@ -99,6 +101,9 @@ pub(crate) struct WindowsPlatformState {
     pub(crate) draw_coordinator: Rc<DrawCoordinator>,
     directx_devices: RefCell<Option<DirectXDevices>>,
     low_power_mode_enabled: Cell<bool>,
+    tray: RefCell<Option<WindowsTrayState>>,
+    global_hotkeys: RefCell<Option<WindowsGlobalHotKeys>>,
+    taskbar_created_msg: u32,
 }
 
 #[derive(Default)]
@@ -112,6 +117,10 @@ struct PlatformCallbacks {
     keyboard_layout_change: Cell<Option<Box<dyn FnMut()>>>,
     system_sleep: Cell<Option<Box<dyn FnMut()>>>,
     system_wake: Cell<Option<Box<dyn FnMut()>>>,
+    session_lock: Cell<Option<Box<dyn FnMut()>>>,
+    session_unlock: Cell<Option<Box<dyn FnMut()>>>,
+    tray_event: Cell<Option<Box<dyn FnMut(TrayEvent)>>>,
+    global_hotkey: Cell<Option<Box<dyn FnMut(GlobalHotKeyId)>>>,
     low_power_mode_change: Cell<Option<Box<dyn FnMut()>>>,
     displays_changed: Cell<Option<Box<dyn FnMut()>>>,
 }
@@ -131,6 +140,9 @@ impl WindowsPlatformState {
             directx_devices: RefCell::new(directx_devices),
             low_power_mode_enabled: Cell::new(false),
             menus: RefCell::new(Vec::new()),
+            tray: RefCell::new(None),
+            global_hotkeys: RefCell::new(None),
+            taskbar_created_msg: taskbar_created_message(),
         }
     }
 }
@@ -286,6 +298,7 @@ impl WindowsPlatform {
             invalidate_devices: Arc::new(AtomicBool::new(false)),
             app_identity: RefCell::new(None),
             system_notifications: RefCell::new(SystemNotificationState::new()),
+            session_notification_registered: Cell::new(false),
         })
     }
 
@@ -383,6 +396,17 @@ impl WindowsPlatform {
 
     fn is_windowed(&self) -> bool {
         self.inner.state.directx_devices.borrow().is_some()
+    }
+
+    fn ensure_session_notification_registered(&self) {
+        if !self.session_notification_registered.get() {
+            if unsafe { WTSRegisterSessionNotification(self.handle, NOTIFY_FOR_THIS_SESSION) }
+                .log_err()
+                .is_some()
+            {
+                self.session_notification_registered.set(true);
+            }
+        }
     }
 
     /// Connects in the initial windowing mode, before the app finishes launching.
@@ -797,15 +821,157 @@ impl Platform for WindowsPlatform {
         directory: &Path,
         suggested_name: Option<&str>,
     ) -> Receiver<Result<Option<PathBuf>>> {
-        let directory = directory.to_owned();
-        let suggested_name = suggested_name.map(|s| s.to_owned());
+        self.prompt_for_save_path(SavePromptOptions {
+            directory: (!directory.as_os_str().is_empty()).then(|| directory.to_owned()),
+            suggested_name: suggested_name.map(|s| SharedString::from(s.to_owned())),
+            ..Default::default()
+        })
+    }
+
+    fn prompt_for_open_paths(
+        &self,
+        options: OpenPromptOptions,
+    ) -> Receiver<Result<Option<Vec<PathBuf>>>> {
         let owner = self
             .find_current_active_window()
             .and_then(|hwnd| self.window_from_hwnd(hwnd))
             .map(|window| window.dialog_owner.clone());
         crate::dialog::show_dialog(owner, &self.foreground_executor, move |window| {
-            file_save_dialog(directory, suggested_name, Some(window))
+            let anchor = UnownedDialogAnchor::acquire_if_needed(window);
+            let parent = anchor.hwnd().or((!window.is_invalid()).then_some(window));
+            file_open_dialog_with_options(options, parent)
         })
+    }
+
+    fn prompt_for_save_path(
+        &self,
+        options: SavePromptOptions,
+    ) -> Receiver<Result<Option<PathBuf>>> {
+        let owner = self
+            .find_current_active_window()
+            .and_then(|hwnd| self.window_from_hwnd(hwnd))
+            .map(|window| window.dialog_owner.clone());
+        crate::dialog::show_dialog(owner, &self.foreground_executor, move |window| {
+            let anchor = UnownedDialogAnchor::acquire_if_needed(window);
+            let parent = anchor.hwnd().or((!window.is_invalid()).then_some(window));
+            file_save_dialog_with_options(options, parent)
+        })
+    }
+
+    fn cursor_position(&self) -> Option<Point<Pixels>> {
+        let mut pt = POINT::default();
+        unsafe { GetCursorPos(&mut pt) }.ok()?;
+        Some(point(px(pt.x as f32), px(pt.y as f32)))
+    }
+
+    fn display_at_cursor(&self) -> Option<Rc<dyn PlatformDisplay>> {
+        let mut pt = POINT::default();
+        if unsafe { GetCursorPos(&mut pt) }.is_ok()
+            && let Some(display) = WindowsDisplay::monitor_at_point(pt.x, pt.y)
+        {
+            return Some(Rc::new(display) as Rc<dyn PlatformDisplay>);
+        }
+        self.primary_display()
+    }
+
+    fn foreground_external_window(&self) -> Option<ExternalWindowHandle> {
+        let hwnd = unsafe { GetForegroundWindow() };
+        if hwnd.is_invalid() {
+            None
+        } else {
+            Some(ExternalWindowHandle(hwnd.0 as isize))
+        }
+    }
+
+    fn activate_external_window(&self, handle: ExternalWindowHandle) -> bool {
+        let hwnd = HWND(handle.0 as *mut _);
+        if hwnd.is_invalid() || !unsafe { IsWindow(Some(hwnd)).as_bool() } {
+            return false;
+        }
+        unsafe { SetForegroundWindow(hwnd).as_bool() }
+    }
+
+    fn on_session_lock(&self, callback: Box<dyn FnMut()>) {
+        self.inner.state.callbacks.session_lock.set(Some(callback));
+        self.ensure_session_notification_registered();
+    }
+
+    fn on_session_unlock(&self, callback: Box<dyn FnMut()>) {
+        self.inner
+            .state
+            .callbacks
+            .session_unlock
+            .set(Some(callback));
+        self.ensure_session_notification_registered();
+    }
+
+    fn set_tray_icon(&self, options: TrayIconOptions) -> Result<()> {
+        let mut slot = self.inner.state.tray.borrow_mut();
+        *slot = None;
+        let tray = WindowsTrayState::create(self.handle, options)?;
+        *slot = Some(tray);
+        Ok(())
+    }
+
+    fn update_tray_tooltip(&self, tooltip: &str) -> Result<()> {
+        let mut slot = self.inner.state.tray.borrow_mut();
+        let tray = slot
+            .as_mut()
+            .ok_or_else(|| anyhow!("no active system tray icon"))?;
+        tray.set_tooltip(tooltip)
+    }
+
+    fn update_tray_icon(&self, icon: TrayIconData) -> Result<()> {
+        let mut slot = self.inner.state.tray.borrow_mut();
+        let tray = slot
+            .as_mut()
+            .ok_or_else(|| anyhow!("no active system tray icon"))?;
+        tray.set_icon(&icon)
+    }
+
+    fn update_tray_menu(&self, menu: Vec<TrayMenuItem>) -> Result<()> {
+        let mut slot = self.inner.state.tray.borrow_mut();
+        let tray = slot
+            .as_mut()
+            .ok_or_else(|| anyhow!("no active system tray icon"))?;
+        tray.set_menu(menu);
+        Ok(())
+    }
+
+    fn remove_tray_icon(&self) {
+        *self.inner.state.tray.borrow_mut() = None;
+    }
+
+    fn on_tray_event(&self, callback: Box<dyn FnMut(TrayEvent)>) {
+        self.inner.state.callbacks.tray_event.set(Some(callback));
+    }
+
+    fn register_global_hotkey(&self, hotkey: GlobalHotKey) -> Result<GlobalHotKeyId> {
+        let mut slot = self.inner.state.global_hotkeys.borrow_mut();
+        let manager = slot.get_or_insert_with(|| WindowsGlobalHotKeys::new(self.handle));
+        manager.register(&hotkey)
+    }
+
+    fn unregister_global_hotkey(&self, id: GlobalHotKeyId) {
+        if let Some(manager) = self.inner.state.global_hotkeys.borrow_mut().as_mut() {
+            manager.unregister(id);
+        }
+    }
+
+    fn on_global_hotkey(&self, callback: Box<dyn FnMut(GlobalHotKeyId)>) {
+        self.inner
+            .state
+            .callbacks
+            .global_hotkey
+            .set(Some(callback));
+    }
+
+    fn is_launch_at_login(&self, app_name: &str) -> Result<bool> {
+        crate::autostart::is_launch_at_login(app_name)
+    }
+
+    fn set_launch_at_login(&self, options: AutostartOptions, enabled: bool) -> Result<()> {
+        crate::autostart::set_launch_at_login(&options, enabled)
     }
 
     fn can_select_mixed_files_and_dirs(&self) -> bool {
@@ -1217,10 +1383,19 @@ impl WindowsPlatformInner {
             | WM_GPUI_KEYBOARD_LAYOUT_CHANGED
             | WM_GPUI_DISPLAYS_CHANGED
             | WM_GPUI_GPU_DEVICE_LOST => self.handle_gpui_events(msg, wparam, lparam),
+            WM_HOTKEY => self.handle_hotkey_msg(wparam),
+            WM_GPUI_TRAY_EVENT => self.handle_tray_msg(handle, lparam),
+            WM_WTSSESSION_CHANGE => self.handle_session_change_msg(wparam),
             WM_POWERBROADCAST => self.handle_power_broadcast(wparam, lparam),
             WM_DISPLAYCHANGE => self.handle_display_change(handle),
             WM_QUERYENDSESSION => Some(1),
             WM_ENDSESSION if wparam.0 != 0 => self.handle_end_session(),
+            m if m != 0 && m == self.state.taskbar_created_msg => {
+                if let Some(tray) = self.state.tray.borrow().as_ref() {
+                    let _ = tray.add_to_shell();
+                }
+                Some(0)
+            }
             _ => None,
         };
         if let Some(result) = handled {
@@ -1433,6 +1608,88 @@ impl WindowsPlatformInner {
 
         Some(0)
     }
+
+    fn handle_hotkey_msg(self: &Rc<Self>, wparam: WPARAM) -> Option<isize> {
+        let id = GlobalHotKeyId(wparam.0 as u32);
+        let this = Rc::clone(self);
+        // Dispatch via foreground executor so hotkey handlers never collide with an active AppCell borrow.
+        ForegroundExecutor::new(self.dispatcher.clone())
+            .spawn(async move {
+                this.with_callback(
+                    |callbacks| &callbacks.global_hotkey,
+                    |callback| callback(id),
+                );
+            })
+            .detach();
+        Some(0)
+    }
+
+    fn handle_tray_msg(self: &Rc<Self>, hwnd: HWND, lparam: LPARAM) -> Option<isize> {
+        let event = decode_tray_mouse_msg(lparam)?;
+        let (should_open_menu, menu_items) = {
+            let slot = self.state.tray.borrow();
+            let Some(tray) = slot.as_ref() else {
+                return Some(0);
+            };
+            let open_menu = match event {
+                TrayEvent::RightClick => true,
+                TrayEvent::LeftClick => tray.menu_on_left_click(),
+                _ => false,
+            };
+            let items = if open_menu {
+                tray.menu().to_vec()
+            } else {
+                Vec::new()
+            };
+            (open_menu && !items.is_empty(), items)
+        };
+
+        let this = Rc::clone(self);
+        ForegroundExecutor::new(self.dispatcher.clone())
+            .spawn(async move {
+                if should_open_menu {
+                    if let Some(id) = show_native_popup_menu(hwnd, &menu_items) {
+                        this.with_callback(
+                            |callbacks| &callbacks.tray_event,
+                            |callback| callback(TrayEvent::MenuItem(id)),
+                        );
+                    }
+                } else {
+                    this.with_callback(
+                        |callbacks| &callbacks.tray_event,
+                        |callback| callback(event),
+                    );
+                }
+            })
+            .detach();
+        Some(0)
+    }
+
+    fn handle_session_change_msg(self: &Rc<Self>, wparam: WPARAM) -> Option<isize> {
+        let code = wparam.0 as u32;
+        let is_lock = match code {
+            WTS_SESSION_LOCK => true,
+            WTS_SESSION_UNLOCK => false,
+            _ => return Some(0),
+        };
+        let this = Rc::clone(self);
+        ForegroundExecutor::new(self.dispatcher.clone())
+            .spawn(async move {
+                if is_lock {
+                    this.with_callback(
+                        |callbacks| &callbacks.session_lock,
+                        |callback| callback(),
+                    );
+                } else {
+                    this.with_callback(
+                        |callbacks| &callbacks.session_unlock,
+                        |callback| callback(),
+                    );
+                }
+            })
+            .detach();
+        Some(0)
+    }
 }
 
 unsafe fn power_saving_status(lparam: LPARAM) -> Option<bool> {
@@ -1457,7 +1714,14 @@ impl Drop for WindowsPlatform {
         if let Some(stop) = self.vsync_stop.borrow_mut().take() {
             stop.store(true, Ordering::Release);
         }
+        // Clean up tray icon and global hotkeys before destroying the platform HWND so no ghost
+        // tray icon or lingering OS hotkey remains.
+        *self.inner.state.tray.borrow_mut() = None;
+        *self.inner.state.global_hotkeys.borrow_mut() = None;
         unsafe {
+            if self.session_notification_registered.replace(false) {
+                WTSUnRegisterSessionNotification(self.handle).log_err();
+            }
             if let Some(notification) = self.suspend_resume_notification.borrow_mut().take() {
                 // SAFETY: notification was returned by RegisterSuspendResumeNotification.
                 UnregisterSuspendResumeNotification(notification).log_err();
@@ -1582,8 +1846,119 @@ fn open_target_in_explorer(target: &Path) -> Result<()> {
     })
 }
 
+/// Creates a temporary invisible topmost anchor window on the cursor's monitor when a native
+/// file dialog is opened with no active GPUI owner window (e.g. from a system tray menu),
+/// preventing Windows from burying the unowned dialog behind other apps.
+struct UnownedDialogAnchor(Option<HWND>);
+
+impl UnownedDialogAnchor {
+    fn acquire_if_needed(owner: HWND) -> Self {
+        if !owner.is_invalid() {
+            return Self(None);
+        }
+        let mut pt = POINT::default();
+        let _ = unsafe { GetCursorPos(&mut pt) };
+        let anchor = unsafe {
+            CreateWindowExW(
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+                w!("STATIC"),
+                w!(""),
+                WS_POPUP,
+                pt.x,
+                pt.y,
+                0,
+                0,
+                None,
+                None,
+                None,
+                None,
+            )
+            .ok()
+        };
+        if let Some(hwnd) = anchor {
+            unsafe {
+                let _ = ShowWindow(hwnd, SW_SHOW);
+                let _ = SetForegroundWindow(hwnd);
+            }
+        }
+        Self(anchor)
+    }
+
+    fn hwnd(&self) -> Option<HWND> {
+        self.0
+    }
+}
+
+impl Drop for UnownedDialogAnchor {
+    fn drop(&mut self) {
+        if let Some(hwnd) = self.0.take() {
+            unsafe {
+                let _ = DestroyWindow(hwnd);
+            }
+        }
+    }
+}
+
+fn build_filter_specs(
+    filters: &[FileFilter],
+) -> (Vec<(HSTRING, HSTRING)>, Vec<Common::COMDLG_FILTERSPEC>) {
+    let storage: Vec<(HSTRING, HSTRING)> = filters
+        .iter()
+        .map(|f| (HSTRING::from(f.name.as_ref()), HSTRING::from(f.windows_spec())))
+        .collect();
+    let specs: Vec<Common::COMDLG_FILTERSPEC> = storage
+        .iter()
+        .map(|(name, spec)| Common::COMDLG_FILTERSPEC {
+            pszName: PCWSTR(name.as_ptr()),
+            pszSpec: PCWSTR(spec.as_ptr()),
+        })
+        .collect();
+    (storage, specs)
+}
+
+fn set_dialog_initial_folder(dialog: &IFileDialog, directory: &Path) {
+    if directory.as_os_str().is_empty() {
+        return;
+    }
+    if let Some(full_path) = directory
+        .canonicalize()
+        .context("failed to canonicalize directory")
+        .log_err()
+    {
+        let full_path = dunce::simplified(&full_path);
+        let full_path_string = full_path.display().to_string();
+        if let Ok(path_item) = unsafe {
+            SHCreateItemFromParsingName::<_, _, IShellItem>(&HSTRING::from(full_path_string), None)
+        } {
+            unsafe {
+                dialog
+                    .SetFolder(&path_item)
+                    .context("failed to set dialog folder")
+                    .log_err();
+            }
+        }
+    }
+}
+
 fn file_open_dialog(
     options: PathPromptOptions,
+    window: Option<HWND>,
+) -> Result<Option<Vec<PathBuf>>> {
+    file_open_dialog_with_options(
+        OpenPromptOptions {
+            files: options.files,
+            directories: options.directories,
+            multiple: options.multiple,
+            prompt: options.prompt,
+            initial_directory: None,
+            filters: Vec::new(),
+        },
+        window,
+    )
+}
+
+fn file_open_dialog_with_options(
+    options: OpenPromptOptions,
     window: Option<HWND>,
 ) -> Result<Option<Vec<PathBuf>>> {
     let folder_dialog: IFileOpenDialog =
@@ -1597,8 +1972,19 @@ fn file_open_dialog(
         dialog_options |= FOS_PICKFOLDERS;
     }
 
+    if let Some(ref dir) = options.initial_directory {
+        let base_dialog: IFileDialog = folder_dialog.cast()?;
+        set_dialog_initial_folder(&base_dialog, dir);
+    }
+
+    let (_filter_storage, filter_specs) = build_filter_specs(&options.filters);
+
     unsafe {
         folder_dialog.SetOptions(dialog_options)?;
+
+        if !filter_specs.is_empty() && !options.directories {
+            folder_dialog.SetFileTypes(&filter_specs)?;
+        }
 
         if let Some(prompt) = options.prompt {
             let prompt: &str = &prompt;
@@ -1629,44 +2015,57 @@ fn file_open_dialog(
     Ok(Some(paths))
 }
 
-fn file_save_dialog(
-    directory: PathBuf,
-    suggested_name: Option<String>,
+fn file_save_dialog_with_options(
+    options: SavePromptOptions,
     window: Option<HWND>,
 ) -> Result<Option<PathBuf>> {
     let dialog: IFileSaveDialog = unsafe { CoCreateInstance(&FileSaveDialog, None, CLSCTX_ALL)? };
-    if !directory.to_string_lossy().is_empty()
-        && let Some(full_path) = directory
-            .canonicalize()
-            .context("failed to canonicalize directory")
-            .log_err()
-    {
-        let full_path = dunce::simplified(&full_path);
-        let full_path_string = full_path.display().to_string();
-        let path_item: IShellItem =
-            unsafe { SHCreateItemFromParsingName(&HSTRING::from(full_path_string), None)? };
-        unsafe {
-            dialog
-                .SetFolder(&path_item)
-                .context("failed to set dialog folder")
-                .log_err()
-        };
+    if let Some(ref directory) = options.directory {
+        let base_dialog: IFileDialog = dialog.cast()?;
+        set_dialog_initial_folder(&base_dialog, directory);
     }
 
-    if let Some(suggested_name) = suggested_name {
+    if let Some(suggested_name) = options.suggested_name {
         unsafe {
             dialog
-                .SetFileName(&HSTRING::from(suggested_name))
+                .SetFileName(&HSTRING::from(suggested_name.as_ref()))
                 .context("failed to set file name")
                 .log_err()
         };
     }
 
+    if let Some(prompt) = options.prompt {
+        unsafe {
+            dialog
+                .SetOkButtonLabel(&HSTRING::from(prompt.as_ref()))
+                .context("failed to set save ok label")
+                .log_err();
+        }
+    }
+
+    if let Some(default_ext) = options.default_extension {
+        let trimmed = default_ext.trim().trim_start_matches('.');
+        if !trimmed.is_empty() {
+            unsafe {
+                dialog
+                    .SetDefaultExtension(&HSTRING::from(trimmed))
+                    .context("failed to set default extension")
+                    .log_err();
+            }
+        }
+    }
+
+    let (_filter_storage, filter_specs) = build_filter_specs(&options.filters);
+
     unsafe {
-        dialog.SetFileTypes(&[Common::COMDLG_FILTERSPEC {
-            pszName: windows::core::w!("All files"),
-            pszSpec: windows::core::w!("*.*"),
-        }])?;
+        if !filter_specs.is_empty() {
+            dialog.SetFileTypes(&filter_specs)?;
+        } else {
+            dialog.SetFileTypes(&[Common::COMDLG_FILTERSPEC {
+                pszName: windows::core::w!("All files"),
+                pszSpec: windows::core::w!("*.*"),
+            }])?;
+        }
         if let Err(error) = dialog.Show(window) {
             if error.code() == HRESULT::from_win32(ERROR_CANCELLED.0) {
                 return Ok(None);

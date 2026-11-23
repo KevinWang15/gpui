@@ -20,8 +20,10 @@ use windows::{
         Foundation::*,
         Graphics::Dwm::*,
         Graphics::Gdi::*,
+        Storage::Xps::*,
         System::{
             Com::*, Diagnostics::Debug::MessageBeep, LibraryLoader::*, Ole::*, SystemServices::*,
+            Threading::{AttachThreadInput, GetCurrentThreadId},
         },
         UI::{Controls::*, HiDpi::*, Input::KeyboardAndMouse::*, Shell::*, WindowsAndMessaging::*},
     },
@@ -51,6 +53,8 @@ pub struct WindowsWindowState {
     pub appearance: Cell<WindowAppearance>,
     pub background_appearance: Cell<WindowBackgroundAppearance>,
     pub backdrop_corner_radius: Cell<Pixels>,
+    pub backdrop_blur_radius: Cell<Pixels>,
+    pub non_activating: Cell<bool>,
     pub scale_factor: Cell<f32>,
     pub restore_from_minimized: Cell<Option<Box<dyn FnMut(RequestFrameOptions)>>>,
 
@@ -125,6 +129,7 @@ impl WindowsWindowState {
         disable_direct_composition: bool,
         invalidate_devices: Arc<AtomicBool>,
         draw_coordinator: Rc<DrawCoordinator>,
+        non_activating: bool,
     ) -> Result<Self> {
         let scale_factor = {
             let monitor_dpi = unsafe { GetDpiForWindow(hwnd) } as f32;
@@ -168,6 +173,8 @@ impl WindowsWindowState {
             appearance: Cell::new(appearance),
             background_appearance: Cell::new(WindowBackgroundAppearance::Opaque),
             backdrop_corner_radius: Cell::new(px(0.)),
+            backdrop_blur_radius: Cell::new(px(DEFAULT_HOST_BLUR_SIGMA)),
+            non_activating: Cell::new(non_activating),
             scale_factor: Cell::new(scale_factor),
             restore_from_minimized: Cell::new(restore_from_minimized),
             min_size,
@@ -284,6 +291,7 @@ impl WindowsWindowInner {
             context.disable_direct_composition,
             context.invalidate_devices.clone(),
             context.draw_coordinator.clone(),
+            context.non_activating,
         )?;
 
         Ok(Rc::new(Self {
@@ -436,6 +444,7 @@ struct WindowCreateContext {
     invalidate_devices: Arc<AtomicBool>,
     draw_coordinator: Rc<DrawCoordinator>,
     parent_hwnd: Option<HWND>,
+    non_activating: bool,
 }
 
 impl WindowsWindow {
@@ -517,6 +526,18 @@ impl WindowsWindow {
 
             (dwexstyle, dwstyle)
         };
+        if params.always_on_top {
+            dwexstyle |= WS_EX_TOPMOST;
+        }
+        if params.skip_taskbar {
+            dwexstyle = (dwexstyle & !WS_EX_APPWINDOW) | WS_EX_TOOLWINDOW;
+        }
+        if params.non_activating {
+            dwexstyle |= WS_EX_NOACTIVATE;
+        }
+        if params.click_through {
+            dwexstyle |= WS_EX_LAYERED | WS_EX_TRANSPARENT;
+        }
         if !disable_direct_composition {
             dwexstyle |= WS_EX_NOREDIRECTIONBITMAP;
         }
@@ -552,6 +573,7 @@ impl WindowsWindow {
             invalidate_devices,
             draw_coordinator,
             parent_hwnd,
+            non_activating: params.non_activating,
         };
         let creation_result = unsafe {
             CreateWindowExW(
@@ -579,6 +601,17 @@ impl WindowsWindow {
         register_drag_drop(&this)?;
         set_non_rude_hwnd(hwnd, true);
         configure_dwm_dark_mode(hwnd, appearance);
+        if params.click_through {
+            unsafe {
+                let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
+            }
+        }
+        if params.window_corner_preference != WindowCornerPreference::Default {
+            apply_window_corner_preference(hwnd, params.window_corner_preference);
+        }
+        if params.hide_window_border {
+            apply_window_border_color(hwnd, None);
+        }
         this.state.border_offset.update(hwnd)?;
         let placement =
             retrieve_window_placement(hwnd, display, params.bounds, &this.state.border_offset)?;
@@ -670,6 +703,7 @@ impl PlatformWindow for WindowsWindow {
         let Some(monitor) = WindowsDisplay::new(display.id()) else {
             return false;
         };
+        self.state.initial_placement.take();
         let bounds = Bounds::new(display.bounds().origin + offset, self.bounds().size)
             .to_device_pixels(monitor.scale_factor());
         let rect = calculate_window_rect(bounds, &self.state.border_offset);
@@ -695,6 +729,298 @@ impl PlatformWindow for WindowsWindow {
         true
     }
 
+    fn set_bounds_on_display(
+        &mut self,
+        display: &dyn PlatformDisplay,
+        bounds: Bounds<Pixels>,
+        activate: bool,
+    ) -> bool {
+        let Some(monitor) = WindowsDisplay::new(display.id()) else {
+            return false;
+        };
+        self.state.initial_placement.take();
+        let target_monitor = monitor.handle;
+        let monitor_scale = monitor.scale_factor();
+        let target_origin = display.bounds().origin + bounds.origin;
+        let device_bounds = Bounds::new(target_origin, bounds.size).to_device_pixels(monitor_scale);
+        let rect = calculate_window_rect(device_bounds, &self.state.border_offset);
+        let hwnd = self.0.hwnd;
+        let mut flags = SWP_NOZORDER;
+        if !activate {
+            flags |= SWP_NOACTIVATE;
+        }
+        self.0
+            .executor
+            .spawn(async move {
+                unsafe {
+                    // When crossing onto a monitor with a different DPI, hop onto the destination
+                    // monitor first so `WM_DPICHANGED` updates scale factor before final sizing.
+                    let current_monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+                    if current_monitor != target_monitor {
+                        let _ = SetWindowPos(
+                            hwnd,
+                            None,
+                            rect.left,
+                            rect.top,
+                            (rect.right - rect.left).max(1),
+                            (rect.bottom - rect.top).max(1),
+                            SWP_NOZORDER | SWP_NOACTIVATE,
+                        );
+                    }
+                    SetWindowPos(
+                        hwnd,
+                        None,
+                        rect.left,
+                        rect.top,
+                        (rect.right - rect.left).max(1),
+                        (rect.bottom - rect.top).max(1),
+                        flags,
+                    )
+                    .context("unable to set window bounds on display")
+                    .log_err();
+                }
+            })
+            .detach();
+        true
+    }
+
+    fn set_physical_bounds(
+        &mut self,
+        bounds: Bounds<DevicePixels>,
+        always_on_top: Option<bool>,
+    ) -> bool {
+        self.state.initial_placement.take();
+        let rect = calculate_window_rect(bounds, &self.state.border_offset);
+        let hwnd = self.0.hwnd;
+        self.0
+            .executor
+            .spawn(async move {
+                let (insert_after, flags) = match always_on_top {
+                    Some(true) => (Some(HWND_TOPMOST), SWP_NOACTIVATE),
+                    Some(false) => (Some(HWND_NOTOPMOST), SWP_NOACTIVATE),
+                    None => (None, SWP_NOZORDER | SWP_NOACTIVATE),
+                };
+                unsafe {
+                    SetWindowPos(
+                        hwnd,
+                        insert_after,
+                        rect.left,
+                        rect.top,
+                        (rect.right - rect.left).max(1),
+                        (rect.bottom - rect.top).max(1),
+                        flags,
+                    )
+                    .context("unable to set physical window bounds")
+                    .log_err();
+                }
+            })
+            .detach();
+        true
+    }
+
+    fn set_visible(&self, visible: bool, activate: bool) {
+        if visible {
+            self.state.initial_placement.take();
+        }
+        let hwnd = self.0.hwnd;
+        let non_activating = self.state.non_activating.get();
+        self.0
+            .executor
+            .spawn(async move {
+                unsafe {
+                    if visible {
+                        if activate && !non_activating {
+                            bring_hwnd_to_front(hwnd);
+                        } else {
+                            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                        }
+                    } else {
+                        let _ = ShowWindow(hwnd, SW_HIDE);
+                    }
+                }
+            })
+            .detach();
+    }
+
+    fn hide_immediately(&self) {
+        let hwnd = self.0.hwnd;
+        self.0
+            .executor
+            .spawn(async move {
+                unsafe {
+                    let disable: BOOL = true.into();
+                    let _ = DwmSetWindowAttribute(
+                        hwnd,
+                        DWMWA_TRANSITIONS_FORCEDISABLED,
+                        &disable as *const _ as *const _,
+                        std::mem::size_of::<BOOL>() as u32,
+                    );
+                    let _ = ShowWindow(hwnd, SW_HIDE);
+                    let _ = DwmFlush();
+                    let _ = DwmFlush();
+                    let enable: BOOL = false.into();
+                    let _ = DwmSetWindowAttribute(
+                        hwnd,
+                        DWMWA_TRANSITIONS_FORCEDISABLED,
+                        &enable as *const _ as *const _,
+                        std::mem::size_of::<BOOL>() as u32,
+                    );
+                }
+            })
+            .detach();
+    }
+
+    fn set_cloaked(&self, cloaked: bool) {
+        let val: BOOL = cloaked.into();
+        unsafe {
+            let _ = DwmSetWindowAttribute(
+                self.0.hwnd,
+                DWMWA_CLOAK,
+                &val as *const _ as *const _,
+                std::mem::size_of::<BOOL>() as u32,
+            );
+        }
+    }
+
+    fn paint_now(&self) {
+        let hwnd = self.0.hwnd;
+        self.0
+            .executor
+            .spawn(async move {
+                unsafe {
+                    let _ = SendMessageW(hwnd, WM_PAINT, None, None);
+                }
+            })
+            .detach();
+    }
+
+    fn set_always_on_top(&self, always_on_top: bool) {
+        let hwnd = self.0.hwnd;
+        self.0
+            .executor
+            .spawn(async move {
+                let insert_after = if always_on_top {
+                    HWND_TOPMOST
+                } else {
+                    HWND_NOTOPMOST
+                };
+                unsafe {
+                    let _ = SetWindowPos(
+                        hwnd,
+                        Some(insert_after),
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                    );
+                }
+            })
+            .detach();
+    }
+
+    fn set_click_through(&self, click_through: bool) {
+        let hwnd = self.0.hwnd;
+        self.0
+            .executor
+            .spawn(async move {
+                unsafe {
+                    let mut ex = WINDOW_EX_STYLE(get_window_long(hwnd, GWL_EXSTYLE) as u32);
+                    if click_through {
+                        ex |= WS_EX_LAYERED | WS_EX_TRANSPARENT;
+                        set_window_long(hwnd, GWL_EXSTYLE, ex.0 as isize);
+                        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
+                    } else {
+                        ex &= !(WS_EX_TRANSPARENT | WS_EX_LAYERED);
+                        set_window_long(hwnd, GWL_EXSTYLE, ex.0 as isize);
+                    }
+                    let _ = SetWindowPos(
+                        hwnd,
+                        None,
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+                    );
+                }
+            })
+            .detach();
+    }
+
+    fn set_non_activating(&self, non_activating: bool) {
+        self.state.non_activating.set(non_activating);
+        let hwnd = self.0.hwnd;
+        self.0
+            .executor
+            .spawn(async move {
+                unsafe {
+                    let mut ex = WINDOW_EX_STYLE(get_window_long(hwnd, GWL_EXSTYLE) as u32);
+                    if non_activating {
+                        ex |= WS_EX_NOACTIVATE;
+                    } else {
+                        ex &= !WS_EX_NOACTIVATE;
+                    }
+                    set_window_long(hwnd, GWL_EXSTYLE, ex.0 as isize);
+                }
+            })
+            .detach();
+    }
+
+    fn set_window_corner_preference(&self, preference: WindowCornerPreference) {
+        apply_window_corner_preference(self.0.hwnd, preference);
+    }
+
+    fn set_border_color(&self, color: Option<Rgba>) {
+        apply_window_border_color(self.0.hwnd, color);
+    }
+
+    fn set_backdrop_blur_radius(&self, radius: Pixels) {
+        self.state.backdrop_blur_radius.set(radius);
+        let sigma_px = f32::from(radius) * self.state.scale_factor.get();
+        if let Ok(renderer) = self.state.renderer.try_borrow() {
+            renderer.set_backdrop_blur_sigma(sigma_px);
+        }
+    }
+
+    fn capture_image(&self) -> anyhow::Result<image::RgbaImage> {
+        capture_hwnd_image(self.0.hwnd)
+    }
+
+    fn show_native_context_menu(
+        &self,
+        items: Vec<TrayMenuItem>,
+        on_select: Box<dyn FnOnce(SharedString)>,
+    ) {
+        let hwnd = self.0.hwnd;
+        self.0
+            .executor
+            .spawn(async move {
+                if let Some(id) = crate::tray::show_native_popup_menu(hwnd, &items) {
+                    on_select(id);
+                }
+            })
+            .detach();
+    }
+
+    fn start_window_move(&self) {
+        let hwnd = self.0.hwnd;
+        self.0
+            .executor
+            .spawn(async move {
+                unsafe {
+                    let _ = ReleaseCapture();
+                    let _ = SendMessageW(
+                        hwnd,
+                        WM_NCLBUTTONDOWN,
+                        Some(WPARAM(HTCAPTION as usize)),
+                        Some(LPARAM(0)),
+                    );
+                }
+            })
+            .detach();
+    }
+
     fn resize(&mut self, size: Size<Pixels>) {
         let hwnd = self.0.hwnd;
         let bounds = gpui::bounds(self.bounds().origin, size).to_device_pixels(self.scale_factor());
@@ -711,7 +1037,7 @@ impl PlatformWindow for WindowsWindow {
                         bounds.origin.y.0,
                         rect.right - rect.left,
                         rect.bottom - rect.top,
-                        SWP_NOMOVE,
+                        SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOZORDER,
                     )
                     .context("unable to set window content size")
                     .log_err();
@@ -862,49 +1188,9 @@ impl PlatformWindow for WindowsWindow {
             .executor
             .spawn(async move {
                 this.set_window_placement().log_err();
-
                 unsafe {
-                    // If the window is minimized, restore it.
-                    if IsIconic(hwnd).as_bool() {
-                        ShowWindowAsync(hwnd, SW_RESTORE).ok().log_err();
-                    }
-
-                    SetActiveWindow(hwnd).ok();
-                    SetFocus(Some(hwnd)).ok();
+                    bring_hwnd_to_front(hwnd);
                 }
-
-                // premium ragebait by windows, this is needed because the window
-                // must have received an input event to be able to set itself to foreground
-                // so let's just simulate user input as that seems to be the most reliable way
-                // some more info: https://gist.github.com/Aetopia/1581b40f00cc0cadc93a0e8ccb65dc8c
-                // bonus: this bug also doesn't manifest if you have vs attached to the process
-                let inputs = [
-                    INPUT {
-                        r#type: INPUT_KEYBOARD,
-                        Anonymous: INPUT_0 {
-                            ki: KEYBDINPUT {
-                                wVk: VK_MENU,
-                                dwFlags: KEYBD_EVENT_FLAGS(0),
-                                ..Default::default()
-                            },
-                        },
-                    },
-                    INPUT {
-                        r#type: INPUT_KEYBOARD,
-                        Anonymous: INPUT_0 {
-                            ki: KEYBDINPUT {
-                                wVk: VK_MENU,
-                                dwFlags: KEYEVENTF_KEYUP,
-                                ..Default::default()
-                            },
-                        },
-                    },
-                ];
-                unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
-
-                // todo(windows)
-                // crate `windows 0.56` reports true as Err
-                unsafe { SetForegroundWindow(hwnd).as_bool() };
             })
             .detach();
     }
@@ -980,7 +1266,9 @@ impl PlatformWindow for WindowsWindow {
                 if let Ok(mut renderer) = self.state.renderer.try_borrow_mut() {
                     renderer.sync_backdrop(false, radius_px);
                 }
-                set_window_composition_attribute(hwnd, None, 2);
+                // Use ACCENT_DISABLED (0), not ACCENT_ENABLE_TRANSPARENTGRADIENT (2), so DirectComposition
+                // alpha transparency stays clean when switching off Blurred.
+                set_window_composition_attribute(hwnd, None, 0);
             }
             WindowBackgroundAppearance::Blurred => {
                 if has_winrt {
@@ -1784,6 +2072,154 @@ fn set_non_rude_hwnd(hwnd: HWND, non_rude: bool) {
         unsafe { SetPropW(hwnd, w!("NonRudeHWND"), Some(HANDLE(1 as _))) }.log_err();
     } else {
         unsafe { RemovePropW(hwnd, w!("NonRudeHWND")) }.log_err();
+    }
+}
+
+/// Reliably brings `hwnd` to the foreground without injecting a fake `VK_MENU` keystroke:
+/// restores/shows the window, attaches to the foreground thread's input queue for
+/// `SetForegroundWindow`, and falls back to a brief topmost bounce (preserving existing topmost
+/// windows) if Windows still denies focus.
+pub(crate) unsafe fn bring_hwnd_to_front(hwnd: HWND) {
+    unsafe {
+        if IsIconic(hwnd).as_bool() {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+        } else if !IsWindowVisible(hwnd).as_bool() {
+            let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
+        }
+
+        let fg = GetForegroundWindow();
+        let fg_tid = if fg.is_invalid() {
+            0
+        } else {
+            GetWindowThreadProcessId(fg, None)
+        };
+        let cur_tid = GetCurrentThreadId();
+        let attached = fg_tid != 0 && fg_tid != cur_tid && AttachThreadInput(fg_tid, cur_tid, true).as_bool();
+
+        let _ = BringWindowToTop(hwnd);
+        let ok = SetForegroundWindow(hwnd).as_bool();
+        let _ = SetActiveWindow(hwnd);
+        let _ = SetFocus(Some(hwnd));
+
+        if attached {
+            let _ = AttachThreadInput(fg_tid, cur_tid, false);
+        }
+
+        if !ok && GetForegroundWindow() != hwnd {
+            let was_topmost =
+                (get_window_long(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0) != 0;
+            let _ = SetWindowPos(
+                hwnd,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+            );
+            if !was_topmost {
+                let _ = SetWindowPos(
+                    hwnd,
+                    Some(HWND_NOTOPMOST),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+                );
+            }
+            let _ = SetForegroundWindow(hwnd);
+        }
+    }
+}
+
+fn apply_window_corner_preference(hwnd: HWND, preference: WindowCornerPreference) {
+    let dwm_pref = match preference {
+        WindowCornerPreference::Default => DWMWCP_DEFAULT,
+        WindowCornerPreference::DoNotRound => DWMWCP_DONOTROUND,
+        WindowCornerPreference::Round => DWMWCP_ROUND,
+        WindowCornerPreference::RoundSmall => DWMWCP_ROUNDSMALL,
+    };
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            &dwm_pref as *const _ as *const _,
+            std::mem::size_of_val(&dwm_pref) as u32,
+        );
+    }
+}
+
+fn apply_window_border_color(hwnd: HWND, color: Option<Rgba>) {
+    let raw: u32 = match color {
+        None => DWMWA_COLOR_NONE,
+        Some(c) => {
+            let r = (c.r.clamp(0.0, 1.0) * 255.0).round() as u32;
+            let g = (c.g.clamp(0.0, 1.0) * 255.0).round() as u32;
+            let b = (c.b.clamp(0.0, 1.0) * 255.0).round() as u32;
+            r | (g << 8) | (b << 16)
+        }
+    };
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_BORDER_COLOR,
+            &raw as *const u32 as *const _,
+            std::mem::size_of::<u32>() as u32,
+        );
+    }
+}
+
+fn capture_hwnd_image(hwnd: HWND) -> anyhow::Result<image::RgbaImage> {
+    let mut rect = RECT::default();
+    unsafe { GetWindowRect(hwnd, &mut rect) }.context("GetWindowRect failed")?;
+    let width = (rect.right - rect.left).max(0) as u32;
+    let height = (rect.bottom - rect.top).max(0) as u32;
+    anyhow::ensure!(width > 0 && height > 0, "cannot capture empty window");
+
+    unsafe {
+        let screen_dc = GetDC(None);
+        let mem_dc = CreateCompatibleDC(Some(screen_dc));
+        let bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width as i32,
+                biHeight: -(height as i32),
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+        let bitmap = CreateDIBSection(Some(mem_dc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0)
+            .context("CreateDIBSection failed")?;
+        let old_obj = SelectObject(mem_dc, bitmap.into());
+
+        // PW_RENDERFULLCONTENT (2) captures DirectComposition / DXGI content cleanly, even off-screen.
+        let ok = PrintWindow(hwnd, mem_dc, PRINT_WINDOW_FLAGS(2)).as_bool();
+
+        let pixel_bytes = (width as usize) * (height as usize) * 4;
+        let mut rgba = vec![0u8; pixel_bytes];
+        if ok && !bits.is_null() {
+            let src = std::slice::from_raw_parts(bits as *const u8, pixel_bytes);
+            for (dst_px, src_px) in rgba.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+                dst_px[0] = src_px[2]; // R
+                dst_px[1] = src_px[1]; // G
+                dst_px[2] = src_px[0]; // B
+                dst_px[3] = src_px[3]; // A
+            }
+        }
+
+        let _ = SelectObject(mem_dc, old_obj);
+        let _ = DeleteObject(bitmap.into());
+        let _ = DeleteDC(mem_dc);
+        let _ = ReleaseDC(None, screen_dc);
+
+        anyhow::ensure!(ok, "PrintWindow(PW_RENDERFULLCONTENT) failed");
+        image::RgbaImage::from_raw(width, height, rgba)
+            .ok_or_else(|| anyhow::anyhow!("invalid captured image buffer"))
     }
 }
 

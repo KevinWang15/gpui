@@ -1,5 +1,6 @@
 #![cfg(target_os = "windows")]
 
+mod autostart;
 mod backdrop_blur;
 mod clipboard;
 mod destination_list;
@@ -12,10 +13,12 @@ mod directx_renderer;
 mod dispatcher;
 mod display;
 mod events;
+mod global_hotkey;
 mod keyboard;
 mod platform;
 mod system_notifications;
 mod system_settings;
+mod tray;
 mod util;
 mod vsync;
 mod window;
@@ -31,10 +34,12 @@ pub(crate) use directx_renderer::*;
 pub(crate) use dispatcher::*;
 pub(crate) use display::*;
 pub(crate) use events::*;
+pub(crate) use global_hotkey::*;
 pub(crate) use keyboard::*;
 pub(crate) use platform::*;
 pub(crate) use system_notifications::*;
 pub(crate) use system_settings::*;
+pub(crate) use tray::*;
 pub(crate) use util::*;
 pub(crate) use vsync::*;
 pub(crate) use window::*;

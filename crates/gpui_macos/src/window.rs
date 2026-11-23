@@ -2735,6 +2735,7 @@ pub(crate) unsafe fn native_cursor(style: CursorStyle) -> *mut AnyObject {
             CursorStyle::DragLink => msg_send![class!(NSCursor), dragLinkCursor],
             CursorStyle::DragCopy => msg_send![class!(NSCursor), dragCopyCursor],
             CursorStyle::ContextualMenu => msg_send![class!(NSCursor), contextualMenuCursor],
+            CursorStyle::Move => msg_send![class!(NSCursor), closedHandCursor],
         }
     }
 }

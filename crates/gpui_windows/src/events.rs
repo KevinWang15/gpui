@@ -91,8 +91,14 @@ impl WindowsWindowInner {
             // The GPUI event is dispatched in between, so a click handler runs while `active_window` is still
             // whichever window was active before the click. If that handler consumes the
             // press, `DefWindowProc` never sees it, so the window is never activated at all.
-            // So, let's eagerly activate the window.
-            WM_MOUSEACTIVATE => Some(MA_ACTIVATE as isize),
+            // So, let's eagerly activate the window — unless it is configured as `non_activating`.
+            WM_MOUSEACTIVATE => {
+                if self.state.non_activating.get() {
+                    Some(MA_NOACTIVATE as isize)
+                } else {
+                    Some(MA_ACTIVATE as isize)
+                }
+            }
             WM_ACTIVATE => self.handle_activate_msg(wparam),
             WM_CREATE => self.handle_create_msg(handle),
             WM_MOVE => self.handle_move_msg(handle, lparam),

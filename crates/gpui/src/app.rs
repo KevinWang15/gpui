@@ -2158,6 +2158,172 @@ impl App {
         self.platform.prompt_for_new_path(directory, suggested_name)
     }
 
+    /// Displays a native open dialog supporting file-type filters and an initial directory.
+    pub fn prompt_for_open_paths(
+        &self,
+        options: crate::OpenPromptOptions,
+    ) -> oneshot::Receiver<Result<Option<Vec<PathBuf>>>> {
+        self.platform.prompt_for_open_paths(options)
+    }
+
+    /// Displays a native save dialog supporting file-type filters, default extension, and
+    /// initial directory.
+    pub fn prompt_for_save_path(
+        &self,
+        options: crate::SavePromptOptions,
+    ) -> oneshot::Receiver<Result<Option<PathBuf>>> {
+        self.platform.prompt_for_save_path(options)
+    }
+
+    /// Returns the global mouse pointer position in unified desktop coordinates, if supported.
+    pub fn cursor_position(&self) -> Option<Point<Pixels>> {
+        self.platform.cursor_position()
+    }
+
+    /// Returns the display currently containing the mouse pointer, falling back to the primary
+    /// display.
+    pub fn display_at_cursor(&self) -> Option<Rc<dyn PlatformDisplay>> {
+        self.platform.display_at_cursor()
+    }
+
+    /// Captures an opaque handle to the current OS foreground window so a floating launcher or
+    /// utility can restore focus to it on dismiss.
+    pub fn foreground_external_window(&self) -> Option<crate::ExternalWindowHandle> {
+        self.platform.foreground_external_window()
+    }
+
+    /// Restores foreground focus to an external OS window previously captured via
+    /// [`Self::foreground_external_window`].
+    pub fn activate_external_window(&self, handle: crate::ExternalWindowHandle) -> bool {
+        self.platform.activate_external_window(handle)
+    }
+
+    /// Registers a handler invoked when the desktop session is locked.
+    pub fn on_session_lock<F>(&self, mut callback: F)
+    where
+        F: 'static + FnMut(&mut App),
+    {
+        let this = self.this.clone();
+        self.platform.on_session_lock(Box::new(move || {
+            if let Some(app) = this.upgrade() {
+                callback(&mut app.borrow_mut());
+            }
+        }));
+    }
+
+    /// Registers a handler invoked when the desktop session is unlocked.
+    pub fn on_session_unlock<F>(&self, mut callback: F)
+    where
+        F: 'static + FnMut(&mut App),
+    {
+        let this = self.this.clone();
+        self.platform.on_session_unlock(Box::new(move || {
+            if let Some(app) = this.upgrade() {
+                callback(&mut app.borrow_mut());
+            }
+        }));
+    }
+
+    /// Creates or replaces the application's native system tray / menu bar icon.
+    pub fn set_tray_icon(&self, options: crate::TrayIconOptions) -> Result<()> {
+        self.platform.set_tray_icon(options)
+    }
+
+    /// Updates the hover tooltip of the active system tray icon.
+    pub fn update_tray_tooltip(&self, tooltip: &str) -> Result<()> {
+        self.platform.update_tray_tooltip(tooltip)
+    }
+
+    /// Updates the image of the active system tray icon.
+    pub fn update_tray_icon(&self, icon: crate::TrayIconData) -> Result<()> {
+        self.platform.update_tray_icon(icon)
+    }
+
+    /// Replaces the context menu attached to the active system tray icon.
+    pub fn update_tray_menu(&self, menu: Vec<crate::TrayMenuItem>) -> Result<()> {
+        self.platform.update_tray_menu(menu)
+    }
+
+    /// Removes the active system tray icon, if present.
+    pub fn remove_tray_icon(&self) {
+        self.platform.remove_tray_icon();
+    }
+
+    /// Registers a handler invoked for clicks and menu selections on the system tray icon.
+    pub fn on_tray_event<F>(&self, mut callback: F)
+    where
+        F: 'static + FnMut(crate::TrayEvent, &mut App),
+    {
+        let this = self.this.clone();
+        self.platform.on_tray_event(Box::new(move |event| {
+            if let Some(app) = this.upgrade() {
+                callback(event, &mut app.borrow_mut());
+            }
+        }));
+    }
+
+    /// Registers a system-wide global hotkey that fires even when the application is unfocused.
+    pub fn register_global_hotkey(
+        &self,
+        hotkey: crate::GlobalHotKey,
+    ) -> Result<crate::GlobalHotKeyId> {
+        self.platform.register_global_hotkey(hotkey)
+    }
+
+    /// Unregisters a previously registered global hotkey.
+    pub fn unregister_global_hotkey(&self, id: crate::GlobalHotKeyId) {
+        self.platform.unregister_global_hotkey(id);
+    }
+
+    /// Probes whether `hotkey` is currently available for global OS registration.
+    pub fn is_global_hotkey_available(&self, hotkey: crate::GlobalHotKey) -> bool {
+        match self.platform.register_global_hotkey(hotkey) {
+            Ok(id) => {
+                self.platform.unregister_global_hotkey(id);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Registers a handler invoked whenever a registered global hotkey is triggered.
+    pub fn on_global_hotkey<F>(&self, mut callback: F)
+    where
+        F: 'static + FnMut(crate::GlobalHotKeyId, &mut App),
+    {
+        let this = self.this.clone();
+        self.platform.on_global_hotkey(Box::new(move |id| {
+            if let Some(app) = this.upgrade() {
+                callback(id, &mut app.borrow_mut());
+            }
+        }));
+    }
+
+    /// Returns whether per-user launch-at-login / Start-with-Windows is currently registered.
+    pub fn is_launch_at_login(&self, app_name: &str) -> Result<bool> {
+        self.platform.is_launch_at_login(app_name)
+    }
+
+    /// Enables or disables per-user launch-at-login / Start-with-Windows.
+    pub fn set_launch_at_login(
+        &self,
+        options: crate::AutostartOptions,
+        enabled: bool,
+    ) -> Result<()> {
+        self.platform.set_launch_at_login(options, enabled)
+    }
+
+    /// If launch-at-login is already enabled for `options.app_name`, rewrites the entry to point
+    /// at the current executable path (self-healing after the user moves or upgrades the binary).
+    pub fn refresh_launch_at_login(&self, options: crate::AutostartOptions) -> Result<bool> {
+        if self.platform.is_launch_at_login(options.app_name.as_ref())? {
+            self.platform.set_launch_at_login(options, true)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
     /// Reveals the specified path at the platform level, such as in Finder on macOS.
     pub fn reveal_path(&self, path: &Path) {
         self.platform.reveal_path(path)

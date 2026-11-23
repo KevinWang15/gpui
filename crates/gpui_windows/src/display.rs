@@ -28,6 +28,7 @@ pub(crate) struct WindowsDisplay {
     bounds: Bounds<Pixels>,
     visible_bounds: Bounds<Pixels>,
     physical_bounds: Bounds<DevicePixels>,
+    physical_work_area: Bounds<DevicePixels>,
     uuid: Uuid,
 }
 
@@ -71,6 +72,13 @@ impl WindowsDisplay {
             physical_bounds: Bounds {
                 origin: point(monitor_size.left.into(), monitor_size.top.into()),
                 size: physical_size,
+            },
+            physical_work_area: Bounds {
+                origin: point(work_area.left.into(), work_area.top.into()),
+                size: size(
+                    (work_area.right - work_area.left).into(),
+                    (work_area.bottom - work_area.top).into(),
+                ),
             },
             uuid,
         })
@@ -133,6 +141,16 @@ impl WindowsDisplay {
     pub fn physical_bounds(&self) -> Bounds<DevicePixels> {
         self.physical_bounds
     }
+
+    pub fn monitor_at_point(x: i32, y: i32) -> Option<Self> {
+        let monitor = unsafe {
+            MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST)
+        };
+        if monitor.is_invalid() {
+            return None;
+        }
+        WindowsDisplay::new(Self::display_id_for_monitor(monitor))
+    }
 }
 
 impl PlatformDisplay for WindowsDisplay {
@@ -148,12 +166,20 @@ impl PlatformDisplay for WindowsDisplay {
         self.bounds
     }
 
+    fn scale_factor(&self) -> f32 {
+        self.scale_factor
+    }
+
     fn desktop_bounds(&self) -> Bounds<Pixels> {
         self.physical_bounds.to_pixels(1.0)
     }
 
     fn visible_bounds(&self) -> Bounds<Pixels> {
         self.visible_bounds
+    }
+
+    fn visible_desktop_bounds(&self) -> Bounds<Pixels> {
+        self.physical_work_area.to_pixels(1.0)
     }
 
     fn refresh_interval(&self) -> Option<std::time::Duration> {

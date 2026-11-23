@@ -1,7 +1,12 @@
 mod app_menu;
+/// Cross-platform desktop and Windows application builder types (tray, global hotkeys, autostart,
+/// filtered file dialogs, corner preferences, external window handles).
+pub mod desktop;
 mod keyboard;
 mod keystroke;
 mod platform_info;
+/// Cross-platform single-instance application lock and local IPC forwarding.
+pub mod single_instance;
 
 #[cfg(all(target_os = "linux", feature = "wayland"))]
 #[expect(missing_docs)]
@@ -80,8 +85,10 @@ use strum::EnumIter;
 use uuid::Uuid;
 
 pub use app_menu::*;
+pub use desktop::*;
 pub use keyboard::*;
 pub use keystroke::*;
+pub use single_instance::*;
 
 /// Whether the platform is presenting a window's frames.
 ///
@@ -668,6 +675,141 @@ pub trait Platform: 'static {
     fn keyboard_layout(&self) -> Box<dyn PlatformKeyboardLayout>;
     fn keyboard_mapper(&self) -> Rc<dyn PlatformKeyboardMapper>;
     fn on_keyboard_layout_change(&self, callback: Box<dyn FnMut()>);
+
+    /// Returns the global pointer cursor position in unified desktop coordinates, if available.
+    fn cursor_position(&self) -> Option<Point<Pixels>> {
+        None
+    }
+
+    /// Returns the display currently containing the mouse cursor, falling back to matching
+    /// [`Self::cursor_position`] against [`Self::displays`] or [`Self::primary_display`].
+    fn display_at_cursor(&self) -> Option<Rc<dyn PlatformDisplay>> {
+        if let Some(pos) = self.cursor_position() {
+            if let Some(display) = self
+                .displays()
+                .into_iter()
+                .find(|d| d.desktop_bounds().contains(&pos))
+            {
+                return Some(display);
+            }
+        }
+        self.primary_display()
+    }
+
+    /// Captures an opaque handle to the current OS foreground window (potentially belonging to
+    /// another process) so a launcher or popup can return focus to it on dismiss.
+    fn foreground_external_window(&self) -> Option<ExternalWindowHandle> {
+        None
+    }
+
+    /// Restores foreground focus to an external OS window previously captured with
+    /// [`Self::foreground_external_window`].
+    fn activate_external_window(&self, _handle: ExternalWindowHandle) -> bool {
+        false
+    }
+
+    /// Registers a callback invoked when the user locks the OS desktop session.
+    fn on_session_lock(&self, _callback: Box<dyn FnMut()>) {}
+
+    /// Registers a callback invoked when the user unlocks the OS desktop session.
+    fn on_session_unlock(&self, _callback: Box<dyn FnMut()>) {}
+
+    /// Creates or replaces the application's system tray / menu bar icon.
+    fn set_tray_icon(&self, _options: TrayIconOptions) -> Result<()> {
+        Err(anyhow::anyhow!(
+            "system tray icons are not supported on this platform"
+        ))
+    }
+
+    /// Updates the hover tooltip of the active system tray icon.
+    fn update_tray_tooltip(&self, _tooltip: &str) -> Result<()> {
+        Err(anyhow::anyhow!(
+            "system tray icons are not supported on this platform"
+        ))
+    }
+
+    /// Updates the image of the active system tray icon.
+    fn update_tray_icon(&self, _icon: TrayIconData) -> Result<()> {
+        Err(anyhow::anyhow!(
+            "system tray icons are not supported on this platform"
+        ))
+    }
+
+    /// Replaces the context menu attached to the active system tray icon.
+    fn update_tray_menu(&self, _menu: Vec<TrayMenuItem>) -> Result<()> {
+        Err(anyhow::anyhow!(
+            "system tray icons are not supported on this platform"
+        ))
+    }
+
+    /// Removes the active system tray icon, if any.
+    fn remove_tray_icon(&self) {}
+
+    /// Registers a callback invoked on system tray clicks and menu item selections.
+    fn on_tray_event(&self, _callback: Box<dyn FnMut(TrayEvent)>) {}
+
+    /// Registers a system-wide global hotkey that fires even while the app is unfocused.
+    fn register_global_hotkey(&self, _hotkey: GlobalHotKey) -> Result<GlobalHotKeyId> {
+        Err(anyhow::anyhow!(
+            "global hotkeys are not supported on this platform"
+        ))
+    }
+
+    /// Unregisters a previously registered global hotkey.
+    fn unregister_global_hotkey(&self, _id: GlobalHotKeyId) {}
+
+    /// Registers a callback invoked when a registered global hotkey is pressed.
+    fn on_global_hotkey(&self, _callback: Box<dyn FnMut(GlobalHotKeyId)>) {}
+
+    /// Opens a native file/folder chooser supporting file-type filters and an initial directory.
+    fn prompt_for_open_paths(
+        &self,
+        options: OpenPromptOptions,
+    ) -> oneshot::Receiver<Result<Option<Vec<PathBuf>>>> {
+        self.prompt_for_paths(PathPromptOptions {
+            files: options.files,
+            directories: options.directories,
+            multiple: options.multiple,
+            prompt: options.prompt,
+        })
+    }
+
+    /// Opens a native save dialog supporting file-type filters and a default extension.
+    fn prompt_for_save_path(
+        &self,
+        options: SavePromptOptions,
+    ) -> oneshot::Receiver<Result<Option<PathBuf>>> {
+        let dir = options.directory.unwrap_or_default();
+        self.prompt_for_new_path(&dir, options.suggested_name.as_deref())
+    }
+
+    /// Returns whether per-user launch-at-login is currently registered for `app_name`.
+    fn is_launch_at_login(&self, app_name: &str) -> Result<bool> {
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "freebsd"))]
+        {
+            desktop::unix_is_launch_at_login(app_name)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "freebsd")))]
+        {
+            let _ = app_name;
+            Ok(false)
+        }
+    }
+
+    /// Registers or removes per-user launch-at-login for `options`.
+    fn set_launch_at_login(&self, options: AutostartOptions, enabled: bool) -> Result<()> {
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "freebsd"))]
+        {
+            desktop::unix_set_launch_at_login(&options, enabled)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "freebsd")))]
+        {
+            let _ = (options, enabled);
+            Err(anyhow::anyhow!(
+                "launch-at-login is not supported on this platform"
+            ))
+        }
+    }
 }
 
 /// A handle to a platform's display, e.g. a monitor or laptop screen.
@@ -681,6 +823,11 @@ pub trait PlatformDisplay: Debug {
 
     /// Get the bounds for this display
     fn bounds(&self) -> Bounds<Pixels>;
+
+    /// The DPI scale factor of this display (e.g. `1.0`, `1.25`, `1.5`, `2.0`).
+    fn scale_factor(&self) -> f32 {
+        1.0
+    }
 
     /// The time between the display's refreshes. Variable refresh rate
     /// displays report their maximum rate. `None` when the platform doesn't
@@ -703,6 +850,12 @@ pub trait PlatformDisplay: Debug {
     /// the virtual desktop at scale 1, even on mixed-DPI desktops.
     fn desktop_bounds(&self) -> Bounds<Pixels> {
         self.bounds()
+    }
+
+    /// The visible (taskbar-excluding) work area in the same common desktop coordinate space
+    /// as [`Self::desktop_bounds`]. Essential for mixed-DPI multi-monitor clamping and docking.
+    fn visible_desktop_bounds(&self) -> Bounds<Pixels> {
+        self.visible_bounds()
     }
 
     /// Get the default bounds for this display to place a window
@@ -1318,6 +1471,61 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     /// size, focus and stacking order. False when positioning is unsupported.
     fn move_on_display(&mut self, _display: &dyn PlatformDisplay, _offset: Point<Pixels>) -> bool {
         false
+    }
+    /// Atomically moves and resizes the window on `display` (in `display`-local logical pixels)
+    /// without stealing activation when `activate` is `false`. Handles cross-DPI monitor hops.
+    fn set_bounds_on_display(
+        &mut self,
+        _display: &dyn PlatformDisplay,
+        _bounds: Bounds<Pixels>,
+        _activate: bool,
+    ) -> bool {
+        false
+    }
+    /// Atomically moves and resizes the window in physical virtual-desktop pixels, optionally
+    /// re-asserting or clearing `always_on_top`, without activating the window.
+    fn set_physical_bounds(
+        &mut self,
+        _bounds: Bounds<DevicePixels>,
+        _always_on_top: Option<bool>,
+    ) -> bool {
+        false
+    }
+    /// Shows or hides this window without destroying its GPU surface or swapchain.
+    fn set_visible(&self, _visible: bool, _activate: bool) {}
+    /// Hides this window immediately, disabling OS hide-transition fade animations where supported.
+    fn hide_immediately(&self) {
+        self.set_visible(false, false);
+    }
+    /// Cloaks or uncloaks this window in the OS compositor (e.g. Windows `DWMWA_CLOAK`), allowing
+    /// an invisible off-compositor repaint before atomic reveal with zero stale-frame flash.
+    fn set_cloaked(&self, _cloaked: bool) {}
+    /// Triggers an immediate synchronous paint/present pass bypassing the next vsync wait.
+    fn paint_now(&self) {}
+    /// Toggles whether this window stays above normal windows (`HWND_TOPMOST` on Windows).
+    fn set_always_on_top(&self, _always_on_top: bool) {}
+    /// Toggles whether mouse/pointer input passes straight through this window to apps behind it.
+    fn set_click_through(&self, _click_through: bool) {}
+    /// Toggles whether clicking this window avoids stealing OS keyboard focus (`WS_EX_NOACTIVATE`).
+    fn set_non_activating(&self, _non_activating: bool) {}
+    /// Sets the OS rounded-corner preference (e.g. Windows 11 `DWMWA_WINDOW_CORNER_PREFERENCE`).
+    fn set_window_corner_preference(&self, _preference: WindowCornerPreference) {}
+    /// Sets the OS window frame border color (`None` suppresses the default 1 px border on Win11).
+    fn set_border_color(&self, _color: Option<crate::Rgba>) {}
+    /// Sets the Gaussian blur radius (logical px) for the platform frosted backdrop (`Blurred`).
+    fn set_backdrop_blur_radius(&self, _radius: Pixels) {}
+    /// Captures this window's rendered pixels into an RGBA8 image (works off-screen on Windows via
+    /// `PrintWindow(PW_RENDERFULLCONTENT)`).
+    fn capture_image(&self) -> Result<image::RgbaImage> {
+        anyhow::bail!("capture_image is not supported on this platform")
+    }
+    /// Shows a native OS popup context menu anchored at the current cursor position, invoking
+    /// `on_select` asynchronously with the chosen item ID.
+    fn show_native_context_menu(
+        &self,
+        _items: Vec<TrayMenuItem>,
+        _on_select: Box<dyn FnOnce(SharedString)>,
+    ) {
     }
     fn scale_factor(&self) -> f32;
     fn appearance(&self) -> WindowAppearance;
@@ -2831,6 +3039,33 @@ pub struct WindowOptions {
 
     /// Whether to render the window using the Display P3 color space on macOS.
     pub use_display_p3: bool,
+
+    /// Keep this window above normal windows (`HWND_TOPMOST` on Windows).
+    pub always_on_top: bool,
+
+    /// Hide this window from the OS taskbar and Alt+Tab switcher (`WS_EX_TOOLWINDOW` on Windows).
+    pub skip_taskbar: bool,
+
+    /// Prevent clicks on this window from stealing OS keyboard focus (`WS_EX_NOACTIVATE` +
+    /// `MA_NOACTIVATE` on Windows). Ideal for floating meters, toolbars, and toasts.
+    pub non_activating: bool,
+
+    /// Allow pointer events to pass directly through this window to underlying windows
+    /// (`WS_EX_LAYERED | WS_EX_TRANSPARENT` on Windows). Ideal for detached tooltips and HUDs.
+    pub click_through: bool,
+
+    /// OS rounded-corner preference (e.g. `DoNotRound` on Windows 11 when painting custom radii
+    /// or using `backdrop_corner_radius`).
+    pub window_corner_preference: WindowCornerPreference,
+
+    /// Suppress the OS's default 1 px frame border (`DWMWA_BORDER_COLOR = DWMWA_COLOR_NONE` on Win11).
+    pub hide_window_border: bool,
+
+    /// Optional initial corner radius (logical px) for the platform frosted backdrop clip.
+    pub backdrop_corner_radius: Option<Pixels>,
+
+    /// Optional initial Gaussian blur sigma (logical px) for [`WindowBackgroundAppearance::Blurred`].
+    pub backdrop_blur_radius: Option<Pixels>,
 }
 
 /// The variables that can be configured when creating a new window
@@ -2899,6 +3134,24 @@ pub struct WindowParams {
 
     #[cfg(target_os = "macos")]
     pub use_display_p3: bool,
+
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub always_on_top: bool,
+
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub skip_taskbar: bool,
+
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub non_activating: bool,
+
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub click_through: bool,
+
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub window_corner_preference: WindowCornerPreference,
+
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub hide_window_border: bool,
 }
 
 /// Represents the status of how a window should be opened.
@@ -2964,6 +3217,14 @@ impl Default for WindowOptions {
             window_decorations: None,
             tabbing_identifier: None,
             use_display_p3: false,
+            always_on_top: false,
+            skip_taskbar: false,
+            non_activating: false,
+            click_through: false,
+            window_corner_preference: WindowCornerPreference::Default,
+            hide_window_border: false,
+            backdrop_corner_radius: None,
+            backdrop_blur_radius: None,
         }
     }
 }
@@ -3245,6 +3506,10 @@ pub enum CursorStyle {
     /// A cursor indicating that the operation will result in a context menu
     /// corresponds to the CSS cursor value `context-menu`
     ContextualMenu,
+
+    /// A 4-way move cursor indicating an element or floating window can be dragged
+    /// corresponds to the CSS cursor value `move` (`IDC_SIZEALL` on Windows)
+    Move,
 }
 
 /// A clipboard item that should be copied to the clipboard
@@ -3288,7 +3553,7 @@ impl std::fmt::Display for ClipboardReadError {
 
 impl std::error::Error for ClipboardReadError {}
 
-/// Either a ClipboardString or a ClipboardImage
+/// Either a ClipboardString, ClipboardImage, ExternalPaths, or app-specific Custom binary payload.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ClipboardEntry {
     /// A string entry
@@ -3297,6 +3562,13 @@ pub enum ClipboardEntry {
     Image(Image),
     /// A file entry
     ExternalPaths(crate::ExternalPaths),
+    /// A custom binary payload keyed by format/MIME name (e.g. `"application/x-myapp-node"`).
+    Custom {
+        /// Registered clipboard format or MIME type name.
+        format: SharedString,
+        /// Raw payload bytes.
+        bytes: Vec<u8>,
+    },
 }
 
 impl ClipboardItem {
@@ -3331,6 +3603,26 @@ impl ClipboardItem {
         Self {
             entries: vec![ClipboardEntry::Image(image.clone())],
         }
+    }
+
+    /// Create a new ClipboardItem containing a custom binary format entry.
+    pub fn new_custom(format: impl Into<SharedString>, bytes: Vec<u8>) -> Self {
+        Self {
+            entries: vec![ClipboardEntry::Custom {
+                format: format.into(),
+                bytes,
+            }],
+        }
+    }
+
+    /// Returns the raw bytes for the first custom entry matching `format`, if present.
+    pub fn custom_bytes(&self, format: &str) -> Option<&[u8]> {
+        self.entries.iter().find_map(|entry| match entry {
+            ClipboardEntry::Custom { format: f, bytes } if f.as_ref() == format => {
+                Some(bytes.as_slice())
+            }
+            _ => None,
+        })
     }
 
     /// Concatenates together all the ClipboardString entries in the item.
