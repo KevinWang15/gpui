@@ -119,7 +119,7 @@ pub use completion::{
     CompletionConfig, FuzzyMatch, MatchTier, SuggestionItem, SuggestionSource, filter_suggestions,
     fuzzy_match_detailed, fuzzy_match_score,
 };
-pub use context_menu::{ContextMenu, context_menu};
+pub use context_menu::{ContextMenu, PopupMenu, context_menu, popup_menu};
 pub use date_time_picker::{
     DatePicker, DatePickerEvent, DatePickerState, TimePicker, TimePickerEvent, TimePickerState,
     TimeValue, date_picker, time_picker,

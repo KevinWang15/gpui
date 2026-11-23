@@ -400,3 +400,96 @@ fn a_menubar_is_one_tab_stop_with_arrow_keys(cx: &mut TestAppContext) {
     keys(cx, "tab enter");
     assert_eq!(*log.borrow(), ["after"]);
 }
+
+struct PopupPage {
+    log: Rc<RefCell<Vec<&'static str>>>,
+    menu_pos: Option<crate::Point<crate::Pixels>>,
+    target_focus: crate::FocusHandle,
+}
+
+impl Render for PopupPage {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let pick = |name: &'static str, log: &Rc<RefCell<Vec<&'static str>>>| {
+            let log = log.clone();
+            move |_: &crate::ClickEvent, _: &mut Window, _: &mut crate::App| {
+                log.borrow_mut().push(name)
+            }
+        };
+        let target_focus = self.target_focus.clone();
+        v_stack()
+            .child(
+                button("popup-trigger")
+                    .label("Open")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.menu_pos = Some(crate::point(crate::px(40.), crate::px(40.)));
+                        cx.notify();
+                    })),
+            )
+            .child(
+                button("popup-after")
+                    .label("After")
+                    .on_click(pick("after", &self.log)),
+            )
+            .child(
+                crate::div()
+                    .id("popup-target")
+                    .track_focus(&self.target_focus),
+            )
+            .child(
+                popup_menu("popup", self.menu_pos)
+                    .on_close(cx.listener(|this, _, _, cx| {
+                        this.menu_pos = None;
+                        cx.notify();
+                    }))
+                    .entry(MenuEntry::item("Disabled", pick("disabled", &self.log)).with_disabled(true))
+                    .entry(MenuEntry::item("Copy", pick("copy", &self.log)))
+                    .entry(MenuEntry::item("Focus target", {
+                        let log = self.log.clone();
+                        move |_, window, cx| {
+                            log.borrow_mut().push("focus-target");
+                            window.focus(&target_focus, cx);
+                        }
+                    })),
+            )
+    }
+}
+
+#[crate::test]
+fn a_popup_menu_takes_focus_handles_keys_and_restores_focus(cx: &mut TestAppContext) {
+    cx.update(init_components);
+    let log = Rc::new(RefCell::new(Vec::new()));
+    let l = log.clone();
+    let (view, cx) = cx.add_window_view(move |_, cx| PopupPage {
+        log: l,
+        menu_pos: None,
+        target_focus: cx.focus_handle(),
+    });
+    cx.run_until_parked();
+
+    // Open from the trigger button; Down skips the disabled item and selects Copy.
+    keys(cx, "tab enter");
+    assert!(view.read_with(cx, |p, _| p.menu_pos.is_some()));
+    keys(cx, "down enter");
+    assert_eq!(*log.borrow(), ["copy"]);
+    assert!(view.read_with(cx, |p, _| p.menu_pos.is_none()));
+
+    // Focus returned to the trigger: Enter opens again, Escape closes and keeps focus on trigger.
+    keys(cx, "enter");
+    assert!(view.read_with(cx, |p, _| p.menu_pos.is_some()));
+    keys(cx, "escape");
+    assert!(view.read_with(cx, |p, _| p.menu_pos.is_none()));
+
+    // Tab from an open popup menu closes it and advances from the trigger to After.
+    keys(cx, "enter tab enter");
+    assert!(view.read_with(cx, |p, _| p.menu_pos.is_none()));
+    assert_eq!(*log.borrow(), ["copy", "after"]);
+
+    // Selecting an item that moves focus explicitly does not have its focus stolen back.
+    keys(cx, "shift-tab enter down down enter");
+    assert_eq!(*log.borrow(), ["copy", "after", "focus-target"]);
+    assert!(view.read_with(cx, |p, _| p.menu_pos.is_none()));
+    let target_focused = cx.update(|window, cx| {
+        view.read(cx).target_focus.is_focused(window)
+    });
+    assert!(target_focused, "explicit focus change in on_select must persist");
+}
