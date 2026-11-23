@@ -9,6 +9,7 @@
 //! [`TextBox`], [`Select`], and [`ComboBox`].
 
 pub mod accordion;
+pub mod ai;
 pub mod alert;
 pub mod app_controls;
 pub mod avatar;
@@ -86,6 +87,19 @@ pub mod typography;
 pub mod window_chrome;
 
 pub use accordion::{Accordion, Disclosure, accordion, disclosure};
+pub use ai::{
+    AgentEvent, AgentLimits, AgentRunConfig, AiActivity, AiAssistantMode, AiConnection,
+    AiConnectionRegistry, AiContextProvider, AiImageRef, AiImageStore, AiMessage, AiMessagePart,
+    AiMessageStatus, AiRole, AiTokenUsage, AnswerComponentRegistry, AnswerComponentSpec, AppTool,
+    AppToolHandler, AskAi, AskAiEvent, AskAiOverlay, AskAiPage, AskAiState, AskAiSuggestion,
+    BranchInfo, BuiltinScriptRunner, ClientTool, Conversation, ConversationWorkspace, FinishReason,
+    ImageLimits, LanguageModel, Markdown, McpClient, McpServerConfig, McpTransport, ProviderField,
+    ProviderFieldKind, ProviderPreset, ProviderProtocol, ProviderValues, ScriptOutcome,
+    SimulatedModel, StoredConnection, StoredConversations, ToolCallStatus, ToolDefinition,
+    WorkspaceFileInfo, WorkspaceLimits, WorkspaceScriptRunner, answer_component_instructions,
+    ask_ai, ask_ai_overlay, build_language_model, build_with_ai_overlay, default_answer_components,
+    default_providers, markdown, simulated_provider,
+};
 pub use alert::{Alert, AlertVariant, alert};
 pub use app_controls::{
     ColorSwatchPopover, CompactStepper, ConfirmButton, ConfirmButtonEvent, ConfirmButtonState,

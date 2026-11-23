@@ -8,6 +8,7 @@ mod pages;
 mod state;
 
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use gpui::components::*;
 use gpui::icons::{Icon, IconSize, LucideAssetSource, LucideIcon};
@@ -59,6 +60,7 @@ impl Render for PlaygroundApp {
 
         let page_content = match self.page {
             Page::Overview => pages::overview::render(self, cx).into_any_element(),
+            Page::AiComponents => pages::ai_assistant::render(self, cx).into_any_element(),
             Page::NativeDesktop => pages::native_desktop::render(self, cx).into_any_element(),
             Page::InteractiveBlur => pages::interactive_blur::render(self, cx).into_any_element(),
             Page::DataTrees => pages::data_trees::render(self, cx).into_any_element(),
@@ -78,6 +80,7 @@ impl Render for PlaygroundApp {
         let mut comp_group = SidebarGroup::new(Some("COMPONENTS"));
         let comp_items: &[(Page, LucideIcon, Option<&str>)] = &[
             (Page::Overview, LucideIcon::House, None),
+            (Page::AiComponents, LucideIcon::Bot, Some("6")),
             (Page::InteractiveBlur, LucideIcon::Sparkles, Some("12")),
             (Page::DataTrees, LucideIcon::FolderTree, Some("7")),
             (Page::PickersForms, LucideIcon::SlidersHorizontal, Some("10")),
@@ -562,6 +565,14 @@ impl Render for PlaygroundApp {
             .child(command_palette(&self.command_palette))
             .child(tour(&self.demo_tour))
             .child(
+                ask_ai_overlay("pg-ai-overlay", &self.ai_overlay_ask)
+                    .show_trigger(self.ai_show_overlay),
+            )
+            .child(
+                build_with_ai_overlay("pg-canvas-build-ai", &self.ai_canvas_builder)
+                    .show_trigger(false),
+            )
+            .child(
                 toast_host(self.toasts.clone())
                     .position(self.toast_position)
                     .on_dismiss(cx.listener(|this, id, _, cx| {
@@ -575,6 +586,7 @@ impl Render for PlaygroundApp {
 fn main() {
     application()
         .with_assets(LucideAssetSource::new())
+        .with_http_client(Arc::new(reqwest_client::ReqwestClient::new()))
         .run(|cx: &mut App| {
             load_bundled_fonts(cx);
             init_components(cx);
@@ -632,6 +644,7 @@ mod tests {
 
         let all_pages = [
             Page::Overview,
+            Page::AiComponents,
             Page::NativeDesktop,
             Page::InteractiveBlur,
             Page::DataTrees,

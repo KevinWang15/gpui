@@ -235,8 +235,9 @@ fn freeform_widget_view(kind: &str, theme: &Theme) -> impl IntoElement {
 
 /// Interactive showcase of [`FreeformCanvas`] + [`CanvasPaletteItem`]: drag new widgets from the
 /// palette onto a 2D canvas, move or resize them with magnetic auto-alignment guides, resize the
-/// canvas frame itself, and align selected widgets in one click.
-fn freeform_canvas_demo(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl IntoElement {
+/// canvas frame itself, align selected widgets in one click, or open the non-blocking floating
+/// **Build with AI** overlay to inspect and edit the canvas live via foreground [`AppTool`]s.
+pub fn freeform_canvas_demo(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl IntoElement {
     let theme = cx.theme().clone();
     let snap_cfg = app.freeform_canvas.read(cx).current_snap();
     let show_grid = app.freeform_canvas.read(cx).is_grid_visible();
@@ -334,6 +335,22 @@ fn freeform_canvas_demo(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) ->
                     .child(
                         h_stack()
                             .spacing(px(6.))
+                            .child({
+                                let bwa_open = app.ai_canvas_builder.read(cx).is_open();
+                                button("pg-fc-build-ai")
+                                    .size(ComponentSize::Xs)
+                                    .leading_icon(LucideIcon::WandSparkles)
+                                    .label(if bwa_open {
+                                        "Close Build with AI"
+                                    } else {
+                                        "Build with AI"
+                                    })
+                                    .map(|b| if bwa_open { b.primary() } else { b.soft() })
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.ai_canvas_builder
+                                            .update(cx, |ai, cx| ai.set_open(!ai.is_open(), cx));
+                                    }))
+                            })
                             .child(
                                 button("pg-fc-snap")
                                     .size(ComponentSize::Xs)

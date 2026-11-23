@@ -1,5 +1,6 @@
 //! Individual interactive component workbench pages for the playground.
 
+pub mod ai_assistant;
 pub mod analytics;
 pub mod buttons;
 pub mod controls;

@@ -2491,8 +2491,14 @@ dependencies = [
 name = "gpui_playground"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "async-channel",
+ "futures",
  "gpui",
  "gpui_platform",
+ "http_client",
+ "reqwest_client",
+ "serde_json",
 ]
 
 [[package]]

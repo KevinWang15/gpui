@@ -24,6 +24,7 @@ use crate::pages::native_desktop::FloatingPaneDemoView;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Page {
     Overview,
+    AiComponents,
     NativeDesktop,
     InteractiveBlur,
     DataTrees,
@@ -44,6 +45,7 @@ impl Page {
     pub const fn title(self) -> &'static str {
         match self {
             Self::Overview => "Overview",
+            Self::AiComponents => "AI Components",
             Self::NativeDesktop => "Desktop & Windows",
             Self::InteractiveBlur => "Interactive & Blur",
             Self::DataTrees => "Trees, Lists & Tables",
@@ -64,6 +66,9 @@ impl Page {
     pub const fn keywords(self) -> &'static str {
         match self {
             Self::Overview => "overview home welcome playground dashboard",
+            Self::AiComponents => {
+                "ai ask build byok llm openai anthropic gemini ollama mcp tool agent loop markdown answer components chat assistant"
+            }
             Self::NativeDesktop => {
                 "native windows desktop app builder spotlight alfred launcher floating frosted glass pane tray global hotkey shortcut recorder autostart launch login detached tooltip titlebar statusbar keyhint confirm button compact stepper status indicator trend badge string list swatch popover toolbar simulated backdrop"
             }
@@ -376,6 +381,13 @@ pub struct PlaygroundApp {
     pub freeform_items: Vec<FreeformDemoItem>,
     pub freeform_size: CanvasSize,
     pub freeform_next_seq: usize,
+
+    // BYOK AI Components showcase
+    pub ai_ask: Entity<AskAiState>,
+    pub ai_overlay_ask: Entity<AskAiState>,
+    /// Live **Build with AI** co-pilot wired directly to the Freeform 2D Canvas via foreground `AppTool`s.
+    pub ai_canvas_builder: Entity<AskAiState>,
+    pub ai_show_overlay: bool,
 }
 
 impl PlaygroundApp {
@@ -2053,6 +2065,641 @@ impl PlaygroundApp {
         })
         .detach();
 
+        // BYOK AI Components (shared connection_key across AskAi, AskAiOverlay, and Build with AI)
+        let ai_conn_key = "playground:ai";
+        let search_components_tool = ClientTool::sync(
+            "search_components",
+            "Search GPUI components by keyword and return matching module names and summaries.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Search keyword" }
+                }
+            }),
+            |args| {
+                let q = args
+                    .get("query")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                let catalog = [
+                    ("AskAi", "BYOK chat assistant with provider settings, MCP, tools, and branching"),
+                    ("AppTool", "Foreground GPUI tool bridge letting Build with AI read and mutate live editors"),
+                    ("Markdown", "Pure-GPUI GFM renderer with code copy and generative Answer Components"),
+                    ("FreeformCanvas", "2D drag, 8-way resize, and auto-align canvas editor"),
+                    ("CommandPalette", "Fuzzy searchable command launcher with keyboard slots"),
+                    ("VirtualTable", "Virtualized multi-column data table with sorting and sticky headers"),
+                    ("Sparkline", "Compact inline trend chart with hover tooltips"),
+                ];
+                let hits: Vec<_> = catalog
+                    .iter()
+                    .filter(|(n, d)| {
+                        q.is_empty()
+                            || n.to_ascii_lowercase().contains(&q)
+                            || d.to_ascii_lowercase().contains(&q)
+                    })
+                    .map(|(n, d)| serde_json::json!({ "name": n, "summary": d }))
+                    .collect();
+                Ok(serde_json::json!({ "count": hits.len(), "matches": hits }))
+            },
+        );
+        let list_categories_tool = ClientTool::sync(
+            "list_categories",
+            "Return component categories and counts in the GPUI library.",
+            serde_json::json!({ "type": "object", "properties": {} }),
+            |_| {
+                Ok(serde_json::json!({
+                    "categories": [
+                        { "name": "Core Controls", "count": 13 },
+                        { "name": "Layout & Navigation", "count": 9 },
+                        { "name": "Data & Charts", "count": 17 },
+                        { "name": "Desktop & Windows", "count": 11 },
+                        { "name": "AI Components", "count": 6 }
+                    ]
+                }))
+            },
+        );
+        let demo_tools = vec![search_components_tool, list_categories_tool];
+
+        let ai_ask = cx.new(|cx| {
+            let mut state = AskAiState::new(cx)
+                .title("Ask AI")
+                .connection_key(ai_conn_key)
+                .with_simulated_provider()
+                .client_tools(demo_tools.clone())
+                .workspace(true)
+                .images(true)
+                .suggestions([
+                    AskAiSuggestion::new(
+                        "Search components",
+                        "Use the search_components tool to find table and chart widgets.",
+                    ),
+                    AskAiSuggestion::new(
+                        "Write workspace notes",
+                        "Create a summary.json workspace file and render a stat-card and bar-chart.",
+                    ),
+                    AskAiSuggestion::new(
+                        "Show component breakdown",
+                        "List the component categories and visualize them with a chart.",
+                    ),
+                ]);
+            let _ = state.connect_preset_defaults("simulated", cx);
+            state
+        });
+        cx.subscribe(&ai_ask, |this, _, ev: &AskAiEvent, cx| match ev {
+            AskAiEvent::Connected(id) => {
+                this.log_event("AskAi", format!("Connected provider '{id}'"), cx);
+            }
+            AskAiEvent::Disconnected => {
+                this.log_event("AskAi", "Disconnected provider", cx);
+            }
+            AskAiEvent::MessageSent => {
+                this.log_event("AskAi", "Sent user prompt", cx);
+            }
+            AskAiEvent::ResponseFinished => {
+                this.log_event("AskAi", "Agent turn completed", cx);
+            }
+            AskAiEvent::OpenChanged(open) => {
+                this.log_event("AskAi", format!("overlay open -> {open}"), cx);
+            }
+        })
+        .detach();
+
+        let ai_overlay_ask = cx.new(|cx| {
+            AskAiState::new(cx)
+                .title("Ask AI")
+                .connection_key(ai_conn_key)
+                .with_simulated_provider()
+                .client_tools(demo_tools.clone())
+                .workspace(true)
+                .images(true)
+                .suggestions([
+                    AskAiSuggestion::new(
+                        "Search components",
+                        "Use the search_components tool to find table and chart widgets.",
+                    ),
+                    AskAiSuggestion::new(
+                        "Write workspace notes",
+                        "Create a summary.json workspace file and render a stat-card and bar-chart.",
+                    ),
+                ])
+        });
+        cx.subscribe(&ai_overlay_ask, |this, _, ev: &AskAiEvent, cx| {
+            if let AskAiEvent::OpenChanged(open) = ev {
+                this.log_event("AskAiOverlay", format!("open -> {open}"), cx);
+            }
+        })
+        .detach();
+
+        // Build with AI: the exact same Ask AI UI/UX, launched as a non-blocking floating panel
+        // over the live Freeform 2D Canvas and wired directly to its GPUI entity via foreground
+        // `AppTool::for_entity` tools + live `context_provider`.
+        let app_weak_ctx = cx.entity().downgrade();
+        let app_weak_get = cx.entity().downgrade();
+        let app_weak_add = cx.entity().downgrade();
+        let app_weak_upd = cx.entity().downgrade();
+        let app_weak_rm = cx.entity().downgrade();
+        let app_weak_resize = cx.entity().downgrade();
+        let app_weak_align = cx.entity().downgrade();
+        let app_weak_layout = cx.entity().downgrade();
+
+        let canvas_tools = vec![
+            AppTool::for_entity(
+                &app_weak_get,
+                "canvas_get_state",
+                "Read the live Freeform 2D Canvas size, every placed widget (id, kind, x, y, width, height), and the currently selected widget IDs.",
+                serde_json::json!({ "type": "object", "properties": {} }),
+                |this, _, cx| {
+                    let selected: Vec<String> = this
+                        .freeform_canvas
+                        .read(cx)
+                        .selected_ids()
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect();
+                    let items: Vec<_> = this
+                        .freeform_items
+                        .iter()
+                        .map(|it| {
+                            serde_json::json!({
+                                "id": it.id.as_ref(),
+                                "kind": it.kind.as_ref(),
+                                "x": it.rect.x,
+                                "y": it.rect.y,
+                                "width": it.rect.width,
+                                "height": it.rect.height
+                            })
+                        })
+                        .collect();
+                    Ok(serde_json::json!({
+                        "canvas": {
+                            "width": this.freeform_size.width,
+                            "height": this.freeform_size.height,
+                            "min_width": 160.0,
+                            "min_height": 72.0,
+                            "max_width": 520.0,
+                            "max_height": 260.0
+                        },
+                        "available_kinds": ["metric", "badge", "chart", "status", "note"],
+                        "selected_ids": selected,
+                        "items": items
+                    }))
+                },
+            ),
+            AppTool::for_entity(
+                &app_weak_add,
+                "canvas_add_widget",
+                "Add a new widget directly onto the live Freeform 2D Canvas. Valid kinds: metric, badge, chart, status, note. Optional x, y, width, height coordinates.",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "kind": { "type": "string", "enum": ["metric", "badge", "chart", "status", "note"] },
+                        "x": { "type": "number" },
+                        "y": { "type": "number" },
+                        "width": { "type": "number" },
+                        "height": { "type": "number" }
+                    },
+                    "required": ["kind"]
+                }),
+                |this, args, cx| {
+                    let kind = match args.get("kind").and_then(|v| v.as_str()).unwrap_or("metric") {
+                        "metric" | "badge" | "chart" | "status" | "note" => {
+                            args["kind"].as_str().unwrap_or("metric")
+                        }
+                        other => {
+                            anyhow::bail!(
+                                "unknown widget kind '{other}' (expected metric, badge, chart, status, or note)"
+                            );
+                        }
+                    };
+                    let (def_w, def_h) = match kind {
+                        "metric" => (148.0, 56.0),
+                        "badge" => (112.0, 28.0),
+                        "chart" => (164.0, 84.0),
+                        "status" => (132.0, 24.0),
+                        _ => (124.0, 24.0),
+                    };
+                    let w = args
+                        .get("width")
+                        .and_then(|v| v.as_f64())
+                        .map(|n| n as f32)
+                        .unwrap_or(def_w)
+                        .max(64.0);
+                    let h = args
+                        .get("height")
+                        .and_then(|v| v.as_f64())
+                        .map(|n| n as f32)
+                        .unwrap_or(def_h)
+                        .max(22.0);
+                    let offset = (this.freeform_items.len() as f32 % 5.0) * 18.0;
+                    let x = args
+                        .get("x")
+                        .and_then(|v| v.as_f64())
+                        .map(|n| n as f32)
+                        .unwrap_or(12.0 + offset);
+                    let y = args
+                        .get("y")
+                        .and_then(|v| v.as_f64())
+                        .map(|n| n as f32)
+                        .unwrap_or(12.0 + offset);
+                    let rect = CanvasRect::new(x, y, w, h).clamped_in(this.freeform_size);
+                    let seq = this.freeform_next_seq;
+                    this.freeform_next_seq += 1;
+                    let id: SharedString = format!("{kind}-{seq}").into();
+                    this.freeform_items.push(FreeformDemoItem {
+                        id: id.clone(),
+                        kind: kind.to_owned().into(),
+                        rect,
+                    });
+                    let sel = id.clone();
+                    this.freeform_canvas
+                        .update(cx, |s, cx| s.select(Some(sel), cx));
+                    this.log_event(
+                        "BuildWithAI",
+                        format!("canvas_add_widget {id} ({kind}) at ({}, {})", rect.x as i32, rect.y as i32),
+                        cx,
+                    );
+                    cx.notify();
+                    Ok(serde_json::json!({
+                        "added": {
+                            "id": id.as_ref(),
+                            "kind": kind,
+                            "x": rect.x,
+                            "y": rect.y,
+                            "width": rect.width,
+                            "height": rect.height
+                        },
+                        "total_items": this.freeform_items.len()
+                    }))
+                },
+            ),
+            AppTool::for_entity(
+                &app_weak_upd,
+                "canvas_update_widget",
+                "Move and/or resize an existing widget on the live Freeform 2D Canvas by its id.",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string" },
+                        "x": { "type": "number" },
+                        "y": { "type": "number" },
+                        "width": { "type": "number" },
+                        "height": { "type": "number" }
+                    },
+                    "required": ["id"]
+                }),
+                |this, args, cx| {
+                    let target_id = args
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| anyhow::anyhow!("missing required field 'id'"))?;
+                    let canvas_sz = this.freeform_size;
+                    let Some(it) = this
+                        .freeform_items
+                        .iter_mut()
+                        .find(|it| it.id.as_ref() == target_id)
+                    else {
+                        anyhow::bail!("widget '{target_id}' not found on canvas");
+                    };
+                    let mut r = it.rect;
+                    if let Some(x) = args.get("x").and_then(|v| v.as_f64()) {
+                        r.x = x as f32;
+                    }
+                    if let Some(y) = args.get("y").and_then(|v| v.as_f64()) {
+                        r.y = y as f32;
+                    }
+                    if let Some(w) = args.get("width").and_then(|v| v.as_f64()) {
+                        r.width = (w as f32).max(64.0);
+                    }
+                    if let Some(h) = args.get("height").and_then(|v| v.as_f64()) {
+                        r.height = (h as f32).max(22.0);
+                    }
+                    it.rect = r.clamped_in(canvas_sz);
+                    let updated = it.rect;
+                    this.log_event(
+                        "BuildWithAI",
+                        format!("canvas_update_widget {target_id} -> ({}, {}, {}×{})", updated.x as i32, updated.y as i32, updated.width as i32, updated.height as i32),
+                        cx,
+                    );
+                    cx.notify();
+                    Ok(serde_json::json!({
+                        "updated": {
+                            "id": target_id,
+                            "x": updated.x,
+                            "y": updated.y,
+                            "width": updated.width,
+                            "height": updated.height
+                        }
+                    }))
+                },
+            ),
+            AppTool::for_entity(
+                &app_weak_rm,
+                "canvas_remove_widget",
+                "Remove one or more widgets from the live Freeform 2D Canvas by their ids.",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "ids": { "type": "array", "items": { "type": "string" } }
+                    },
+                    "required": ["ids"]
+                }),
+                |this, args, cx| {
+                    let ids: Vec<String> = args
+                        .get("ids")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(ToOwned::to_owned))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let before = this.freeform_items.len();
+                    this.freeform_items
+                        .retain(|it| !ids.iter().any(|id| id == it.id.as_ref()));
+                    let removed = before - this.freeform_items.len();
+                    this.freeform_canvas.update(cx, |s, cx| s.select(None, cx));
+                    this.log_event(
+                        "BuildWithAI",
+                        format!("canvas_remove_widget removed {removed} item(s)"),
+                        cx,
+                    );
+                    cx.notify();
+                    Ok(serde_json::json!({
+                        "removed_count": removed,
+                        "remaining_items": this.freeform_items.len()
+                    }))
+                },
+            ),
+            AppTool::for_entity(
+                &app_weak_resize,
+                "canvas_resize_canvas",
+                "Resize the Freeform 2D Canvas frame (width: 160..520, height: 72..260) and clamp widgets inside.",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "width": { "type": "number" },
+                        "height": { "type": "number" }
+                    },
+                    "required": ["width", "height"]
+                }),
+                |this, args, cx| {
+                    let w = args
+                        .get("width")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(this.freeform_size.width as f64)
+                        .clamp(160.0, 520.0) as f32;
+                    let h = args
+                        .get("height")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(this.freeform_size.height as f64)
+                        .clamp(72.0, 260.0) as f32;
+                    let sz = CanvasSize::new(w, h);
+                    this.freeform_size = sz;
+                    for it in &mut this.freeform_items {
+                        it.rect = it.rect.clamped_in(sz);
+                    }
+                    this.log_event(
+                        "BuildWithAI",
+                        format!("canvas_resize_canvas -> {}×{}", w as i32, h as i32),
+                        cx,
+                    );
+                    cx.notify();
+                    Ok(serde_json::json!({ "width": w, "height": h }))
+                },
+            ),
+            AppTool::for_entity(
+                &app_weak_align,
+                "canvas_align_widgets",
+                "Align widgets on the live Freeform 2D Canvas. Actions: left, center_horizontal, right, top, center_vertical, bottom, fill_width, snap_to_grid. Set all=true to align every item.",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": ["left", "center_horizontal", "right", "top", "center_vertical", "bottom", "fill_width", "snap_to_grid"]
+                        },
+                        "all": { "type": "boolean" }
+                    },
+                    "required": ["action"]
+                }),
+                |this, args, cx| {
+                    let action_str = args.get("action").and_then(|v| v.as_str()).unwrap_or("left");
+                    let action = match action_str {
+                        "left" => AlignAction::Left,
+                        "center_horizontal" => AlignAction::CenterHorizontal,
+                        "right" => AlignAction::Right,
+                        "top" => AlignAction::Top,
+                        "center_vertical" => AlignAction::CenterVertical,
+                        "bottom" => AlignAction::Bottom,
+                        "fill_width" => AlignAction::FillWidth,
+                        "snap_to_grid" => AlignAction::SnapToGrid,
+                        other => anyhow::bail!("unknown align action '{other}'"),
+                    };
+                    let snap = this.freeform_canvas.read(cx).current_snap();
+                    let all = args.get("all").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let selected: Vec<SharedString> =
+                        this.freeform_canvas.read(cx).selected_ids().to_vec();
+                    let target_indices: Vec<usize> = if all || selected.is_empty() {
+                        (0..this.freeform_items.len()).collect()
+                    } else {
+                        this.freeform_items
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(i, it)| selected.contains(&it.id).then_some(i))
+                            .collect()
+                    };
+                    if target_indices.len() == 1 {
+                        let idx = target_indices[0];
+                        this.freeform_items[idx].rect = align_item(
+                            this.freeform_items[idx].rect,
+                            this.freeform_size,
+                            snap.canvas_padding,
+                            snap.grid,
+                            action,
+                        );
+                    } else if target_indices.len() > 1 {
+                        let rects: Vec<CanvasRect> = target_indices
+                            .iter()
+                            .map(|&i| this.freeform_items[i].rect)
+                            .collect();
+                        let aligned = align_items(
+                            &rects,
+                            this.freeform_size,
+                            snap.canvas_padding,
+                            snap.grid,
+                            action,
+                        );
+                        for (idx, rect) in target_indices.iter().copied().zip(aligned) {
+                            this.freeform_items[idx].rect = rect;
+                        }
+                    }
+                    this.log_event(
+                        "BuildWithAI",
+                        format!("canvas_align_widgets({action_str}, {} items)", target_indices.len()),
+                        cx,
+                    );
+                    cx.notify();
+                    Ok(serde_json::json!({
+                        "action": action_str,
+                        "aligned_count": target_indices.len()
+                    }))
+                },
+            ),
+            AppTool::for_entity(
+                &app_weak_layout,
+                "canvas_set_layout",
+                "Replace or rearrange the live Freeform 2D Canvas layout atomically with an optional new canvas_width/canvas_height and a list of widget placements.",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "canvas_width": { "type": "number" },
+                        "canvas_height": { "type": "number" },
+                        "items": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "id": { "type": "string" },
+                                    "kind": { "type": "string", "enum": ["metric", "badge", "chart", "status", "note"] },
+                                    "x": { "type": "number" },
+                                    "y": { "type": "number" },
+                                    "width": { "type": "number" },
+                                    "height": { "type": "number" }
+                                },
+                                "required": ["kind", "x", "y", "width", "height"]
+                            }
+                        }
+                    },
+                    "required": ["items"]
+                }),
+                |this, args, cx| {
+                    let cw = args
+                        .get("canvas_width")
+                        .and_then(|v| v.as_f64())
+                        .map(|n| (n as f32).clamp(160.0, 520.0))
+                        .unwrap_or(this.freeform_size.width);
+                    let ch = args
+                        .get("canvas_height")
+                        .and_then(|v| v.as_f64())
+                        .map(|n| (n as f32).clamp(72.0, 260.0))
+                        .unwrap_or(this.freeform_size.height);
+                    let new_sz = CanvasSize::new(cw, ch);
+                    let raw_items = args
+                        .get("items")
+                        .and_then(|v| v.as_array())
+                        .ok_or_else(|| anyhow::anyhow!("missing 'items' array"))?;
+                    let mut next_items = Vec::with_capacity(raw_items.len());
+                    for entry in raw_items {
+                        let kind = match entry
+                            .get("kind")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("metric")
+                        {
+                            k @ ("metric" | "badge" | "chart" | "status" | "note") => k,
+                            _ => "metric",
+                        };
+                        let id: SharedString = match entry.get("id").and_then(|v| v.as_str()) {
+                            Some(s) if !s.trim().is_empty() => s.to_owned().into(),
+                            _ => {
+                                let seq = this.freeform_next_seq;
+                                this.freeform_next_seq += 1;
+                                format!("{kind}-{seq}").into()
+                            }
+                        };
+                        let rect = CanvasRect::new(
+                            entry["x"].as_f64().unwrap_or(12.0) as f32,
+                            entry["y"].as_f64().unwrap_or(12.0) as f32,
+                            (entry["width"].as_f64().unwrap_or(140.0) as f32).max(64.0),
+                            (entry["height"].as_f64().unwrap_or(48.0) as f32).max(22.0),
+                        )
+                        .clamped_in(new_sz);
+                        next_items.push(FreeformDemoItem {
+                            id,
+                            kind: kind.to_owned().into(),
+                            rect,
+                        });
+                    }
+                    this.freeform_size = new_sz;
+                    this.freeform_items = next_items;
+                    this.freeform_canvas.update(cx, |s, cx| s.select(None, cx));
+                    this.log_event(
+                        "BuildWithAI",
+                        format!(
+                            "canvas_set_layout ({}×{}, {} items)",
+                            cw as i32,
+                            ch as i32,
+                            this.freeform_items.len()
+                        ),
+                        cx,
+                    );
+                    cx.notify();
+                    Ok(serde_json::json!({
+                        "canvas": { "width": cw, "height": ch },
+                        "item_count": this.freeform_items.len()
+                    }))
+                },
+            ),
+        ];
+
+        let mut canvas_providers = default_providers();
+        canvas_providers.push(crate::pages::ai_assistant::canvas_demo_simulated_provider());
+
+        let ai_canvas_builder = cx.new(|cx| {
+            AskAiState::build_with_ai(cx)
+                .title("Build with AI · Canvas")
+                .connection_key(ai_conn_key)
+                .providers(canvas_providers)
+                .app_tools(canvas_tools)
+                .context_provider(move |cx| {
+                    let app = app_weak_ctx.upgrade()?;
+                    let state = app.read(cx);
+                    let selected: Vec<&str> = state
+                        .freeform_canvas
+                        .read(cx)
+                        .selected_ids()
+                        .iter()
+                        .map(|s| s.as_ref())
+                        .collect();
+                    Some(format!(
+                        "Active editor: Freeform 2D Canvas ({}×{} px, {} widget(s), selected: {:?}). Available widget kinds: metric, badge, chart, status, note.",
+                        state.freeform_size.width as i32,
+                        state.freeform_size.height as i32,
+                        state.freeform_items.len(),
+                        selected
+                    ))
+                })
+                .suggestions([
+                    AskAiSuggestion::new(
+                        "Arrange into a 2-column grid",
+                        "Arrange all widgets on the canvas into a neat 2-column grid.",
+                    ),
+                    AskAiSuggestion::new(
+                        "Add a KPI metric and mini chart",
+                        "Add a metric widget and a chart widget onto the canvas.",
+                    ),
+                    AskAiSuggestion::new(
+                        "Resize canvas to 480×220",
+                        "Resize the canvas frame to 480x220 so widgets have more room.",
+                    ),
+                    AskAiSuggestion::new(
+                        "Remove the caption",
+                        "Remove the note widget from the canvas.",
+                    ),
+                ])
+        });
+        cx.subscribe(&ai_canvas_builder, |this, _, ev: &AskAiEvent, cx| match ev {
+            AskAiEvent::OpenChanged(open) => {
+                this.log_event("BuildWithAI", format!("overlay open -> {open}"), cx);
+                cx.notify();
+            }
+            AskAiEvent::ResponseFinished => {
+                this.log_event("BuildWithAI", "Finished live canvas edit turn", cx);
+            }
+            _ => {}
+        })
+        .detach();
+
         let mut app = Self {
             page: Page::InteractiveBlur,
             accent: AccentPreset::Indigo,
@@ -2298,6 +2945,11 @@ impl PlaygroundApp {
             freeform_items: Self::default_freeform_items(),
             freeform_size: CanvasSize::new(360.0, 152.0),
             freeform_next_seq: 2,
+
+            ai_ask,
+            ai_overlay_ask,
+            ai_canvas_builder,
+            ai_show_overlay: false,
         };
 
         app.log_event(

@@ -10,8 +10,14 @@ description = "Interactive developer playground for GPUI components and Lucide i
 workspace = true
 
 [dependencies]
+anyhow = { workspace = true }
+async-channel = { workspace = true }
+futures = { workspace = true }
 gpui = { workspace = true, features = ["components", "lucide"] }
 gpui_platform = { workspace = true, features = ["font-kit", "wayland", "x11"] }
+http_client = { workspace = true }
+reqwest_client = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["components", "lucide", "test-support"] }
