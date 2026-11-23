@@ -667,6 +667,7 @@ fn render_interactive_chart_legend(
     let hover_bg = theme.surface_hover;
     let mut row = div()
         .id(base_id)
+        .flex_shrink_0()
         .flex()
         .flex_wrap()
         .items_center()
@@ -839,6 +840,7 @@ impl RenderOnce for ChartCard {
             .gap(px(14.))
             .child(
                 div()
+                    .flex_shrink_0()
                     .flex()
                     .items_center()
                     .justify_between()
@@ -884,6 +886,7 @@ impl RenderOnce for ChartCard {
             let toggle_state = show_table_state;
             let fg_hover = theme.foreground;
             let toggle_row = div()
+                .flex_shrink_0()
                 .pt(px(4.))
                 .flex()
                 .flex_col()

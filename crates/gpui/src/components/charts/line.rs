@@ -341,6 +341,7 @@ pub struct LineChart {
     x_domain: Option<(f64, f64)>,
     x_ticks: Vec<(f64, SharedString)>,
     height: Pixels,
+    fill_height: bool,
     value_format: ChartValueFormat,
     palette: Option<ChartPalette>,
     smooth: bool,
@@ -366,6 +367,7 @@ impl LineChart {
             x_domain: None,
             x_ticks: Vec::new(),
             height: px(220.),
+            fill_height: false,
             value_format: ChartValueFormat::Currency,
             palette: None,
             smooth: false,
@@ -402,9 +404,17 @@ impl LineChart {
         self
     }
 
-    /// Sets the plot height (default `220px`).
+    /// Sets the plot height (default `220px`) and disables [`Self::fill_height`].
     pub fn height(mut self, height: Pixels) -> Self {
         self.height = height;
+        self.fill_height = false;
+        self
+    }
+
+    /// Expands vertically to fill available flex container space instead of using a fixed
+    /// [`Self::height`]. Defaults to a `160px` minimum height (customize via [`Styled::min_h`]).
+    pub fn fill_height(mut self, fill: bool) -> Self {
+        self.fill_height = fill;
         self
     }
 
@@ -750,8 +760,9 @@ impl RenderOnce for LineChart {
                 }
             },
         )
-        .w_full()
-        .h(self.height);
+        .flex_1()
+        .min_h_0()
+        .w_full();
 
         let selectable = self.selectable;
         let on_brush_up = self.on_brush_select.clone();
@@ -768,7 +779,18 @@ impl RenderOnce for LineChart {
             .id(self.id)
             .relative()
             .w_full()
-            .h(self.height)
+            .flex()
+            .flex_col()
+            .map(|el| {
+                if self.fill_height {
+                    el.flex_grow_1()
+                        .flex_shrink_1()
+                        .flex_basis(px(0.))
+                        .min_h(px(160.))
+                } else {
+                    el.h(self.height)
+                }
+            })
             .when(selectable, |el| el.cursor(CursorStyle::Crosshair))
             .on_mouse_down(MouseButton::Left, move |event: &MouseDownEvent, _, cx| {
                 if !selectable {

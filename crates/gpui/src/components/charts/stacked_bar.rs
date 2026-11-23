@@ -119,6 +119,7 @@ pub struct StackedBarChart {
     series: Vec<StackedBarSeries>,
     points: Vec<StackedBarPoint>,
     height: Pixels,
+    fill_height: bool,
     value_format: ChartValueFormat,
     bar_radius: Pixels,
     palette: Option<ChartPalette>,
@@ -142,6 +143,7 @@ impl StackedBarChart {
             series: Vec::new(),
             points: Vec::new(),
             height: px(220.),
+            fill_height: false,
             value_format: ChartValueFormat::Currency,
             bar_radius: px(3.),
             palette: None,
@@ -165,9 +167,17 @@ impl StackedBarChart {
         self
     }
 
-    /// Sets the chart plot height (default `220px`).
+    /// Sets the chart plot height (default `220px`) and disables [`Self::fill_height`].
     pub fn height(mut self, height: Pixels) -> Self {
         self.height = height;
+        self.fill_height = false;
+        self
+    }
+
+    /// Expands vertically to fill available flex container space instead of using a fixed
+    /// [`Self::height`]. Defaults to a `160px` minimum height (customize via [`Styled::min_h`]).
+    pub fn fill_height(mut self, fill: bool) -> Self {
+        self.fill_height = fill;
         self
     }
 
@@ -460,8 +470,9 @@ impl RenderOnce for StackedBarChart {
                 }
             },
         )
-        .w_full()
-        .h(self.height);
+        .flex_1()
+        .min_h_0()
+        .w_full();
 
         let selectable = self.selectable;
         let on_bar_click = self.on_bar_click;
@@ -489,7 +500,18 @@ impl RenderOnce for StackedBarChart {
             .id(self.id)
             .relative()
             .w_full()
-            .h(self.height)
+            .flex()
+            .flex_col()
+            .map(|el| {
+                if self.fill_height {
+                    el.flex_grow_1()
+                        .flex_shrink_1()
+                        .flex_basis(px(0.))
+                        .min_h(px(160.))
+                } else {
+                    el.h(self.height)
+                }
+            })
             .when_some(cursor_style, |el, cursor| el.cursor(cursor))
             .on_mouse_down(MouseButton::Left, move |event: &MouseDownEvent, _, cx| {
                 let mut state = down_entity.read(cx).borrow_mut();

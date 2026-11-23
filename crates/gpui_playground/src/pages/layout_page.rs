@@ -938,7 +938,222 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
                                             ),
                                     ),
                             ),
-                    ),
+                    )
+                    .child(divider())
+                    .child({
+                        let overflow_y = f32::from(app.scroll_fill_handle.max_offset().y);
+                        let is_scrolling = overflow_y > 0.5;
+                        v_stack()
+                            .spacing(px(10.))
+                            .child(
+                                h_stack()
+                                    .flex_wrap()
+                                    .justify_between()
+                                    .gap(px(8.))
+                                    .child(
+                                        h_stack()
+                                            .spacing(px(8.))
+                                            .child(label("Viewport-filling `ScrollArea::fill_viewport(true)`"))
+                                            .child(
+                                                badge(if is_scrolling {
+                                                    format!("Scrolls (+{:.0}px)", overflow_y)
+                                                } else {
+                                                    "Fits viewport · 0 scroll".to_string()
+                                                })
+                                                .color(if is_scrolling {
+                                                    BadgeColor::Amber
+                                                } else {
+                                                    BadgeColor::Green
+                                                })
+                                                .pill(true),
+                                            ),
+                                    )
+                                    .child(
+                                        h_stack()
+                                            .spacing(px(6.))
+                                            .children([240.0f32, 340.0, 440.0].into_iter().map(|h| {
+                                                button(("sa-fill-h", h as usize))
+                                                    .size(ComponentSize::Xs)
+                                                    .outline()
+                                                    .selected((app.scroll_fill_viewport_h - h).abs() < 1.0)
+                                                    .label(format!("{}px", h as usize))
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        this.scroll_fill_viewport_h = h;
+                                                        cx.notify();
+                                                    }))
+                                            }))
+                                            .child(
+                                                toggle("sa-fill-extra", app.scroll_fill_extra_panel)
+                                                    .size(ComponentSize::Xs)
+                                                    .label("+120px banner")
+                                                    .on_change(cx.listener(|this, on: &bool, _, cx| {
+                                                        this.scroll_fill_extra_panel = *on;
+                                                        cx.notify();
+                                                    })),
+                                            ),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .w_full()
+                                    .h(px(app.scroll_fill_viewport_h))
+                                    .rounded(theme.radius_lg)
+                                    .border_1()
+                                    .border_color(theme.border)
+                                    .bg(theme.background)
+                                    .overflow_hidden()
+                                    .flex()
+                                    .flex_col()
+                                    .child(
+                                        h_stack()
+                                            .flex_none()
+                                            .justify_between()
+                                            .px(px(12.))
+                                            .py(px(7.))
+                                            .bg(theme.sidebar_bg)
+                                            .border_b_1()
+                                            .border_color(theme.border)
+                                            .child(
+                                                div()
+                                                    .text_size(px(12.))
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .child("Simulated Window Frame"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(px(11.))
+                                                    .text_color(theme.muted_foreground)
+                                                    .font_features(tabular_numerals())
+                                                    .child(format!("height: {}px", app.scroll_fill_viewport_h as usize)),
+                                            ),
+                                    )
+                                    .child(
+                                        scroll_area("pg-scroll-fill-viewport")
+                                            .fill_viewport(true)
+                                            .flex_1()
+                                            .min_h_0()
+                                            .padding(px(10.))
+                                            .spacing(px(8.))
+                                            .track_scroll(&app.scroll_fill_handle)
+                                            .when(app.scroll_fill_extra_panel, |el| {
+                                                el.child(
+                                                    div()
+                                                        .flex_none()
+                                                        .h(px(120.))
+                                                        .p(px(10.))
+                                                        .rounded(theme.radius_md)
+                                                        .bg(theme.primary_soft.opacity(0.45))
+                                                        .border_1()
+                                                        .border_color(theme.border)
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_center()
+                                                        .text_size(px(12.))
+                                                        .text_color(theme.foreground)
+                                                        .child("Optional 120px banner — pushes layout past viewport height when active"),
+                                                )
+                                            })
+                                            .child(
+                                                div()
+                                                    .w_full()
+                                                    .flex_grow_1()
+                                                    .flex_shrink_0()
+                                                    .flex()
+                                                    .items_stretch()
+                                                    .gap(px(8.))
+                                                    .child(
+                                                        div()
+                                                            .flex_grow(2.)
+                                                            .flex_basis(px(0.))
+                                                            .min_h(px(140.))
+                                                            .p(px(12.))
+                                                            .rounded(theme.radius_md)
+                                                            .bg(theme.surface)
+                                                            .border_1()
+                                                            .border_color(theme.border)
+                                                            .flex()
+                                                            .flex_col()
+                                                            .justify_center()
+                                                            .items_center()
+                                                            .gap(px(4.))
+                                                            .child(
+                                                                div()
+                                                                    .text_size(px(12.5))
+                                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                                    .child("Flexible Primary Pane (min_h 140px)"),
+                                                            )
+                                                            .child(
+                                                                div()
+                                                                    .text_size(px(11.5))
+                                                                    .text_color(theme.muted_foreground)
+                                                                    .child("Expands to fill available height; stops at 140px and scrolls outer area when tight."),
+                                                            ),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .flex_grow(1.)
+                                                            .flex_basis(px(0.))
+                                                            .min_h(px(140.))
+                                                            .flex()
+                                                            .flex_col()
+                                                            .child(
+                                                                div()
+                                                                    .flex_grow_1()
+                                                                    .flex_shrink_1()
+                                                                    .flex_basis(px(0.))
+                                                                    .min_h_0()
+                                                                    .rounded(theme.radius_md)
+                                                                    .bg(theme.surface)
+                                                                    .border_1()
+                                                                    .border_color(theme.border)
+                                                                    .p(px(8.))
+                                                                    .flex()
+                                                                    .flex_col()
+                                                                    .gap(px(6.))
+                                                                    .child(
+                                                                        div()
+                                                                            .flex_shrink_0()
+                                                                            .text_size(px(11.5))
+                                                                            .font_weight(FontWeight::SEMIBOLD)
+                                                                            .child("Inner Scroll List (10 rows)"),
+                                                                    )
+                                                                    .child(
+                                                                        scroll_area("pg-scroll-fill-inner")
+                                                                            .flex_grow_1()
+                                                                            .flex_shrink_1()
+                                                                            .flex_basis(px(0.))
+                                                                            .min_h_0()
+                                                                            .spacing(px(4.))
+                                                                            .children((1..=10).map(|i| {
+                                                                                div()
+                                                                                    .px(px(8.))
+                                                                                    .py(px(4.))
+                                                                                    .rounded(theme.radius_sm)
+                                                                                    .bg(theme.surface_muted.opacity(0.6))
+                                                                                    .text_size(px(11.))
+                                                                                    .text_color(theme.muted_foreground)
+                                                                                    .child(format!("Row #{i:02} · matched height"))
+                                                                            })),
+                                                                    ),
+                                                            ),
+                                                    ),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex_none()
+                                                    .px(px(12.))
+                                                    .py(px(8.))
+                                                    .rounded(theme.radius_md)
+                                                    .bg(theme.surface)
+                                                    .border_1()
+                                                    .border_color(theme.border)
+                                                    .text_size(px(11.5))
+                                                    .text_color(theme.muted_foreground)
+                                                    .child("Fixed summary footer card — stays pinned at the bottom without scrolling when height is enough."),
+                                            ),
+                                    ),
+                            )
+                    }),
                 ),
         )
         // Tabs (Underline, Pills, Segmented)

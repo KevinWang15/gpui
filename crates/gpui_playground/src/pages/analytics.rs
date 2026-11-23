@@ -424,7 +424,9 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
             }),
         );
 
-    let stats_strip = stat_group("analytics-kpis").items([
+    let stats_strip = stat_group("analytics-kpis")
+        .compact(app.analytics_compact_stats)
+        .items([
         StatItem::new(format!("{span_days}-day cost"), format!("${total_cost:.2}"))
             .delta(StatDelta::percent(
                 10.9,
@@ -499,6 +501,15 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
                         .on_change(cx.listener(|this, enabled: &bool, _, cx| {
                             this.analytics_line_smooth = *enabled;
                             this.log_event("LineChart", format!("smooth -> {}", *enabled), cx);
+                        })),
+                )
+                .child(
+                    toggle("analytics-compact-stats-toggle", app.analytics_compact_stats)
+                        .size(ComponentSize::Sm)
+                        .label("Compact KPIs")
+                        .on_change(cx.listener(|this, enabled: &bool, _, cx| {
+                            this.analytics_compact_stats = *enabled;
+                            this.log_event("StatGroup", format!("compact -> {}", *enabled), cx);
                         })),
                 ),
         )
@@ -814,6 +825,156 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
                 ),
         );
 
+    // Responsive flex-height ChartCard showcase (StackedBarChart / LineChart .fill_height(true))
+    let resp_bar_series: Vec<StackedBarSeries> = active_models
+        .iter()
+        .map(|&(orig_idx, m)| StackedBarSeries::new(m.name).color(palette.color(orig_idx)))
+        .collect();
+    let resp_line_series: Vec<LineSeries> = active_models
+        .iter()
+        .enumerate()
+        .map(|(i, &(orig_idx, m))| {
+            let pts: Vec<(f64, f64)> = bar_points
+                .iter()
+                .enumerate()
+                .map(|(day_i, pt)| (day_i as f64, pt.values.get(i).copied().unwrap_or(0.0)))
+                .collect();
+            LineSeries::new(m.name, pts)
+                .color(palette.color(orig_idx))
+                .fill_area(active_models.len() == 1)
+        })
+        .collect();
+    let resp_chart_body = if app.analytics_responsive_use_line {
+        let n = bar_points.len().max(1);
+        line_chart("analytics-responsive-line")
+            .series(resp_line_series)
+            .smooth(line_smooth)
+            .x_domain(0.0, (n - 1).max(1) as f64)
+            .fill_height(true)
+            .min_h(px(150.))
+            .value_format(value_format.clone())
+            .into_any_element()
+    } else {
+        stacked_bar_chart("analytics-responsive-bars")
+            .series(resp_bar_series)
+            .points(bar_points.clone())
+            .fill_height(true)
+            .min_h(px(150.))
+            .value_format(value_format.clone())
+            .into_any_element()
+    };
+    let responsive_chart_demo = card()
+        .child(
+            card_header().bordered().child(
+                h_stack()
+                    .flex_wrap()
+                    .justify_between()
+                    .gap(px(8.))
+                    .child(
+                        v_stack()
+                            .spacing(px(2.))
+                            .child(card_title("Responsive Flex-Height Charts (.fill_height(true))"))
+                            .child(card_description(
+                                "Charts stretch smoothly to match their parent container height with zero manual pixel math.",
+                            )),
+                    )
+                    .child(
+                        h_stack()
+                            .spacing(px(6.))
+                            .children([260.0f32, 340.0, 440.0].into_iter().map(|h| {
+                                button(("resp-chart-h", h as usize))
+                                    .size(ComponentSize::Xs)
+                                    .outline()
+                                    .selected((app.analytics_responsive_h - h).abs() < 1.0)
+                                    .label(format!("{}px", h as usize))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.analytics_responsive_h = h;
+                                        cx.notify();
+                                    }))
+                            }))
+                            .child(
+                                segmented_control(
+                                    "resp-chart-kind",
+                                    if app.analytics_responsive_use_line { "line" } else { "bar" },
+                                )
+                                .size(ComponentSize::Xs)
+                                .items([
+                                    SegmentedItem::new("bar", "StackedBar"),
+                                    SegmentedItem::new("line", "Line"),
+                                ])
+                                .on_change(cx.listener(|this, v: &SharedString, _, cx| {
+                                    this.analytics_responsive_use_line = v.as_ref() == "line";
+                                    cx.notify();
+                                })),
+                            ),
+                    ),
+            ),
+        )
+        .child(
+            card_content().child(
+                div()
+                    .w_full()
+                    .h(px(app.analytics_responsive_h))
+                    .flex()
+                    .items_stretch()
+                    .gap(px(14.))
+                    .child(
+                        chart_card("analytics-resp-card", format!("Responsive {metric_noun} chart"))
+                            .subtitle(format!("Container {}px", app.analytics_responsive_h as usize))
+                            .content(resp_chart_body)
+                            .flex_grow(2.)
+                            .flex_basis(px(0.))
+                            .h_full(),
+                    )
+                    .child(
+                        div()
+                            .flex_grow(1.)
+                            .flex_basis(px(0.))
+                            .min_w(px(240.))
+                            .h_full()
+                            .rounded(theme.radius_xl)
+                            .bg(theme.surface)
+                            .border_1()
+                            .border_color(theme.border)
+                            .p(px(16.))
+                            .flex()
+                            .flex_col()
+                            .gap(px(10.))
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_size(px(13.5))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("Height-matched scrollable side panel"),
+                            )
+                            .child(
+                                scroll_area("analytics-resp-side")
+                                    .flex_grow_1()
+                                    .flex_shrink_1()
+                                    .flex_basis(px(0.))
+                                    .min_h_0()
+                                    .spacing(px(6.))
+                                    .children((1..=12).map(|i| {
+                                        h_stack()
+                                            .justify_between()
+                                            .px(px(8.))
+                                            .py(px(5.))
+                                            .rounded(theme.radius_md)
+                                            .bg(theme.surface_muted.opacity(0.55))
+                                            .text_size(px(12.))
+                                            .child(format!("Dimension #{i:02}"))
+                                            .child(
+                                                div()
+                                                    .font_features(tabular_numerals())
+                                                    .text_color(theme.muted_foreground)
+                                                    .child(format!("${:.2}", 140.0 / (i as f64))),
+                                            )
+                                    })),
+                            ),
+                    ),
+            ),
+        );
+
     let split_charts = div()
         .w_full()
         .flex_shrink_0()
@@ -859,4 +1020,5 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
         .child(sparkline_strip)
         .child(stacked_card)
         .child(split_charts)
+        .child(responsive_chart_demo)
 }

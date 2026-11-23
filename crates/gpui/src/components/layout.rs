@@ -1373,6 +1373,7 @@ pub struct ScrollArea {
     id: ElementId,
     horizontal: bool,
     vertical: bool,
+    fill_viewport: bool,
     max_height: Option<Pixels>,
     height: Option<Pixels>,
     max_width: Option<Pixels>,
@@ -1397,6 +1398,7 @@ impl ScrollArea {
             id: id.into(),
             horizontal: false,
             vertical: true,
+            fill_viewport: false,
             max_height: None,
             height: None,
             max_width: None,
@@ -1416,6 +1418,7 @@ impl ScrollArea {
             id: id.into(),
             horizontal: true,
             vertical: false,
+            fill_viewport: false,
             max_height: None,
             height: None,
             max_width: None,
@@ -1435,6 +1438,7 @@ impl ScrollArea {
             id: id.into(),
             horizontal: true,
             vertical: true,
+            fill_viewport: false,
             max_height: None,
             height: None,
             max_width: None,
@@ -1446,6 +1450,16 @@ impl ScrollArea {
             style: StyleRefinement::default(),
             children: SmallVec::new(),
         }
+    }
+
+    /// Stretches the inner vertical wrapper to at least 100% of the scroll viewport height
+    /// (`min_h_full`) so flexible children (`flex_grow_1()` / `flex_1()`) expand to fill
+    /// available space without scrolling when height is sufficient, while still growing
+    /// naturally and enabling vertical scrolling when children's minimum heights exceed
+    /// the viewport.
+    pub fn fill_viewport(mut self, fill: bool) -> Self {
+        self.fill_viewport = fill;
+        self
     }
 
     /// Caps the scrollable viewport height; content grows naturally up to `height` then scrolls.
@@ -1520,6 +1534,7 @@ impl RenderOnce for ScrollArea {
                 .flex_col()
                 .w_full()
                 .min_w_0()
+                .when(self.fill_viewport, |el| el.min_h_full())
                 .when_some(self.gap, |el, g| el.gap(g))
                 .when_some(self.padding, |el, p| el.p(p))
                 .children(self.children),
@@ -1536,6 +1551,7 @@ impl RenderOnce for ScrollArea {
                 .flex_col()
                 .flex_shrink_0()
                 .min_w_full()
+                .when(self.fill_viewport, |el| el.min_h_full())
                 .when_some(self.gap, |el, g| el.gap(g))
                 .when_some(self.padding, |el, p| el.p(p))
                 .children(self.children),

@@ -4086,3 +4086,322 @@ fn shortcut_recorder_confirm_button_string_list_and_standalone_palette(cx: &mut 
         &[SharedString::from("vscode:new-window")]
     );
 }
+
+#[gpui::test]
+fn scroll_area_fill_viewport_and_flex_height_charts_adapt_without_unnecessary_scrolling(
+    cx: &mut TestAppContext,
+) {
+    use crate::{Bounds, Pixels, ScrollHandle, canvas, div};
+
+    struct ViewportLayoutView {
+        viewport_h: f32,
+        use_line: bool,
+        show_extra_banner: bool,
+        outer_scroll: ScrollHandle,
+        inner_scroll: ScrollHandle,
+        chart_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+        breakdown_card_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+        chart_card_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    }
+
+    impl Render for ViewportLayoutView {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let chart_bounds = self.chart_bounds.clone();
+            let chart_card_bounds = self.chart_card_bounds.clone();
+            let breakdown_card_bounds = self.breakdown_card_bounds.clone();
+
+            let chart_el = if self.use_line {
+                line_chart("test-fill-line")
+                    .series([LineSeries::new("Today", vec![(0.0, 10.0), (12.0, 25.0), (24.0, 40.0)])])
+                    .x_domain(0.0, 24.0)
+                    .fill_height(true)
+                    .min_h(px(170.))
+                    .into_any_element()
+            } else {
+                stacked_bar_chart("test-fill-bar")
+                    .series([StackedBarSeries::new("Model A")])
+                    .points([
+                        StackedBarPoint::new("D1", vec![12.0]),
+                        StackedBarPoint::new("D2", vec![24.0]),
+                    ])
+                    .fill_height(true)
+                    .min_h(px(170.))
+                    .into_any_element()
+            };
+
+            let measured_chart = div()
+                .relative()
+                .w_full()
+                .flex_1()
+                .min_h(px(170.))
+                .flex()
+                .flex_col()
+                .child(chart_el)
+                .child(
+                    canvas(
+                        move |bounds, _, _| {
+                            chart_bounds.set(Some(bounds));
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .inset_0(),
+                );
+
+            let left_card = chart_card("test-chart-card", "Usage over time")
+                .subtitle("30 days")
+                .legend([ChartLegendItem::dot("Model A", cx.theme().primary)])
+                .content(measured_chart)
+                .p(px(16.))
+                .gap(px(10.))
+                .flex_grow_1()
+                .flex_shrink_0();
+
+            let left_col = div()
+                .relative()
+                .flex_grow(2.)
+                .flex_basis(px(0.))
+                .min_w(px(400.))
+                .flex()
+                .flex_col()
+                .child(left_card)
+                .child(
+                    canvas(
+                        move |bounds, _, _| {
+                            chart_card_bounds.set(Some(bounds));
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .inset_0(),
+                );
+
+            let mut list = v_stack().w_full().spacing(px(4.));
+            for i in 0..25 {
+                list = list.child(div().w_full().h(px(32.)).child(format!("Item {i}")));
+            }
+
+            let right_card = div()
+                .relative()
+                .w_full()
+                .flex_grow_1()
+                .flex_shrink_1()
+                .flex_basis(px(0.))
+                .min_h_0()
+                .p(px(16.))
+                .flex()
+                .flex_col()
+                .gap(px(10.))
+                .child(div().flex_shrink_0().h(px(20.)).child("Breakdown"))
+                .child(
+                    scroll_area("test-inner-breakdown")
+                        .flex_grow_1()
+                        .flex_shrink_1()
+                        .flex_basis(px(0.))
+                        .min_h_0()
+                        .track_scroll(&self.inner_scroll)
+                        .child(list),
+                )
+                .child(
+                    canvas(
+                        move |bounds, _, _| {
+                            breakdown_card_bounds.set(Some(bounds));
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .inset_0(),
+                );
+
+            let right_col = div()
+                .flex_grow(1.)
+                .flex_basis(px(0.))
+                .min_w(px(260.))
+                .min_h(px(240.))
+                .flex()
+                .flex_col()
+                .child(right_card);
+
+            let charts_row = div()
+                .w_full()
+                .flex_grow_1()
+                .flex_shrink_0()
+                .flex()
+                .flex_wrap()
+                .items_stretch()
+                .gap(px(12.))
+                .child(left_col)
+                .child(right_col);
+
+            let stats = stat_group("test-compact-stats").compact(true).items([
+                StatItem::new("Total", "$593.44").delta(StatDelta::positive("-12.2%")),
+                StatItem::new("Biggest model", "anthropic/claude-opus-4.5-super-long-name-2026")
+                    .delta(StatDelta::neutral("$201.29 · 34%")),
+            ]);
+
+            let section_body = loading_overlay(false)
+                .id("test-reload-overlay")
+                .w_full()
+                .flex()
+                .flex_col()
+                .flex_grow_1()
+                .flex_shrink_0()
+                .child(
+                    v_stack()
+                        .w_full()
+                        .flex_grow_1()
+                        .flex_shrink_0()
+                        .spacing(px(10.))
+                        .child(stats)
+                        .child(charts_row),
+                );
+
+            let section = context_menu(
+                "test-section-menu",
+                v_stack()
+                    .w_full()
+                    .flex_grow_1()
+                    .flex_shrink_0()
+                    .spacing(px(10.))
+                    .child(div().flex_none().h(px(28.)).child("Header"))
+                    .child(section_body),
+            )
+            .w_full()
+            .flex()
+            .flex_col()
+            .flex_grow_1()
+            .flex_shrink_0();
+
+            div()
+                .w(px(1100.))
+                .h(px(self.viewport_h))
+                .flex()
+                .flex_col()
+                .child(div().flex_none().h(px(46.)).child("Title bar"))
+                .child(
+                    scroll_area("test-outer-page")
+                        .fill_viewport(true)
+                        .flex_1()
+                        .min_h_0()
+                        .padding(px(12.))
+                        .spacing(px(10.))
+                        .track_scroll(&self.outer_scroll)
+                        .when(self.show_extra_banner, |el| {
+                            el.child(div().flex_none().h(px(260.)).child("Tall extra block"))
+                        })
+                        .child(section)
+                        .child(div().flex_none().h(px(160.)).child("Peers card")),
+                )
+                .child(div().flex_none().h(px(34.)).child("Footer"))
+        }
+    }
+
+    cx.update(init_components);
+    let outer_scroll = ScrollHandle::new();
+    let inner_scroll = ScrollHandle::new();
+    let chart_bounds = Rc::new(Cell::new(None));
+    let chart_card_bounds = Rc::new(Cell::new(None));
+    let breakdown_card_bounds = Rc::new(Cell::new(None));
+
+    let (view, cx) = cx.add_window_view({
+        let outer_scroll = outer_scroll.clone();
+        let inner_scroll = inner_scroll.clone();
+        let chart_bounds = chart_bounds.clone();
+        let chart_card_bounds = chart_card_bounds.clone();
+        let breakdown_card_bounds = breakdown_card_bounds.clone();
+        move |_, _| ViewportLayoutView {
+            viewport_h: 960.0,
+            use_line: false,
+            show_extra_banner: false,
+            outer_scroll,
+            inner_scroll,
+            chart_bounds,
+            chart_card_bounds,
+            breakdown_card_bounds,
+        }
+    });
+    cx.run_until_parked();
+
+    // 1. Spacious viewport (960px): outer ScrollArea fits with ZERO vertical scroll overflow,
+    //    chart expands well past its 170px min_h, breakdown card matches chart card height,
+    //    and the 25-row breakdown list scrolls internally rather than inflating the page.
+    assert_eq!(
+        outer_scroll.max_offset().y,
+        px(0.),
+        "spacious viewport should have zero vertical scroll, got {:?}",
+        outer_scroll.max_offset()
+    );
+    let tall_chart_h = chart_bounds.get().expect("chart bounds").size.height;
+    assert!(
+        tall_chart_h > px(360.),
+        "StackedBarChart::fill_height should expand in spacious viewport, got {:?}",
+        tall_chart_h
+    );
+    let left_h = chart_card_bounds.get().expect("left card bounds").size.height;
+    let right_h = breakdown_card_bounds.get().expect("right card bounds").size.height;
+    assert!(
+        (left_h.0 - right_h.0).abs() <= 1.0,
+        "chart card ({left_h:?}) and breakdown card ({right_h:?}) should stretch to equal height"
+    );
+    assert!(
+        inner_scroll.max_offset().y > px(200.),
+        "25-row breakdown list should scroll internally, got {:?}",
+        inner_scroll.max_offset()
+    );
+
+    // 2. Switch to LineChart::fill_height(true): stretches identically with zero outer scroll.
+    view.update(cx, |v, cx| {
+        v.use_line = true;
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert_eq!(outer_scroll.max_offset().y, px(0.));
+    let line_h = chart_bounds.get().expect("line bounds").size.height;
+    assert!(
+        (line_h.0 - tall_chart_h.0).abs() <= 2.0,
+        "LineChart::fill_height ({line_h:?}) should match StackedBarChart ({tall_chart_h:?})"
+    );
+
+    // 3. Constrained viewport (540px): chart clamps at its 170px min_h and outer ScrollArea scrolls.
+    view.update(cx, |v, cx| {
+        v.viewport_h = 540.0;
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert!(
+        outer_scroll.max_offset().y > px(50.),
+        "constrained viewport should activate vertical scrolling, got {:?}",
+        outer_scroll.max_offset()
+    );
+    let compact_chart_h = chart_bounds.get().expect("compact chart bounds").size.height;
+    assert!(
+        compact_chart_h >= px(169.),
+        "chart must not squash below min_h(170px), got {:?}",
+        compact_chart_h
+    );
+
+    // 4. Spacious viewport with extra tall block (e.g. expanded table/banner): scrolls cleanly,
+    //    then returns to 0 scroll when collapsed again.
+    view.update(cx, |v, cx| {
+        v.viewport_h = 800.0;
+        v.show_extra_banner = true;
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert!(
+        outer_scroll.max_offset().y > px(20.),
+        "extra tall block should trigger outer scrolling, got {:?}",
+        outer_scroll.max_offset()
+    );
+    view.update(cx, |v, cx| {
+        v.show_extra_banner = false;
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        outer_scroll.max_offset().y,
+        px(0.),
+        "collapsing extra block should return to zero scroll, got {:?}",
+        outer_scroll.max_offset()
+    );
+}

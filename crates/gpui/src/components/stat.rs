@@ -145,6 +145,7 @@ impl StatItem {
 pub struct StatGroup {
     id: ElementId,
     items: Vec<StatItem>,
+    compact: bool,
     style: StyleRefinement,
 }
 
@@ -159,8 +160,15 @@ impl StatGroup {
         Self {
             id: id.into(),
             items: Vec::new(),
+            compact: false,
             style: StyleRefinement::default(),
         }
+    }
+
+    /// Uses tighter padding and slightly smaller figure typography for dense dashboards.
+    pub fn compact(mut self, compact: bool) -> Self {
+        self.compact = compact;
+        self
     }
 
     /// Appends one [`StatItem`] cell.
@@ -200,27 +208,38 @@ impl RenderOnce for StatGroup {
             .when(theme.elevation_shadows, |el| el.shadow_xs())
             .overflow_hidden();
 
+        let (pad_x, pad_y, cell_gap, label_sz, value_sz, value_lh, delta_sz) = if self.compact {
+            (px(16.), px(10.), px(2.), px(12.), px(20.), px(25.), px(11.5))
+        } else {
+            (px(20.), px(16.), px(4.), px(12.5), px(24.), px(30.), px(12.))
+        };
+
         for (index, item) in self.items.into_iter().enumerate() {
             let mut cell = div()
                 .flex_1()
                 .min_w(px(140.))
+                .overflow_hidden()
                 .flex()
                 .flex_col()
-                .gap(px(4.))
-                .px(px(20.))
-                .py(px(16.))
+                .gap(cell_gap)
+                .px(pad_x)
+                .py(pad_y)
                 .when(index > 0, |el| el.border_l_1().border_color(theme.border))
                 .child(
                     div()
-                        .text_size(px(12.5))
+                        .min_w_0()
+                        .truncate()
+                        .text_size(label_sz)
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(theme.muted_foreground)
                         .child(item.label),
                 )
                 .child(
                     div()
-                        .text_size(px(24.))
-                        .line_height(px(30.))
+                        .min_w_0()
+                        .truncate()
+                        .text_size(value_sz)
+                        .line_height(value_lh)
                         .font_weight(FontWeight::SEMIBOLD)
                         .font_features(tnum.clone())
                         .text_color(theme.foreground)
@@ -231,7 +250,9 @@ impl RenderOnce for StatGroup {
                 let color = delta.color(&theme);
                 cell = cell.child(
                     div()
-                        .text_size(px(12.))
+                        .min_w_0()
+                        .truncate()
+                        .text_size(delta_sz)
                         .font_weight(FontWeight::MEDIUM)
                         .font_features(tnum.clone())
                         .text_color(color)
