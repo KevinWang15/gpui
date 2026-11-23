@@ -285,6 +285,7 @@ pub fn freeform_canvas_demo(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>
     let can_redo = app.freeform_history.can_redo();
     let can_paste = !app.freeform_clipboard.is_empty();
 
+    let app_entity_ctx = cx.entity().clone();
     let mut fc = freeform_canvas("pg-freeform-canvas", &app.freeform_canvas)
         .w_full()
         .min_h(px(270.))
@@ -294,6 +295,20 @@ pub fn freeform_canvas_demo(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>
         .can_undo(can_undo)
         .can_redo(can_redo)
         .can_paste(can_paste)
+        .context_menu_builder(move |target, _selected, mut entries, _window, _cx| {
+            if target.item_id.is_none() {
+                let app_reset = app_entity_ctx.clone();
+                entries.push(MenuEntry::Separator);
+                entries.push(MenuEntry::item_with_icon(
+                    "Reset Layout",
+                    LucideIcon::RotateCcw,
+                    move |_, _, cx| {
+                        app_reset.update(cx, |this, cx| this.reset_freeform_demo(cx));
+                    },
+                ));
+            }
+            entries
+        })
         .empty(
             div()
                 .text_size(px(12.))
@@ -302,12 +317,20 @@ pub fn freeform_canvas_demo(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>
         );
 
     for item in &app.freeform_items {
+        let label = match item.kind.as_ref() {
+            "metric" => "KPI Metric",
+            "badge" => "Trend Pill",
+            "chart" => "Mini Chart",
+            "status" => "Live Status",
+            _ => "Caption",
+        };
         fc = fc.item(
             CanvasItemSpec::new(
                 item.id.clone(),
                 item.rect,
                 freeform_widget_view(item.kind.as_ref(), &theme),
             )
+            .label(label)
             .min_size(64.0, 22.0),
         );
     }

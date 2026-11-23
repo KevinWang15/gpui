@@ -116,9 +116,10 @@ impl FloatingWindowEdge {
 }
 
 /// Initial viewport placement used before a [`FloatingWindow`] is dragged or resized by the user.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum FloatingWindowAnchor {
     /// Centered in the host viewport.
+    #[default]
     Center,
     /// Anchored to the top-left corner of the viewport.
     TopLeft {
@@ -148,12 +149,6 @@ pub enum FloatingWindowAnchor {
         /// Vertical inset from the bottom edge.
         bottom: Pixels,
     },
-}
-
-impl Default for FloatingWindowAnchor {
-    fn default() -> Self {
-        Self::Center
-    }
 }
 
 /// Events emitted by [`FloatingWindowState`].

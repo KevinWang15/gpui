@@ -1,0 +1,233 @@
+//! Low-level GPUI quad & badge painting helpers for [`super::FreeformCanvas`].
+
+use crate::{
+    AnyElement, Bounds, FontWeight, Hsla, IntoElement, ParentElement, Pixels, Point, Styled,
+    Window, div, fill, point, px, size,
+};
+
+use super::geometry::{CanvasRect, GuideAxis, GuideKind, SnapGuide};
+use crate::components::theme::tabular_numerals;
+
+const MAX_DOT_GRID_QUADS: f32 = 12_000.0;
+
+pub(super) fn resolve_dot_grid_step(grid_step: f32, width: f32, height: f32) -> f32 {
+    let mut step = grid_step.max(4.0);
+    if width <= 4.0 || height <= 4.0 {
+        return step;
+    }
+    while (width / step) * (height / step) > MAX_DOT_GRID_QUADS {
+        step *= 2.0;
+    }
+    step
+}
+
+pub(super) fn paint_dot_grid(
+    bounds: Bounds<Pixels>,
+    grid_step: f32,
+    color: Hsla,
+    window: &mut Window,
+) {
+    if grid_step < 4.0 {
+        return;
+    }
+    let w = bounds.size.width.0;
+    let h = bounds.size.height.0;
+    let step = resolve_dot_grid_step(grid_step, w, h);
+    let ox = bounds.origin.x.0;
+    let oy = bounds.origin.y.0;
+
+    // Draw uniform dots at the exact resolved `step` so a finer step (e.g. 4px) is
+    // unambiguously denser than a coarser step (e.g. 8px).
+    let dot_size = if step < 8.0 { 1.1 } else { 1.4 };
+    let half = dot_size * 0.5;
+    let mut dot_col = color;
+    dot_col.a = (color.a * if step < 8.0 { 0.85 } else { 1.05 }).clamp(0.0, 0.45);
+
+    let mut ix: usize = 1;
+    loop {
+        let x = ix as f32 * step;
+        if x >= w - 2.0 {
+            break;
+        }
+        let mut iy: usize = 1;
+        loop {
+            let y = iy as f32 * step;
+            if y >= h - 2.0 {
+                break;
+            }
+            window.paint_quad(fill(
+                Bounds::new(
+                    point(px(ox + x - half), px(oy + y - half)),
+                    size(px(dot_size), px(dot_size)),
+                ),
+                dot_col,
+            ));
+            iy += 1;
+        }
+        ix += 1;
+    }
+}
+
+pub(super) fn paint_dashed_rect(
+    bounds: Bounds<Pixels>,
+    rect: CanvasRect,
+    color: Hsla,
+    window: &mut Window,
+) {
+    let x0 = bounds.origin.x.0 + rect.x - 1.0;
+    let y0 = bounds.origin.y.0 + rect.y - 1.0;
+    let w = (rect.width + 2.0).max(2.0);
+    let h = (rect.height + 2.0).max(2.0);
+    let dash = 4.0_f32;
+    let step = 7.0_f32;
+
+    let mut x = 0.0_f32;
+    while x < w {
+        let len = (w - x).min(dash);
+        window.paint_quad(fill(
+            Bounds::new(point(px(x0 + x), px(y0)), size(px(len), px(1.0))),
+            color,
+        ));
+        window.paint_quad(fill(
+            Bounds::new(
+                point(px(x0 + x), px(y0 + h - 1.0)),
+                size(px(len), px(1.0)),
+            ),
+            color,
+        ));
+        x += step;
+    }
+
+    let mut y = 0.0_f32;
+    while y < h {
+        let len = (h - y).min(dash);
+        window.paint_quad(fill(
+            Bounds::new(point(px(x0), px(y0 + y)), size(px(1.0), px(len))),
+            color,
+        ));
+        window.paint_quad(fill(
+            Bounds::new(
+                point(px(x0 + w - 1.0), px(y0 + y)),
+                size(px(1.0), px(len)),
+            ),
+            color,
+        ));
+        y += step;
+    }
+}
+
+pub(super) fn paint_marquee_rect(
+    clip_bounds: Bounds<Pixels>,
+    start: Point<Pixels>,
+    current: Point<Pixels>,
+    fill_color: Hsla,
+    stroke_color: Hsla,
+    window: &mut Window,
+) {
+    let min_x = clip_bounds.origin.x.0;
+    let min_y = clip_bounds.origin.y.0;
+    let max_x = min_x + clip_bounds.size.width.0;
+    let max_y = min_y + clip_bounds.size.height.0;
+
+    let x0 = start.x.0.min(current.x.0).clamp(min_x, max_x);
+    let y0 = start.y.0.min(current.y.0).clamp(min_y, max_y);
+    let x1 = start.x.0.max(current.x.0).clamp(min_x, max_x);
+    let y1 = start.y.0.max(current.y.0).clamp(min_y, max_y);
+    let w = (x1 - x0).max(1.0);
+    let h = (y1 - y0).max(1.0);
+
+    window.paint_quad(fill(
+        Bounds::new(point(px(x0), px(y0)), size(px(w), px(h))),
+        fill_color,
+    ));
+    window.paint_quad(fill(
+        Bounds::new(point(px(x0), px(y0)), size(px(w), px(1.0))),
+        stroke_color,
+    ));
+    window.paint_quad(fill(
+        Bounds::new(point(px(x0), px(y0 + h - 1.0)), size(px(w), px(1.0))),
+        stroke_color,
+    ));
+    window.paint_quad(fill(
+        Bounds::new(point(px(x0), px(y0)), size(px(1.0), px(h))),
+        stroke_color,
+    ));
+    window.paint_quad(fill(
+        Bounds::new(point(px(x0 + w - 1.0), px(y0)), size(px(1.0), px(h))),
+        stroke_color,
+    ));
+}
+
+pub(super) fn paint_snap_guides(
+    bounds: Bounds<Pixels>,
+    guides: &[SnapGuide],
+    edge_color: Hsla,
+    center_color: Hsla,
+    gap_color: Hsla,
+    window: &mut Window,
+) {
+    for g in guides {
+        let color = match g.kind {
+            GuideKind::SiblingEdge | GuideKind::SiblingCenter => edge_color,
+            GuideKind::CanvasCenter | GuideKind::CanvasMargin => center_color,
+            GuideKind::SiblingGap => gap_color,
+        };
+        let quad_bounds = match g.axis {
+            GuideAxis::Vertical => Bounds::new(
+                point(
+                    px(bounds.origin.x.0 + g.position - 0.5),
+                    px(bounds.origin.y.0 + g.span_start),
+                ),
+                size(px(1.0), px((g.span_end - g.span_start).max(1.0))),
+            ),
+            GuideAxis::Horizontal => Bounds::new(
+                point(
+                    px(bounds.origin.x.0 + g.span_start),
+                    px(bounds.origin.y.0 + g.position - 0.5),
+                ),
+                size(px((g.span_end - g.span_start).max(1.0)), px(1.0)),
+            ),
+        };
+        window.paint_quad(fill(quad_bounds, color.opacity(0.9)));
+    }
+}
+
+pub(super) fn build_guide_badges(
+    guides: &[SnapGuide],
+    cw: f32,
+    ch: f32,
+    gap_color: Hsla,
+) -> Vec<AnyElement> {
+    guides
+        .iter()
+        .filter_map(|g| {
+            let label = g.label.clone()?;
+            let (bx, by) = match g.axis {
+                GuideAxis::Vertical => (
+                    (g.position - 14.0).clamp(2.0, (cw - 32.0).max(2.0)),
+                    ((g.span_start + g.span_end) * 0.5 - 8.0).clamp(2.0, (ch - 18.0).max(2.0)),
+                ),
+                GuideAxis::Horizontal => (
+                    ((g.span_start + g.span_end) * 0.5 - 14.0).clamp(2.0, (cw - 32.0).max(2.0)),
+                    (g.position - 8.0).clamp(2.0, (ch - 18.0).max(2.0)),
+                ),
+            };
+            Some(
+                div()
+                    .absolute()
+                    .left(px(bx))
+                    .top(px(by))
+                    .px(px(4.))
+                    .py(px(1.))
+                    .rounded(px(3.))
+                    .bg(gap_color)
+                    .text_color(crate::white())
+                    .text_size(px(9.5))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .font_features(tabular_numerals())
+                    .child(label)
+                    .into_any_element(),
+            )
+        })
+        .collect()
+}

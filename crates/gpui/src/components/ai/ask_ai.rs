@@ -4013,7 +4013,7 @@ impl RenderOnce for AskAiOverlay {
 
         div()
             .child(
-                floating_window((id.clone(), "window"), &floating_win)
+                floating_window((id, "window"), &floating_win)
                     .show_header(false)
                     .modal(is_modal)
                     .priority(priority)
