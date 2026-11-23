@@ -386,29 +386,58 @@ fn read_files() -> Option<ClipboardEntry> {
 
 /// DIB is BMP without the 14-byte BITMAPFILEHEADER. Prepend one.
 fn convert_dib_to_bmp(dib: &[u8]) -> Option<Vec<u8>> {
-    if dib.len() < 40 {
+    const BITMAPFILEHEADER_SIZE: u32 = 14;
+    const BITMAPINFOHEADER_SIZE: u32 = 40;
+    const BI_RGB: u32 = 0;
+    const BI_BITFIELDS: u32 = 3;
+    const BI_ALPHABITFIELDS: u32 = 6;
+
+    if dib.len() < BITMAPINFOHEADER_SIZE as usize {
         return None;
     }
 
     let header_size = u32::from_le_bytes(dib[0..4].try_into().ok()?);
+    if header_size < BITMAPINFOHEADER_SIZE || (header_size as usize) > dib.len() {
+        return None;
+    }
     let bit_count = u16::from_le_bytes(dib[14..16].try_into().ok()?);
     let compression = u32::from_le_bytes(dib[16..20].try_into().ok()?);
+    let colors_used = u32::from_le_bytes(dib[32..36].try_into().ok()?);
 
-    let color_table_size = if bit_count <= 8 {
-        let colors_used = u32::from_le_bytes(dib[32..36].try_into().ok()?);
-        (if colors_used == 0 {
+    // For a 40-byte BITMAPINFOHEADER, BI_BITFIELDS / BI_ALPHABITFIELDS color masks follow
+    // immediately after the header. Extended headers (BITMAPV2/V3/V4/V5, size > 40) already
+    // embed those channel masks within `header_size`.
+    let bitfield_masks_size = if header_size == BITMAPINFOHEADER_SIZE && bit_count > 8 {
+        match compression {
+            BI_BITFIELDS => 12u32,
+            BI_ALPHABITFIELDS => 16u32,
+            _ => 0u32,
+        }
+    } else {
+        0u32
+    };
+
+    let palette_entries = if bit_count > 0 && bit_count <= 8 {
+        if colors_used == 0 {
             1u32 << bit_count
         } else {
             colors_used
-        }) * 4
-    } else if compression == 3 {
-        12 // BI_BITFIELDS
+        }
     } else {
-        0
+        colors_used
     };
+    let color_table_size = palette_entries.checked_mul(4)?;
 
-    let pixel_offset = 14 + header_size + color_table_size;
-    let file_size = 14 + dib.len() as u32;
+    let pixel_offset = BITMAPFILEHEADER_SIZE
+        .checked_add(header_size)?
+        .checked_add(bitfield_masks_size)?
+        .checked_add(color_table_size)?;
+    let file_size = u32::try_from(dib.len())
+        .ok()?
+        .checked_add(BITMAPFILEHEADER_SIZE)?;
+    if pixel_offset > file_size {
+        return None;
+    }
 
     let mut bmp = Vec::with_capacity(file_size as usize);
     bmp.extend_from_slice(b"BM");
@@ -420,7 +449,7 @@ fn convert_dib_to_bmp(dib: &[u8]) -> Option<Vec<u8>> {
     // Many Windows apps write 32-bit BI_RGB DIBs with every alpha byte set to 0 (meaning opaque
     // BGRX). If all alpha bytes are 0, normalize them to 255 so image decoding doesn't produce a
     // fully transparent image.
-    if bit_count == 32 && compression == 0 {
+    if bit_count == 32 && compression == BI_RGB {
         let off = pixel_offset as usize;
         if off < bmp.len() {
             let pixels = &mut bmp[off..];
@@ -533,4 +562,92 @@ impl Drop for LockedGlobal {
 pub(crate) fn read_raw_clipboard_text() -> Option<String> {
     let _clip = ClipboardGuard::open()?;
     get_clipboard_string(CF_UNICODETEXT.0 as u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::convert_dib_to_bmp;
+
+    fn write_base_header(buf: &mut [u8], header_size: u32, bit_count: u16, compression: u32, image_size: u32) {
+        buf[0..4].copy_from_slice(&header_size.to_le_bytes());
+        buf[4..8].copy_from_slice(&1i32.to_le_bytes()); // width
+        buf[8..12].copy_from_slice(&1i32.to_le_bytes()); // height
+        buf[12..14].copy_from_slice(&1u16.to_le_bytes()); // planes
+        buf[14..16].copy_from_slice(&bit_count.to_le_bytes());
+        buf[16..20].copy_from_slice(&compression.to_le_bytes());
+        buf[20..24].copy_from_slice(&image_size.to_le_bytes());
+    }
+
+    #[test]
+    fn convert_dib_v1_bitfields_includes_12_byte_masks() {
+        let mut dib = vec![0u8; 40 + 12 + 4];
+        write_base_header(&mut dib, 40, 32, 3, 4);
+        dib[40..44].copy_from_slice(&0x00ff_0000u32.to_le_bytes()); // R
+        dib[44..48].copy_from_slice(&0x0000_ff00u32.to_le_bytes()); // G
+        dib[48..52].copy_from_slice(&0x0000_00ffu32.to_le_bytes()); // B
+        dib[52..56].copy_from_slice(&[56, 34, 12, 0]); // BGRX -> RGB(12, 34, 56)
+
+        let bmp = convert_dib_to_bmp(&dib).expect("valid v1 bitfields DIB");
+        assert_eq!(u32::from_le_bytes(bmp[10..14].try_into().unwrap()), 14 + 40 + 12);
+        let decoded = image::load_from_memory_with_format(&bmp, image::ImageFormat::Bmp)
+            .expect("decodes v1 bitfields BMP")
+            .to_rgba8();
+        assert_eq!(decoded.get_pixel(0, 0), &image::Rgba([12, 34, 56, 255]));
+    }
+
+    #[test]
+    fn convert_dib_v4_and_v5_bitfields_do_not_double_count_masks() {
+        for header_size in [108u32, 124u32] {
+            let mut dib = vec![0u8; header_size as usize + 4];
+            write_base_header(&mut dib, header_size, 32, 3, 4);
+            // Channel masks live inside the V4/V5 header at offsets 40..56.
+            dib[40..44].copy_from_slice(&0x00ff_0000u32.to_le_bytes()); // R
+            dib[44..48].copy_from_slice(&0x0000_ff00u32.to_le_bytes()); // G
+            dib[48..52].copy_from_slice(&0x0000_00ffu32.to_le_bytes()); // B
+            dib[52..56].copy_from_slice(&0xff00_0000u32.to_le_bytes()); // A
+            dib[header_size as usize..header_size as usize + 4]
+                .copy_from_slice(&[56, 34, 12, 255]); // BGRA -> RGBA(12, 34, 56, 255)
+
+            let bmp = convert_dib_to_bmp(&dib).expect("valid extended bitfields DIB");
+            assert_eq!(
+                u32::from_le_bytes(bmp[10..14].try_into().unwrap()),
+                14 + header_size
+            );
+            let decoded = image::load_from_memory_with_format(&bmp, image::ImageFormat::Bmp)
+                .expect("decodes extended bitfields BMP")
+                .to_rgba8();
+            assert_eq!(decoded.get_pixel(0, 0), &image::Rgba([12, 34, 56, 255]));
+        }
+    }
+
+    #[test]
+    fn convert_dib_32bit_bi_rgb_normalizes_all_zero_alpha() {
+        let mut dib = vec![0u8; 40 + 4];
+        write_base_header(&mut dib, 40, 32, 0, 4);
+        dib[40..44].copy_from_slice(&[56, 34, 12, 0]);
+
+        let bmp = convert_dib_to_bmp(&dib).expect("valid 32-bit BI_RGB DIB");
+        let decoded = image::load_from_memory_with_format(&bmp, image::ImageFormat::Bmp)
+            .expect("decodes 32-bit BI_RGB BMP")
+            .to_rgba8();
+        assert_eq!(decoded.get_pixel(0, 0), &image::Rgba([12, 34, 56, 255]));
+    }
+
+    #[test]
+    fn convert_dib_rejects_malformed_or_overflowing_headers() {
+        assert!(convert_dib_to_bmp(&[0u8; 20]).is_none());
+
+        let mut bad_header_size = vec![0u8; 44];
+        write_base_header(&mut bad_header_size, 12, 32, 0, 4);
+        assert!(convert_dib_to_bmp(&bad_header_size).is_none());
+
+        let mut header_past_end = vec![0u8; 44];
+        write_base_header(&mut header_past_end, 124, 32, 3, 4);
+        assert!(convert_dib_to_bmp(&header_past_end).is_none());
+
+        let mut palette_overflow = vec![0u8; 44];
+        write_base_header(&mut palette_overflow, 40, 8, 0, 4);
+        palette_overflow[32..36].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(convert_dib_to_bmp(&palette_overflow).is_none());
+    }
 }
