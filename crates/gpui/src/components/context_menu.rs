@@ -133,7 +133,9 @@ fn render_positioned_menu_panel(
             .snap_to_window_with_margin(px(8.))
             .child(menu_el),
     )
-    .priority(40)
+    // Transient context menus must float above drawers (48), dialogs (50), command palettes (55),
+    // floating windows (75), and floating AI overlays (80–82).
+    .priority(120)
     .into_any_element()
 }
 

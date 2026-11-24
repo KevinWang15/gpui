@@ -48,7 +48,7 @@ use crate::components::selectable_text::selectable_text_actions::{
     ClearSelection, Copy, SelectAll,
 };
 use crate::components::table::{Table, TableColumn, TableRow};
-use crate::components::theme::ActiveTheme;
+use crate::components::theme::{ActiveTheme, ThemeMode};
 
 /// Optional URL resolver for Markdown links (return `None` to render the link as plain text).
 pub type LinkResolver = Rc<dyn Fn(&str) -> Option<String> + 'static>;
@@ -2382,9 +2382,20 @@ impl RenderOnce for Markdown {
                 (0..0, false, None, None)
             };
 
+        let (code_pill_bg, code_pill_border) = match theme.mode {
+            ThemeMode::Light => (
+                theme.foreground.opacity(0.065),
+                theme.foreground.opacity(0.11),
+            ),
+            ThemeMode::Dark => (
+                theme.foreground.opacity(0.09),
+                theme.foreground.opacity(0.14),
+            ),
+        };
+
         let render_ctx = TextRenderCtx {
-            code_pill_bg: theme.surface_muted,
-            code_pill_border: theme.border.opacity(0.65),
+            code_pill_bg,
+            code_pill_border,
             selection: selected_range,
             selection_color: theme.selection,
             selectable: self.selectable,
