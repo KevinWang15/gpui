@@ -670,8 +670,228 @@ pub(crate) fn parse_blocks(src: &str) -> Vec<MdBlock> {
     parse_blocks_with_options(src, true)
 }
 
+/// Escapes unambiguous standalone currency `$` figures (e.g. `$12.50`, `**$26.96**`, `$10-$20`,
+/// `$1,234.56`) outside code fences, inline code spans, and `$$...$$` display math blocks so
+/// `pulldown-cmark`'s `ENABLE_MATH` never pairs two currency signs across prose or emphasis
+/// markers (like `**$12.50** to **$26.96**`) while keeping real TeX math (`$O(L)$`, `$E = mc^2$`,
+/// `$2x + 1$`, `$10^6$`, `$3 \times 4$`, `$42$`, `$$...$$`) completely intact.
+fn escape_currency_dollars_for_math(src: &str) -> std::borrow::Cow<'_, str> {
+    if !src.contains('$') {
+        return std::borrow::Cow::Borrowed(src);
+    }
+
+    let bytes = src.as_bytes();
+    let len = bytes.len();
+    let mut out: Option<String> = None;
+    let mut last_copied = 0usize;
+    let mut i = 0usize;
+    let mut at_line_start = true;
+    let mut active_fence: Option<(u8, usize)> = None;
+
+    while i < len {
+        // Track fenced code blocks (``` or ~~~) at line starts so we never touch code.
+        if at_line_start {
+            let mut j = i;
+            let mut indent = 0usize;
+            while j < len && bytes[j] == b' ' && indent < 3 {
+                j += 1;
+                indent += 1;
+            }
+            if j < len && (bytes[j] == b'`' || bytes[j] == b'~') {
+                let ch = bytes[j];
+                let mut run = 0usize;
+                while j + run < len && bytes[j + run] == ch {
+                    run += 1;
+                }
+                if run >= 3 {
+                    match active_fence {
+                        None => {
+                            // Backtick fence info string may not contain backticks per CommonMark.
+                            let line_end = bytes[j + run..]
+                                .iter()
+                                .position(|&b| b == b'\n')
+                                .map(|rel| j + run + rel)
+                                .unwrap_or(len);
+                            let info = &bytes[j + run..line_end];
+                            if ch == b'~' || !info.contains(&b'`') {
+                                active_fence = Some((ch, run));
+                            }
+                            i = (line_end + 1).min(len);
+                            at_line_start = true;
+                            continue;
+                        }
+                        Some((fch, flen)) if ch == fch && run >= flen => {
+                            let line_end = bytes[j + run..]
+                                .iter()
+                                .position(|&b| b == b'\n')
+                                .map(|rel| j + run + rel)
+                                .unwrap_or(len);
+                            let tail = &bytes[j + run..line_end];
+                            if tail.iter().all(|b| b.is_ascii_whitespace()) {
+                                active_fence = None;
+                                i = (line_end + 1).min(len);
+                                at_line_start = true;
+                                continue;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        if active_fence.is_some() {
+            let nl = bytes[i..]
+                .iter()
+                .position(|&b| b == b'\n')
+                .map(|rel| i + rel + 1)
+                .unwrap_or(len);
+            i = nl;
+            at_line_start = true;
+            continue;
+        }
+
+        let b = bytes[i];
+        if b == b'\n' {
+            i += 1;
+            at_line_start = true;
+            continue;
+        }
+        at_line_start = false;
+
+        // Skip backslash escapes (including `\$`, `` \` ``).
+        if b == b'\\' && i + 1 < len {
+            i += 2;
+            continue;
+        }
+
+        // Skip inline code spans atomically.
+        if b == b'`' {
+            let mut ticks = 0usize;
+            while i + ticks < len && bytes[i + ticks] == b'`' {
+                ticks += 1;
+            }
+            let mut k = i + ticks;
+            let mut found = None;
+            while k < len {
+                if bytes[k] == b'`' {
+                    let mut close_run = 0usize;
+                    while k + close_run < len && bytes[k + close_run] == b'`' {
+                        close_run += 1;
+                    }
+                    if close_run == ticks {
+                        found = Some(k + close_run);
+                        break;
+                    }
+                    k += close_run;
+                } else {
+                    k += 1;
+                }
+            }
+            i = found.unwrap_or(i + ticks);
+            continue;
+        }
+
+        // Skip `$$...$$` display math spans atomically.
+        if b == b'$' && i + 1 < len && bytes[i + 1] == b'$' {
+            let mut k = i + 2;
+            while k + 1 < len {
+                if bytes[k] == b'\\' {
+                    k += 2;
+                    continue;
+                }
+                if bytes[k] == b'$' && bytes[k + 1] == b'$' {
+                    k += 2;
+                    break;
+                }
+                k += 1;
+            }
+            i = k.min(len);
+            continue;
+        }
+
+        // Single `$` followed by an ASCII digit: check if this is a standalone currency figure.
+        if b == b'$' && i + 1 < len && bytes[i + 1].is_ascii_digit() {
+            let mut num_end = i + 1;
+            while num_end < len
+                && (bytes[num_end].is_ascii_digit()
+                    || matches!(bytes[num_end], b'.' | b','))
+            {
+                num_end += 1;
+            }
+            // Optional magnitude suffix (`$50k`, `$1.2M`, `$3B`, `$4T`) when bounded.
+            let mut tail = num_end;
+            if tail < len
+                && matches!(bytes[tail], b'k' | b'K' | b'm' | b'M' | b'b' | b'B' | b't' | b'T')
+                && (tail + 1 >= len || !bytes[tail + 1].is_ascii_alphanumeric())
+            {
+                tail += 1;
+            }
+
+            let is_currency = if tail >= len {
+                true
+            } else {
+                let next = bytes[tail];
+                if next == b'$' {
+                    // Explicit numeric math like `$42$`
+                    false
+                } else if matches!(next, b'^' | b'_' | b'\\' | b'=' | b'<' | b'>' | b'+' | b'/') {
+                    // Immediate math operator like `$10^6$`, `$2+2$`
+                    false
+                } else if next == b'-' {
+                    // `$10-$20` is a currency range; `$10-x$` is math
+                    tail + 1 >= len || bytes[tail + 1] == b'$' || bytes[tail + 1].is_ascii_whitespace()
+                } else if next.is_ascii_alphabetic() {
+                    // `$2x$` or `$3n$` is algebra, not currency
+                    false
+                } else if next == b' ' {
+                    // Check for `$3 \times 4$` or `$2 + 2$` vs `$12.50 to ...`
+                    let after_ws = bytes[tail..]
+                        .iter()
+                        .position(|&c| c != b' ')
+                        .map(|rel| tail + rel)
+                        .unwrap_or(len);
+                    let looks_like_math_rhs = after_ws < len
+                        && matches!(
+                            bytes[after_ws],
+                            b'\\' | b'+' | b'=' | b'<' | b'>' | b'^' | b'_' | b'*' | b'/'
+                        );
+                    !looks_like_math_rhs
+                } else {
+                    // Followed by punctuation/emphasis (`**`, `,`, `)`, `]`, `;`, `:`, newline, etc.)
+                    true
+                }
+            };
+
+            if is_currency {
+                let buf = out.get_or_insert_with(|| String::with_capacity(len + 8));
+                buf.push_str(&src[last_copied..i]);
+                buf.push_str("\\$");
+                last_copied = i + 1;
+            }
+            i = tail;
+            continue;
+        }
+
+        i += 1;
+    }
+
+    match out {
+        Some(mut buf) => {
+            buf.push_str(&src[last_copied..]);
+            std::borrow::Cow::Owned(buf)
+        }
+        None => std::borrow::Cow::Borrowed(src),
+    }
+}
+
 pub(crate) fn parse_blocks_with_options(src: &str, math_enabled: bool) -> Vec<MdBlock> {
-    let parser = Parser::new_ext(src, cmark_options(math_enabled));
+    let preprocessed = if math_enabled {
+        escape_currency_dollars_for_math(src)
+    } else {
+        std::borrow::Cow::Borrowed(src)
+    };
+    let parser = Parser::new_ext(preprocessed.as_ref(), cmark_options(math_enabled));
     let events: Vec<Event<'_>> = parser.collect();
 
     let mut block_stack: Vec<BlockFrame> = vec![BlockFrame::Document(Vec::new())];
@@ -3419,8 +3639,8 @@ impl RenderEnv<'_> {
         let is_wrapped = self.wrapped_code_blocks.contains(&code_idx);
         let line_count = lines.len();
         let digits = ((line_count.max(1) as f32).log10().floor() as usize) + 1;
-        let gutter_w = px((digits.max(2) as f32 * 8.0 + 6.0).ceil());
-        let line_h = px(19.);
+        let gutter_w = px((digits.max(2) as f32 * 8.0 + 18.0).ceil());
+        let line_h = px(20.);
 
         let state_for_wrap = self.state.clone();
         let header = div()
@@ -3491,7 +3711,6 @@ impl RenderEnv<'_> {
                 .py(px(8.))
                 .flex()
                 .flex_col()
-                .gap(px(1.))
                 .text_size(px(12.25))
                 .line_height(line_h)
                 .text_color(syntax.plain)
@@ -3530,13 +3749,10 @@ impl RenderEnv<'_> {
                 .w(gutter_w)
                 .flex_shrink_0()
                 .py(px(8.))
-                .pl(px(8.))
-                .pr(px(8.))
                 .border_r_1()
                 .border_color(syntax.code_border.opacity(0.6))
                 .flex()
                 .flex_col()
-                .gap(px(1.))
                 .text_size(px(12.25))
                 .line_height(line_h)
                 .text_right()
@@ -3548,7 +3764,6 @@ impl RenderEnv<'_> {
                 .py(px(8.))
                 .flex()
                 .flex_col()
-                .gap(px(1.))
                 .text_size(px(12.25))
                 .line_height(line_h)
                 .text_color(syntax.plain);
@@ -3563,7 +3778,10 @@ impl RenderEnv<'_> {
                 if self.show_line_numbers {
                     gutter_col = gutter_col.child(
                         div()
+                            .w_full()
                             .min_h(line_h)
+                            .pl(px(8.))
+                            .pr(px(8.))
                             .whitespace_nowrap()
                             .when_some(row_bg, |el, fill| el.bg(fill))
                             .child(format!("{}", ln + 1)),
@@ -3930,7 +4148,7 @@ mod tests {
             "> - Nested item 1\n",
             ">   - Deep nested item\n",
             "\n",
-            "Spending went from $12.50 to $26.96 (range $10-$20), while $E = mc^2$ is math.\n\n",
+            "Spend moved from **$12.50** to **$26.96** (range $10-$20), while $E = mc^2$ and $2x + 1 = 5$ and $10^6$ are math.\n\n",
             "$$\n\\sum_{i=1}^n x_i^2\n$$\n\n",
             "| Metric | Alignment | Value |\n",
             "|:-------|:---------:|------:|\n",
@@ -3977,17 +4195,32 @@ mod tests {
             &None,
         );
         assert!(
-            compiled.text.contains("$12.50 to $26.96")
+            compiled.text.contains("Spend moved from $12.50 to $26.96")
+                && !compiled.text.contains("**")
                 && compiled.text.contains("$10-$20")
-                && compiled.text.contains("E = mc^2"),
-            "currency must not be corrupted into math while real math parses cleanly: {:?}",
+                && compiled.text.contains("E = mc^2")
+                && compiled.text.contains("2x + 1 = 5")
+                && compiled.text.contains("10^6"),
+            "bold currency must not leak `**` or get corrupted into math while real math parses cleanly: {:?}",
             compiled.text
         );
         assert!(
             currency_inlines
                 .iter()
-                .any(|n| matches!(n, MdInlineNode::InlineMath(t) if t == "E = mc^2")),
-            "expected InlineMath(E = mc^2): {currency_inlines:?}"
+                .any(|n| matches!(n, MdInlineNode::Bold(c) if matches!(c.first(), Some(MdInlineNode::Text(t)) if t == "$12.50"))),
+            "expected Bold($12.50): {currency_inlines:?}"
+        );
+        assert!(
+            currency_inlines
+                .iter()
+                .any(|n| matches!(n, MdInlineNode::InlineMath(t) if t == "E = mc^2"))
+                && currency_inlines
+                    .iter()
+                    .any(|n| matches!(n, MdInlineNode::InlineMath(t) if t == "2x + 1 = 5"))
+                && currency_inlines
+                    .iter()
+                    .any(|n| matches!(n, MdInlineNode::InlineMath(t) if t == "10^6")),
+            "expected InlineMath spans: {currency_inlines:?}"
         );
 
         // 3. Display math block

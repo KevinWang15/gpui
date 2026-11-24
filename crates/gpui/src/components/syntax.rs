@@ -611,6 +611,7 @@ mod engine {
         meta_attribute: Scope,
         meta_macro: Scope,
         meta_preprocessor: Scope,
+        meta_return_type: Scope,
         // Punctuation (special cases vs generic)
         punct_def_comment: Scope,
         punct_def_string: Scope,
@@ -708,6 +709,7 @@ mod engine {
                 meta_attribute: s("meta.attribute"),
                 meta_macro: s("meta.macro"),
                 meta_preprocessor: s("meta.preprocessor"),
+                meta_return_type: s("meta.function.return-type"),
                 punct_def_comment: s("punctuation.definition.comment"),
                 punct_def_string: s("punctuation.definition.string"),
                 punct_def_tag: s("punctuation.definition.tag"),
@@ -788,12 +790,13 @@ mod engine {
         }
 
         #[inline]
-        fn classify_stack(&self, stack: &[Scope]) -> SyntaxToken {
+        fn classify_stack(&self, stack: &[Scope], token_text: &str) -> SyntaxToken {
             // Check stack-wide context flags in a single quick bitwise pass.
             let mut in_comment = false;
             let mut in_mapping_key = false;
             let mut in_diff_header = false;
             let mut in_annotation = false;
+            let mut in_return_type = false;
             for &sc in stack {
                 if self.comment.is_prefix_of(sc) {
                     in_comment = true;
@@ -808,6 +811,9 @@ mod engine {
                 }
                 if self.meta_annotation.is_prefix_of(sc) || self.meta_attribute.is_prefix_of(sc) {
                     in_annotation = true;
+                }
+                if self.meta_return_type.is_prefix_of(sc) {
+                    in_return_type = true;
                 }
             }
 
@@ -904,6 +910,40 @@ mod engine {
                 {
                     return SyntaxToken::Keyword;
                 }
+                if self.storage_type_rust.is_prefix_of(sc)
+                    || self.storage_type_c.is_prefix_of(sc)
+                    || self.storage_type_go.is_prefix_of(sc)
+                    || self.storage_type_java.is_prefix_of(sc)
+                    || self.storage_type_cs.is_prefix_of(sc)
+                {
+                    // Sublime grammars assign `storage.type.*` to both declaration keywords
+                    // (e.g. Rust `let`) and primitive types (`f64`, `usize`, `bool`).
+                    let kw = token_text.trim();
+                    return if matches!(
+                        kw,
+                        "let"
+                            | "const"
+                            | "var"
+                            | "fn"
+                            | "func"
+                            | "def"
+                            | "class"
+                            | "struct"
+                            | "enum"
+                            | "trait"
+                            | "impl"
+                            | "type"
+                            | "interface"
+                            | "pub"
+                            | "mut"
+                            | "static"
+                            | "auto"
+                    ) {
+                        SyntaxToken::Keyword
+                    } else {
+                        SyntaxToken::Type
+                    };
+                }
                 if self.entity_name_type.is_prefix_of(sc)
                     || self.entity_name_struct.is_prefix_of(sc)
                     || self.entity_name_enum.is_prefix_of(sc)
@@ -916,11 +956,6 @@ mod engine {
                     || self.storage_type_primitive.is_prefix_of(sc)
                     || self.storage_type_numeric.is_prefix_of(sc)
                     || self.storage_type_builtin.is_prefix_of(sc)
-                    || self.storage_type_rust.is_prefix_of(sc)
-                    || self.storage_type_c.is_prefix_of(sc)
-                    || self.storage_type_go.is_prefix_of(sc)
-                    || self.storage_type_java.is_prefix_of(sc)
-                    || self.storage_type_cs.is_prefix_of(sc)
                 {
                     return SyntaxToken::Type;
                 }
@@ -997,6 +1032,14 @@ mod engine {
                 SyntaxToken::DiffHeader
             } else if in_annotation {
                 SyntaxToken::Attribute
+            } else if in_return_type
+                && token_text
+                    .trim()
+                    .chars()
+                    .next()
+                    .is_some_and(|ch| ch.is_ascii_uppercase())
+            {
+                SyntaxToken::Type
             } else {
                 SyntaxToken::Plain
             }
@@ -1148,14 +1191,18 @@ mod engine {
             for (pos, op) in ops {
                 let end = pos.min(line_len);
                 if end > cursor {
-                    let token = self.matchers.classify_stack(scope_stack.as_slice());
+                    let token = self
+                        .matchers
+                        .classify_stack(scope_stack.as_slice(), &line[cursor..end]);
                     push_token_span(&mut spans, cursor..end, token);
                 }
                 let _ = scope_stack.apply(&op);
                 cursor = end;
             }
             if cursor < line_len {
-                let token = self.matchers.classify_stack(scope_stack.as_slice());
+                let token = self
+                    .matchers
+                    .classify_stack(scope_stack.as_slice(), &line[cursor..line_len]);
                 push_token_span(&mut spans, cursor..line_len, token);
             }
 
@@ -1482,19 +1529,23 @@ mod tests {
         // Rust
         let rust_code = concat!(
             "// Greeting helper\n",
-            "pub fn greet(name: &str) -> usize {\n",
-            "    println!(\"hello {}\", name);\n",
-            "    42\n",
+            "pub fn greet(name: &str) -> String {\n",
+            "    let count: usize = 42;\n",
+            "    println!(\"hello {} {}\", name, count);\n",
+            "    name.to_owned()\n",
             "}"
         );
         let rust_lines = highlight_code("rust", rust_code);
-        assert_eq!(rust_lines.len(), 5);
+        assert_eq!(rust_lines.len(), 6);
         assert_eq!(token_at(&rust_lines[0], "// Greeting helper"), Some(SyntaxToken::Comment));
+        assert_eq!(token_at(&rust_lines[1], "pub"), Some(SyntaxToken::Keyword));
         assert_eq!(token_at(&rust_lines[1], "fn"), Some(SyntaxToken::Keyword));
         assert_eq!(token_at(&rust_lines[1], "greet"), Some(SyntaxToken::Function));
-        assert_eq!(token_at(&rust_lines[1], "usize"), Some(SyntaxToken::Type));
-        assert_eq!(token_at(&rust_lines[2], "hello"), Some(SyntaxToken::String));
-        assert_eq!(token_at(&rust_lines[3], "42"), Some(SyntaxToken::Number));
+        assert_eq!(token_at(&rust_lines[1], "String"), Some(SyntaxToken::Type));
+        assert_eq!(token_at(&rust_lines[2], "let"), Some(SyntaxToken::Keyword));
+        assert_eq!(token_at(&rust_lines[2], "usize"), Some(SyntaxToken::Type));
+        assert_eq!(token_at(&rust_lines[2], "42"), Some(SyntaxToken::Number));
+        assert_eq!(token_at(&rust_lines[3], "hello"), Some(SyntaxToken::String));
 
         // TypeScript & TSX/JSX
         let tsx_code = "const count: number = 3;\nexport const el = <Button label=\"Go\" />;";
