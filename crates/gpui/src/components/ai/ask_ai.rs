@@ -475,7 +475,8 @@ impl AskAiState {
         self
     }
 
-    /// Enables atomic disk persistence for conversations under `path`.
+    /// Enables atomic disk persistence for conversations under `path` (and persists attached
+    /// user & tool-preview images alongside it in a sibling `<stem>-images` directory).
     pub fn storage_path(mut self, path: impl Into<PathBuf>) -> Self {
         let path = path.into();
         if let Ok(loaded) = StoredConversations::load_from_disk(&path)
@@ -487,6 +488,17 @@ impl AskAiState {
                 .filter(|id| self.conversations.iter().any(|c| &c.id == id))
                 .unwrap_or_else(|| self.conversations[0].id.clone());
         }
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("ai");
+        let images_dir = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.join(format!("{stem}-images")))
+            .unwrap_or_else(|| PathBuf::from(format!("{stem}-images")));
+        self.image_store = AiImageStore::on_disk(images_dir);
         self.storage_path = Some(path);
         self
     }
@@ -1149,6 +1161,13 @@ impl AskAiState {
             for node in &conv.nodes {
                 for img in node.message.images() {
                     self.image_store.remove(&img.id);
+                }
+                for part in &node.message.parts {
+                    if let AiMessagePart::ToolCall { images, .. } = part {
+                        for img in images {
+                            self.image_store.remove(&img.id);
+                        }
+                    }
                 }
             }
         }

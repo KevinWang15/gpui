@@ -31,8 +31,9 @@ mod tests;
 pub use agent::{
     AgentEvent, AgentRunConfig, AppTool, AppToolAsyncHandler, AppToolHandler, ClientTool,
     ClientToolHandler, ClientToolOutputHandler, DEFAULT_BUILD_SYSTEM_PROMPT,
-    DEFAULT_SYSTEM_PROMPT, FAILURE_MESSAGE, FINAL_STEP_INSTRUCTION, ImageMediaType, ToolOutput,
-    ToolResultContent, run_agent_turn, to_rig_messages, tool_output_with_image,
+    DEFAULT_SYSTEM_PROMPT, FAILURE_MESSAGE, FINAL_STEP_INSTRUCTION, ImageMediaType,
+    TOOL_IMAGE_OMITTED_HISTORY, ToolOutput, ToolResultContent, run_agent_turn, to_rig_messages,
+    tool_output_with_image,
 };
 pub use answer_components::{
     AnswerComponentRegistry, AnswerComponentRenderFn, AnswerComponentSpec, SplitStreamingMarkdown,

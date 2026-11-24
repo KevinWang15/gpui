@@ -68,6 +68,13 @@ pub const IMAGE_NOTE_UNSUPPORTED: &str =
 pub const IMAGE_NOTE_MISSING: &str =
     "[An image was attached here, but its file is no longer stored.]";
 
+/// Placeholder text inserted when an older tool-returned image is pruned from history to bound context size.
+pub const TOOL_IMAGE_OMITTED_HISTORY: &str =
+    "[Earlier tool preview image omitted from older history to save context.]";
+
+/// Maximum number of most-recent historical tool-result images re-attached verbatim across turns.
+const MAX_HISTORY_TOOL_IMAGES: usize = 4;
+
 /// Placeholder inserted when repairing an interrupted tool call from an earlier aborted turn.
 pub const INTERRUPTED_TOOL_RESULT: &str =
     "Tool execution was interrupted. No result is available.";
@@ -423,12 +430,28 @@ pub struct AgentRunConfig {
 }
 
 /// Converts a GPUI conversation branch into Rig [`Message`]s (`history` + latest `prompt`),
-/// repairing interrupted tool calls and substituting image notes when unsupported or missing.
+/// repairing interrupted tool calls, preserving multi-step reasoning/tool boundaries, and
+/// re-attaching recent multimodal tool-result images (with explicit notes when unsupported,
+/// pruned from older history, or missing).
 pub fn to_rig_messages(
     history: &[AiMessage],
     image_store: &AiImageStore,
     accepts_images: bool,
 ) -> (Vec<Message>, Message) {
+    // Count total historical tool-call images so we re-attach only the most recent
+    // `MAX_HISTORY_TOOL_IMAGES` verbatim while explicitly annotating older pruned ones.
+    let total_tool_images: usize = history
+        .iter()
+        .filter(|m| m.role == AiRole::Assistant)
+        .flat_map(|m| m.parts.iter())
+        .map(|p| match p {
+            AiMessagePart::ToolCall { images, .. } => images.len(),
+            _ => 0,
+        })
+        .sum();
+    let keep_tool_images_from = total_tool_images.saturating_sub(MAX_HISTORY_TOOL_IMAGES);
+    let mut seen_tool_images: usize = 0;
+
     let mut out: Vec<Message> = Vec::new();
     for msg in history {
         match msg.role {
@@ -496,11 +519,20 @@ pub fn to_rig_messages(
                             }
                             pending_text.push_str(text);
                         }
+                        AiMessagePart::Reasoning { .. } => {
+                            // A reasoning block following tool calls marks the start of the next
+                            // model step; flush the prior batch so sequential steps never collapse
+                            // into a single synthetic parallel tool-call turn.
+                            if !tool_results.is_empty() {
+                                flush_tool_batch(&mut out, &mut assistant_blocks, &mut tool_results);
+                            }
+                        }
                         AiMessagePart::ToolCall {
                             id,
                             name,
                             arguments,
                             result,
+                            images,
                             is_error,
                             ..
                         } => {
@@ -514,13 +546,47 @@ pub fn to_rig_messages(
                                     id.clone(),
                                     ToolFunction::new(tool_name.clone(), arguments.clone()),
                                 );
-                                let content = match result {
+                                let mut content = match result {
                                     Some(Value::String(s)) => {
                                         vec![ToolResultContent::text(s.clone())]
                                     }
                                     Some(val) => vec![ToolResultContent::json(val.clone())],
                                     None => vec![ToolResultContent::text(INTERRUPTED_TOOL_RESULT)],
                                 };
+                                for img_ref in images {
+                                    let img_idx = seen_tool_images;
+                                    seen_tool_images += 1;
+                                    if !accepts_images {
+                                        if content.last().and_then(ToolResultContent::as_text)
+                                            != Some(IMAGE_NOTE_UNSUPPORTED)
+                                        {
+                                            content.push(ToolResultContent::text(
+                                                IMAGE_NOTE_UNSUPPORTED,
+                                            ));
+                                        }
+                                    } else if img_idx < keep_tool_images_from {
+                                        if content.last().and_then(ToolResultContent::as_text)
+                                            != Some(TOOL_IMAGE_OMITTED_HISTORY)
+                                        {
+                                            content.push(ToolResultContent::text(
+                                                TOOL_IMAGE_OMITTED_HISTORY,
+                                            ));
+                                        }
+                                    } else if let Some(bytes) = image_store.get(&img_ref.id) {
+                                        let media_type =
+                                            ImageMediaType::from_mime_type(&img_ref.media_type)
+                                                .or_else(|| ImageMediaType::sniff(&bytes));
+                                        content.push(ToolResultContent::image_base64(
+                                            base64_encode(&bytes),
+                                            media_type,
+                                            None,
+                                        ));
+                                    } else if content.last().and_then(ToolResultContent::as_text)
+                                        != Some(IMAGE_NOTE_MISSING)
+                                    {
+                                        content.push(ToolResultContent::text(IMAGE_NOTE_MISSING));
+                                    }
+                                }
                                 let tr = ToolResult {
                                     call: call.id.clone(),
                                     name: tool_name,
@@ -529,11 +595,11 @@ pub fn to_rig_messages(
                                 };
                                 assistant_blocks.push(AssistantContent::ToolCall(call));
                                 tool_results.push(UserContent::ToolResult(tr));
+                            } else {
+                                seen_tool_images += images.len();
                             }
                         }
-                        AiMessagePart::Text { .. }
-                        | AiMessagePart::Reasoning { .. }
-                        | AiMessagePart::Image(_) => {}
+                        AiMessagePart::Text { .. } | AiMessagePart::Image(_) => {}
                     }
                 }
                 if !tool_results.is_empty() {

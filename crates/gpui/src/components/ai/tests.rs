@@ -1780,3 +1780,146 @@ async fn live_openai_compatible_multimodal_tool_image() {
         "expected model to visually identify red canvas from tool PNG, got: {reply:?}"
     );
 }
+
+#[test]
+fn to_rig_messages_preserves_step_boundaries_and_reattaches_recent_tool_images() {
+    use super::agent::TOOL_IMAGE_OMITTED_HISTORY;
+    use rig_core::message::{AssistantContent, ToolResultContent};
+
+    let store = AiImageStore::in_memory();
+    let png = Arc::new(solid_test_png(12, 8, 40, 120, 220));
+    let mut img_refs = Vec::new();
+    for i in 0..5 {
+        let id = format!("preview-img-{i}");
+        store.put(&id, png.clone()).unwrap();
+        img_refs.push(AiImageRef {
+            id,
+            name: format!("preview-{i}.png"),
+            media_type: "image/png".into(),
+            width: 12,
+            height: 8,
+            size_bytes: png.len(),
+        });
+    }
+
+    // Build an assistant turn with 2 distinct reasoning -> tool-call steps (5 total tool images
+    // across calls so the oldest image must be pruned while the latest 4 are re-attached verbatim).
+    let mut assistant = AiMessage {
+        id: "a1".into(),
+        role: AiRole::Assistant,
+        parts: vec![
+            AiMessagePart::Reasoning {
+                text: "Step 1: edit then preview".into(),
+            },
+            AiMessagePart::ToolCall {
+                id: "call_1".into(),
+                name: "pane_render_preview".into(),
+                arguments: json!({}),
+                status: ToolCallStatus::Complete,
+                result: Some(json!({ "ok": true, "step": 1 })),
+                images: vec![img_refs[0].clone(), img_refs[1].clone()],
+                is_error: false,
+            },
+            AiMessagePart::Reasoning {
+                text: "Step 2: polish then preview again".into(),
+            },
+            AiMessagePart::ToolCall {
+                id: "call_2".into(),
+                name: "pane_render_preview".into(),
+                arguments: json!({}),
+                status: ToolCallStatus::Complete,
+                result: Some(json!({ "ok": true, "step": 2 })),
+                images: vec![img_refs[2].clone(), img_refs[3].clone(), img_refs[4].clone()],
+                is_error: false,
+            },
+            AiMessagePart::Text {
+                text: "Verified cleanly.".into(),
+            },
+        ],
+        status: AiMessageStatus::Complete,
+        created_at: chrono::Utc::now(),
+        usage: None,
+    };
+    let history = vec![
+        AiMessage::user("Build card", Vec::new()),
+        assistant.clone(),
+        AiMessage::user("Did you inspect it visually?", Vec::new()),
+    ];
+
+    let (rig_history, prompt) = to_rig_messages(&history, &store, true);
+    assert!(matches!(prompt, Message::User { .. }));
+
+    // Expect: User("Build card"), Assistant(call_1), User(res_1), Assistant(call_2), User(res_2), Assistant("Verified cleanly.").
+    let assistant_tool_turns: Vec<usize> = rig_history
+        .iter()
+        .filter_map(|m| match m {
+            Message::Assistant(a) => {
+                let n = a
+                    .content
+                    .iter()
+                    .filter(|p| matches!(p, AssistantContent::ToolCall(_)))
+                    .count();
+                (n > 0).then_some(n)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        assistant_tool_turns,
+        vec![1, 1],
+        "reasoning boundary must keep step 1 and step 2 separate instead of collapsing into one parallel batch"
+    );
+
+    let tool_results: Vec<&rig_core::message::ToolResult> = rig_history
+        .iter()
+        .filter_map(|m| match m {
+            Message::User { content } => Some(content.iter()),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|p| match p {
+            UserContent::ToolResult(tr) => Some(tr),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(tool_results.len(), 2);
+
+    // Call 1 had images [0, 1]: image 0 is pruned (oldest of 5), image 1 is kept verbatim!
+    assert!(
+        tool_results[0]
+            .content
+            .iter()
+            .any(|c| c.as_text() == Some(TOOL_IMAGE_OMITTED_HISTORY)),
+        "oldest pruned tool image must be annotated honestly"
+    );
+    let c1_imgs = tool_results[0]
+        .content
+        .iter()
+        .filter(|c| matches!(c, ToolResultContent::Image(_)))
+        .count();
+    let c2_imgs = tool_results[1]
+        .content
+        .iter()
+        .filter(|c| matches!(c, ToolResultContent::Image(_)))
+        .count();
+    assert_eq!((c1_imgs, c2_imgs), (1, 3), "latest 4 historical tool images must be re-attached");
+
+    // When accepts_images == false, images are replaced by IMAGE_NOTE_UNSUPPORTED.
+    assistant.parts.truncate(2);
+    let (no_img_hist, _) = to_rig_messages(
+        &[AiMessage::user("hi", Vec::new()), assistant, AiMessage::user("next", Vec::new())],
+        &store,
+        false,
+    );
+    let has_raw_img = no_img_hist.iter().any(|m| match m {
+        Message::User { content } => content.iter().any(|p| match p {
+            UserContent::ToolResult(tr) => tr
+                .content
+                .iter()
+                .any(|c| matches!(c, ToolResultContent::Image(_))),
+            _ => false,
+        }),
+        _ => false,
+    });
+    assert!(!has_raw_img);
+}
