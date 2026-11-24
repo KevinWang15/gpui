@@ -497,6 +497,9 @@ pub enum AiMessagePart {
         /// Captured tool output (if finished).
         #[serde(default)]
         result: Option<Value>,
+        /// Optional image outputs captured from multimodal tools (stored in [`AiImageStore`]).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<AiImageRef>,
         /// Whether the tool reported an error.
         #[serde(default)]
         is_error: bool,

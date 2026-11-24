@@ -347,6 +347,7 @@ fn conversation_branching_repair_and_disk_persistence() {
         name: "lookup".into(),
         arguments: json!({}),
         result: None,
+        images: Vec::new(),
         status: ToolCallStatus::Running,
         is_error: false,
     });
@@ -1510,4 +1511,258 @@ fn ask_ai_dynamic_providers_status_banner_and_field_options(cx: &mut TestAppCont
     let _ = window.update(cx, |_, window, cx| {
         assert!(!ai.read(cx).is_text_input_focused(window, cx));
     });
+}
+
+/// Generates a minimal valid `w×h` solid-color PNG in memory for multimodal tool tests.
+fn solid_test_png(w: u32, h: u32, r: u8, g: u8, b: u8) -> Vec<u8> {
+    let img = image::RgbImage::from_pixel(w, h, image::Rgb([r, g, b]));
+    let mut out = Vec::new();
+    image::DynamicImage::ImageRgb8(img)
+        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+        .expect("encode test png");
+    out
+}
+
+#[crate::test]
+fn ask_ai_guidance_and_async_multimodal_image_app_tool(cx: &mut TestAppContext) {
+    use super::agent::{ImageMediaType, tool_output_with_image};
+    use super::types::{ProviderPreset, ProviderProtocol};
+
+    cx.executor().allow_parking();
+    cx.update(|cx| {
+        init_components(cx);
+        Theme::set_global(Theme::dark(), cx);
+    });
+
+    struct PreviewEditor {
+        captures: usize,
+    }
+
+    let editor = cx.new(|_| PreviewEditor { captures: 0 });
+    let editor_weak = editor.downgrade();
+
+    let saw_guidance = Arc::new(AtomicBool::new(false));
+    let saw_image_in_tool_result = Arc::new(AtomicBool::new(false));
+    let saw_guidance_bg = saw_guidance.clone();
+    let saw_image_bg = saw_image_in_tool_result.clone();
+
+    let model_provider = ProviderPreset {
+        id: "vision-mock".into(),
+        name: "Vision Mock".into(),
+        description: "Local vision tool test".into(),
+        protocol: ProviderProtocol::Simulated,
+        fields: Vec::new(),
+        default_values: std::collections::BTreeMap::new(),
+        accepts_images: true,
+        validator: None,
+        custom_model: Some(Arc::new(move |_| {
+            let saw_guidance_bg = saw_guidance_bg.clone();
+            let saw_image_bg = saw_image_bg.clone();
+            Ok(local_completion_model(
+                "vision-mock",
+                "vision-mock-1",
+                Arc::new(move |req, tx| {
+                    let saw_guidance_bg = saw_guidance_bg.clone();
+                    let saw_image_bg = saw_image_bg.clone();
+                    Box::pin(async move {
+                        if req.chat_history.iter().any(|m| {
+                            matches!(
+                                m.as_ref(),
+                                Message::System { content }
+                                    if content.contains("Always call editor_render_preview")
+                            )
+                        }) {
+                            saw_guidance_bg.store(true, Ordering::SeqCst);
+                        }
+                        let has_tool_image = req.chat_history.iter().any(|msg| match msg.as_ref() {
+                            Message::User { content } => content.iter().any(|part| match part {
+                                UserContent::ToolResult(tr) => tr.content.iter().any(|c| {
+                                    matches!(c, rig_core::message::ToolResultContent::Image(_))
+                                }),
+                                UserContent::Image(_) => true,
+                                _ => false,
+                            }),
+                            _ => false,
+                        });
+                        if has_tool_image {
+                            saw_image_bg.store(true, Ordering::SeqCst);
+                            let _ = tx
+                                .send(LocalCompletionEvent::TextDelta(
+                                    "Visual preview verified cleanly.".to_owned(),
+                                ))
+                                .await;
+                            let _ = tx
+                                .send(LocalCompletionEvent::Finish {
+                                    usage: AiTokenUsage::default(),
+                                    reason: FinishReason::Stop,
+                                })
+                                .await;
+                            return Ok(());
+                        }
+                        let _ = tx
+                            .send(LocalCompletionEvent::ToolCall {
+                                id: "call_preview_1".to_owned(),
+                                name: "editor_render_preview".to_owned(),
+                                arguments: json!({}),
+                            })
+                            .await;
+                        let _ = tx
+                            .send(LocalCompletionEvent::Finish {
+                                usage: AiTokenUsage::default(),
+                                reason: FinishReason::ToolCalls,
+                            })
+                            .await;
+                        Ok(())
+                    })
+                }),
+            ))
+        })),
+    };
+
+    let render_preview_tool = AppTool::async_for_entity(
+        &editor_weak,
+        "editor_render_preview",
+        "Render a PNG screenshot of the current canvas for visual checks.",
+        json!({ "type": "object", "properties": {} }),
+        |ed, _args, cx| {
+            ed.captures += 1;
+            let count = ed.captures;
+            cx.spawn(async move |_, cx| {
+                let png = cx
+                    .background_executor()
+                    .spawn(async move { solid_test_png(16, 12, 32, 128, 240) })
+                    .await;
+                Ok(tool_output_with_image(
+                    json!({ "ok": true, "capture": count, "width": 16, "height": 12 }),
+                    ImageMediaType::PNG,
+                    &png,
+                ))
+            })
+        },
+    );
+
+    let ai = cx.new(|cx| {
+        AskAiState::build_with_ai(cx)
+            .providers(vec![model_provider])
+            .guidance("Always call editor_render_preview after layout changes to visually verify the result.")
+            .app_tools(vec![render_preview_tool])
+    });
+
+    ai.update(cx, |s, cx| {
+        assert!(s.connect_preset_defaults("vision-mock", cx).is_none());
+        s.send_message("Check the canvas preview", cx);
+    });
+
+    wait_until_idle(cx, &ai);
+
+    assert!(saw_guidance.load(Ordering::SeqCst), "guidance must be injected into system prompt");
+    assert!(
+        saw_image_in_tool_result.load(Ordering::SeqCst),
+        "multimodal ToolResultContent::Image must reach the model"
+    );
+    editor.read_with(cx, |ed, _| assert_eq!(ed.captures, 1));
+    ai.read_with(cx, |s, _| {
+        let conv = s.active_conversation().unwrap();
+        let branch = conversation_branch(conv);
+        let assistant = branch.last().unwrap();
+        assert!(assistant.plain_text().contains("Visual preview verified cleanly."));
+        let tc_images = assistant.parts.iter().find_map(|p| match p {
+            AiMessagePart::ToolCall { name, images, .. } if name == "editor_render_preview" => {
+                Some(images.clone())
+            }
+            _ => None,
+        });
+        let imgs = tc_images.expect("tool call recorded");
+        assert_eq!(imgs.len(), 1);
+        assert_eq!((imgs[0].width, imgs[0].height), (16, 12));
+        assert_eq!(imgs[0].media_type, "image/png");
+    });
+}
+
+/// Optional env-driven live multimodal tool-image test against any OpenAI-compatible vision model.
+#[tokio::test]
+#[ignore = "requires GPUI_AI_TEST_BASE_URL, GPUI_AI_TEST_API_KEY, and GPUI_AI_TEST_MODEL"]
+async fn live_openai_compatible_multimodal_tool_image() {
+    use super::agent::{ImageMediaType, tool_output_with_image};
+
+    let base_url = std::env::var("GPUI_AI_TEST_BASE_URL").unwrap();
+    let api_key = std::env::var("GPUI_AI_TEST_API_KEY").unwrap();
+    let model_name = std::env::var("GPUI_AI_TEST_MODEL").unwrap();
+
+    let preset = default_providers()
+        .into_iter()
+        .find(|p| p.id.as_ref() == "compatible")
+        .expect("compatible preset");
+    let mut values = ProviderValues::new();
+    values.insert("baseURL".into(), base_url);
+    values.insert("apiKey".into(), api_key);
+    values.insert("model".into(), model_name);
+
+    let called = Arc::new(AtomicBool::new(false));
+    let called_ref = called.clone();
+    let preview_tool = ClientTool::sync_output(
+        "render_color_preview",
+        "Renders a preview PNG image of the active canvas and returns it for visual inspection.",
+        json!({ "type": "object", "properties": {} }),
+        move |_args| {
+            called_ref.store(true, Ordering::SeqCst);
+            let png = solid_test_png(96, 64, 235, 35, 35);
+            Ok(tool_output_with_image(
+                json!({ "width": 96, "height": 64, "note": "Inspect the attached preview image." }),
+                ImageMediaType::PNG,
+                &png,
+            ))
+        },
+    );
+
+    let model = build_completion_model(&preset, &values).expect("build_completion_model");
+    let image_store = AiImageStore::in_memory();
+    let (tx, rx) = async_channel::unbounded();
+    run_agent_turn(
+        AgentRunConfig {
+            model,
+            system_prompt: "You must call `render_color_preview` and inspect the returned preview image visually. State the dominant color of the image in one concise sentence.".into(),
+            history: vec![AiMessage::user(
+                "Call render_color_preview and tell me what color the canvas is.",
+                Vec::new(),
+            )],
+            mcp_servers: Vec::new(),
+            client_tools: vec![preview_tool],
+            workspace: None,
+            script_runner: None,
+            image_store: image_store.clone(),
+            accepts_images: true,
+            limits: AgentLimits {
+                max_steps: 4,
+                max_output_tokens: Some(128),
+                ..AgentLimits::default()
+            },
+            abort: Arc::new(AtomicBool::new(false)),
+        },
+        tx,
+    )
+    .await;
+
+    let mut reply = String::new();
+    let mut errors = Vec::new();
+    let mut captured_images = 0usize;
+    while let Ok(ev) = rx.recv().await {
+        match ev {
+            AgentEvent::TextDelta(t) => reply.push_str(&t),
+            AgentEvent::ToolCallFinish { images, is_error, .. } => {
+                assert!(!is_error, "tool unexpectedly failed");
+                captured_images += images.len();
+            }
+            AgentEvent::Error(e) => errors.push(e),
+            _ => {}
+        }
+    }
+    assert!(errors.is_empty(), "live vision tool errors: {errors:?}");
+    assert!(called.load(Ordering::SeqCst), "model must call render_color_preview");
+    assert_eq!(captured_images, 1, "expected 1 preview image captured in image_store");
+    let lower = reply.to_ascii_lowercase();
+    assert!(
+        lower.contains("red") || lower.contains("crimson") || lower.contains("scarlet"),
+        "expected model to visually identify red canvas from tool PNG, got: {reply:?}"
+    );
 }

@@ -3267,6 +3267,9 @@ impl PlaygroundApp {
                 .title("Build with AI · Canvas")
                 .connection_key(ai_conn_key)
                 .providers(canvas_providers)
+                .guidance(
+                    "Inspect the live canvas before modifying it, prefer batching layout updates cleanly, keep all widgets inside the canvas padding without overlapping, and summarize the exact coordinates changed.",
+                )
                 .app_tools(canvas_tools)
                 .context_provider(move |cx| {
                     let app = app_weak_ctx.upgrade()?;

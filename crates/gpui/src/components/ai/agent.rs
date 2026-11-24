@@ -27,12 +27,13 @@ use rig_agent::agent::{
 use rig_agent::streaming::{Item, StreamEvent};
 use rig_agent::{AgentBuilder, completion::PromptError};
 use rig_core::effect::EffectKind;
+pub use rig_core::message::{ImageMediaType, ToolResultContent};
+pub use rig_core::tool::ToolOutput;
 use rig_core::message::{
-    AssistantContent, AssistantMessage, DocumentSourceKind, Image, ImageMediaType, Message,
-    MimeType, Text, ToolCall, ToolChoice, ToolFunction, ToolName, ToolResult, ToolResultContent,
-    UserContent,
+    AssistantContent, AssistantMessage, DocumentSourceKind, Image, Message, MimeType, Text,
+    ToolCall, ToolChoice, ToolFunction, ToolName, ToolResult, UserContent,
 };
-use rig_core::tool::{DynamicTool, ToolExecutionError, ToolOutput};
+use rig_core::tool::{DynamicTool, ToolExecutionError};
 use serde_json::{Value, json};
 
 use super::mcp::{
@@ -40,8 +41,8 @@ use super::mcp::{
 };
 use super::providers::{RigCompletionModel, ai_tokio_handle};
 use super::types::{
-    AgentLimits, AiActivity, AiMessage, AiMessagePart, AiRole, AiTokenUsage, McpServerConfig,
-    base64_encode,
+    AgentLimits, AiActivity, AiImageRef, AiMessage, AiMessagePart, AiRole, AiTokenUsage,
+    McpServerConfig, base64_decode, base64_encode, new_id,
 };
 use super::workspace::{
     AiImageStore, BuiltinScriptRunner, ConversationWorkspace, WorkspaceScriptRunner,
@@ -75,9 +76,36 @@ pub const INTERRUPTED_TOOL_RESULT: &str =
 pub const FAILURE_MESSAGE: &str =
     "The request failed. Check your API key, model name, endpoint URL, and MCP servers.";
 
-/// Async handler backing a host-registered [`ClientTool`].
+/// Converts a JSON [`Value`] into a [`ToolOutput`] (plain strings become text, others JSON).
+pub(crate) fn value_to_tool_output(val: Value) -> ToolOutput {
+    match val {
+        Value::String(text) => ToolOutput::text(text),
+        other => ToolOutput::json(other),
+    }
+}
+
+/// Builds a multimodal [`ToolOutput`] pairing a structured JSON (or text) summary with an inline
+/// encoded image (e.g. a rendered canvas/editor preview PNG for visual inspection by the model).
+pub fn tool_output_with_image(
+    summary: Value,
+    media_type: ImageMediaType,
+    bytes: &[u8],
+) -> ToolOutput {
+    let text_part = match summary {
+        Value::String(text) => ToolResultContent::text(text),
+        other => ToolResultContent::json(other),
+    };
+    let img_part = ToolResultContent::image_base64(base64_encode(bytes), Some(media_type), None);
+    ToolOutput::content(vec![text_part, img_part]).expect("non-empty tool output")
+}
+
+/// Legacy JSON-only async handler type alias for [`ClientTool`].
 pub type ClientToolHandler =
     Arc<dyn Fn(Value) -> BoxFuture<'static, Result<Value>> + Send + Sync>;
+
+/// Async multimodal handler backing a host-registered [`ClientTool`].
+pub type ClientToolOutputHandler =
+    Arc<dyn Fn(Value) -> BoxFuture<'static, Result<ToolOutput>> + Send + Sync>;
 
 /// Host-registered local Rust tool callable by the model during agent turns.
 #[derive(Clone)]
@@ -88,8 +116,8 @@ pub struct ClientTool {
     pub description: String,
     /// JSON Schema for the tool's input object.
     pub input_schema: Value,
-    /// Async execution closure returning a JSON result.
-    pub execute: ClientToolHandler,
+    /// Async execution closure returning a text, JSON, or multimodal [`ToolOutput`].
+    pub execute: ClientToolOutputHandler,
 }
 
 impl std::fmt::Debug for ClientTool {
@@ -102,7 +130,7 @@ impl std::fmt::Debug for ClientTool {
 }
 
 impl ClientTool {
-    /// Creates a new [`ClientTool`] with a synchronous handler closure.
+    /// Creates a new [`ClientTool`] with a synchronous JSON/text handler closure.
     pub fn sync(
         name: impl Into<String>,
         description: impl Into<String>,
@@ -116,12 +144,31 @@ impl ClientTool {
             input_schema,
             execute: Arc::new(move |args| {
                 let h = handler.clone();
+                Box::pin(async move { h(args).map(value_to_tool_output) })
+            }),
+        }
+    }
+
+    /// Creates a new [`ClientTool`] with a synchronous multimodal [`ToolOutput`] handler.
+    pub fn sync_output(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        input_schema: Value,
+        handler: impl Fn(Value) -> Result<ToolOutput> + Send + Sync + 'static,
+    ) -> Self {
+        let handler = Arc::new(handler);
+        Self {
+            name: name.into(),
+            description: description.into(),
+            input_schema,
+            execute: Arc::new(move |args| {
+                let h = handler.clone();
                 Box::pin(async move { h(args) })
             }),
         }
     }
 
-    /// Creates a new [`ClientTool`] with an asynchronous handler closure.
+    /// Creates a new [`ClientTool`] with an asynchronous JSON/text handler closure.
     pub fn async_fn<F, Fut>(
         name: impl Into<String>,
         description: impl Into<String>,
@@ -139,19 +186,49 @@ impl ClientTool {
             input_schema,
             execute: Arc::new(move |args| {
                 let h = handler.clone();
+                Box::pin(async move { h(args).await.map(value_to_tool_output) })
+            }),
+        }
+    }
+
+    /// Creates a new [`ClientTool`] with an asynchronous multimodal [`ToolOutput`] handler.
+    pub fn async_output<F, Fut>(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        input_schema: Value,
+        handler: F,
+    ) -> Self
+    where
+        F: Fn(Value) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<ToolOutput>> + Send + 'static,
+    {
+        let handler = Arc::new(handler);
+        Self {
+            name: name.into(),
+            description: description.into(),
+            input_schema,
+            execute: Arc::new(move |args| {
+                let h = handler.clone();
                 Box::pin(async move { h(args).await })
             }),
         }
     }
 }
 
-/// Foreground GPUI callback backing a live editor [`AppTool`].
+/// Legacy synchronous JSON-only GPUI callback type alias for [`AppTool`].
 pub type AppToolHandler = Rc<dyn Fn(Value, &mut crate::App) -> Result<Value> + 'static>;
 
+/// Foreground GPUI async callback backing a live editor [`AppTool`] (supports both instant
+/// synchronous edits via [`crate::Task::ready`] and asynchronous UI work such as frame-synced
+/// preview captures returning multimodal [`ToolOutput`] images).
+pub type AppToolAsyncHandler =
+    Rc<dyn Fn(Value, &mut crate::App) -> crate::Task<Result<ToolOutput>> + 'static>;
+
 /// Foreground GPUI tool invoked on the main UI thread with `&mut App` access, allowing
-/// **Build with AI** assistants to directly inspect and mutate live GPUI editor entities
-/// (e.g. a [`FreeformCanvas`](crate::components::FreeformCanvas), form builder, document editor,
-/// or settings state) from inside the unified [`AskAi`](super::ask_ai::AskAi) agent loop.
+/// **Build with AI** assistants to directly inspect, mutate, and visually verify live GPUI
+/// editor entities (e.g. a [`FreeformCanvas`](crate::components::FreeformCanvas), form builder,
+/// document editor, or settings state) from inside the unified [`AskAi`](super::ask_ai::AskAi)
+/// agent loop.
 #[derive(Clone)]
 pub struct AppTool {
     /// Tool name (`[a-zA-Z0-9_-]+`, may not contain `"__"`).
@@ -161,7 +238,7 @@ pub struct AppTool {
     /// JSON Schema for the tool's input object.
     pub input_schema: Value,
     /// Foreground execution closure invoked on `&mut App`.
-    pub execute: AppToolHandler,
+    pub execute: AppToolAsyncHandler,
 }
 
 impl std::fmt::Debug for AppTool {
@@ -174,12 +251,45 @@ impl std::fmt::Debug for AppTool {
 }
 
 impl AppTool {
-    /// Creates a new foreground [`AppTool`] that receives `&mut App` on the UI thread.
+    /// Creates a new synchronous foreground [`AppTool`] that receives `&mut App` on the UI thread.
     pub fn new(
         name: impl Into<String>,
         description: impl Into<String>,
         input_schema: Value,
         handler: impl Fn(Value, &mut crate::App) -> Result<Value> + 'static,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            input_schema,
+            execute: Rc::new(move |args, cx| {
+                crate::Task::ready(handler(args, cx).map(value_to_tool_output))
+            }),
+        }
+    }
+
+    /// Creates a synchronous foreground [`AppTool`] returning a multimodal [`ToolOutput`].
+    pub fn new_output(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        input_schema: Value,
+        handler: impl Fn(Value, &mut crate::App) -> Result<ToolOutput> + 'static,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            input_schema,
+            execute: Rc::new(move |args, cx| crate::Task::ready(handler(args, cx))),
+        }
+    }
+
+    /// Creates an asynchronous foreground [`AppTool`] that can await UI frames or async GPUI
+    /// operations on the main thread without blocking rendering.
+    pub fn async_new(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        input_schema: Value,
+        handler: impl Fn(Value, &mut crate::App) -> crate::Task<Result<ToolOutput>> + 'static,
     ) -> Self {
         Self {
             name: name.into(),
@@ -204,6 +314,44 @@ impl AppTool {
             let h = handler.clone();
             weak.update(cx, |this, cx| h(this, args, cx))
                 .map_err(|_| anyhow!("target editor is no longer mounted"))?
+        })
+    }
+
+    /// Synchronous entity-bound [`AppTool`] returning a multimodal [`ToolOutput`] (e.g. text + image).
+    pub fn for_entity_output<T: 'static>(
+        entity: &crate::WeakEntity<T>,
+        name: impl Into<String>,
+        description: impl Into<String>,
+        input_schema: Value,
+        handler: impl Fn(&mut T, Value, &mut crate::Context<T>) -> Result<ToolOutput> + 'static,
+    ) -> Self {
+        let weak = entity.clone();
+        let handler = Rc::new(handler);
+        Self::new_output(name, description, input_schema, move |args, cx| {
+            let h = handler.clone();
+            weak.update(cx, |this, cx| h(this, args, cx))
+                .map_err(|_| anyhow!("target editor is no longer mounted"))?
+        })
+    }
+
+    /// Asynchronous entity-bound [`AppTool`] returning a [`crate::Task<Result<ToolOutput>>`] —
+    /// ideal for visual preview capture tools that trigger a paint and await rendered image bytes.
+    pub fn async_for_entity<T: 'static>(
+        entity: &crate::WeakEntity<T>,
+        name: impl Into<String>,
+        description: impl Into<String>,
+        input_schema: Value,
+        handler: impl Fn(&mut T, Value, &mut crate::Context<T>) -> crate::Task<Result<ToolOutput>>
+            + 'static,
+    ) -> Self {
+        let weak = entity.clone();
+        let handler = Rc::new(handler);
+        Self::async_new(name, description, input_schema, move |args, cx| {
+            let h = handler.clone();
+            match weak.update(cx, |this, cx| h(this, args, cx)) {
+                Ok(task) => task,
+                Err(_) => crate::Task::ready(Err(anyhow!("target editor is no longer mounted"))),
+            }
         })
     }
 }
@@ -232,6 +380,8 @@ pub enum AgentEvent {
         id: String,
         /// Structured JSON or string result.
         result: Value,
+        /// Optional images returned by multimodal tools (saved into [`AiImageStore`]).
+        images: Vec<AiImageRef>,
         /// Whether execution reported an error.
         is_error: bool,
     },
@@ -406,8 +556,16 @@ pub fn to_rig_messages(
 }
 
 fn format_tool_result_value(result: &ToolResult) -> Value {
-    if result.content.len() == 1 {
-        match &result.content[0] {
+    let non_image: Vec<&ToolResultContent> = result
+        .content
+        .iter()
+        .filter(|part| !matches!(part, ToolResultContent::Image(_)))
+        .collect();
+    if non_image.is_empty() {
+        return Value::String("[image]".to_owned());
+    }
+    if non_image.len() == 1 {
+        match non_image[0] {
             ToolResultContent::Json { value } => return value.clone(),
             ToolResultContent::Text(t) => {
                 if let Ok(parsed) = serde_json::from_str::<Value>(&t.text) {
@@ -415,11 +573,10 @@ fn format_tool_result_value(result: &ToolResult) -> Value {
                 }
                 return Value::String(t.text.clone());
             }
-            ToolResultContent::Image(_) => return Value::String("[image]".to_owned()),
+            ToolResultContent::Image(_) => unreachable!(),
         }
     }
-    let joined = result
-        .content
+    let joined = non_image
         .iter()
         .map(|item| match item {
             ToolResultContent::Text(t) => t.text.clone(),
@@ -431,6 +588,57 @@ fn format_tool_result_value(result: &ToolResult) -> Value {
         .collect::<Vec<_>>()
         .join("\n");
     Value::String(joined)
+}
+
+fn extract_tool_result_images(
+    tool_name: &str,
+    result: &ToolResult,
+    image_store: &AiImageStore,
+) -> Vec<AiImageRef> {
+    let mut refs = Vec::new();
+    for (idx, part) in result.content.iter().enumerate() {
+        let ToolResultContent::Image(image) = part else {
+            continue;
+        };
+        let bytes = match &image.data {
+            DocumentSourceKind::Base64(b64) => match base64_decode(b64) {
+                Ok(b) if !b.is_empty() => b,
+                _ => continue,
+            },
+            DocumentSourceKind::Raw(raw) if !raw.is_empty() => raw.clone(),
+            _ => continue,
+        };
+        let media_type = image
+            .media_type
+            .as_ref()
+            .map(|m| m.to_mime_type().to_owned())
+            .or_else(|| {
+                ImageMediaType::sniff(&bytes).map(|m| m.to_mime_type().to_owned())
+            })
+            .unwrap_or_else(|| "image/png".to_owned());
+        let (width, height) = image::load_from_memory(&bytes)
+            .map(|img| (img.width(), img.height()))
+            .unwrap_or((0, 0));
+        let id = new_id();
+        let size_bytes = bytes.len();
+        if image_store.put(&id, Arc::new(bytes)).is_ok() {
+            let ext = match media_type.as_str() {
+                "image/jpeg" => "jpg",
+                "image/webp" => "webp",
+                "image/gif" => "gif",
+                _ => "png",
+            };
+            refs.push(AiImageRef {
+                id,
+                name: format!("{tool_name}-{}.{ext}", idx + 1),
+                media_type,
+                width,
+                height,
+                size_bytes,
+            });
+        }
+    }
+    refs
 }
 
 /// [`rig_agent::AgentHook`] enforcing `byok-ai` budgets (`max_steps` final-step disable,
@@ -571,11 +779,9 @@ fn client_tool_to_dynamic(tool: ClientTool) -> Result<DynamicTool> {
         move |args| {
             let exec = exec.clone();
             Box::pin(async move {
-                match exec(args).await {
-                    Ok(Value::String(text)) => Ok(ToolOutput::text(text)),
-                    Ok(val) => Ok(ToolOutput::json(val)),
-                    Err(err) => Err(ToolExecutionError::other(err.to_string())),
-                }
+                exec(args)
+                    .await
+                    .map_err(|err| ToolExecutionError::other(err.to_string()))
             })
         },
     ))
@@ -976,10 +1182,16 @@ async fn run_agent_turn_on_tokio(config: AgentRunConfig, tx: async_channel::Send
                 }
                 Ok(MultiTurnStreamItem::ToolResult { tool_result }) => {
                     let display = format_tool_result_value(&tool_result);
+                    let images = extract_tool_result_images(
+                        tool_result.name.as_str(),
+                        &tool_result,
+                        &config.image_store,
+                    );
                     let _ = tx
                         .send(AgentEvent::ToolCallFinish {
                             id: tool_result.call.to_string(),
                             result: display,
+                            images,
                             is_error: tool_result.is_error,
                         })
                         .await;

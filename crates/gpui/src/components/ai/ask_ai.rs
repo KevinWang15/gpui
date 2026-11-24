@@ -21,15 +21,15 @@ use serde_json::Value;
 use crate::icons::{Icon, IconSize, LucideIcon};
 use crate::{
     AnyElement, App, ClipboardItem, Context, CursorStyle, ElementId, Entity, EventEmitter,
-    FileFilter, Focusable as _, FontWeight, IntoElement, MouseButton, MouseDownEvent,
-    OpenPromptOptions, Pixels, Render, RenderOnce, ScrollEvent, ScrollHandle, ScrollbarVisibility,
-    SharedString, StyleRefinement, Styled, Task, Window, anchored, deferred, div, point,
-    prelude::*, px, size,
+    FileFilter, Focusable as _, FontWeight, Image, ImageFormat, IntoElement, MouseButton,
+    MouseDownEvent, ObjectFit, OpenPromptOptions, Pixels, Render, RenderOnce, ScrollEvent,
+    ScrollHandle, ScrollbarVisibility, SharedString, StyleRefinement, Styled, Task, Window,
+    anchored, deferred, div, img, point, prelude::*, px, size,
 };
 
 use super::agent::{
     AgentEvent, AgentRunConfig, AppTool, ClientTool, DEFAULT_BUILD_SYSTEM_PROMPT,
-    DEFAULT_SYSTEM_PROMPT, run_agent_turn,
+    DEFAULT_SYSTEM_PROMPT, ToolOutput, run_agent_turn,
 };
 use super::answer_components::{AnswerComponentRegistry, answer_component_instructions};
 use super::markdown::markdown;
@@ -85,7 +85,7 @@ pub type AiContextProvider = Rc<dyn Fn(&App) -> Option<String> + 'static>;
 struct UiToolRequest {
     name: String,
     arguments: Value,
-    reply: async_channel::Sender<anyhow::Result<Value>>,
+    reply: async_channel::Sender<anyhow::Result<ToolOutput>>,
 }
 
 /// Active sub-page inside an [`AskAi`] assistant panel.
@@ -203,6 +203,7 @@ pub struct AskAiState {
     answer_components: AnswerComponentRegistry,
     component_instructions: bool,
     system_prompt: String,
+    guidance: Option<String>,
     limits: AgentLimits,
     suggestions: Vec<AskAiSuggestion>,
 
@@ -386,6 +387,7 @@ impl AskAiState {
             answer_components: AnswerComponentRegistry::with_defaults(),
             component_instructions: true,
             system_prompt: DEFAULT_SYSTEM_PROMPT.to_owned(),
+            guidance: None,
             limits: AgentLimits::default(),
             suggestions: vec![
                 AskAiSuggestion::new("What tools are available?", "Describe the available tools and what each one can do."),
@@ -572,6 +574,21 @@ impl AskAiState {
     pub fn system_prompt(mut self, prompt: impl Into<String>) -> Self {
         self.system_prompt = prompt.into();
         self
+    }
+
+    /// Attaches host-specific guidance & tool best practices appended to the system prompt
+    /// (for example, which tools or MCP servers to prefer and reminders to call visual preview
+    /// verification tools after layout edits).
+    pub fn guidance(mut self, guidance: impl Into<String>) -> Self {
+        let g = guidance.into();
+        self.guidance = (!g.trim().is_empty()).then_some(g);
+        self
+    }
+
+    /// Updates or clears the host guidance appended to the system prompt at runtime.
+    pub fn set_guidance(&mut self, guidance: Option<String>, cx: &mut Context<Self>) {
+        self.guidance = guidance.filter(|g| !g.trim().is_empty());
+        cx.notify();
     }
 
     /// Sets step, tool-call, token, and timeout budgets.
@@ -783,6 +800,11 @@ impl AskAiState {
         self.conversations
             .iter()
             .find(|c| c.id == self.active_conversation_id)
+    }
+
+    /// Returns the underlying [`AiImageStore`] holding user attachments and multimodal tool images.
+    pub fn image_store(&self) -> &AiImageStore {
+        &self.image_store
     }
 
     fn active_conversation_mut(&mut self) -> Option<&mut Conversation> {
@@ -1369,6 +1391,12 @@ impl AskAiState {
         }
 
         let mut system_prompt = self.system_prompt.clone();
+        if let Some(ref guidance) = self.guidance
+            && !guidance.trim().is_empty()
+        {
+            system_prompt.push_str("\n\n## Guidance & Best Practices\n");
+            system_prompt.push_str(guidance.trim());
+        }
         if let Some(ref provider) = self.context_provider
             && let Some(live_ctx) = provider(cx)
             && !live_ctx.trim().is_empty()
@@ -1395,7 +1423,8 @@ impl AskAiState {
 
         // Bridge foreground GPUI `AppTool`s into background-callable `ClientTool` wrappers via a
         // per-turn request/reply channel so tools execute directly on `&mut App` / live entities
-        // while Rig streaming and rmcp network I/O stay off the UI thread.
+        // (including async UI work like frame-synced visual preview capture) while Rig streaming
+        // and rmcp network I/O stay off the UI thread.
         let mut combined_tools = self.client_tools.clone();
         self._ui_tool_task = None;
         if !self.app_tools.is_empty() {
@@ -1403,7 +1432,7 @@ impl AskAiState {
             for app_tool in &self.app_tools {
                 let tool_name = app_tool.name.clone();
                 let req_tx = ui_tx.clone();
-                combined_tools.push(ClientTool::async_fn(
+                combined_tools.push(ClientTool::async_output(
                     app_tool.name.clone(),
                     app_tool.description.clone(),
                     app_tool.input_schema.clone(),
@@ -1440,7 +1469,10 @@ impl AskAiState {
                         .ok()
                         .flatten();
                     let result = match handler {
-                        Some(exec) => cx.update(|cx| exec(req.arguments, cx)),
+                        Some(exec) => {
+                            let task = cx.update(|cx| exec(req.arguments, cx));
+                            task.await
+                        }
                         None => Err(anyhow::anyhow!(
                             "editor tool '{}' is no longer registered",
                             req.name
@@ -1533,6 +1565,7 @@ impl AskAiState {
                         name,
                         arguments,
                         result: None,
+                        images: Vec::new(),
                         is_error: false,
                         status: ToolCallStatus::Running,
                     });
@@ -1541,6 +1574,7 @@ impl AskAiState {
             AgentEvent::ToolCallFinish {
                 id,
                 result,
+                images,
                 is_error,
             } => {
                 if let Some(msg) = target_msg {
@@ -1548,6 +1582,7 @@ impl AskAiState {
                         if let AiMessagePart::ToolCall {
                             id: cid,
                             result: res,
+                            images: part_images,
                             is_error: err_flag,
                             status,
                             ..
@@ -1555,6 +1590,7 @@ impl AskAiState {
                             && *cid == id
                         {
                             *res = Some(result);
+                            *part_images = images;
                             *err_flag = is_error;
                             *status = if is_error {
                                 ToolCallStatus::Error
@@ -3525,11 +3561,12 @@ impl AskAiState {
                             name,
                             arguments,
                             result,
+                            images,
                             is_error,
                             status,
                         } = &parts[idx]
                         {
-                            group.push((id, name, arguments, result, *is_error, *status));
+                            group.push((id, name, arguments, result, images, *is_error, *status));
                             idx += 1;
                         } else {
                             break;
@@ -3539,10 +3576,11 @@ impl AskAiState {
                     let group_key = format!("{}-tg-{group_start}", msg.id);
                     let group_open = self.expanded_tool_groups.contains(&group_key);
                     let group_key_click = group_key.clone();
-                    let any_running = group.iter().any(|g| g.5 == ToolCallStatus::Running);
+                    let any_running = group.iter().any(|g| g.6 == ToolCallStatus::Running);
                     let any_issue = group
                         .iter()
-                        .any(|g| g.4 || g.5 == ToolCallStatus::Interrupted);
+                        .any(|g| g.5 || g.6 == ToolCallStatus::Interrupted);
+                    let preview_count: usize = group.iter().map(|g| g.4.len()).sum();
                     let summary_text = if any_running {
                         "Using connected tools"
                     } else if any_issue {
@@ -3602,7 +3640,18 @@ impl AskAiState {
                                             badge(format!("{}", group.len()))
                                                 .color(BadgeColor::Gray)
                                                 .pill(true),
-                                        ),
+                                        )
+                                        .when(preview_count > 0, |el| {
+                                            el.child(
+                                                badge(if preview_count == 1 {
+                                                    "Visual check".to_owned()
+                                                } else {
+                                                    format!("{preview_count} previews")
+                                                })
+                                                .color(BadgeColor::Indigo)
+                                                .pill(true),
+                                            )
+                                        }),
                                 )
                                 .child(
                                     Icon::new(if group_open {
@@ -3621,7 +3670,7 @@ impl AskAiState {
                             .px(px(10.))
                             .pb(px(8.))
                             .spacing(px(6.));
-                        for (t_i, (cid, name, args, result, is_err, status)) in
+                        for (t_i, (cid, name, args, result, tool_images, is_err, status)) in
                             group.into_iter().enumerate()
                         {
                             let t_key = cid.clone();
@@ -3640,6 +3689,27 @@ impl AskAiState {
                                     .unwrap_or_else(|_| v.to_string()),
                                 None => "No result yet.".to_owned(),
                             };
+                            let rendered_previews: Vec<(AiImageRef, Arc<Image>)> = if t_open {
+                                tool_images
+                                    .iter()
+                                    .filter_map(|iref| {
+                                        let bytes = self.image_store.get(&iref.id)?;
+                                        let fmt = match iref.media_type.as_str() {
+                                            "image/jpeg" => ImageFormat::Jpeg,
+                                            "image/webp" => ImageFormat::Webp,
+                                            "image/gif" => ImageFormat::Gif,
+                                            _ => ImageFormat::Png,
+                                        };
+                                        Some((
+                                            iref.clone(),
+                                            Arc::new(Image::from_bytes(fmt, bytes.as_ref().clone())),
+                                        ))
+                                    })
+                                    .collect()
+                            } else {
+                                Vec::new()
+                            };
+                            let has_tool_images = !tool_images.is_empty();
 
                             rows_col = rows_col.child(
                                 v_stack()
@@ -3689,7 +3759,14 @@ impl AskAiState {
                                                             .text_size(px(12.))
                                                             .font_weight(FontWeight::MEDIUM)
                                                             .child(friendly_tool_label(name)),
-                                                    ),
+                                                    )
+                                                    .when(has_tool_images, |el| {
+                                                        el.child(
+                                                            badge("Image")
+                                                                .color(BadgeColor::Indigo)
+                                                                .pill(true),
+                                                        )
+                                                    }),
                                             )
                                             .child(
                                                 h_stack()
@@ -3747,6 +3824,37 @@ impl AskAiState {
                                                         .text_color(theme.muted_foreground)
                                                         .child("Result"),
                                                 )
+                                                .when(!rendered_previews.is_empty(), |col| {
+                                                    col.children(rendered_previews.into_iter().map(
+                                                        |(iref, image_data)| {
+                                                            v_stack()
+                                                                .spacing(px(4.))
+                                                                .p(px(6.))
+                                                                .rounded(theme.radius_sm)
+                                                                .bg(theme.surface_muted.opacity(0.45))
+                                                                .border_1()
+                                                                .border_color(theme.border)
+                                                                .child(
+                                                                    img(image_data)
+                                                                        .w_full()
+                                                                        .max_h(px(220.))
+                                                                        .object_fit(ObjectFit::Contain)
+                                                                        .rounded(theme.radius_sm),
+                                                                )
+                                                                .child(
+                                                                    div()
+                                                                        .text_size(px(10.5))
+                                                                        .text_color(theme.muted_foreground)
+                                                                        .child(format!(
+                                                                            "{} · {}×{} px",
+                                                                            iref.name,
+                                                                            iref.width,
+                                                                            iref.height
+                                                                        )),
+                                                                )
+                                                        },
+                                                    ))
+                                                })
                                                 .child(
                                                     div()
                                                         .p(px(6.))
