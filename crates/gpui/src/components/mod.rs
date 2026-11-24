@@ -67,6 +67,7 @@ pub mod radio;
 pub mod result;
 pub mod segmented;
 pub mod select;
+pub mod selectable_text;
 pub mod shortcut_recorder;
 pub mod slider;
 pub mod split_pane;
@@ -227,6 +228,10 @@ pub use radio::{RadioGroup, RadioOption, RadioVariant, radio_group};
 pub use result::{ResultStatus, ResultView, result_view};
 pub use segmented::{SegmentedControl, SegmentedItem, segmented_control};
 pub use select::{Select, SelectEvent, SelectOption, SelectState, select};
+pub use selectable_text::{
+    SelectableText, SelectableTextContextMenuBuilder, SelectableTextEvent, SelectableTextState,
+    bind_selectable_text_keys, selectable_text,
+};
 pub use shortcut_recorder::{
     ShortcutRecorder, ShortcutRecorderEvent, ShortcutRecorderState, shortcut_recorder,
 };

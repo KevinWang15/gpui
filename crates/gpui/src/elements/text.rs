@@ -932,6 +932,46 @@ impl TextLayout {
         Err(line_start_ix.saturating_sub(1))
     }
 
+    /// Get the closest character-boundary byte index into the input for the pixel position.
+    ///
+    /// Unlike [`Self::index_for_position`], positions inside a glyph round to the nearest leading or
+    /// trailing boundary, matching cursor and selection hit-testing across wrapped lines.
+    pub fn closest_index_for_position(&self, position: Point<Pixels>) -> Result<usize, usize> {
+        let element_state = self.0.borrow();
+        let element_state = element_state
+            .as_ref()
+            .expect("measurement has not been performed");
+        let bounds = element_state
+            .bounds
+            .expect("prepaint has not been performed");
+
+        if position.y < bounds.top() {
+            return Err(0);
+        }
+
+        let line_height = element_state.line_height;
+        let mut line_origin = bounds.origin;
+        let mut line_start_ix = 0;
+        for line in &element_state.lines {
+            let line_size = line.size(line_height);
+            let line_bottom = line_origin.y + line_size.height;
+            if position.y >= line_bottom {
+                line_origin.y = line_bottom;
+                line_start_ix += line.len() + 1;
+            } else {
+                let mut position_within_line = position - line_origin;
+                let max_y = (line_size.height - crate::px(0.001)).max(Pixels::ZERO);
+                position_within_line.y = position_within_line.y.clamp(Pixels::ZERO, max_y);
+                match line.closest_index_for_position(position_within_line, line_height) {
+                    Ok(index_within_line) => return Ok(line_start_ix + index_within_line),
+                    Err(index_within_line) => return Err(line_start_ix + index_within_line),
+                }
+            }
+        }
+
+        Err(line_start_ix.saturating_sub(1))
+    }
+
     /// Get the pixel position for the given byte index.
     pub fn position_for_index(&self, index: usize) -> Option<Point<Pixels>> {
         let element_state = self.0.borrow();
