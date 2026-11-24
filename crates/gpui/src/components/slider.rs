@@ -14,6 +14,11 @@ use crate::{
 
 use super::theme::{ActiveTheme, tabular_numerals};
 
+/// Diameter of the circular slider thumb in logical pixels.
+const THUMB_SIZE: f32 = 18.0;
+/// Half-width inset keeping the thumb strictly inside the slider's horizontal bounds at 0% and 100%.
+const THUMB_RADIUS: f32 = THUMB_SIZE * 0.5;
+
 fn sanitize_range(min: f32, max: f32) -> (f32, f32) {
     let min = if min.is_finite() { min } else { 0.0 };
     let raw_max = if max.is_finite() { max } else { min + 100.0 };
@@ -362,54 +367,8 @@ impl Render for SliderState {
                             .on_key_down(cx.listener(Self::on_key_down))
                     })
                     .when(disabled, |el| el.cursor_not_allowed())
-                    .child(
-                        canvas(
-                            move |bounds, _, _| {
-                                bounds_cell.set(Some(bounds));
-                            },
-                            move |_, _, window, _| {
-                                if !dragging {
-                                    return;
-                                }
-                                let ent_move = entity.clone();
-                                window.on_mouse_event(move |ev: &MouseMoveEvent, phase, _, cx| {
-                                    if phase != DispatchPhase::Capture {
-                                        return;
-                                    }
-                                    if ev.pressed_button != Some(MouseButton::Left) {
-                                        ent_move.update(cx, |s, cx| {
-                                            if s.dragging {
-                                                s.dragging = false;
-                                                cx.notify();
-                                            }
-                                        });
-                                        return;
-                                    }
-                                    ent_move.update(cx, |s, cx| {
-                                        if s.dragging && !s.disabled {
-                                            s.update_from_x(ev.position.x, cx);
-                                        }
-                                    });
-                                });
-                                let ent_up = entity;
-                                window.on_mouse_event(move |ev: &MouseUpEvent, phase, _, cx| {
-                                    if phase == DispatchPhase::Capture
-                                        && ev.button == MouseButton::Left
-                                    {
-                                        ent_up.update(cx, |s, cx| {
-                                            if s.dragging {
-                                                s.dragging = false;
-                                                cx.notify();
-                                            }
-                                        });
-                                    }
-                                });
-                            },
-                        )
-                        .absolute()
-                        .size_full(),
-                    )
-                    // Background rail
+                    // Background rail with thumb-radius inset travel zone so the fill meets the
+                    // thumb center across 0%..=100% with no subpixel seam.
                     .child(
                         div()
                             .w_full()
@@ -417,32 +376,107 @@ impl Render for SliderState {
                             .rounded_full()
                             .bg(theme.slider_track)
                             .overflow_hidden()
+                            .px(px(THUMB_RADIUS))
                             .child(
                                 div()
-                                    .h_full()
-                                    .w(relative(pct))
-                                    .rounded_full()
-                                    .bg(theme.slider_fill),
+                                    .relative()
+                                    .size_full()
+                                    .when(pct > 0.0, |el| {
+                                        el.child(
+                                            div()
+                                                .absolute()
+                                                .top_0()
+                                                .bottom_0()
+                                                .left(px(-THUMB_RADIUS))
+                                                .right(relative(1.0 - pct))
+                                                .bg(theme.slider_fill),
+                                        )
+                                    }),
                             ),
                     )
-                    // Thumb positioned at fraction
+                    // Thumb travel zone inset by THUMB_RADIUS on each end so the circular thumb
+                    // stays strictly within [0, width] at 0% and 100% and never gets clipped by
+                    // scrollable or overflow-hidden ancestor containers.
                     .child(
                         div()
                             .absolute()
-                            .left(relative(pct))
-                            .ml(px(-9.))
-                            .w(px(18.))
-                            .h(px(18.))
-                            .rounded_full()
-                            .bg(theme.slider_thumb)
-                            .border_2()
-                            .border_color(theme.slider_fill)
-                            .when(theme.elevation_shadows, |el| el.shadow_sm())
-                            .when(focused && !disabled, |el| {
-                                el.when_some(super::focus::focus_outline(&theme), |el, outline| {
-                                    el.outline(outline)
-                                })
-                            }),
+                            .top_0()
+                            .bottom_0()
+                            .left(px(THUMB_RADIUS))
+                            .right(px(THUMB_RADIUS))
+                            .flex()
+                            .items_center()
+                            .child(
+                                canvas(
+                                    move |bounds, _, _| {
+                                        bounds_cell.set(Some(bounds));
+                                    },
+                                    move |_, _, window, _| {
+                                        if !dragging {
+                                            return;
+                                        }
+                                        let ent_move = entity.clone();
+                                        window.on_mouse_event(
+                                            move |ev: &MouseMoveEvent, phase, _, cx| {
+                                                if phase != DispatchPhase::Capture {
+                                                    return;
+                                                }
+                                                if ev.pressed_button != Some(MouseButton::Left) {
+                                                    ent_move.update(cx, |s, cx| {
+                                                        if s.dragging {
+                                                            s.dragging = false;
+                                                            cx.notify();
+                                                        }
+                                                    });
+                                                    return;
+                                                }
+                                                ent_move.update(cx, |s, cx| {
+                                                    if s.dragging && !s.disabled {
+                                                        s.update_from_x(ev.position.x, cx);
+                                                    }
+                                                });
+                                            },
+                                        );
+                                        let ent_up = entity;
+                                        window.on_mouse_event(
+                                            move |ev: &MouseUpEvent, phase, _, cx| {
+                                                if phase == DispatchPhase::Capture
+                                                    && ev.button == MouseButton::Left
+                                                {
+                                                    ent_up.update(cx, |s, cx| {
+                                                        if s.dragging {
+                                                            s.dragging = false;
+                                                            cx.notify();
+                                                        }
+                                                    });
+                                                }
+                                            },
+                                        );
+                                    },
+                                )
+                                .absolute()
+                                .size_full(),
+                            )
+                            // Thumb positioned at fraction along the inset travel range
+                            .child(
+                                div()
+                                    .absolute()
+                                    .left(relative(pct))
+                                    .ml(px(-THUMB_RADIUS))
+                                    .w(px(THUMB_SIZE))
+                                    .h(px(THUMB_SIZE))
+                                    .rounded_full()
+                                    .bg(theme.slider_thumb)
+                                    .border_2()
+                                    .border_color(theme.slider_fill)
+                                    .when(theme.elevation_shadows, |el| el.shadow_sm())
+                                    .when(focused && !disabled, |el| {
+                                        el.when_some(
+                                            super::focus::focus_outline(&theme),
+                                            |el, outline| el.outline(outline),
+                                        )
+                                    }),
+                            ),
                     ),
             )
             .when(!self.marks.is_empty(), |el| {
@@ -450,33 +484,38 @@ impl Render for SliderState {
                 let max = self.max;
                 el.child(
                     div()
-                        .relative()
                         .w_full()
+                        .px(px(THUMB_RADIUS))
                         .h(px(18.))
-                        .children(self.marks.iter().enumerate().map(|(i, mark)| {
-                            let frac = safe_fraction(mark.value, min, max);
-                            let target_val = mark.value;
+                        .child(
                             div()
-                                .id(("sl-mark", i))
-                                .absolute()
-                                .left(relative(frac))
-                                .ml(px(-22.))
-                                .w(px(44.))
-                                .flex()
-                                .justify_center()
-                                .text_size(px(11.))
-                                .font_features(tabular_numerals())
-                                .text_color(theme.muted_foreground)
-                                .when(!disabled, |el| {
-                                    el.cursor_pointer()
-                                        .hover(|s| s.text_color(theme.foreground))
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            window.focus(&this.focus_handle, cx);
-                                            this.set_value(target_val, cx);
-                                        }))
-                                })
-                                .child(mark.label.clone())
-                        })),
+                                .relative()
+                                .size_full()
+                                .children(self.marks.iter().enumerate().map(|(i, mark)| {
+                                    let frac = safe_fraction(mark.value, min, max);
+                                    let target_val = mark.value;
+                                    div()
+                                        .id(("sl-mark", i))
+                                        .absolute()
+                                        .left(relative(frac))
+                                        .ml(px(-22.))
+                                        .w(px(44.))
+                                        .flex()
+                                        .justify_center()
+                                        .text_size(px(11.))
+                                        .font_features(tabular_numerals())
+                                        .text_color(theme.muted_foreground)
+                                        .when(!disabled, |el| {
+                                            el.cursor_pointer()
+                                                .hover(|s| s.text_color(theme.foreground))
+                                                .on_click(cx.listener(move |this, _, window, cx| {
+                                                    window.focus(&this.focus_handle, cx);
+                                                    this.set_value(target_val, cx);
+                                                }))
+                                        })
+                                        .child(mark.label.clone())
+                                })),
+                        ),
                 )
             });
         crate::Refineable::refine(root.style(), &self.frame_style);
@@ -863,9 +902,9 @@ impl Render for RangeSliderState {
                 .when_some(focus, |el, focus| el.track_focus(focus))
                 .absolute()
                 .left(relative(pct))
-                .ml(px(-9.))
-                .w(px(18.))
-                .h(px(18.))
+                .ml(px(-THUMB_RADIUS))
+                .w(px(THUMB_SIZE))
+                .h(px(THUMB_SIZE))
                 .rounded_full()
                 .bg(theme.slider_thumb)
                 .border_2()
@@ -938,109 +977,139 @@ impl Render for RangeSliderState {
                             .on_key_down(cx.listener(Self::on_key_down))
                     })
                     .when(disabled, |el| el.cursor_not_allowed())
-                    .child(
-                        canvas(
-                            move |bounds, _, _| bounds_cell.set(Some(bounds)),
-                            move |_, _, window, _| {
-                                let Some(thumb) = dragging else {
-                                    return;
-                                };
-                                let ent_move = entity.clone();
-                                window.on_mouse_event(move |ev: &MouseMoveEvent, phase, _, cx| {
-                                    if phase != DispatchPhase::Capture {
-                                        return;
-                                    }
-                                    if ev.pressed_button != Some(MouseButton::Left) {
-                                        ent_move.update(cx, |s, cx| {
-                                            if s.dragging.take().is_some() {
-                                                cx.notify();
-                                            }
-                                        });
-                                        return;
-                                    }
-                                    ent_move.update(cx, |s, cx| {
-                                        if s.dragging == Some(thumb)
-                                            && !s.disabled
-                                            && let Some(val) = s.value_at_x(ev.position.x)
-                                        {
-                                            s.apply_thumb_value(thumb, val, cx);
-                                        }
-                                    });
-                                });
-                                let ent_up = entity;
-                                window.on_mouse_event(move |ev: &MouseUpEvent, phase, _, cx| {
-                                    if phase == DispatchPhase::Capture
-                                        && ev.button == MouseButton::Left
-                                    {
-                                        ent_up.update(cx, |s, cx| {
-                                            if s.dragging.take().is_some() {
-                                                cx.notify();
-                                            }
-                                        });
-                                    }
-                                });
-                            },
-                        )
-                        .absolute()
-                        .size_full(),
-                    )
-                    // Background rail + highlighted interior segment
+                    // Background rail + highlighted interior segment aligned with the inset thumb centers
                     .child(
                         div()
-                            .relative()
                             .w_full()
                             .h(px(6.))
                             .rounded_full()
                             .bg(theme.slider_track)
                             .overflow_hidden()
+                            .px(px(THUMB_RADIUS))
                             .child(
                                 div()
-                                    .absolute()
-                                    .top_0()
-                                    .bottom_0()
-                                    .left(relative(start_pct))
-                                    .w(relative((end_pct - start_pct).max(0.0)))
-                                    .rounded_full()
-                                    .bg(theme.slider_fill),
+                                    .relative()
+                                    .size_full()
+                                    .when(end_pct > start_pct, |el| {
+                                        el.child(
+                                            div()
+                                                .absolute()
+                                                .top_0()
+                                                .bottom_0()
+                                                .left(relative(start_pct))
+                                                .right(relative(1.0 - end_pct))
+                                                .bg(theme.slider_fill),
+                                        )
+                                    }),
                             ),
                     )
-                    .child(first_thumb)
-                    .child(second_thumb),
+                    // Inset travel layer so both thumbs stay strictly within [0, width]
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .bottom_0()
+                            .left(px(THUMB_RADIUS))
+                            .right(px(THUMB_RADIUS))
+                            .flex()
+                            .items_center()
+                            .child(
+                                canvas(
+                                    move |bounds, _, _| bounds_cell.set(Some(bounds)),
+                                    move |_, _, window, _| {
+                                        let Some(thumb) = dragging else {
+                                            return;
+                                        };
+                                        let ent_move = entity.clone();
+                                        window.on_mouse_event(
+                                            move |ev: &MouseMoveEvent, phase, _, cx| {
+                                                if phase != DispatchPhase::Capture {
+                                                    return;
+                                                }
+                                                if ev.pressed_button != Some(MouseButton::Left) {
+                                                    ent_move.update(cx, |s, cx| {
+                                                        if s.dragging.take().is_some() {
+                                                            cx.notify();
+                                                        }
+                                                    });
+                                                    return;
+                                                }
+                                                ent_move.update(cx, |s, cx| {
+                                                    if s.dragging == Some(thumb)
+                                                        && !s.disabled
+                                                        && let Some(val) = s.value_at_x(ev.position.x)
+                                                    {
+                                                        s.apply_thumb_value(thumb, val, cx);
+                                                    }
+                                                });
+                                            },
+                                        );
+                                        let ent_up = entity;
+                                        window.on_mouse_event(
+                                            move |ev: &MouseUpEvent, phase, _, cx| {
+                                                if phase == DispatchPhase::Capture
+                                                    && ev.button == MouseButton::Left
+                                                {
+                                                    ent_up.update(cx, |s, cx| {
+                                                        if s.dragging.take().is_some() {
+                                                            cx.notify();
+                                                        }
+                                                    });
+                                                }
+                                            },
+                                        );
+                                    },
+                                )
+                                .absolute()
+                                .size_full(),
+                            )
+                            .child(first_thumb)
+                            .child(second_thumb),
+                    ),
             )
             .when(!self.marks.is_empty(), |el| {
                 let min = self.min;
                 let max = self.max;
                 el.child(
                     div()
-                        .relative()
                         .w_full()
+                        .px(px(THUMB_RADIUS))
                         .h(px(18.))
-                        .children(self.marks.iter().enumerate().map(|(i, mark)| {
-                            let frac = safe_fraction(mark.value, min, max);
-                            let target_val = mark.value;
+                        .child(
                             div()
-                                .id(("rsl-mark", i))
-                                .absolute()
-                                .left(relative(frac))
-                                .ml(px(-22.))
-                                .w(px(44.))
-                                .flex()
-                                .justify_center()
-                                .text_size(px(11.))
-                                .font_features(tabular_numerals())
-                                .text_color(theme.muted_foreground)
-                                .when(!disabled, |el| {
-                                    el.cursor_pointer()
-                                        .hover(|s| s.text_color(theme.foreground))
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            let thumb = this.pick_thumb_for_target(target_val);
-                                            window.focus(&this.thumb_handle(thumb).clone(), cx);
-                                            this.active_thumb = thumb;
-                                            this.apply_thumb_value(thumb, target_val, cx);
-                                        }))
-                                })
-                                .child(mark.label.clone())
-                        })),
+                                .relative()
+                                .size_full()
+                                .children(self.marks.iter().enumerate().map(|(i, mark)| {
+                                    let frac = safe_fraction(mark.value, min, max);
+                                    let target_val = mark.value;
+                                    div()
+                                        .id(("rsl-mark", i))
+                                        .absolute()
+                                        .left(relative(frac))
+                                        .ml(px(-22.))
+                                        .w(px(44.))
+                                        .flex()
+                                        .justify_center()
+                                        .text_size(px(11.))
+                                        .font_features(tabular_numerals())
+                                        .text_color(theme.muted_foreground)
+                                        .when(!disabled, |el| {
+                                            el.cursor_pointer()
+                                                .hover(|s| s.text_color(theme.foreground))
+                                                .on_click(cx.listener(move |this, _, window, cx| {
+                                                    let thumb =
+                                                        this.pick_thumb_for_target(target_val);
+                                                    window.focus(
+                                                        &this.thumb_handle(thumb).clone(),
+                                                        cx,
+                                                    );
+                                                    this.active_thumb = thumb;
+                                                    this.apply_thumb_value(thumb, target_val, cx);
+                                                }))
+                                        })
+                                        .child(mark.label.clone())
+                                })),
+                        ),
                 )
             });
 

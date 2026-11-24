@@ -104,6 +104,7 @@ const M_PI_F: f32 = 3.1415926;
 const GRAYSCALE_FACTORS: vec3<f32> = vec3<f32>(0.2126, 0.7152, 0.0722);
 
 const SIMPLE_PRIMITIVE_FLAG: u32 = 0x80000000u;
+const ROUNDED_MASK_FLAG: u32 = 0x80000000u;
 
 struct Bounds {
     origin: vec2<f32>,
@@ -115,6 +116,11 @@ struct Corners {
     top_right: f32,
     bottom_right: f32,
     bottom_left: f32,
+}
+
+struct ContentMask {
+    bounds: Bounds,
+    corner_radii: Corners,
 }
 
 struct Edges {
@@ -351,6 +357,13 @@ fn pick_corner_radius(center_to_point: vec2<f32>, radii: Corners) -> f32 {
     }
 }
 
+fn has_rounded_corners(corner_radii: Corners) -> bool {
+    return corner_radii.top_left != 0.0
+        || corner_radii.top_right != 0.0
+        || corner_radii.bottom_right != 0.0
+        || corner_radii.bottom_left != 0.0;
+}
+
 // Signed distance of the point to the quad's border - positive outside the
 // border, and negative inside.
 //
@@ -364,6 +377,23 @@ fn quad_sdf(point: vec2<f32>, bounds: Bounds, corner_radii: Corners) -> f32 {
     let corner_to_point = abs(center_to_point) - half_size;
     let corner_center_to_point = corner_to_point + corner_radius;
     return quad_sdf_impl(corner_center_to_point, corner_radius);
+}
+
+fn content_mask_alpha(point: vec2<f32>, mask: ContentMask) -> f32 {
+    if (!has_rounded_corners(mask.corner_radii)) {
+        return 1.0;
+    }
+    let half_size = mask.bounds.size * 0.5;
+    let center = mask.bounds.origin + half_size;
+    let center_to_point = point - center;
+    let corner_radius = min(
+        pick_corner_radius(center_to_point, mask.corner_radii),
+        min(half_size.x, half_size.y),
+    );
+    let corner_to_point = abs(center_to_point) - half_size;
+    let corner_center_to_point = corner_to_point + corner_radius;
+    let distance = quad_sdf_impl(corner_center_to_point, corner_radius);
+    return saturate(0.5 - distance);
 }
 
 fn quad_sdf_impl(corner_center_to_point: vec2<f32>, corner_radius: f32) -> f32 {
@@ -520,18 +550,11 @@ struct Quad {
     order: u32,
     border_style: u32,
     bounds: Bounds,
-    content_mask: Bounds,
+    content_mask: ContentMask,
     background: Background,
     border_color: Hsla,
     corner_radii: Corners,
     border_widths: Edges,
-}
-
-fn has_rounded_corners(corner_radii: Corners) -> bool {
-    return corner_radii.top_left != 0.0
-        || corner_radii.top_right != 0.0
-        || corner_radii.bottom_right != 0.0
-        || corner_radii.bottom_left != 0.0;
 }
 
 fn has_border(border_widths: Edges) -> bool {
@@ -556,7 +579,8 @@ fn is_opaque_rectangle(quad: Quad) -> bool {
     return quad.background.tag == 0u
         && quad.background.solid.a >= 1.0
         && !has_rounded_corners(quad.corner_radii)
-        && !has_border(quad.border_widths);
+        && !has_border(quad.border_widths)
+        && !has_rounded_corners(quad.content_mask.corner_radii);
 }
 
 struct QuadVarying {
@@ -580,12 +604,14 @@ fn vs_quad(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) insta
     }
 
     let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
-    let clipped = clip_to_mask(unit_vertex, quad.bounds, quad.content_mask);
+    let clipped = clip_to_mask(unit_vertex, quad.bounds, quad.content_mask.bounds);
     out.position = to_device_position_impl(clipped.position);
     out.position.z = quad_depth(instance_id);
 
     out.border_color = hsla_to_rgba(quad.border_color);
-    let simple = !is_shaped(quad) && quad.background.tag == 0u;
+    let simple = !is_shaped(quad)
+        && quad.background.tag == 0u
+        && !has_rounded_corners(quad.content_mask.corner_radii);
     out.quad_id = instance_id | select(0u, SIMPLE_PRIMITIVE_FLAG, simple);
     let background = prepare_background(quad.background);
     out.background_color0 = background.color0;
@@ -601,6 +627,10 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
     }
 
     let quad = load_quad(input.quad_id);
+    let mask_alpha = content_mask_alpha(input.position.xy, quad.content_mask);
+    if (mask_alpha == 0.0) {
+        return vec4<f32>(0.0);
+    }
     let prepared = PreparedBackground(input.background_color0, input.background_color1,
         input.background_tag);
     let background = background_color(prepared, quad.background, quad.bounds, input.position.xy);
@@ -669,7 +699,7 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
     // However, that might negatively impact performance in the case of
     // reasonable sizes for rounded corners.
     if (is_within_inner_straight_border && !is_near_rounded_corner) {
-        return blend_color(background, 1.0);
+        return blend_color(background, mask_alpha);
     }
 
     // Signed distance of the point to the outside edge of the quad's border. It
@@ -905,7 +935,7 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
         color = over(background, border_color);
     }
 
-    return blend_color(color, saturate(antialias_threshold - outer_sdf));
+    return blend_color(color, saturate(antialias_threshold - outer_sdf) * mask_alpha);
 }
 
 // Returns the dash velocity of a corner given the dash velocity of the two
@@ -980,7 +1010,7 @@ fn vs_opaque_quad(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index
     }
 
     let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
-    let clipped = clip_to_mask(unit_vertex, quad.bounds, quad.content_mask);
+    let clipped = clip_to_mask(unit_vertex, quad.bounds, quad.content_mask.bounds);
     out.position = to_device_position_impl(clipped.position);
     out.position.z = quad_depth(quad_id);
     out.color = blend_color(hsla_to_rgba(quad.background.solid), 1.0);
@@ -1001,7 +1031,7 @@ struct Shadow {
     // that an inset shadow is clipped to.
     bounds: Bounds,
     corner_radii: Corners,
-    content_mask: Bounds,
+    content_mask: ContentMask,
     color: Hsla,
     // The shape that is blurred: the silhouette of a drop shadow, or the hole of an
     // inset shadow.
@@ -1092,7 +1122,7 @@ fn vs_shadow(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) ins
     var shadow = load_shadow(instance_id);
 
     var out = ShadowVarying();
-    let clipped = clip_to_mask(unit_vertex, shadow.bounds, shadow.content_mask);
+    let clipped = clip_to_mask(unit_vertex, shadow.bounds, shadow.content_mask.bounds);
     out.position = to_device_position_impl(clipped.position);
     out.color = hsla_to_rgba(shadow.color);
     out.shadow_id = instance_id;
@@ -1108,6 +1138,10 @@ fn vs_shadow(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) ins
 @fragment
 fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
     let shadow = load_shadow(input.shadow_id);
+    let mask_alpha = content_mask_alpha(input.position.xy, shadow.content_mask);
+    if (mask_alpha == 0.0) {
+        return vec4<f32>(0.0);
+    }
 
     var alpha: f32;
     if (shadow.blur_radius == 0.0) {
@@ -1128,7 +1162,7 @@ fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
         alpha *= saturate(0.5 - element_distance);
     }
 
-    return blend_color(input.color, alpha);
+    return blend_color(input.color, alpha * mask_alpha);
 }
 
 // --- path tiles --- //
@@ -1156,7 +1190,7 @@ struct PathCurve {
 
 struct PathPaint {
     bounds: Bounds,
-    content_mask: Bounds,
+    content_mask: ContentMask,
     color: Background,
     even_odd: u32,
     pad: u32,
@@ -1177,8 +1211,8 @@ fn vs_path_tile(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) 
     let tile = load_path_tile(instance_id);
     let paint = load_path_paint(tile.paint);
 
-    let mask_top_left = paint.content_mask.origin;
-    let mask_bottom_right = paint.content_mask.origin + paint.content_mask.size;
+    let mask_top_left = paint.content_mask.bounds.origin;
+    let mask_bottom_right = paint.content_mask.bounds.origin + paint.content_mask.bounds.size;
     let top_left = clamp(tile.top_left, mask_top_left, mask_bottom_right);
     let bottom_right = clamp(tile.bottom_right, top_left, mask_bottom_right);
     let position = vec2<f32>(
@@ -1188,7 +1222,7 @@ fn vs_path_tile(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) 
 
     var out = PathTileVarying();
     out.position = to_device_position_impl(position);
-    out.tile_id = instance_id;
+    out.tile_id = instance_id | select(0u, ROUNDED_MASK_FLAG, has_rounded_corners(paint.content_mask.corner_radii));
     out.curve_box = vec4<f32>(tile.curves_top_left, tile.curves_bottom_right);
     let background = prepare_background(paint.color);
     out.background_color0 = background.color0;
@@ -1262,12 +1296,23 @@ fn correct_for_endpoint(endpoint: vec2<f32>, step: f32, reference: vec2<f32>, ce
 @fragment
 fn fs_path_tile(input: PathTileVarying) -> @location(0) vec4<f32> {
     let center = floor(input.position.xy) + 0.5;
-    if (input.background_tag == 0u
+    let rounded_mask = (input.tile_id & ROUNDED_MASK_FLAG) != 0u;
+    let tile_id = input.tile_id & ~ROUNDED_MASK_FLAG;
+    if (!rounded_mask
+        && input.background_tag == 0u
         && (any(center < input.curve_box.xy) || any(center > input.curve_box.zw))) {
         return blend_color(input.background_color0, 1.0);
     }
-    let tile = load_path_tile(input.tile_id);
+    let tile = load_path_tile(tile_id);
     let paint = load_path_paint(tile.paint);
+    let mask_alpha = select(1.0, content_mask_alpha(input.position.xy, paint.content_mask), rounded_mask);
+    if (mask_alpha == 0.0) {
+        return vec4<f32>(0.0);
+    }
+    if (input.background_tag == 0u
+        && (any(center < input.curve_box.xy) || any(center > input.curve_box.zw))) {
+        return blend_color(input.background_color0, mask_alpha);
+    }
 
     var winding = vec2<f32>(f32(tile.backdrop));
     var weight = vec2<f32>(0.0);
@@ -1301,7 +1346,7 @@ fn fs_path_tile(input: PathTileVarying) -> @location(0) vec4<f32> {
     let prepared = PreparedBackground(input.background_color0, input.background_color1,
         input.background_tag);
     let color = background_color(prepared, paint.color, paint.bounds, input.position.xy);
-    return blend_color(color, coverage);
+    return blend_color(color, coverage * mask_alpha);
 }
 
 // --- underlines --- //
@@ -1310,7 +1355,7 @@ struct Underline {
     order: u32,
     pad: u32,
     bounds: Bounds,
-    content_mask: Bounds,
+    content_mask: ContentMask,
     color: Hsla,
     thickness: f32,
     wavy: u32,
@@ -1329,10 +1374,11 @@ fn vs_underline(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) 
     let underline = load_underline(instance_id);
 
     var out = UnderlineVarying();
-    let clipped = clip_to_mask(unit_vertex, underline.bounds, underline.content_mask);
+    let clipped = clip_to_mask(unit_vertex, underline.bounds, underline.content_mask.bounds);
     out.position = to_device_position_impl(clipped.position);
     out.color = hsla_to_rgba(underline.color);
-    out.underline_id = instance_id | select(0u, SIMPLE_PRIMITIVE_FLAG, underline.wavy == 0u);
+    let simple = underline.wavy == 0u && !has_rounded_corners(underline.content_mask.corner_radii);
+    out.underline_id = instance_id | select(0u, SIMPLE_PRIMITIVE_FLAG, simple);
     return out;
 }
 
@@ -1346,6 +1392,10 @@ fn fs_underline(input: UnderlineVarying) -> @location(0) vec4<f32> {
     }
 
     let underline = load_underline(input.underline_id);
+    let mask_alpha = content_mask_alpha(input.position.xy, underline.content_mask);
+    if (underline.wavy == 0u) {
+        return blend_color(input.color, mask_alpha * input.color.a);
+    }
     let half_thickness = underline.thickness * 0.5;
 
     let st = (input.position.xy - underline.bounds.origin) / underline.bounds.size.y - vec2<f32>(0.0, 0.5);
@@ -1359,7 +1409,7 @@ fn fs_underline(input: UnderlineVarying) -> @location(0) vec4<f32> {
     let distance_from_top_border = distance_in_pixels - half_thickness;
     let distance_from_bottom_border = distance_in_pixels + half_thickness;
     let alpha = saturate(0.5 - max(-distance_from_bottom_border, distance_from_top_border));
-    return blend_color(input.color, alpha * input.color.a);
+    return blend_color(input.color, alpha * mask_alpha * input.color.a);
 }
 
 // --- monochrome sprites --- //
@@ -1369,7 +1419,7 @@ struct MonochromeSprite {
     pad: u32,
     tile: AtlasTile,
     bounds: Bounds,
-    content_mask: Bounds,
+    content_mask: ContentMask,
     color: Hsla,
     transformation: TransformationMatrix,
 }
@@ -1379,6 +1429,7 @@ struct MonoSpriteVarying {
     @builtin(position) position: vec4<f32>,
     @location(0) tile_position: vec2<f32>,
     @location(1) @interpolate(flat) color: vec4<f32>,
+    @location(2) @interpolate(flat) sprite_id: u32,
     @location(3) clip_distances: vec4<f32>,
 }
 
@@ -1392,7 +1443,8 @@ fn vs_mono_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index
 
     out.tile_position = to_tile_position(unit_vertex, sprite.tile);
     out.color = hsla_to_rgba(sprite.color);
-    out.clip_distances = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds, sprite.content_mask, sprite.transformation);
+    out.sprite_id = instance_id | select(0u, ROUNDED_MASK_FLAG, has_rounded_corners(sprite.content_mask.corner_radii));
+    out.clip_distances = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds, sprite.content_mask.bounds, sprite.transformation);
     return out;
 }
 
@@ -1406,7 +1458,13 @@ fn fs_mono_sprite(input: MonoSpriteVarying) -> @location(0) vec4<f32> {
         return vec4<f32>(0.0);
     }
 
-    return blend_color(input.color, alpha_corrected);
+    var mask_alpha = 1.0;
+    if ((input.sprite_id & ROUNDED_MASK_FLAG) != 0u) {
+        let sprite = load_mono_sprite(input.sprite_id & ~ROUNDED_MASK_FLAG);
+        mask_alpha = content_mask_alpha(input.position.xy, sprite.content_mask);
+    }
+
+    return blend_color(input.color, alpha_corrected * mask_alpha);
 }
 
 // --- polychrome sprites --- //
@@ -1418,7 +1476,7 @@ struct PolychromeSprite {
     grayscale: u32,
     opacity: f32,
     bounds: Bounds,
-    content_mask: Bounds,
+    content_mask: ContentMask,
     corner_radii: Corners,
 }
 
@@ -1436,10 +1494,12 @@ fn vs_poly_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index
     let sprite = load_poly_sprite(instance_id);
 
     var out = PolySpriteVarying();
-    let clipped = clip_to_mask(unit_vertex, sprite.bounds, sprite.content_mask);
+    let clipped = clip_to_mask(unit_vertex, sprite.bounds, sprite.content_mask.bounds);
     out.position = to_device_position_impl(clipped.position);
     out.tile_position = to_tile_position(clipped.unit_vertex, sprite.tile);
-    let simple = !has_rounded_corners(sprite.corner_radii) && sprite.grayscale == 0u;
+    let simple = !has_rounded_corners(sprite.corner_radii)
+        && sprite.grayscale == 0u
+        && !has_rounded_corners(sprite.content_mask.corner_radii);
     out.sprite_id = instance_id | select(0u, SIMPLE_PRIMITIVE_FLAG, simple);
     out.opacity = sprite.opacity;
     return out;
@@ -1457,14 +1517,15 @@ fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
         color = vec4<f32>(vec3<f32>(dot(color.rgb, GRAYSCALE_FACTORS)), color.a);
     }
     let distance = quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
-    return blend_color(color, input.opacity * saturate(0.5 - distance));
+    let mask_alpha = content_mask_alpha(input.position.xy, sprite.content_mask);
+    return blend_color(color, input.opacity * saturate(0.5 - distance) * mask_alpha);
 }
 
 // --- surfaces --- //
 
 struct SurfaceParams {
     bounds: Bounds,
-    content_mask: Bounds,
+    content_mask: ContentMask,
 }
 
 @group(1) @binding(0) var<uniform> surface_locals: SurfaceParams;
@@ -1489,7 +1550,7 @@ fn vs_surface(@builtin(vertex_index) vertex_id: u32) -> SurfaceVarying {
     let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
 
     var out = SurfaceVarying();
-    let clipped = clip_to_mask(unit_vertex, surface_locals.bounds, surface_locals.content_mask);
+    let clipped = clip_to_mask(unit_vertex, surface_locals.bounds, surface_locals.content_mask.bounds);
     out.position = to_device_position_impl(clipped.position);
     // The whole texture is copied, so sample at the vertex's position within the unclipped bounds.
     out.texture_position = clipped.unit_vertex;
@@ -1503,5 +1564,7 @@ fn fs_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
         textureSampleLevel(t_cb_cr, s_surface, input.texture_position, 0.0).rg,
         1.0);
 
-    return ycbcr_to_RGB * y_cb_cr;
+    let color = ycbcr_to_RGB * y_cb_cr;
+    let mask_alpha = content_mask_alpha(input.position.xy, surface_locals.content_mask);
+    return blend_color(color, mask_alpha);
 }

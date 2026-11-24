@@ -219,9 +219,25 @@ impl From<Bounds<ScaledPixels>> for PodBounds {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
+struct PodCorners {
+    top_left: f32,
+    top_right: f32,
+    bottom_right: f32,
+    bottom_left: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct PodContentMask {
+    bounds: PodBounds,
+    corner_radii: PodCorners,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
 struct SurfaceParams {
     bounds: PodBounds,
-    content_mask: PodBounds,
+    content_mask: PodContentMask,
 }
 
 #[repr(C)]
@@ -3957,7 +3973,7 @@ mod tests {
             order: 0,
             border_style: BorderStyle::Solid,
             bounds,
-            content_mask: ContentMask { bounds },
+            content_mask: ContentMask::new(bounds),
             background: color.into(),
             border_color: color,
             corner_radii: Corners::default(),
@@ -4115,7 +4131,7 @@ mod tests {
             region,
             Corners { top_left: 10.0.into(), top_right: 4.0.into(), bottom_right: 10.0.into(), bottom_left: 0.0.into() },
             radius.into(),
-            ContentMask { bounds: Bounds { origin: Point::default(), size: Size { width: 96.0.into(), height: 96.0.into() } } },
+            ContentMask::new(Bounds { origin: Point::default(), size: Size { width: 96.0.into(), height: 96.0.into() } }),
             1.0,
         ));
         blurred.finish();
@@ -4154,6 +4170,139 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn headless_rounded_content_mask_clips_quad_path_and_blur() -> anyhow::Result<()> {
+        use gpui::{
+            BorderStyle, Bounds, ContentMask, Corners, Edges, PathBuilder, PaintedPath,
+            PlatformHeadlessRenderer as _, Point, Quad, ScaledPixels, Scene, Size, point, px, size,
+        };
+
+        let mut renderer = WgpuHeadlessRenderer::new()?;
+        let (w, h) = (96i32, 96i32);
+        let full_bounds = Bounds {
+            origin: Point {
+                x: ScaledPixels(0.0),
+                y: ScaledPixels(0.0),
+            },
+            size: Size {
+                width: ScaledPixels(w as f32),
+                height: ScaledPixels(h as f32),
+            },
+        };
+        let box_bounds = Bounds {
+            origin: Point {
+                x: ScaledPixels(8.0),
+                y: ScaledPixels(8.0),
+            },
+            size: Size {
+                width: ScaledPixels(80.0),
+                height: ScaledPixels(80.0),
+            },
+        };
+        let rounded_mask = ContentMask::rounded(box_bounds, Corners::all(ScaledPixels(20.0)));
+
+        // 1. Opaque unrounded red Quad clipped by rounded ContentMask must leave corners pure white.
+        let mut quad_scene = Scene::default();
+        quad_scene.insert_primitive(Quad {
+            order: 0,
+            border_style: BorderStyle::Solid,
+            bounds: full_bounds,
+            content_mask: ContentMask::new(full_bounds),
+            background: gpui::white().into(),
+            border_color: gpui::white(),
+            corner_radii: Corners::default(),
+            border_widths: Edges::default(),
+        });
+        quad_scene.insert_primitive(Quad {
+            order: 0,
+            border_style: BorderStyle::Solid,
+            bounds: box_bounds,
+            content_mask: rounded_mask,
+            background: gpui::red().into(),
+            border_color: gpui::red(),
+            corner_radii: Corners::default(),
+            border_widths: Edges::default(),
+        });
+        quad_scene.finish();
+        let img = renderer.render_scene_to_image(&quad_scene, device_size(w, h))?;
+        assert_eq!(img.get_pixel(9, 9).0, [255, 255, 255, 255], "top-left corner of opaque quad must be clipped cleanly");
+        assert_eq!(img.get_pixel(86, 86).0, [255, 255, 255, 255], "bottom-right corner of opaque quad must be clipped cleanly");
+        assert_eq!(img.get_pixel(48, 48).0, [255, 0, 0, 255], "interior of clipped quad must remain red");
+
+        // 2. Square blue PaintedPath clipped by rounded ContentMask must leave corners pure white.
+        let mut pb = PathBuilder::fill();
+        pb.move_to(point(px(8.0), px(8.0)));
+        pb.line_to(point(px(88.0), px(8.0)));
+        pb.line_to(point(px(88.0), px(88.0)));
+        pb.line_to(point(px(8.0), px(88.0)));
+        pb.close();
+        let path = pb.build()?;
+        let logical_mask = ContentMask::rounded(
+            Bounds::new(point(px(8.0), px(8.0)), size(px(80.0), px(80.0))),
+            Corners::all(px(20.0)),
+        );
+        let mut path_scene = Scene::default();
+        path_scene.insert_primitive(Quad {
+            order: 0,
+            border_style: BorderStyle::Solid,
+            bounds: full_bounds,
+            content_mask: ContentMask::new(full_bounds),
+            background: gpui::white().into(),
+            border_color: gpui::white(),
+            corner_radii: Corners::default(),
+            border_widths: Edges::default(),
+        });
+        path_scene.insert_primitive(PaintedPath::new(path, 1.0, logical_mask, gpui::blue().into()));
+        path_scene.finish();
+        let path_img = renderer.render_scene_to_image(&path_scene, device_size(w, h))?;
+        assert_eq!(path_img.get_pixel(9, 9).0, [255, 255, 255, 255], "top-left corner of path must be clipped cleanly");
+        assert_eq!(path_img.get_pixel(86, 86).0, [255, 255, 255, 255], "bottom-right corner of path must be clipped cleanly");
+        assert_eq!(path_img.get_pixel(48, 48).0, [0, 0, 255, 255], "interior of clipped path must remain blue");
+
+        // 3. Unrounded BackdropBlur clipped by rounded ContentMask must leave corner stripes untouched.
+        let mut base = Scene::default();
+        let add_stripes = |scene: &mut Scene| {
+            for i in 0..12 {
+                let color = if i % 2 == 0 { gpui::white() } else { gpui::red() };
+                let b = Bounds {
+                    origin: Point { x: ScaledPixels(i as f32 * 8.0), y: ScaledPixels(0.0) },
+                    size: Size { width: ScaledPixels(8.0), height: ScaledPixels(96.0) },
+                };
+                scene.insert_primitive(Quad {
+                    order: 0,
+                    border_style: BorderStyle::Solid,
+                    bounds: b,
+                    content_mask: ContentMask::new(b),
+                    background: color.into(),
+                    border_color: color,
+                    corner_radii: Corners::default(),
+                    border_widths: Edges::default(),
+                });
+            }
+        };
+        add_stripes(&mut base);
+        base.finish();
+        let before = renderer.render_scene_to_image(&base, device_size(w, h))?;
+
+        let mut blur_scene = Scene::default();
+        add_stripes(&mut blur_scene);
+        blur_scene.insert_primitive(gpui::BackdropBlur::plain(
+            box_bounds,
+            Corners::default(),
+            ScaledPixels(8.0),
+            rounded_mask,
+            1.0,
+        ));
+        blur_scene.finish();
+        let after = renderer.render_scene_to_image(&blur_scene, device_size(w, h))?;
+        assert_eq!(after.get_pixel(9, 9), before.get_pixel(9, 9), "top-left corner outside rounded blur mask must stay untouched");
+        assert_eq!(after.get_pixel(86, 86), before.get_pixel(86, 86), "bottom-right corner outside rounded blur mask must stay untouched");
+        assert_ne!(after.get_pixel(48, 48), before.get_pixel(48, 48), "interior inside rounded blur mask must be blurred");
+
+        Ok(())
+    }
+
     #[test]
     fn storage_buffer_shader_is_valid_wgsl() {
         validate_wgsl(STORAGE_BUFFER_SHADERS, naga::valid::Capabilities::empty());
@@ -4176,15 +4325,15 @@ mod tests {
 
     #[test]
     fn webgl_record_sizes_match_shader_word_strides() {
-        assert_eq!(std::mem::size_of::<Quad>(), 40 * 4);
-        assert_eq!(std::mem::size_of::<Shadow>(), 28 * 4);
+        assert_eq!(std::mem::size_of::<Quad>(), 44 * 4);
+        assert_eq!(std::mem::size_of::<Shadow>(), 32 * 4);
         assert_eq!(std::mem::size_of::<PathTile>(), 14 * 4);
         assert_eq!(std::mem::size_of::<PathCurve>(), 10 * 4);
-        assert_eq!(std::mem::size_of::<PathPaint>(), 28 * 4);
-        assert_eq!(std::mem::size_of::<Underline>(), 16 * 4);
-        assert_eq!(std::mem::size_of::<MonochromeSprite>(), 28 * 4);
-        assert_eq!(std::mem::size_of::<SubpixelSprite>(), 28 * 4);
-        assert_eq!(std::mem::size_of::<PolychromeSprite>(), 24 * 4);
+        assert_eq!(std::mem::size_of::<PathPaint>(), 32 * 4);
+        assert_eq!(std::mem::size_of::<Underline>(), 20 * 4);
+        assert_eq!(std::mem::size_of::<MonochromeSprite>(), 32 * 4);
+        assert_eq!(std::mem::size_of::<SubpixelSprite>(), 32 * 4);
+        assert_eq!(std::mem::size_of::<PolychromeSprite>(), 28 * 4);
     }
 
     #[test]
@@ -4212,6 +4361,12 @@ mod tests {
                         width: 7.0.into(),
                         height: 8.0.into(),
                     },
+                },
+                corner_radii: Corners {
+                    top_left: 9.0.into(),
+                    top_right: 10.0.into(),
+                    bottom_right: 9.5.into(),
+                    bottom_left: 10.5.into(),
                 },
             },
             background: linear_gradient(
@@ -4271,6 +4426,10 @@ mod tests {
                 6.0_f32.to_bits(),
                 7.0_f32.to_bits(),
                 8.0_f32.to_bits(),
+                9.0_f32.to_bits(),
+                10.0_f32.to_bits(),
+                9.5_f32.to_bits(),
+                10.5_f32.to_bits(),
                 1,
                 1,
                 0,
@@ -4332,18 +4491,16 @@ mod tests {
             .view
             .clone();
 
-        let full_mask = ContentMask {
-            bounds: Bounds {
-                origin: Point {
-                    x: ScaledPixels(0.0),
-                    y: ScaledPixels(0.0),
-                },
-                size: Size {
-                    width: ScaledPixels(w as f32),
-                    height: ScaledPixels(h as f32),
-                },
+        let full_mask = ContentMask::new(Bounds {
+            origin: Point {
+                x: ScaledPixels(0.0),
+                y: ScaledPixels(0.0),
             },
-        };
+            size: Size {
+                width: ScaledPixels(w as f32),
+                height: ScaledPixels(h as f32),
+            },
+        });
 
         let hsla = |h: f32, s: f32, l: f32, a: f32| Hsla { h, s, l, a };
         let build_dashboard = |dark: bool| {
@@ -4877,18 +5034,16 @@ mod tests {
         // Build a hybrid "new" scene where ONLY the two cards switched to dark content while
         // the surrounding chrome remains light!
         let mut hybrid_new = build_dashboard(false);
-        let full_mask = ContentMask {
-            bounds: Bounds {
-                origin: Point {
-                    x: ScaledPixels(0.0),
-                    y: ScaledPixels(0.0),
-                },
-                size: Size {
-                    width: ScaledPixels(w as f32),
-                    height: ScaledPixels(h as f32),
-                },
+        let full_mask = ContentMask::new(Bounds {
+            origin: Point {
+                x: ScaledPixels(0.0),
+                y: ScaledPixels(0.0),
             },
-        };
+            size: Size {
+                width: ScaledPixels(w as f32),
+                height: ScaledPixels(h as f32),
+            },
+        });
         let dark_card_bg = Hsla { h: 0.62, s: 0.34, l: 0.13, a: 1.0 };
         let dark_card_border = Hsla { h: 0.62, s: 0.28, l: 0.24, a: 1.0 };
         hybrid_new.insert_primitive(Quad {
@@ -5038,18 +5193,16 @@ mod tests {
 
         let build_scene = |bg: Hsla, card_bg: Hsla, accent: Hsla| {
             let mut scene = Scene::default();
-            let full_mask = ContentMask {
-                bounds: Bounds {
-                    origin: Point {
-                        x: ScaledPixels(0.0),
-                        y: ScaledPixels(0.0),
-                    },
-                    size: Size {
-                        width: ScaledPixels(1280.0),
-                        height: ScaledPixels(800.0),
-                    },
+            let full_mask = ContentMask::new(Bounds {
+                origin: Point {
+                    x: ScaledPixels(0.0),
+                    y: ScaledPixels(0.0),
                 },
-            };
+                size: Size {
+                    width: ScaledPixels(1280.0),
+                    height: ScaledPixels(800.0),
+                },
+            });
             // Backdrop
             scene.insert_primitive(Quad {
                 order: 0,
@@ -5256,18 +5409,16 @@ mod tests {
             width: DevicePixels(w as i32),
             height: DevicePixels(h as i32),
         };
-        let full_mask = ContentMask {
-            bounds: Bounds {
-                origin: Point {
-                    x: ScaledPixels(0.0),
-                    y: ScaledPixels(0.0),
-                },
-                size: Size {
-                    width: ScaledPixels(w as f32),
-                    height: ScaledPixels(h as f32),
-                },
+        let full_mask = ContentMask::new(Bounds {
+            origin: Point {
+                x: ScaledPixels(0.0),
+                y: ScaledPixels(0.0),
             },
-        };
+            size: Size {
+                width: ScaledPixels(w as f32),
+                height: ScaledPixels(h as f32),
+            },
+        });
         let hsla = |h: f32, s: f32, l: f32, a: f32| Hsla { h, s, l, a };
         let build_scene = |dark: bool| {
             let mut scene = Scene::default();
@@ -5575,18 +5726,16 @@ mod tests {
             width: DevicePixels(w as i32),
             height: DevicePixels(h as i32),
         };
-        let full_mask = ContentMask {
-            bounds: Bounds {
-                origin: Point {
-                    x: ScaledPixels(0.0),
-                    y: ScaledPixels(0.0),
-                },
-                size: Size {
-                    width: ScaledPixels(w as f32),
-                    height: ScaledPixels(h as f32),
-                },
+        let full_mask = ContentMask::new(Bounds {
+            origin: Point {
+                x: ScaledPixels(0.0),
+                y: ScaledPixels(0.0),
             },
-        };
+            size: Size {
+                width: ScaledPixels(w as f32),
+                height: ScaledPixels(h as f32),
+            },
+        });
         let bg = Hsla { h: 222.0 / 360.0, s: 0.45, l: 0.10, a: 1.0 };
         let stripe_a = Hsla { h: 350.0 / 360.0, s: 0.90, l: 0.56, a: 1.0 };
         let stripe_b = Hsla { h: 155.0 / 360.0, s: 0.85, l: 0.48, a: 1.0 };
@@ -5783,18 +5932,16 @@ mod tests {
         headless.ensure_render_target(size).expect("render target");
         let target_view = headless.render_target.as_ref().unwrap().view.clone();
 
-        let full_mask = ContentMask {
-            bounds: Bounds {
-                origin: Point {
-                    x: ScaledPixels(0.0),
-                    y: ScaledPixels(0.0),
-                },
-                size: Size {
-                    width: ScaledPixels(320.0),
-                    height: ScaledPixels(200.0),
-                },
+        let full_mask = ContentMask::new(Bounds {
+            origin: Point {
+                x: ScaledPixels(0.0),
+                y: ScaledPixels(0.0),
             },
-        };
+            size: Size {
+                width: ScaledPixels(320.0),
+                height: ScaledPixels(200.0),
+            },
+        });
         let red = Hsla { h: 0.0, s: 1.0, l: 0.5, a: 1.0 };
         let blue = Hsla { h: 240.0 / 360.0, s: 1.0, l: 0.5, a: 1.0 };
 
@@ -5915,12 +6062,10 @@ mod tests {
         headless.ensure_render_target(size).expect("render target");
         let target_view = headless.render_target.as_ref().unwrap().view.clone();
 
-        let full_mask = ContentMask {
-            bounds: Bounds {
-                origin: Point { x: ScaledPixels(0.0), y: ScaledPixels(0.0) },
-                size: Size { width: ScaledPixels(320.0), height: ScaledPixels(120.0) },
-            },
-        };
+        let full_mask = ContentMask::new(Bounds {
+            origin: Point { x: ScaledPixels(0.0), y: ScaledPixels(0.0) },
+            size: Size { width: ScaledPixels(320.0), height: ScaledPixels(120.0) },
+        });
         let dark = Hsla { h: 0.0, s: 0.0, l: 0.05, a: 1.0 };
         let green = Hsla { h: 120.0 / 360.0, s: 1.0, l: 0.5, a: 1.0 };
 
@@ -6021,12 +6166,10 @@ mod tests {
             });
         };
 
-        let full_mask = ContentMask {
-            bounds: Bounds {
-                origin: Point { x: ScaledPixels(0.0), y: ScaledPixels(0.0) },
-                size: Size { width: ScaledPixels(1280.0), height: ScaledPixels(800.0) },
-            },
-        };
+        let full_mask = ContentMask::new(Bounds {
+            origin: Point { x: ScaledPixels(0.0), y: ScaledPixels(0.0) },
+            size: Size { width: ScaledPixels(1280.0), height: ScaledPixels(800.0) },
+        });
         let bg = Hsla { h: 0.62, s: 0.35, l: 0.08, a: 1.0 };
         let card = Hsla { h: 0.62, s: 0.25, l: 0.14, a: 1.0 };
         let accent = Hsla { h: 0.66, s: 0.80, l: 0.58, a: 1.0 };

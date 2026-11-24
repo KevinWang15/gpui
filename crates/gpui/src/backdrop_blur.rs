@@ -200,7 +200,7 @@ pub fn group_by_plan(blurs: &[crate::BackdropBlur]) -> Vec<(Option<BlurPlan>, Ve
 }
 
 /// The uniform every blur shader reads (WGSL `BlurParams`, HLSL cbuffer
-/// `BackdropBlurParams`, MSL `BlurParams`): 128 bytes of 4-byte fields, no
+/// `BackdropBlurParams`, MSL `BlurParams`): 144 bytes of 4-byte fields, no
 /// padding, in this order.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 #[repr(C)]
@@ -228,6 +228,8 @@ pub struct BlurParams {
     pub mask_origin: [f32; 2],
     /// The content mask's size.
     pub mask_size: [f32; 2],
+    /// The content mask's corner radii (top left, top right, bottom right, bottom left).
+    pub mask_corner_radii: [f32; 4],
     /// Glass: refraction strength.
     pub refraction: f32,
     /// Glass: chromatic dispersion.
@@ -277,6 +279,7 @@ impl BlurParams {
         }
         let tint = crate::Rgba::from(blur.tint);
         let mask = blur.content_mask.bounds;
+        let mask_radii = blur.content_mask.corner_radii;
         BlurParams {
             viewport_size: [width as f32, height as f32],
             texel_size: [1.0 / l1w as f32, 1.0 / l1h as f32],
@@ -294,6 +297,12 @@ impl BlurParams {
             ],
             mask_origin: [mask.origin.x.0, mask.origin.y.0],
             mask_size: [mask.size.width.0, mask.size.height.0],
+            mask_corner_radii: [
+                mask_radii.top_left.0,
+                mask_radii.top_right.0,
+                mask_radii.bottom_right.0,
+                mask_radii.bottom_left.0,
+            ],
             refraction: blur.refraction,
             dispersion: blur.dispersion,
             bevel_width: blur.bevel_width.0,
@@ -313,7 +322,7 @@ impl BlurParams {
     }
 }
 
-const _: () = assert!(std::mem::size_of::<BlurParams>() == 128);
+const _: () = assert!(std::mem::size_of::<BlurParams>() == 144);
 
 /// The drop shadow's extent beyond a glass surface's bounds, in device
 /// pixels: (left and right, top, bottom). The composite shaders draw it there.
@@ -677,7 +686,7 @@ mod tests {
                 order: 0,
                 border_style: BorderStyle::Solid,
                 bounds: b,
-                content_mask: ContentMask { bounds: rect(0.0, 0.0, 1000.0, 1000.0) },
+                content_mask: ContentMask::new(rect(0.0, 0.0, 1000.0, 1000.0)),
                 background: crate::red().into(),
                 border_color: crate::red(),
                 corner_radii: Corners::default(),
@@ -685,7 +694,7 @@ mod tests {
             }
         }
         fn blur(b: Bounds<ScaledPixels>, radius: f32) -> BackdropBlur {
-            BackdropBlur::plain(b, Corners::default(), ScaledPixels(radius), ContentMask { bounds: rect(0.0, 0.0, 1000.0, 1000.0) }, 1.0)
+            BackdropBlur::plain(b, Corners::default(), ScaledPixels(radius), ContentMask::new(rect(0.0, 0.0, 1000.0, 1000.0)), 1.0)
         }
         /// Batch kinds in draw order: 'b' blur, 'q' quads.
         fn kinds(scene: &Scene) -> String {

@@ -820,6 +820,116 @@ fn slider_value_clamping_and_keyboard_stepping(cx: &mut TestAppContext) {
     assert_eq!(sl.read_with(cx, |s, _| s.value()), 0.0);
 }
 
+#[gpui::test]
+fn slider_and_range_slider_thumbs_stay_inside_bounds(cx: &mut TestAppContext) {
+    use crate::{Modifiers, MouseButton, VisualTestContext, div};
+    cx.update(init_components);
+
+    struct ClippedSlidersView {
+        single: Entity<SliderState>,
+        range: Entity<RangeSliderState>,
+    }
+
+    impl Render for ClippedSlidersView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .p(px(20.))
+                .child(
+                    div()
+                        .w(px(200.))
+                        .overflow_hidden()
+                        .flex()
+                        .flex_col()
+                        .gap(px(12.))
+                        .child(slider(&self.single))
+                        .child(range_slider(&self.range)),
+                )
+        }
+    }
+
+    let (view, cx) = cx.add_window_view(|_, cx| {
+        let single = cx.new(|cx| {
+            SliderState::new(cx)
+                .range(0.0, 100.0)
+                .step(1.0)
+                .default_value(100.0)
+                .show_value(false)
+        });
+        let range = cx.new(|cx| {
+            RangeSliderState::new(cx)
+                .range(0.0, 100.0)
+                .step(1.0)
+                .default_range(0.0, 100.0)
+                .show_value(false)
+        });
+        ClippedSlidersView { single, range }
+    });
+    cx.run_until_parked();
+
+    let assert_thumbs_within = |cx: &mut VisualTestContext, expected_count: usize| {
+        let thumb_bounds: Vec<(f32, f32)> = cx.update(|window, _| {
+            let scale = window.scale_factor();
+            window
+                .rendered_frame
+                .scene
+                .quads
+                .iter()
+                .filter(|q| {
+                    (q.bounds.size.width.0 / scale - 18.0).abs() < 0.5
+                        && (q.bounds.size.height.0 / scale - 18.0).abs() < 0.5
+                        && q.border_widths.left.0 > 0.5
+                })
+                .map(|q| {
+                    (
+                        q.bounds.origin.x.0 / scale,
+                        (q.bounds.origin.x.0 + q.bounds.size.width.0) / scale,
+                    )
+                })
+                .collect()
+        });
+        assert!(
+            thumb_bounds.len() >= expected_count,
+            "expected at least {expected_count} slider thumb quads, found {thumb_bounds:?}"
+        );
+        for (left, right) in thumb_bounds {
+            assert!(
+                left >= 19.9 && right <= 220.1,
+                "slider thumb [{left}, {right}] overflowed its [20, 220] container"
+            );
+        }
+    };
+
+    // At 100% (single) and 0%..=100% (range), every circular thumb stays inside [20, 220].
+    assert_thumbs_within(cx, 3);
+
+    // Move single slider to 0% and verify left edge also stays strictly inside [20, 220].
+    let single = view.read_with(cx, |v, _| v.single.clone());
+    single.update(cx, |s, cx| s.set_value(0.0, cx));
+    cx.run_until_parked();
+    assert_thumbs_within(cx, 3);
+
+    // Pointer click at the middle of the [20, 220] slider track (x = 120) maps to 50.
+    let mid_y = cx.update(|window, _| {
+        let scale = window.scale_factor();
+        window
+            .rendered_frame
+            .scene
+            .quads
+            .iter()
+            .find(|q| {
+                (q.bounds.size.width.0 / scale - 18.0).abs() < 0.5
+                    && (q.bounds.size.height.0 / scale - 18.0).abs() < 0.5
+                    && q.border_widths.left.0 > 0.5
+            })
+            .map(|q| (q.bounds.origin.y.0 + q.bounds.size.height.0 * 0.5) / scale)
+            .unwrap()
+    });
+    cx.simulate_mouse_down(crate::point(px(120.), px(mid_y)), MouseButton::Left, Modifiers::none());
+    cx.simulate_mouse_up(crate::point(px(120.), px(mid_y)), MouseButton::Left, Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(single.read_with(cx, |s, _| s.value()), 50.0);
+}
+
 struct FullComponentShowcaseView {
     toggled: bool,
     checked: CheckState,
@@ -2355,12 +2465,10 @@ fn gpu_offload_quad_animations_and_backdrop_blur(cx: &mut TestAppContext) {
 
     // 2. Verify Scene::insert_animated_quad keeps base_generation constant while advancing
     let mut scene = crate::Scene::default();
-    let mask = crate::ContentMask {
-        bounds: crate::Bounds {
-            origin: crate::point(crate::ScaledPixels(0.0), crate::ScaledPixels(0.0)),
-            size: size(crate::ScaledPixels(800.0), crate::ScaledPixels(600.0)),
-        },
-    };
+    let mask = crate::ContentMask::new(crate::Bounds {
+        origin: crate::point(crate::ScaledPixels(0.0), crate::ScaledPixels(0.0)),
+        size: size(crate::ScaledPixels(800.0), crate::ScaledPixels(600.0)),
+    });
     let start_b = crate::Bounds {
         origin: crate::point(crate::ScaledPixels(10.0), crate::ScaledPixels(10.0)),
         size: size(crate::ScaledPixels(20.0), crate::ScaledPixels(20.0)),
@@ -2504,12 +2612,10 @@ fn blur_container_loading_overlay_spinners_and_progress_ring(cx: &mut TestAppCon
 
     // 1. Verify QuadAnimationMode::SyncedWave oscillates bounds & alpha without mutating base_generation
     let mut scene = crate::Scene::default();
-    let mask = crate::ContentMask {
-        bounds: crate::Bounds {
-            origin: crate::point(crate::ScaledPixels(0.0), crate::ScaledPixels(0.0)),
-            size: size(crate::ScaledPixels(400.0), crate::ScaledPixels(200.0)),
-        },
-    };
+    let mask = crate::ContentMask::new(crate::Bounds {
+        origin: crate::point(crate::ScaledPixels(0.0), crate::ScaledPixels(0.0)),
+        size: size(crate::ScaledPixels(400.0), crate::ScaledPixels(200.0)),
+    });
     let low_b = crate::Bounds {
         origin: crate::point(crate::ScaledPixels(10.0), crate::ScaledPixels(30.0)),
         size: size(crate::ScaledPixels(6.0), crate::ScaledPixels(10.0)),

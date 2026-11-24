@@ -2998,7 +2998,7 @@ mod backdrop_blur_tests {
                 bottom_left: ScaledPixels(0.0),
             },
             ScaledPixels(radius),
-            ContentMask { bounds: rect(0.0, 0.0, W as f32, H as f32) },
+            ContentMask::new(rect(0.0, 0.0, W as f32, H as f32)),
             1.0,
         );
         draw_blur_batch(&device, &context, &pipeline, &mut targets, &target, &rtv, &viewport, &[blur]).unwrap();
@@ -3059,7 +3059,7 @@ mod backdrop_blur_tests {
             rect(20.0, 16.0, 56.0, 40.0),
             Corners::all(ScaledPixels(12.0)),
             ScaledPixels(0.0),
-            ContentMask { bounds: rect(0.0, 0.0, W as f32, H as f32) },
+            ContentMask::new(rect(0.0, 0.0, W as f32, H as f32)),
             1.0,
         );
         lens.refraction = 1.2;

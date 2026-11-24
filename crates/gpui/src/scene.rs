@@ -1981,8 +1981,12 @@ impl Scene {
             origin: b.origin + offset,
             size: b.size,
         };
-        let mask = |m: ContentMask<ScaledPixels>| ContentMask {
-            bounds: shift(m.bounds).intersect(&clip.bounds),
+        let mask = |m: ContentMask<ScaledPixels>| {
+            ContentMask {
+                bounds: shift(m.bounds),
+                corner_radii: m.corner_radii,
+            }
+            .intersect(&clip)
         };
         for op in snapshot.primitives.iter() {
             let primitive = match op {
@@ -2044,11 +2048,23 @@ impl Scene {
                     let (source, scale_factor) = &path.source;
                     let logical = |v: ScaledPixels| Pixels(v.0 / scale_factor);
                     let moved = source.translated(crate::point(logical(offset.x), logical(offset.y)));
-                    let clip = mask(path.paint.content_mask).bounds;
+                    let clipped_mask = mask(path.paint.content_mask);
                     let content_mask = ContentMask {
                         bounds: Bounds {
-                            origin: crate::point(logical(clip.origin.x), logical(clip.origin.y)),
-                            size: crate::size(logical(clip.size.width), logical(clip.size.height)),
+                            origin: crate::point(
+                                logical(clipped_mask.bounds.origin.x),
+                                logical(clipped_mask.bounds.origin.y),
+                            ),
+                            size: crate::size(
+                                logical(clipped_mask.bounds.size.width),
+                                logical(clipped_mask.bounds.size.height),
+                            ),
+                        },
+                        corner_radii: Corners {
+                            top_left: logical(clipped_mask.corner_radii.top_left),
+                            top_right: logical(clipped_mask.corner_radii.top_right),
+                            bottom_right: logical(clipped_mask.corner_radii.bottom_right),
+                            bottom_left: logical(clipped_mask.corner_radii.bottom_left),
                         },
                     };
                     self.insert_primitive(PaintedPath::new(
@@ -2095,7 +2111,7 @@ mod tests {
     fn quad(x: f32) -> Quad {
         Quad {
             bounds: square(x),
-            content_mask: ContentMask { bounds: square(x) },
+            content_mask: ContentMask::new(square(x)),
             ..Default::default()
         }
     }
@@ -2105,7 +2121,7 @@ mod tests {
             order: 0,
             pad: 0,
             bounds: square(x),
-            content_mask: ContentMask { bounds: square(x) },
+            content_mask: ContentMask::new(square(x)),
             color: Hsla::default(),
             thickness: ScaledPixels(1.),
             wavy: false.into(),

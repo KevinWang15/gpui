@@ -710,38 +710,71 @@ impl Style {
             _ => {
                 let mut min = bounds.origin;
                 let mut max = bounds.bottom_right();
+                let mut border_widths = Edges::default();
 
                 if self
                     .border_color
                     .is_some_and(|color| !color.is_transparent())
                 {
-                    min.x += self.border_widths.left.to_pixels(rem_size);
-                    max.x -= self.border_widths.right.to_pixels(rem_size);
-                    min.y += self.border_widths.top.to_pixels(rem_size);
-                    max.y -= self.border_widths.bottom.to_pixels(rem_size);
+                    border_widths = self.border_widths.to_pixels(rem_size);
+                    min.x += border_widths.left;
+                    max.x -= border_widths.right;
+                    min.y += border_widths.top;
+                    max.y -= border_widths.bottom;
                 }
 
-                let bounds = match (
+                let (mask_bounds, corner_radii) = match (
                     self.overflow.x == Overflow::Visible,
                     self.overflow.y == Overflow::Visible,
                 ) {
                     // x and y both visible
                     (true, true) => return None,
                     // x visible, y hidden
-                    (true, false) => Bounds::from_corners(
-                        point(min.x, bounds.origin.y),
-                        point(max.x, bounds.bottom_right().y),
+                    (true, false) => (
+                        Bounds::from_corners(
+                            point(min.x, bounds.origin.y),
+                            point(max.x, bounds.bottom_right().y),
+                        ),
+                        Corners::default(),
                     ),
                     // x hidden, y visible
-                    (false, true) => Bounds::from_corners(
-                        point(bounds.origin.x, min.y),
-                        point(bounds.bottom_right().x, max.y),
+                    (false, true) => (
+                        Bounds::from_corners(
+                            point(bounds.origin.x, min.y),
+                            point(bounds.bottom_right().x, max.y),
+                        ),
+                        Corners::default(),
                     ),
-                    // both hidden
-                    (false, false) => Bounds::from_corners(min, max),
+                    // both hidden: clip descendants to the CSS padding-box inner corner radii
+                    (false, false) => {
+                        let mask_bounds = Bounds::from_corners(min, max);
+                        let outer_radii = self
+                            .corner_radii
+                            .to_pixels(rem_size)
+                            .clamp_radii_for_quad_size(bounds.size);
+                        let inner_radii = Corners {
+                            top_left: (outer_radii.top_left
+                                - border_widths.top.max(border_widths.left))
+                            .max(px(0.)),
+                            top_right: (outer_radii.top_right
+                                - border_widths.top.max(border_widths.right))
+                            .max(px(0.)),
+                            bottom_right: (outer_radii.bottom_right
+                                - border_widths.bottom.max(border_widths.right))
+                            .max(px(0.)),
+                            bottom_left: (outer_radii.bottom_left
+                                - border_widths.bottom.max(border_widths.left))
+                            .max(px(0.)),
+                        }
+                        .clamp_radii_for_quad_size(mask_bounds.size);
+                        (mask_bounds, inner_radii)
+                    }
                 };
 
-                Some(ContentMask { bounds })
+                Some(ContentMask {
+                    bounds: mask_bounds,
+                    corner_radii,
+                })
             }
         }
     }

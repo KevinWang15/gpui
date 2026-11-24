@@ -1483,6 +1483,11 @@ impl MetalRenderer {
                 instance_bindings.surfaces.offset,
                 SurfaceInputIndex::Surfaces as usize,
             );
+            command_encoder.setFragmentBuffer_offset_atIndex(
+                Some(&instance_bindings.surfaces.buffer),
+                instance_bindings.surfaces.offset,
+                SurfaceInputIndex::Surfaces as usize,
+            );
         }
 
         for (index, surface) in surfaces.iter().enumerate() {
@@ -2084,7 +2089,7 @@ mod tests {
             origin: Point { x: ScaledPixels(x), y: ScaledPixels(y) },
             size: size(ScaledPixels(width), ScaledPixels(height)),
         };
-        let everything = ContentMask { bounds: rect(0.0, 0.0, w as f32, h as f32) };
+        let everything = ContentMask::new(rect(0.0, 0.0, w as f32, h as f32));
         let stripes = |scene: &mut Scene| {
             for i in 0..12 {
                 let color = if i % 2 == 0 { gpui::white() } else { gpui::red() };
@@ -2093,7 +2098,7 @@ mod tests {
                     order: 0,
                     border_style: BorderStyle::Solid,
                     bounds,
-                    content_mask: ContentMask { bounds },
+                    content_mask: ContentMask::new(bounds),
                     background: color.into(),
                     border_color: color,
                     corner_radii: Corners::default(),
@@ -2251,7 +2256,7 @@ mod tests {
         scene.insert_primitive(PaintSurface {
             order: 0,
             bounds,
-            content_mask: ContentMask { bounds },
+            content_mask: ContentMask::new(bounds),
             image_buffer: image_buffer.clone(),
         });
         drop(image_buffer);

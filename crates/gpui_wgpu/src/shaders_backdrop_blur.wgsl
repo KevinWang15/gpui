@@ -24,6 +24,7 @@ struct BlurParams {
     corner_radii: vec4<f32>, // (top_left, top_right, bottom_right, bottom_left)
     mask_origin: vec2<f32>,
     mask_size: vec2<f32>,
+    mask_corner_radii: vec4<f32>, // (top_left, top_right, bottom_right, bottom_left)
     refraction: f32,
     dispersion: f32,
     bevel_width: f32,
@@ -302,8 +303,19 @@ fn fs_backdrop_blur(input: FullscreenVarying) -> @location(0) vec4<f32> {
     let r = min(pick_corner_radius(rel, params.corner_radii), min(half_size.x, half_size.y));
     let q = abs(rel) - (half_size - vec2<f32>(r));
     let dist = length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - r;
-    let cov = clamp(0.5 - dist, 0.0, 1.0);
-    let shadow_a = shadow_alpha(rel, half_size, 1.0 - cov);
+    var cov = clamp(0.5 - dist, 0.0, 1.0);
+    var shadow_a = shadow_alpha(rel, half_size, 1.0 - cov);
+    if (any(params.mask_corner_radii != vec4<f32>(0.0))) {
+        let mask_half = max(params.mask_size * 0.5, vec2<f32>(0.5));
+        let mask_rel = frag_px - (params.mask_origin + mask_half);
+        let mask_dist = rounded_rect_sdf(mask_rel, mask_half, params.mask_corner_radii);
+        let mask_cov = clamp(0.5 - mask_dist, 0.0, 1.0);
+        cov *= mask_cov;
+        shadow_a *= mask_cov;
+    }
+    if (cov <= 0.0 && shadow_a <= 0.0) {
+        discard;
+    }
 
     var inside = blurred_at(input.uv);
     if (glass) {
@@ -314,9 +326,6 @@ fn fs_backdrop_blur(input: FullscreenVarying) -> @location(0) vec4<f32> {
     var backdrop = textureLoad(t_snapshot, coord, 0);
     if (params.straight_alpha != 0u) {
         backdrop = premultiply(backdrop);
-    }
-    if (cov <= 0.0 && shadow_a <= 0.0) {
-        discard;
     }
     var out = mix(backdrop, inside, cov);
     // The shadow: premultiplied "over".
