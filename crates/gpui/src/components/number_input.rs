@@ -63,7 +63,11 @@ impl Focusable for NumberInputState {
 impl NumberInputState {
     /// Creates a new [`NumberInputState`] starting at `0` with `step = 1.0`.
     pub fn new(cx: &mut Context<Self>) -> Self {
-        let input = cx.new(|cx| InputState::new(cx).default_value("0"));
+        let input = cx.new(|cx| {
+            InputState::new(cx)
+                .default_value("0")
+                .allow_vertical_selection(false)
+        });
         cx.subscribe(&input, |this, _, ev: &InputEvent, cx| match ev {
             InputEvent::Change(text) => {
                 if let Ok(parsed) = text.trim().parse::<f64>()

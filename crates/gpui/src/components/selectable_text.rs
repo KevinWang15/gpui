@@ -13,6 +13,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
+use unicode_segmentation::UnicodeSegmentation;
+
 use crate::icons::LucideIcon;
 use crate::{
     AnyElement, App, Bounds, ClipboardItem, Context, CursorStyle, DispatchPhase, Element,
@@ -37,7 +39,24 @@ const MAX_CHUNK_BYTES: usize = 2000;
 pub mod selectable_text_actions {
     use crate::actions;
 
-    actions!(gpui_selectable_text, [Copy, SelectAll, ClearSelection]);
+    actions!(
+        gpui_selectable_text,
+        [
+            Copy,
+            SelectAll,
+            ClearSelection,
+            SelectLeft,
+            SelectRight,
+            SelectWordLeft,
+            SelectWordRight,
+            SelectUp,
+            SelectDown,
+            SelectLineStart,
+            SelectLineEnd,
+            SelectDocStart,
+            SelectDocEnd,
+        ]
+    );
 }
 use selectable_text_actions::*;
 
@@ -50,6 +69,22 @@ pub fn bind_selectable_text_keys(cx: &mut App) {
         KeyBinding::new("cmd-a", SelectAll, ctx),
         KeyBinding::new("ctrl-a", SelectAll, ctx),
         KeyBinding::new("escape", ClearSelection, ctx),
+        KeyBinding::new("shift-left", SelectLeft, ctx),
+        KeyBinding::new("shift-right", SelectRight, ctx),
+        KeyBinding::new("alt-shift-left", SelectWordLeft, ctx),
+        KeyBinding::new("alt-shift-right", SelectWordRight, ctx),
+        KeyBinding::new("ctrl-shift-left", SelectWordLeft, ctx),
+        KeyBinding::new("ctrl-shift-right", SelectWordRight, ctx),
+        KeyBinding::new("shift-up", SelectUp, ctx),
+        KeyBinding::new("shift-down", SelectDown, ctx),
+        KeyBinding::new("shift-home", SelectLineStart, ctx),
+        KeyBinding::new("shift-end", SelectLineEnd, ctx),
+        KeyBinding::new("cmd-shift-left", SelectLineStart, ctx),
+        KeyBinding::new("cmd-shift-right", SelectLineEnd, ctx),
+        KeyBinding::new("cmd-shift-up", SelectDocStart, ctx),
+        KeyBinding::new("cmd-shift-down", SelectDocEnd, ctx),
+        KeyBinding::new("ctrl-shift-home", SelectDocStart, ctx),
+        KeyBinding::new("ctrl-shift-end", SelectDocEnd, ctx),
     ]);
 }
 
@@ -253,6 +288,7 @@ pub struct SelectableTextState {
     highlights: Arc<Vec<(Range<usize>, HighlightStyle)>>,
     selected_range: Range<usize>,
     selection_reversed: bool,
+    preferred_col: Option<usize>,
     is_selecting: bool,
     drag_mode: DragMode,
     scrollable: bool,
@@ -295,6 +331,7 @@ impl SelectableTextState {
             highlights: Arc::new(Vec::new()),
             selected_range: 0..0,
             selection_reversed: false,
+            preferred_col: None,
             is_selecting: false,
             drag_mode: DragMode::Char,
             scrollable: true,
@@ -392,6 +429,7 @@ impl SelectableTextState {
         let had_selection = !self.selected_range.is_empty();
         self.selected_range = 0..0;
         self.selection_reversed = false;
+        self.preferred_col = None;
         self.is_selecting = false;
         self.drag_mode = DragMode::Char;
         self.last_drag_position = None;
@@ -459,6 +497,7 @@ impl SelectableTextState {
         self.is_selecting = false;
         self.autoscroll_task = None;
         self.last_drag_position = None;
+        self.preferred_col = None;
         if !self.selected_range.is_empty() {
             self.selected_range = 0..0;
             self.selection_reversed = false;
@@ -571,6 +610,130 @@ impl SelectableTextState {
         } else {
             self.selected_range.start
         }
+    }
+
+    fn cursor_offset(&self) -> usize {
+        if self.selection_reversed {
+            self.selected_range.start
+        } else {
+            self.selected_range.end
+        }
+    }
+
+    fn previous_boundary(&self, offset: usize) -> usize {
+        let text = self.text.as_ref();
+        let offset = clamp_char_boundary(text, offset);
+        text.grapheme_indices(true)
+            .rev()
+            .find_map(|(idx, _)| (idx < offset).then_some(idx))
+            .unwrap_or(0)
+    }
+
+    fn next_boundary(&self, offset: usize) -> usize {
+        let text = self.text.as_ref();
+        let offset = clamp_char_boundary(text, offset);
+        text.grapheme_indices(true)
+            .find_map(|(idx, _)| (idx > offset).then_some(idx))
+            .unwrap_or(text.len())
+    }
+
+    fn previous_word_boundary(&self, offset: usize) -> usize {
+        let text = self.text.as_ref();
+        let slice = &text[..clamp_char_boundary(text, offset)];
+        let mut iter = slice.char_indices().rev().peekable();
+        while let Some(&(_, ch)) = iter.peek() {
+            if !is_word_char(ch) {
+                iter.next();
+            } else {
+                break;
+            }
+        }
+        for (idx, ch) in iter {
+            if !is_word_char(ch) {
+                return idx + ch.len_utf8();
+            }
+        }
+        0
+    }
+
+    fn next_word_boundary(&self, offset: usize) -> usize {
+        let text = self.text.as_ref();
+        let start = clamp_char_boundary(text, offset);
+        let slice = &text[start..];
+        let mut iter = slice.char_indices().peekable();
+        while let Some(&(_, ch)) = iter.peek() {
+            if !is_word_char(ch) {
+                iter.next();
+            } else {
+                break;
+            }
+        }
+        for (idx, ch) in iter {
+            if !is_word_char(ch) {
+                return start + idx;
+            }
+        }
+        text.len()
+    }
+
+    fn logical_line_ranges(&self) -> Vec<Range<usize>> {
+        let text = self.text.as_ref();
+        let mut ranges = Vec::new();
+        let mut start = 0;
+        for (idx, ch) in text.char_indices() {
+            if ch == '\n' {
+                let end = if idx > start && text.as_bytes()[idx - 1] == b'\r' {
+                    idx - 1
+                } else {
+                    idx
+                };
+                ranges.push(start..end);
+                start = idx + 1;
+            }
+        }
+        ranges.push(start..text.len());
+        ranges
+    }
+
+    fn line_index_for_offset(&self, offset: usize) -> usize {
+        let text = self.text.as_ref();
+        text[..clamp_char_boundary(text, offset)]
+            .bytes()
+            .filter(|&b| b == b'\n')
+            .count()
+    }
+
+    fn vertical_target(&mut self, delta: isize) -> usize {
+        let text = self.text.as_ref();
+        let cursor = clamp_char_boundary(text, self.cursor_offset());
+        let ranges = self.logical_line_ranges();
+        let current_line = self.line_index_for_offset(cursor);
+        let target_line = (current_line as isize + delta)
+            .clamp(0, ranges.len().saturating_sub(1) as isize) as usize;
+        if target_line == current_line {
+            self.preferred_col = None;
+            return if delta < 0 { 0 } else { text.len() };
+        }
+        let col = self.preferred_col.unwrap_or_else(|| {
+            text[ranges[current_line].start..cursor.min(ranges[current_line].end)]
+                .chars()
+                .count()
+        });
+        self.preferred_col = Some(col);
+        let target_range = &ranges[target_line];
+        text[target_range.clone()]
+            .char_indices()
+            .nth(col)
+            .map(|(i, _)| target_range.start + i)
+            .unwrap_or(target_range.end)
+    }
+
+    fn select_to(&mut self, head: usize, reset_col: bool, cx: &mut Context<Self>) {
+        if reset_col {
+            self.preferred_col = None;
+        }
+        let anchor = self.anchor_offset();
+        self.update_selection_to(anchor, head, cx);
     }
 
     fn update_selection_to(&mut self, anchor: usize, head: usize, cx: &mut Context<Self>) {
@@ -708,6 +871,7 @@ impl SelectableTextState {
         window.prevent_default();
         self.context_menu_position = None;
         self.is_selecting = true;
+        self.preferred_col = None;
         self.last_drag_position = Some(event.position);
         self.autoscroll_task = None;
 
@@ -879,16 +1043,108 @@ impl SelectableTextState {
     fn on_clear_selection_action(
         &mut self,
         _: &ClearSelection,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.context_menu_position.take().is_some() {
+            window.focus(&self.focus_handle, cx);
             cx.notify();
         } else if !self.selected_range.is_empty() {
             self.clear_selection(cx);
         } else {
             cx.propagate();
         }
+    }
+
+    fn on_select_left_action(&mut self, _: &SelectLeft, _window: &mut Window, cx: &mut Context<Self>) {
+        let target = self.previous_boundary(self.cursor_offset());
+        self.select_to(target, true, cx);
+    }
+
+    fn on_select_right_action(
+        &mut self,
+        _: &SelectRight,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = self.next_boundary(self.cursor_offset());
+        self.select_to(target, true, cx);
+    }
+
+    fn on_select_word_left_action(
+        &mut self,
+        _: &SelectWordLeft,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = self.previous_word_boundary(self.cursor_offset());
+        self.select_to(target, true, cx);
+    }
+
+    fn on_select_word_right_action(
+        &mut self,
+        _: &SelectWordRight,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = self.next_word_boundary(self.cursor_offset());
+        self.select_to(target, true, cx);
+    }
+
+    fn on_select_up_action(&mut self, _: &SelectUp, _window: &mut Window, cx: &mut Context<Self>) {
+        let target = self.vertical_target(-1);
+        self.select_to(target, false, cx);
+    }
+
+    fn on_select_down_action(
+        &mut self,
+        _: &SelectDown,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = self.vertical_target(1);
+        self.select_to(target, false, cx);
+    }
+
+    fn on_select_line_start_action(
+        &mut self,
+        _: &SelectLineStart,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let line_idx = self.line_index_for_offset(self.cursor_offset());
+        let start = self.logical_line_ranges()[line_idx].start;
+        self.select_to(start, true, cx);
+    }
+
+    fn on_select_line_end_action(
+        &mut self,
+        _: &SelectLineEnd,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let line_idx = self.line_index_for_offset(self.cursor_offset());
+        let end = self.logical_line_ranges()[line_idx].end;
+        self.select_to(end, true, cx);
+    }
+
+    fn on_select_doc_start_action(
+        &mut self,
+        _: &SelectDocStart,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_to(0, true, cx);
+    }
+
+    fn on_select_doc_end_action(
+        &mut self,
+        _: &SelectDocEnd,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let end = self.text.len();
+        self.select_to(end, true, cx);
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -935,9 +1191,10 @@ impl SelectableTextState {
         let select_all_entity = entity;
 
         let defaults = vec![
-            MenuEntry::item_with_icon("Copy", LucideIcon::Copy, move |_, _, cx| {
+            MenuEntry::item_with_icon("Copy", LucideIcon::Copy, move |_, window, cx| {
                 copy_entity.update(cx, |s, cx| {
                     s.copy_selection(cx);
+                    window.focus(&s.focus_handle, cx);
                 });
             })
             .with_shortcut(shortcut_hint("⌘C", "Ctrl+C"))
@@ -945,9 +1202,10 @@ impl SelectableTextState {
             MenuEntry::item_with_icon(
                 "Select All",
                 LucideIcon::SquareDashedMousePointer,
-                move |_, _, cx| {
+                move |_, window, cx| {
                     select_all_entity.update(cx, |s, cx| {
                         s.select_all(cx);
+                        window.focus(&s.focus_handle, cx);
                     });
                 },
             )
@@ -967,14 +1225,24 @@ impl SelectableTextState {
 impl Render for SelectableTextState {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let focused = self.focus_handle.is_focused(window);
+        let focused =
+            self.focus_handle.contains_focused(window, cx) || self.context_menu_position.is_some();
         if focused != self.was_focused {
             self.was_focused = focused;
-            cx.emit(if focused {
-                SelectableTextEvent::Focus
+            if focused {
+                cx.emit(SelectableTextEvent::Focus);
             } else {
-                SelectableTextEvent::Blur
-            });
+                self.is_selecting = false;
+                self.autoscroll_task = None;
+                self.last_drag_position = None;
+                self.preferred_col = None;
+                if !self.selected_range.is_empty() {
+                    self.selected_range = 0..0;
+                    self.selection_reversed = false;
+                    cx.emit(SelectableTextEvent::SelectionChanged(0..0));
+                }
+                cx.emit(SelectableTextEvent::Blur);
+            }
         }
 
         let selection_color = self.selection_color.unwrap_or(theme.selection);
@@ -984,7 +1252,11 @@ impl Render for SelectableTextState {
         let text = self.text.clone();
         let chunks = self.chunks.clone();
         let highlights = self.highlights.clone();
-        let selected_range = self.selected_range.clone();
+        let selected_range = if focused {
+            self.selected_range.clone()
+        } else {
+            0..0
+        };
         let line_height = self.line_height;
         let rendered_chunks = self.rendered_chunks.clone();
         let viewport_bounds = self.viewport_bounds.clone();
@@ -1112,6 +1384,16 @@ impl Render for SelectableTextState {
             .on_action(cx.listener(Self::on_copy_action))
             .on_action(cx.listener(Self::on_select_all_action))
             .on_action(cx.listener(Self::on_clear_selection_action))
+            .on_action(cx.listener(Self::on_select_left_action))
+            .on_action(cx.listener(Self::on_select_right_action))
+            .on_action(cx.listener(Self::on_select_word_left_action))
+            .on_action(cx.listener(Self::on_select_word_right_action))
+            .on_action(cx.listener(Self::on_select_up_action))
+            .on_action(cx.listener(Self::on_select_down_action))
+            .on_action(cx.listener(Self::on_select_line_start_action))
+            .on_action(cx.listener(Self::on_select_line_end_action))
+            .on_action(cx.listener(Self::on_select_doc_start_action))
+            .on_action(cx.listener(Self::on_select_doc_end_action))
             .child(content)
             .child(menu);
 
@@ -1867,6 +2149,66 @@ mod tests {
         assert_eq!(
             long_st.read_with(cx_long, |s, _| s.list_state().logical_scroll_top().item_ix),
             0
+        );
+    }
+
+    #[crate::test]
+    fn selectable_text_keyboard_selection_and_blur_clears_selection(cx: &mut TestAppContext) {
+        let (_view, text, cx) = setup_host(cx, "hello world", false);
+
+        // Single-line: focus and place anchor at 5, then Shift+Up -> start, Shift+Down -> end.
+        text.update_in(cx, |s, window, cx| {
+            window.focus(&s.focus_handle(cx), cx);
+            s.set_selection(5..5, cx);
+        });
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("shift-up");
+        cx.run_until_parked();
+        assert_eq!(
+            text.read_with(cx, |s, _| s.selected_text().map(str::to_owned)),
+            Some("hello".to_string())
+        );
+
+        cx.simulate_keystrokes("shift-down");
+        cx.run_until_parked();
+        assert_eq!(
+            text.read_with(cx, |s, _| s.selected_text().map(str::to_owned)),
+            Some(" world".to_string())
+        );
+
+        // Multi-line: Shift+Up then Shift+Down returns to anchor; Shift+Down moves to line 2.
+        text.update_in(cx, |s, _window, cx| {
+            s.set_text("first line\nsecond line\nthird line", cx);
+            s.set_selection(17..17, cx);
+        });
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("shift-up");
+        cx.run_until_parked();
+        assert_eq!(text.read_with(cx, |s, _| s.selected_range()), 6..17);
+
+        cx.simulate_keystrokes("shift-down");
+        cx.run_until_parked();
+        assert_eq!(text.read_with(cx, |s, _| s.selected_range()), 17..17);
+
+        cx.simulate_keystrokes("shift-down");
+        cx.run_until_parked();
+        assert_eq!(text.read_with(cx, |s, _| s.selected_range()), 17..29);
+
+        cx.simulate_keystrokes("shift-home");
+        cx.run_until_parked();
+        assert_eq!(text.read_with(cx, |s, _| s.selected_range()), 17..23);
+
+        // Blurring clears the selection.
+        cx.update(|window, cx| window.blur(cx));
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        assert!(
+            !text.read_with(cx, |s, _| s.has_selection()),
+            "blurring SelectableText must clear its selection"
         );
     }
 }

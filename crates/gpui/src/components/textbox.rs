@@ -36,10 +36,18 @@ pub mod textbox_actions {
             Right,
             Up,
             Down,
+            WordLeft,
+            WordRight,
             SelectLeft,
             SelectRight,
             SelectUp,
             SelectDown,
+            SelectWordLeft,
+            SelectWordRight,
+            SelectLineStart,
+            SelectLineEnd,
+            SelectDocStart,
+            SelectDocEnd,
             SelectAll,
             LineStart,
             LineEnd,
@@ -70,10 +78,26 @@ pub fn bind_textbox_keys(cx: &mut App) {
         KeyBinding::new("right", Right, ctx),
         KeyBinding::new("up", Up, ctx),
         KeyBinding::new("down", Down, ctx),
+        KeyBinding::new("alt-left", WordLeft, ctx),
+        KeyBinding::new("alt-right", WordRight, ctx),
+        KeyBinding::new("ctrl-left", WordLeft, ctx),
+        KeyBinding::new("ctrl-right", WordRight, ctx),
         KeyBinding::new("shift-left", SelectLeft, ctx),
         KeyBinding::new("shift-right", SelectRight, ctx),
         KeyBinding::new("shift-up", SelectUp, ctx),
         KeyBinding::new("shift-down", SelectDown, ctx),
+        KeyBinding::new("alt-shift-left", SelectWordLeft, ctx),
+        KeyBinding::new("alt-shift-right", SelectWordRight, ctx),
+        KeyBinding::new("ctrl-shift-left", SelectWordLeft, ctx),
+        KeyBinding::new("ctrl-shift-right", SelectWordRight, ctx),
+        KeyBinding::new("shift-home", SelectLineStart, ctx),
+        KeyBinding::new("shift-end", SelectLineEnd, ctx),
+        KeyBinding::new("cmd-shift-left", SelectLineStart, ctx),
+        KeyBinding::new("cmd-shift-right", SelectLineEnd, ctx),
+        KeyBinding::new("cmd-shift-up", SelectDocStart, ctx),
+        KeyBinding::new("cmd-shift-down", SelectDocEnd, ctx),
+        KeyBinding::new("ctrl-shift-home", SelectDocStart, ctx),
+        KeyBinding::new("ctrl-shift-end", SelectDocEnd, ctx),
         KeyBinding::new("home", LineStart, ctx),
         KeyBinding::new("end", LineEnd, ctx),
         KeyBinding::new("cmd-left", LineStart, ctx),
@@ -369,6 +393,11 @@ impl TextBoxState {
         &self.content
     }
 
+    /// Returns the current selection byte range within [`Self::value`].
+    pub fn selected_range(&self) -> Range<usize> {
+        self.selected_range.clone()
+    }
+
     /// Returns the number of lines in the current text.
     pub fn line_count(&self) -> usize {
         self.content.split('\n').count()
@@ -446,6 +475,16 @@ impl TextBoxState {
     /// Updates the disabled state dynamically.
     pub fn set_disabled(&mut self, disabled: bool, cx: &mut Context<Self>) {
         self.disabled = disabled;
+        if disabled {
+            self.blink.stop();
+            self.is_selecting = false;
+            if !self.selected_range.is_empty() {
+                let cursor = self.cursor_offset();
+                self.selected_range = cursor..cursor;
+                self.selection_reversed = false;
+                self.preferred_x = None;
+            }
+        }
         cx.notify();
     }
 
@@ -539,6 +578,8 @@ impl TextBoxState {
         if self.selected_range.end < self.selected_range.start {
             self.selection_reversed = !self.selection_reversed;
             self.selected_range = self.selected_range.end..self.selected_range.start;
+        } else if self.selected_range.is_empty() {
+            self.selection_reversed = false;
         }
         if reset_x {
             self.preferred_x = None;
@@ -581,13 +622,32 @@ impl TextBoxState {
         0
     }
 
-    fn vertical_target(&mut self, delta: isize) -> usize {
-        let cursor = self.cursor_offset();
+    fn next_word_boundary(&self, offset: usize) -> usize {
+        let start = offset.min(self.content.len());
+        let slice = &self.content[start..];
+        let mut iter = slice.char_indices().peekable();
+        while let Some(&(_, ch)) = iter.peek() {
+            if !is_word_char(ch) {
+                iter.next();
+            } else {
+                break;
+            }
+        }
+        for (idx, ch) in iter {
+            if !is_word_char(ch) {
+                return start + idx;
+            }
+        }
+        self.content.len()
+    }
+
+    fn vertical_target_from(&mut self, from: usize, delta: isize) -> usize {
         let ranges = self.line_ranges();
-        let current_line = self.line_index_for_offset(cursor);
+        let current_line = self.line_index_for_offset(from);
         let target_line = (current_line as isize + delta)
             .clamp(0, ranges.len().saturating_sub(1) as isize) as usize;
         if target_line == current_line {
+            self.preferred_x = None;
             return if delta < 0 { 0 } else { self.content.len() };
         }
 
@@ -596,7 +656,7 @@ impl TextBoxState {
             self.last_lines.get(current_line),
             self.last_lines.get(target_line),
         ) {
-            let local = cursor.saturating_sub(curr_layout.byte_range.start);
+            let local = from.saturating_sub(curr_layout.byte_range.start);
             let x = self
                 .preferred_x
                 .unwrap_or_else(|| curr_layout.shaped.x_for_index(local));
@@ -605,7 +665,7 @@ impl TextBoxState {
             return (next_layout.byte_range.start + next_local).min(next_layout.byte_range.end);
         }
 
-        let col = self.content[ranges[current_line].start..cursor]
+        let col = self.content[ranges[current_line].start..from]
             .chars()
             .count();
         let target_range = &ranges[target_line];
@@ -614,6 +674,11 @@ impl TextBoxState {
             .nth(col)
             .map(|(i, _)| target_range.start + i)
             .unwrap_or(target_range.end)
+    }
+
+    fn vertical_target(&mut self, delta: isize) -> usize {
+        let cursor = self.cursor_offset();
+        self.vertical_target_from(cursor, delta)
     }
 
     fn index_for_mouse_position(&self, position: Point<Pixels>) -> usize {
@@ -683,13 +748,35 @@ impl TextBoxState {
     }
 
     fn up<S: TextBoxBacking>(&mut self, window: &mut Window, cx: &mut Context<S>) {
-        let target = self.vertical_target(-1);
+        let from = if self.selected_range.is_empty() {
+            self.cursor_offset()
+        } else {
+            self.preferred_x = None;
+            self.selected_range.start
+        };
+        let target = self.vertical_target_from(from, -1);
         self.move_to(target, false, window, cx);
     }
 
     fn down<S: TextBoxBacking>(&mut self, window: &mut Window, cx: &mut Context<S>) {
-        let target = self.vertical_target(1);
+        let from = if self.selected_range.is_empty() {
+            self.cursor_offset()
+        } else {
+            self.preferred_x = None;
+            self.selected_range.end
+        };
+        let target = self.vertical_target_from(from, 1);
         self.move_to(target, false, window, cx);
+    }
+
+    fn word_left<S: TextBoxBacking>(&mut self, window: &mut Window, cx: &mut Context<S>) {
+        let target = self.previous_word_boundary(self.cursor_offset());
+        self.move_to(target, true, window, cx);
+    }
+
+    fn word_right<S: TextBoxBacking>(&mut self, window: &mut Window, cx: &mut Context<S>) {
+        let target = self.next_word_boundary(self.cursor_offset());
+        self.move_to(target, true, window, cx);
     }
 
     fn select_left<S: TextBoxBacking>(&mut self, window: &mut Window, cx: &mut Context<S>) {
@@ -708,6 +795,36 @@ impl TextBoxState {
     fn select_down<S: TextBoxBacking>(&mut self, window: &mut Window, cx: &mut Context<S>) {
         let target = self.vertical_target(1);
         self.select_to(target, false, window, cx);
+    }
+
+    fn select_word_left<S: TextBoxBacking>(&mut self, window: &mut Window, cx: &mut Context<S>) {
+        let target = self.previous_word_boundary(self.cursor_offset());
+        self.select_to(target, true, window, cx);
+    }
+
+    fn select_word_right<S: TextBoxBacking>(&mut self, window: &mut Window, cx: &mut Context<S>) {
+        let target = self.next_word_boundary(self.cursor_offset());
+        self.select_to(target, true, window, cx);
+    }
+
+    fn select_line_start<S: TextBoxBacking>(&mut self, window: &mut Window, cx: &mut Context<S>) {
+        let line_idx = self.line_index_for_offset(self.cursor_offset());
+        let start = self.line_ranges()[line_idx].start;
+        self.select_to(start, true, window, cx);
+    }
+
+    fn select_line_end<S: TextBoxBacking>(&mut self, window: &mut Window, cx: &mut Context<S>) {
+        let line_idx = self.line_index_for_offset(self.cursor_offset());
+        let end = self.line_ranges()[line_idx].end;
+        self.select_to(end, true, window, cx);
+    }
+
+    fn select_doc_start<S: TextBoxBacking>(&mut self, window: &mut Window, cx: &mut Context<S>) {
+        self.select_to(0, true, window, cx);
+    }
+
+    fn select_doc_end<S: TextBoxBacking>(&mut self, window: &mut Window, cx: &mut Context<S>) {
+        self.select_to(self.content.len(), true, window, cx);
     }
 
     fn select_all<S: TextBoxBacking>(&mut self, window: &mut Window, cx: &mut Context<S>) {
@@ -1515,8 +1632,10 @@ impl<S: TextBoxBacking> Element for MultiLineTextElement<S> {
             );
         }
 
-        for quad in prepaint.selections.drain(..) {
-            window.paint_quad(quad);
+        if focused {
+            for quad in prepaint.selections.drain(..) {
+                window.paint_quad(quad);
+            }
         }
 
         if let Some(placeholder) = prepaint.placeholder_line.take() {
@@ -1657,6 +1776,16 @@ fn render_textbox_backing<S: TextBoxBacking>(
         let focused = tb.focus_handle.is_focused(window);
         if focused != tb.was_focused {
             tb.was_focused = focused;
+            if !focused {
+                tb.is_selecting = false;
+                if !tb.selected_range.is_empty() {
+                    let cursor = tb.cursor_offset();
+                    tb.selected_range = cursor..cursor;
+                    tb.selection_reversed = false;
+                    tb.preferred_x = None;
+                    window.notify_text_selection_changed(&tb.focus_handle);
+                }
+            }
             cx.emit(if focused {
                 TextBoxEvent::Focus
             } else {
@@ -1796,6 +1925,12 @@ fn render_textbox_backing<S: TextBoxBacking>(
                     .on_action(cx.listener(|this: &mut S, _: &Down, window, cx| {
                         this.textbox_mut().down(window, cx);
                     }))
+                    .on_action(cx.listener(|this: &mut S, _: &WordLeft, window, cx| {
+                        this.textbox_mut().word_left(window, cx);
+                    }))
+                    .on_action(cx.listener(|this: &mut S, _: &WordRight, window, cx| {
+                        this.textbox_mut().word_right(window, cx);
+                    }))
                     .on_action(cx.listener(|this: &mut S, _: &SelectLeft, window, cx| {
                         this.textbox_mut().select_left(window, cx);
                     }))
@@ -1807,6 +1942,24 @@ fn render_textbox_backing<S: TextBoxBacking>(
                     }))
                     .on_action(cx.listener(|this: &mut S, _: &SelectDown, window, cx| {
                         this.textbox_mut().select_down(window, cx);
+                    }))
+                    .on_action(cx.listener(|this: &mut S, _: &SelectWordLeft, window, cx| {
+                        this.textbox_mut().select_word_left(window, cx);
+                    }))
+                    .on_action(cx.listener(|this: &mut S, _: &SelectWordRight, window, cx| {
+                        this.textbox_mut().select_word_right(window, cx);
+                    }))
+                    .on_action(cx.listener(|this: &mut S, _: &SelectLineStart, window, cx| {
+                        this.textbox_mut().select_line_start(window, cx);
+                    }))
+                    .on_action(cx.listener(|this: &mut S, _: &SelectLineEnd, window, cx| {
+                        this.textbox_mut().select_line_end(window, cx);
+                    }))
+                    .on_action(cx.listener(|this: &mut S, _: &SelectDocStart, window, cx| {
+                        this.textbox_mut().select_doc_start(window, cx);
+                    }))
+                    .on_action(cx.listener(|this: &mut S, _: &SelectDocEnd, window, cx| {
+                        this.textbox_mut().select_doc_end(window, cx);
                     }))
                     .on_action(cx.listener(|this: &mut S, _: &SelectAll, window, cx| {
                         this.textbox_mut().select_all(window, cx);
@@ -2088,6 +2241,11 @@ impl AutoGrowInputState {
         self.inner.value()
     }
 
+    /// Returns the current selection byte range within [`Self::value`].
+    pub fn selected_range(&self) -> Range<usize> {
+        self.inner.selected_range()
+    }
+
     /// Returns the number of lines in the current text.
     pub fn line_count(&self) -> usize {
         self.inner.line_count()
@@ -2131,6 +2289,16 @@ impl AutoGrowInputState {
     /// Updates the disabled state dynamically.
     pub fn set_disabled(&mut self, disabled: bool, cx: &mut Context<Self>) {
         self.inner.disabled = disabled;
+        if disabled {
+            self.inner.blink.stop();
+            self.inner.is_selecting = false;
+            if !self.inner.selected_range.is_empty() {
+                let cursor = self.inner.cursor_offset();
+                self.inner.selected_range = cursor..cursor;
+                self.inner.selection_reversed = false;
+                self.inner.preferred_x = None;
+            }
+        }
         cx.notify();
     }
 

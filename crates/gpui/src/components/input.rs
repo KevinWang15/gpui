@@ -43,6 +43,8 @@ pub mod input_actions {
             WordRight,
             SelectLeft,
             SelectRight,
+            SelectUp,
+            SelectDown,
             SelectWordLeft,
             SelectWordRight,
             SelectToStart,
@@ -77,6 +79,8 @@ pub fn bind_input_keys(cx: &mut App) {
         KeyBinding::new("ctrl-right", WordRight, ctx),
         KeyBinding::new("shift-left", SelectLeft, ctx),
         KeyBinding::new("shift-right", SelectRight, ctx),
+        KeyBinding::new("shift-up", SelectUp, ctx),
+        KeyBinding::new("shift-down", SelectDown, ctx),
         KeyBinding::new("alt-shift-left", SelectWordLeft, ctx),
         KeyBinding::new("alt-shift-right", SelectWordRight, ctx),
         KeyBinding::new("ctrl-shift-left", SelectWordLeft, ctx),
@@ -85,10 +89,18 @@ pub fn bind_input_keys(cx: &mut App) {
         KeyBinding::new("shift-end", SelectToEnd, ctx),
         KeyBinding::new("cmd-shift-left", SelectToStart, ctx),
         KeyBinding::new("cmd-shift-right", SelectToEnd, ctx),
+        KeyBinding::new("cmd-shift-up", SelectToStart, ctx),
+        KeyBinding::new("cmd-shift-down", SelectToEnd, ctx),
+        KeyBinding::new("ctrl-shift-home", SelectToStart, ctx),
+        KeyBinding::new("ctrl-shift-end", SelectToEnd, ctx),
         KeyBinding::new("home", Home, ctx),
         KeyBinding::new("end", End, ctx),
         KeyBinding::new("cmd-left", Home, ctx),
         KeyBinding::new("cmd-right", End, ctx),
+        KeyBinding::new("cmd-up", Home, ctx),
+        KeyBinding::new("cmd-down", End, ctx),
+        KeyBinding::new("ctrl-home", Home, ctx),
+        KeyBinding::new("ctrl-end", End, ctx),
         KeyBinding::new("cmd-a", SelectAll, ctx),
         KeyBinding::new("ctrl-a", SelectAll, ctx),
         KeyBinding::new("cmd-c", Copy, ctx),
@@ -201,6 +213,7 @@ pub struct InputState {
     redo_stack: Vec<UndoEntry>,
     was_focused: bool,
     tab_stop: bool,
+    allow_vertical_selection: bool,
     content_px: Option<Pixels>,
     blink: CursorBlink,
     completions: Option<CompletionController>,
@@ -244,6 +257,7 @@ impl InputState {
             redo_stack: Vec::new(),
             was_focused: false,
             tab_stop: true,
+            allow_vertical_selection: true,
             content_px: None,
             blink: CursorBlink::new(),
             completions: None,
@@ -277,6 +291,13 @@ impl InputState {
     /// [`super::transfer_tags::TagInput`].
     pub(crate) fn content_px(mut self, px_x: Pixels) -> Self {
         self.content_px = Some(px_x);
+        self
+    }
+
+    /// Controls whether `Shift+Up` / `Shift+Down` select to line start/end or propagate to an
+    /// enclosing composite widget (such as [`super::number_input::NumberInput`]).
+    pub(crate) fn allow_vertical_selection(mut self, allow: bool) -> Self {
+        self.allow_vertical_selection = allow;
         self
     }
 
@@ -633,6 +654,12 @@ impl InputState {
         self.disabled = disabled;
         if disabled {
             self.blink.stop();
+            self.is_selecting = false;
+            if !self.selected_range.is_empty() {
+                let cursor = self.cursor_offset();
+                self.selected_range = cursor..cursor;
+                self.selection_reversed = false;
+            }
             if let Some(ctrl) = self.completions.as_mut() {
                 ctrl.close();
             }
@@ -744,6 +771,8 @@ impl InputState {
         if self.selected_range.end < self.selected_range.start {
             self.selection_reversed = !self.selection_reversed;
             self.selected_range = self.selected_range.end..self.selected_range.start;
+        } else if self.selected_range.is_empty() {
+            self.selection_reversed = false;
         }
         self.blink.reset(cx);
         window.notify_text_selection_changed(&self.focus_handle);
@@ -921,6 +950,22 @@ impl InputState {
 
     fn select_right(&mut self, _: &SelectRight, window: &mut Window, cx: &mut Context<Self>) {
         self.select_to(self.next_boundary(self.cursor_offset()), window, cx);
+    }
+
+    fn select_up(&mut self, _: &SelectUp, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.allow_vertical_selection {
+            cx.propagate();
+            return;
+        }
+        self.select_to(0, window, cx);
+    }
+
+    fn select_down(&mut self, _: &SelectDown, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.allow_vertical_selection {
+            cx.propagate();
+            return;
+        }
+        self.select_to(self.content.len(), window, cx);
     }
 
     fn select_word_left(
@@ -1632,7 +1677,7 @@ impl Element for InputTextElement {
             );
         }
 
-        if let Some(selection) = prepaint.selection.take() {
+        if focused && let Some(selection) = prepaint.selection.take() {
             window.paint_quad(selection);
         }
 
@@ -1682,6 +1727,13 @@ impl Render for InputState {
                 }
                 cx.emit(InputEvent::Focus);
             } else {
+                self.is_selecting = false;
+                if !self.selected_range.is_empty() {
+                    let cursor = self.cursor_offset();
+                    self.selected_range = cursor..cursor;
+                    self.selection_reversed = false;
+                    window.notify_text_selection_changed(&self.focus_handle);
+                }
                 if let Some(ctrl) = self.completions.as_mut() {
                     ctrl.close();
                 }
@@ -1804,6 +1856,8 @@ impl Render for InputState {
                     .on_action(cx.listener(Self::word_right))
                     .on_action(cx.listener(Self::select_left))
                     .on_action(cx.listener(Self::select_right))
+                    .on_action(cx.listener(Self::select_up))
+                    .on_action(cx.listener(Self::select_down))
                     .on_action(cx.listener(Self::select_word_left))
                     .on_action(cx.listener(Self::select_word_right))
                     .on_action(cx.listener(Self::select_to_start))

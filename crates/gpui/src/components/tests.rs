@@ -271,6 +271,217 @@ fn autogrow_input_grows_caps_shrinks_and_handles_enter_vs_shift_enter(cx: &mut T
 }
 
 #[gpui::test]
+fn input_shift_up_down_selection_and_blur_clears_selection(cx: &mut TestAppContext) {
+    cx.update(init_components);
+
+    struct TwoInputsHost {
+        first: Entity<InputState>,
+        second: Entity<InputState>,
+        number: Entity<NumberInputState>,
+    }
+
+    impl Render for TwoInputsHost {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            v_stack()
+                .w(px(400.))
+                .spacing(px(8.))
+                .child(input(&self.first))
+                .child(input(&self.second))
+                .child(number_input(&self.number))
+        }
+    }
+
+    let (view, cx) = cx.add_window_view(|_, cx| TwoInputsHost {
+        first: cx.new(|cx| InputState::new(cx).default_value("hello world")),
+        second: cx.new(|cx| InputState::new(cx).default_value("asdasd")),
+        number: cx.new(|cx| NumberInputState::new(cx).default_value(10.0, cx).step(1.0)),
+    });
+    let (first, second, number) = view.read_with(cx, |v, _| {
+        (v.first.clone(), v.second.clone(), v.number.clone())
+    });
+
+    // Focus first input with caret at index 5 ("hello| world").
+    first.update_in(cx, |inp, window, cx| {
+        window.focus(&inp.focus_handle(cx), cx);
+        inp.set_selected_text_range(5..5, window, cx);
+    });
+    cx.refresh().unwrap();
+    cx.run_until_parked();
+
+    // Shift+Up selects from caret to start of line; Shift+Down flips around anchor to end of line.
+    cx.simulate_keystrokes("shift-up");
+    cx.run_until_parked();
+    assert_eq!(first.read_with(cx, |i, _| i.selected_range()), 0..5);
+
+    cx.simulate_keystrokes("shift-down");
+    cx.run_until_parked();
+    assert_eq!(first.read_with(cx, |i, _| i.selected_range()), 5..11);
+
+    cx.simulate_keystrokes("shift-up");
+    cx.run_until_parked();
+    assert_eq!(first.read_with(cx, |i, _| i.selected_range()), 0..5);
+
+    // From end of line: Shift+Up selects all, Shift+Down collapses back to end.
+    first.update_in(cx, |inp, window, cx| {
+        inp.set_selected_text_range(11..11, window, cx);
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("shift-up");
+    cx.run_until_parked();
+    assert_eq!(first.read_with(cx, |i, _| i.selected_range()), 0..11);
+    cx.simulate_keystrokes("shift-down");
+    cx.run_until_parked();
+    assert_eq!(first.read_with(cx, |i, _| i.selected_range()), 11..11);
+
+    // From start of line: Shift+Down selects all, Shift+Up collapses back to start.
+    first.update_in(cx, |inp, window, cx| {
+        inp.set_selected_text_range(0..0, window, cx);
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("shift-down");
+    cx.run_until_parked();
+    assert_eq!(first.read_with(cx, |i, _| i.selected_range()), 0..11);
+    cx.simulate_keystrokes("shift-up");
+    cx.run_until_parked();
+    assert_eq!(first.read_with(cx, |i, _| i.selected_range()), 0..0);
+
+    // Selecting text in first input and blurring to second input clears first input's selection.
+    first.update_in(cx, |inp, window, cx| {
+        inp.set_selected_text_range(2..5, window, cx);
+    });
+    cx.refresh().unwrap();
+    cx.run_until_parked();
+    assert_eq!(first.read_with(cx, |i, _| i.selected_range()), 2..5);
+
+    second.update_in(cx, |inp, window, cx| {
+        window.focus(&inp.focus_handle(cx), cx);
+        inp.set_selected_text_range(1..4, window, cx);
+    });
+    cx.refresh().unwrap();
+    cx.run_until_parked();
+    assert!(
+        first.read_with(cx, |i, _| i.selected_range().is_empty()),
+        "blurring Input must clear its text selection"
+    );
+    assert_eq!(second.read_with(cx, |i, _| i.selected_range()), 1..4);
+
+    // Blurring window focus entirely clears second input's selection too.
+    cx.update(|window, cx| window.blur(cx));
+    cx.refresh().unwrap();
+    cx.run_until_parked();
+    assert!(
+        second.read_with(cx, |i, _| i.selected_range().is_empty()),
+        "window.blur must clear active Input selection"
+    );
+
+    // NumberInput retains its 10x Shift+Up / Shift+Down stepping even when its inner Input is focused.
+    second.update_in(cx, |inp, window, cx| {
+        window.focus(&inp.focus_handle(cx), cx);
+    });
+    cx.refresh().unwrap();
+    cx.run_until_parked();
+    super::keyboard_tests::keys(cx, "tab");
+    cx.simulate_keystrokes("shift-up");
+    cx.run_until_parked();
+    assert!((number.read_with(cx, |n, _| n.value()) - 20.0).abs() < 1e-6);
+    cx.simulate_keystrokes("shift-down");
+    cx.run_until_parked();
+    assert!((number.read_with(cx, |n, _| n.value()) - 10.0).abs() < 1e-6);
+}
+
+#[gpui::test]
+fn textbox_selection_navigation_and_blur_clears_selection(cx: &mut TestAppContext) {
+    cx.update(init_components);
+
+    struct TextBoxBlurHost {
+        tb: Entity<TextBoxState>,
+        other: Entity<InputState>,
+    }
+
+    impl Render for TextBoxBlurHost {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            v_stack()
+                .w(px(400.))
+                .spacing(px(8.))
+                .child(text_box(&self.tb))
+                .child(input(&self.other))
+        }
+    }
+
+    let (view, cx) = cx.add_window_view(|_, cx| TextBoxBlurHost {
+        tb: cx.new(|cx| TextBoxState::new(cx).default_value("hello world")),
+        other: cx.new(|cx| InputState::new(cx).default_value("other")),
+    });
+    let (tb, other) = view.read_with(cx, |v, _| (v.tb.clone(), v.other.clone()));
+
+    // Single-line TextBox: Shift+Up -> start, Shift+Down -> end around anchor.
+    tb.update_in(cx, |state, window, cx| {
+        window.focus(&state.focus_handle(cx), cx);
+        state.set_selected_text_range(5..5, window, cx);
+    });
+    cx.refresh().unwrap();
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes("shift-up");
+    cx.run_until_parked();
+    assert_eq!(tb.read_with(cx, |s, _| s.selected_range()), 0..5);
+
+    cx.simulate_keystrokes("shift-down");
+    cx.run_until_parked();
+    assert_eq!(tb.read_with(cx, |s, _| s.selected_range()), 5..11);
+
+    // Multi-line TextBox: Shift+Up/Down, Shift+Home/End, Ctrl+Shift+Home/End.
+    tb.update_in(cx, |state, window, cx| {
+        state.set_value("first line\nsecond line\nthird line", cx);
+        // Line 1 col 6: "second| line" -> byte offset 11 + 6 = 17.
+        state.set_selected_text_range(17..17, window, cx);
+    });
+    cx.refresh().unwrap();
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes("shift-up");
+    cx.run_until_parked();
+    let up_sel = tb.read_with(cx, |s, _| s.selected_range());
+    assert_eq!(up_sel.end, 17);
+    assert!(up_sel.start < 11, "expected selection to move to line 0, got {up_sel:?}");
+
+    cx.simulate_keystrokes("shift-down");
+    cx.run_until_parked();
+    assert_eq!(
+        tb.read_with(cx, |s, _| s.selected_range()),
+        17..17,
+        "Shift+Up followed by Shift+Down should return to anchor on multi-line TextBox"
+    );
+
+    cx.simulate_keystrokes("shift-home");
+    cx.run_until_parked();
+    assert_eq!(tb.read_with(cx, |s, _| s.selected_range()), 11..17);
+
+    cx.simulate_keystrokes("shift-end");
+    cx.run_until_parked();
+    assert_eq!(tb.read_with(cx, |s, _| s.selected_range()), 17..22);
+
+    cx.simulate_keystrokes("ctrl-shift-home");
+    cx.run_until_parked();
+    assert_eq!(tb.read_with(cx, |s, _| s.selected_range()), 0..17);
+
+    cx.simulate_keystrokes("ctrl-shift-end");
+    cx.run_until_parked();
+    assert_eq!(tb.read_with(cx, |s, _| s.selected_range()), 17..33);
+
+    // Blurring TextBox to another input clears its selection.
+    other.update_in(cx, |inp, window, cx| {
+        window.focus(&inp.focus_handle(cx), cx);
+    });
+    cx.refresh().unwrap();
+    cx.run_until_parked();
+    assert!(
+        tb.read_with(cx, |s, _| s.selected_range().is_empty()),
+        "blurring TextBox must clear its text selection"
+    );
+}
+
+#[gpui::test]
 fn select_keyboard_navigation_and_disabled_skip(cx: &mut TestAppContext) {
     cx.update(init_components);
     let changes: Rc<RefCell<Vec<Option<String>>>> = Rc::new(RefCell::new(Vec::new()));
