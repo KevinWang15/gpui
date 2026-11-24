@@ -268,6 +268,8 @@ pub struct DropdownMenu {
     trigger: Option<AnyElement>,
     entries: Vec<MenuEntry>,
     min_width: Pixels,
+    max_width: Option<Pixels>,
+    max_height: Option<Pixels>,
     style: StyleRefinement,
     on_close: Option<Rc<dyn Fn(&(), &mut Window, &mut App) + 'static>>,
 }
@@ -286,6 +288,8 @@ impl DropdownMenu {
             trigger: None,
             entries: Vec::new(),
             min_width: px(210.),
+            max_width: None,
+            max_height: None,
             style: StyleRefinement::default(),
             on_close: None,
         }
@@ -312,6 +316,18 @@ impl DropdownMenu {
     /// Sets minimum dropdown width.
     pub fn min_width(mut self, width: Pixels) -> Self {
         self.min_width = width;
+        self
+    }
+
+    /// Caps the dropdown menu's maximum width so long item labels truncate cleanly.
+    pub fn max_width(mut self, width: Pixels) -> Self {
+        self.max_width = Some(width);
+        self
+    }
+
+    /// Caps the dropdown menu's maximum height and enables vertical scrolling when exceeded.
+    pub fn max_height(mut self, height: Pixels) -> Self {
+        self.max_height = Some(height);
         self
     }
 
@@ -420,11 +436,14 @@ pub(crate) fn render_menu_entries(
                             div()
                                 .flex()
                                 .flex_row()
+                                .flex_1()
+                                .min_w_0()
                                 .items_center()
                                 .gap(px(8.))
                                 .when_some(checked, |el, is_checked| {
                                     el.child(
                                         div()
+                                            .flex_none()
                                             .w(px(16.))
                                             .flex()
                                             .items_center()
@@ -439,13 +458,18 @@ pub(crate) fn render_menu_entries(
                                     )
                                 })
                                 .when_some(icon, |el, ic| {
-                                    el.child(Icon::new(ic).size(IconSize::Sm).color(icon_fg))
+                                    el.child(
+                                        div()
+                                            .flex_none()
+                                            .child(Icon::new(ic).size(IconSize::Sm).color(icon_fg)),
+                                    )
                                 })
-                                .child(label),
+                                .child(div().flex_1().min_w_0().truncate().child(label)),
                         )
                         .when_some(shortcut, |el, sc| {
                             el.child(
                                 div()
+                                    .flex_none()
                                     .text_size(px(11.5))
                                     .text_color(theme.muted_foreground)
                                     .child(sc),
@@ -528,6 +552,10 @@ impl RenderOnce for DropdownMenu {
             self.on_close.clone(),
             &theme,
         )
+        .when_some(self.max_width, |el, max_w| el.max_w(max_w))
+        .when_some(self.max_height, |el, max_h| {
+            el.max_h(max_h).overflow_y_scroll()
+        })
         .track_focus(&handle)
         .focus_trap()
         .on_key_down(move |ev: &KeyDownEvent, window, cx| {
