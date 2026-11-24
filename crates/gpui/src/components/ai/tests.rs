@@ -1923,3 +1923,210 @@ fn to_rig_messages_preserves_step_boundaries_and_reattaches_recent_tool_images()
     });
     assert!(!has_raw_img);
 }
+
+#[gpui::test]
+fn ask_ai_history_delete_click_and_clear_conversations(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    cx.update(init_components);
+
+    let tmp_root = std::env::temp_dir().join(format!(
+        "gpui-ai-history-test-{}-{}",
+        std::process::id(),
+        super::types::new_id()
+    ));
+    let conv_path = tmp_root.join("pane-ai-conversations.json");
+    let images_dir = tmp_root.join("pane-ai-conversations-images");
+    let reg_dir = tmp_root.join("ai");
+    let conn_key = format!("test-history-conn-{}", super::types::new_id());
+
+    cx.update(|cx| AiConnectionRegistry::set_storage_dir(&reg_dir, cx));
+
+    let ai = cx.new(|cx| {
+        let mut s = AskAiState::build_with_ai(cx)
+            .connection_key(conn_key.clone())
+            .storage_path(conv_path.clone())
+            .with_simulated_provider();
+        assert!(s.connect_preset_defaults("simulated", cx).is_none());
+        s.set_open(true, cx);
+        s
+    });
+
+    // Fresh state has 0 saved conversations and never writes an empty shell file on disk.
+    ai.read_with(cx, |s, _| {
+        assert_eq!(s.saved_conversation_count(), 0);
+    });
+    assert!(!conv_path.exists());
+
+    // Calling new_conversation on an already-empty conversation reuses it without duplicating blanks.
+    ai.update(cx, |s, cx| {
+        s.new_conversation(cx);
+        s.new_conversation(cx);
+    });
+    ai.read_with(cx, |s, _| {
+        assert_eq!(s.conversations().len(), 1);
+        assert_eq!(s.saved_conversation_count(), 0);
+    });
+
+    // Send 2 real conversations so both appear in History and persist on disk.
+    ai.update(cx, |s, cx| s.send_message("First test prompt", cx));
+    wait_until_idle(cx, &ai);
+    ai.update(cx, |s, cx| {
+        s.new_conversation(cx);
+        s.send_message("Second test prompt", cx);
+    });
+    wait_until_idle(cx, &ai);
+
+    // Store an on-disk image to verify clear_conversations removes the image directory too.
+    let img_bytes = Arc::new(solid_test_png(8, 8, 12, 34, 56));
+    ai.read_with(cx, |s, _| {
+        assert_eq!(s.saved_conversation_count(), 2);
+        s.image_store().put("test-img-1", img_bytes.clone()).unwrap();
+    });
+    assert!(conv_path.exists(), "non-empty conversations must be persisted on disk");
+    assert!(images_dir.join("test-img-1").exists());
+
+    // Render AskAiOverlay on the History page and verify simulated clicking Trash -> Delete works!
+    ai.update(cx, |s, cx| s.set_page(AskAiPage::History, cx));
+
+    struct OverlayHost {
+        ai: crate::Entity<AskAiState>,
+    }
+    impl crate::Render for OverlayHost {
+        fn render(
+            &mut self,
+            _window: &mut crate::Window,
+            _cx: &mut crate::Context<Self>,
+        ) -> impl crate::IntoElement {
+            crate::div()
+                .size_full()
+                .child(build_with_ai_overlay("test-hist-overlay", &self.ai).show_trigger(false))
+        }
+    }
+
+    let ai_clone = ai.clone();
+    let window = cx.open_window(size(px(900.), px(720.)), |_, _| OverlayHost {
+        ai: ai_clone,
+    });
+    cx.run_until_parked();
+
+    // Panel is 420x560 anchored BottomRight { right: 24, bottom: 24 } on 900x720:
+    // origin = (456, 136), right = 876, top = 136.
+    // Scan the right side of the first history card (y ~ 270..305) to click Trash,
+    // then click the red Delete confirmation button!
+    let panel = ai.read_with(cx, |s, cx| {
+        s.floating_window()
+            .read(cx)
+            .resolve_bounds(size(px(900.), px(720.)))
+    });
+    assert_eq!(panel.origin, crate::point(px(456.), px(136.)));
+
+    let click_at = |vcx: &mut crate::VisualTestContext, pos: crate::Point<crate::Pixels>| {
+        vcx.simulate_event(crate::MouseMoveEvent {
+            position: pos,
+            pressed_button: None,
+            modifiers: crate::Modifiers::none(),
+        });
+        vcx.simulate_event(crate::MouseDownEvent {
+            position: pos,
+            button: crate::MouseButton::Left,
+            modifiers: crate::Modifiers::none(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        vcx.run_until_parked();
+        vcx.simulate_event(crate::MouseUpEvent {
+            position: pos,
+            button: crate::MouseButton::Left,
+            modifiers: crate::Modifiers::none(),
+            click_count: 1,
+        });
+        vcx.run_until_parked();
+    };
+
+    // First history row's Trash button sits inside the card near right = panel.right() - 18(scroll) - 11(pad) - 12(half icon) = ~835,
+    // y = panel.top(136) + header(~53) + pad(16) + title_row(~24) + gap(12) + search(~32) + gap(12) + card_pad(11) + half_btn(12) = ~308.
+    let mut clicked_delete = false;
+    {
+        let mut vcx = crate::VisualTestContext::from_window(window.into(), cx);
+        let mut trash_y = None;
+        for y in (270..=350).step_by(6) {
+            let pt = crate::point(panel.right() - px(40.), px(y as f32));
+            click_at(&mut vcx, pt);
+            let confirming = ai.read_with(&vcx, |s, _| s.saved_conversation_count() == 2);
+            if !confirming {
+                break;
+            }
+            // Check whether clicking Trash exposed the Delete button by scanning left for it.
+            for x_off in [84.0f32, 96.0, 108.0] {
+                let del_pt = crate::point(panel.right() - px(x_off), px(y as f32));
+                click_at(&mut vcx, del_pt);
+                if ai.read_with(&vcx, |s, _| s.saved_conversation_count()) == 1 {
+                    trash_y = Some(y);
+                    clicked_delete = true;
+                    break;
+                }
+            }
+            if clicked_delete {
+                break;
+            }
+        }
+        assert!(
+            clicked_delete,
+            "simulated click on Trash -> Delete inside AskAiOverlay must delete the conversation (trash_y={trash_y:?})"
+        );
+    }
+
+    assert_eq!(ai.read_with(cx, |s, _| s.saved_conversation_count()), 1);
+    assert!(conv_path.exists());
+
+    // Delete the last remaining conversation: saved count drops to 0 and disk file is removed!
+    let last_id = ai.read_with(cx, |s, _| {
+        s.conversations()
+            .iter()
+            .find(|c| !c.is_empty())
+            .unwrap()
+            .id
+            .clone()
+    });
+    ai.update(cx, |s, cx| s.delete_conversation(&last_id, cx));
+    cx.run_until_parked();
+    assert_eq!(ai.read_with(cx, |s, _| s.saved_conversation_count()), 0);
+    assert!(
+        !conv_path.exists(),
+        "deleting the final saved conversation must remove the empty persistence file"
+    );
+
+    // Re-populate conversation + image + MCP server, then verify clear_conversations + AiConnectionRegistry::clear wipe everything.
+    ai.update(cx, |s, cx| {
+        s.add_mcp_server(
+            super::types::McpServerConfig::http("docs", "Docs", "http://127.0.0.1:9/mcp"),
+            cx,
+        );
+        s.send_message("Another prompt before factory reset", cx);
+    });
+    wait_until_idle(cx, &ai);
+    ai.read_with(cx, |s, _| {
+        s.image_store().put("test-img-2", img_bytes.clone()).unwrap();
+    });
+    assert!(conv_path.exists());
+    assert!(images_dir.join("test-img-2").exists());
+
+    ai.update(cx, |s, cx| {
+        s.clear_conversations(cx);
+        s.disconnect(cx);
+    });
+    cx.update(|cx| AiConnectionRegistry::clear(&conn_key, cx));
+    cx.run_until_parked();
+
+    ai.read_with(cx, |s, _| {
+        assert_eq!(s.saved_conversation_count(), 0);
+        assert!(s.active_conversation().is_some_and(Conversation::is_empty));
+        assert!(s.image_store().get("test-img-2").is_none());
+    });
+    assert!(!conv_path.exists(), "clear_conversations must remove disk conversation file");
+    assert!(!images_dir.exists(), "clear_conversations must remove disk image store directory");
+    assert!(cx.update(|cx| AiConnectionRegistry::load(&conn_key, cx).is_none()));
+    assert!(cx.update(|cx| AiConnectionRegistry::load_mcp_servers(&conn_key, cx).is_none()));
+
+    let _ = std::fs::remove_dir_all(&tmp_root);
+}

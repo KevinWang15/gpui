@@ -23,8 +23,8 @@ use crate::{
     AnyElement, App, ClipboardItem, Context, CursorStyle, ElementId, Entity, EventEmitter,
     FileFilter, Focusable as _, FontWeight, Image, ImageFormat, IntoElement, MouseButton,
     MouseDownEvent, ObjectFit, OpenPromptOptions, Pixels, Render, RenderOnce, ScrollEvent,
-    ScrollHandle, ScrollbarVisibility, SharedString, StyleRefinement, Styled, Task, Window,
-    anchored, deferred, div, img, point, prelude::*, px, size,
+    ScrollHandle, ScrollbarVisibility, SharedString, StyleRefinement, Styled, Subscription, Task,
+    Window, anchored, deferred, div, img, point, prelude::*, px, size,
 };
 
 use super::agent::{
@@ -182,6 +182,7 @@ pub struct AskAiState {
     editing_message_id: Option<String>,
     edit_input: Entity<AutoGrowInputState>,
     confirm_delete_conv_id: Option<String>,
+    confirm_clear_all: bool,
 
     // Expand/collapse UI state
     expanded_tool_groups: HashSet<String>,
@@ -370,6 +371,7 @@ impl AskAiState {
             editing_message_id: None,
             edit_input,
             confirm_delete_conv_id: None,
+            confirm_clear_all: false,
             expanded_tool_groups: HashSet::new(),
             expanded_tools: HashSet::new(),
             expanded_reasoning: HashSet::new(),
@@ -716,6 +718,10 @@ impl AskAiState {
             return;
         }
         self.page = page;
+        if page != AskAiPage::History {
+            self.confirm_delete_conv_id = None;
+            self.confirm_clear_all = false;
+        }
         if page == AskAiPage::Settings {
             self.sync_draft_from_connection(cx);
         } else if page == AskAiPage::Chat && self.chat_stick_to_bottom {
@@ -812,6 +818,16 @@ impl AskAiState {
         self.conversations
             .iter()
             .find(|c| c.id == self.active_conversation_id)
+    }
+
+    /// Returns all conversations held in state (including an active empty draft conversation).
+    pub fn conversations(&self) -> &[Conversation] {
+        &self.conversations
+    }
+
+    /// Returns the number of saved (non-empty) conversations shown in history.
+    pub fn saved_conversation_count(&self) -> usize {
+        self.conversations.iter().filter(|c| !c.is_empty()).count()
     }
 
     /// Returns the underlying [`AiImageStore`] holding user attachments and multimodal tool images.
@@ -1109,14 +1125,26 @@ impl AskAiState {
         cx.notify();
     }
 
-    /// Creates and focuses a fresh empty conversation.
+    /// Creates and focuses a fresh empty conversation (reusing an existing empty conversation
+    /// instead of accumulating blank drafts).
     pub fn new_conversation(&mut self, cx: &mut Context<Self>) {
         if self.busy {
             return;
         }
-        let fresh = Conversation::new();
-        self.active_conversation_id = fresh.id.clone();
-        self.conversations.push(fresh);
+        let existing_empty_id = self
+            .conversations
+            .iter()
+            .find(|c| c.is_empty())
+            .map(|c| c.id.clone());
+        if let Some(id) = existing_empty_id {
+            self.active_conversation_id = id;
+        } else {
+            let fresh = Conversation::new();
+            self.active_conversation_id = fresh.id.clone();
+            self.conversations.push(fresh);
+        }
+        self.confirm_delete_conv_id = None;
+        self.confirm_clear_all = false;
         self.pending_images.clear();
         self.editing_message_id = None;
         self.error = None;
@@ -1137,6 +1165,8 @@ impl AskAiState {
             return;
         }
         self.active_conversation_id = id.to_owned();
+        self.confirm_delete_conv_id = None;
+        self.confirm_clear_all = false;
         self.pending_images.clear();
         self.editing_message_id = None;
         self.error = None;
@@ -1174,16 +1204,89 @@ impl AskAiState {
         if let Some(ws) = self.workspaces.remove(id) {
             ws.clear_all();
         }
+        let was_active = self.active_conversation_id == id;
         self.conversations.retain(|c| c.id != id);
         if self.conversations.is_empty() {
             let fresh = Conversation::new();
             self.active_conversation_id = fresh.id.clone();
             self.conversations.push(fresh);
-        } else if self.active_conversation_id == id {
-            self.active_conversation_id = self.conversations[0].id.clone();
+        } else if was_active {
+            let next_id = self
+                .conversations
+                .iter()
+                .filter(|c| !c.is_empty())
+                .max_by_key(|c| c.updated_at)
+                .or_else(|| self.conversations.first())
+                .map(|c| c.id.clone())
+                .unwrap_or_default();
+            self.active_conversation_id = next_id;
+        }
+        if was_active {
+            self.pending_images.clear();
+            self.editing_message_id = None;
+            self.error = None;
+            self.selected_workspace_file = None;
+            let draft = self
+                .active_conversation()
+                .map(|c| c.draft.clone())
+                .unwrap_or_default();
+            self.composer_input
+                .update(cx, |i, cx| i.set_value_silent(draft, cx));
         }
         self.confirm_delete_conv_id = None;
+        self.confirm_clear_all = false;
         self.persist_conversations();
+        cx.notify();
+    }
+
+    /// Cancels any active run and permanently clears all conversations, workspace files, stored
+    /// images, and persisted conversation history on disk.
+    pub fn clear_conversations(&mut self, cx: &mut Context<Self>) {
+        let was_busy = self.busy;
+        if let Some(ref abort) = self.abort {
+            abort.store(true, Ordering::Relaxed);
+        }
+        self.busy = false;
+        self.activity = AiActivity::Idle;
+        self.abort = None;
+        self._run_task = None;
+        self._ui_tool_task = None;
+
+        for (_, ws) in self.workspaces.drain() {
+            ws.clear_all();
+        }
+        self.image_store.clear_all();
+
+        let fresh = Conversation::new();
+        self.active_conversation_id = fresh.id.clone();
+        self.conversations = vec![fresh];
+
+        self.confirm_delete_conv_id = None;
+        self.confirm_clear_all = false;
+        self.pending_images.clear();
+        self.editing_message_id = None;
+        self.error = None;
+        self.selected_workspace_file = None;
+        self.expanded_tool_groups.clear();
+        self.expanded_tools.clear();
+        self.expanded_reasoning.clear();
+        self.copied_message_id = None;
+
+        self.composer_input
+            .update(cx, |i, cx| i.set_value_silent(String::new(), cx));
+        self.history_search
+            .update(cx, |i, cx| i.set_value_silent(String::new(), cx));
+        self.edit_input
+            .update(cx, |i, cx| i.set_value_silent(String::new(), cx));
+        self.chat_scroll.set_offset(point(px(0.), px(0.)));
+        self.chat_prev_max_y = px(0.);
+        self.chat_stick_to_bottom = true;
+        self.chat_force_bottom_frames = 0;
+
+        self.persist_conversations();
+        if was_busy {
+            cx.emit(AskAiEvent::ResponseFinished);
+        }
         cx.notify();
     }
 
@@ -2548,11 +2651,12 @@ impl AskAiState {
         let eid = cx.entity_id();
         let filter = self.history_search.read(cx).value().trim().to_lowercase();
         let now = Utc::now();
+        let saved_count = self.saved_conversation_count();
 
         let mut listed: Vec<&Conversation> = self
             .conversations
             .iter()
-            .filter(|c| !c.is_empty() || c.id == self.active_conversation_id)
+            .filter(|c| !c.is_empty())
             .filter(|c| {
                 filter.is_empty()
                     || c.title.to_lowercase().contains(&filter)
@@ -2563,14 +2667,52 @@ impl AskAiState {
 
         let mut rows = v_stack().spacing(px(8.));
         if listed.is_empty() {
-            rows = rows.child(
+            rows = rows.child(if !filter.is_empty() {
                 div()
-                    .py(px(24.))
+                    .py(px(28.))
                     .text_center()
                     .text_size(px(12.5))
                     .text_color(theme.muted_foreground)
-                    .child("Your saved conversations will appear here."),
-            );
+                    .child("No conversations match your search.")
+                    .into_any_element()
+            } else {
+                v_stack()
+                    .w_full()
+                    .items_center()
+                    .py(px(32.))
+                    .px(px(16.))
+                    .spacing(px(8.))
+                    .child(
+                        div()
+                            .w(px(36.))
+                            .h(px(36.))
+                            .rounded_full()
+                            .bg(theme.surface_muted)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                Icon::new(LucideIcon::Clock)
+                                    .size(IconSize::Sm)
+                                    .color(theme.muted_foreground),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme.foreground)
+                            .child("No saved conversations yet"),
+                    )
+                    .child(
+                        div()
+                            .text_center()
+                            .text_size(px(12.))
+                            .text_color(theme.muted_foreground)
+                            .child("Start a chat and your conversation history will appear here."),
+                    )
+                    .into_any_element()
+            });
         } else {
             for (idx, conv) in listed.into_iter().enumerate() {
                 let is_current = conv.id == self.active_conversation_id;
@@ -2660,6 +2802,12 @@ impl AskAiState {
                                     button(("ask-hist-del-yes", idx))
                                         .destructive()
                                         .size(ComponentSize::Xs)
+                                        .disabled(self.busy)
+                                        .tooltip_text(if self.busy {
+                                            "Wait for the current response to finish"
+                                        } else {
+                                            "Permanently delete this conversation"
+                                        })
                                         .label("Delete")
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.delete_conversation(&cid_del, cx);
@@ -2680,9 +2828,15 @@ impl AskAiState {
                             Button::icon(("ask-hist-del", idx), LucideIcon::Trash)
                                 .ghost()
                                 .size(ComponentSize::Xs)
-                                .tooltip_text("Delete conversation")
+                                .disabled(self.busy)
+                                .tooltip_text(if self.busy {
+                                    "Wait for the current response to finish"
+                                } else {
+                                    "Delete conversation"
+                                })
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.confirm_delete_conv_id = Some(cid_del.clone());
+                                    this.confirm_clear_all = false;
                                     cx.notify();
                                 }))
                                 .into_any_element()
@@ -2690,6 +2844,54 @@ impl AskAiState {
                 );
             }
         }
+
+        let clear_all_banner = (self.confirm_clear_all && saved_count > 0).then(|| {
+            div()
+                .w_full()
+                .p(px(10.))
+                .rounded(theme.radius_md)
+                .bg(theme.destructive.opacity(0.08))
+                .border_1()
+                .border_color(theme.destructive.opacity(0.35))
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap(px(8.))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_size(px(12.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(theme.foreground)
+                        .child(format!("Delete all {saved_count} saved conversations?")),
+                )
+                .child(
+                    h_stack()
+                        .spacing(px(4.))
+                        .child(
+                            button(("ask-hist-clear-yes", eid))
+                                .destructive()
+                                .size(ComponentSize::Xs)
+                                .disabled(self.busy)
+                                .label("Delete all")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.clear_conversations(cx);
+                                })),
+                        )
+                        .child(
+                            button(("ask-hist-clear-no", eid))
+                                .ghost()
+                                .size(ComponentSize::Xs)
+                                .label("Cancel")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.confirm_clear_all = false;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+        });
 
         div()
             .id(("ask-hist-scroll", eid))
@@ -2717,16 +2919,41 @@ impl AskAiState {
                                     .child("Conversations"),
                             )
                             .child(
-                                button(("ask-hist-new", eid))
-                                    .soft()
-                                    .size(ComponentSize::Xs)
-                                    .leading_icon(LucideIcon::Plus)
-                                    .label("New Chat")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.new_conversation(cx);
-                                    })),
+                                h_stack()
+                                    .spacing(px(6.))
+                                    .when(saved_count >= 2 && !self.confirm_clear_all, |el| {
+                                        el.child(
+                                            button(("ask-hist-clear", eid))
+                                                .ghost()
+                                                .size(ComponentSize::Xs)
+                                                .disabled(self.busy)
+                                                .tooltip_text(if self.busy {
+                                                    "Wait for the current response to finish"
+                                                } else {
+                                                    "Delete all saved conversations"
+                                                })
+                                                .label("Clear all")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.confirm_clear_all = true;
+                                                    this.confirm_delete_conv_id = None;
+                                                    cx.notify();
+                                                })),
+                                        )
+                                    })
+                                    .child(
+                                        button(("ask-hist-new", eid))
+                                            .soft()
+                                            .size(ComponentSize::Xs)
+                                            .disabled(self.busy)
+                                            .leading_icon(LucideIcon::Plus)
+                                            .label("New Chat")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.new_conversation(cx);
+                                            })),
+                                    ),
                             ),
                     )
+                    .when_some(clear_all_banner, |el, b| el.child(b))
                     .child(Input::new(&self.history_search))
                     .child(rows),
             )
@@ -4251,6 +4478,30 @@ impl AskAiOverlay {
     }
 }
 
+/// Internal view mounted inside [`AskAiOverlay`]'s [`FloatingWindow`] so any `cx.notify()` on
+/// [`AskAiState`] (streaming deltas, button clicks, async results, `clear_conversations`) repaints
+/// the floating panel immediately without requiring the host view to call `cx.observe`.
+struct AskAiOverlayHost {
+    state: Entity<AskAiState>,
+    _observe: Subscription,
+}
+
+impl AskAiOverlayHost {
+    fn new(state: Entity<AskAiState>, cx: &mut Context<Self>) -> Self {
+        let observe = cx.observe(&state, |_, _, cx| cx.notify());
+        Self {
+            state,
+            _observe: observe,
+        }
+    }
+}
+
+impl Render for AskAiOverlayHost {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.state.update(cx, |s, cx| s.render_panel_inner(true, cx))
+    }
+}
+
 impl RenderOnce for AskAiOverlay {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
@@ -4326,8 +4577,19 @@ impl RenderOnce for AskAiOverlay {
             }
         };
 
+        let panel_host = window.use_keyed_state(
+            (id.clone(), "panel-host"),
+            cx,
+            |_, cx| AskAiOverlayHost::new(state_panel.clone(), cx),
+        );
+        if panel_host.read(cx).state != state_panel {
+            panel_host.update(cx, |host, cx| {
+                host._observe = cx.observe(&state_panel, |_, _, cx| cx.notify());
+                host.state = state_panel.clone();
+            });
+        }
         let panel_body = if floating_win.read(cx).is_open() {
-            Some(state_panel.update(cx, |s, cx| s.render_panel_inner(true, cx)))
+            Some(panel_host)
         } else {
             None
         };

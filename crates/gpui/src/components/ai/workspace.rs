@@ -758,6 +758,14 @@ impl AiImageStore {
             let _ = std::fs::remove_file(root.join(id));
         }
     }
+
+    /// Removes all cached and on-disk images (deleting the backing directory if disk-backed).
+    pub fn clear_all(&self) {
+        self.cache.lock().clear();
+        if let Some(ref root) = self.root_dir {
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -940,7 +948,8 @@ impl StoredConversations {
         Ok(parsed)
     }
 
-    /// Saves non-empty conversations atomically to `path`.
+    /// Saves non-empty conversations atomically to `path`, or removes `path` when no non-empty
+    /// conversations remain.
     pub fn save_to_disk(&self, path: &Path) -> Result<()> {
         let filtered = Self {
             conversations: self
@@ -951,6 +960,14 @@ impl StoredConversations {
                 .collect(),
             active_conversation_id: self.active_conversation_id.clone(),
         };
+        if filtered.conversations.is_empty() {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err.into()),
+            }
+            return Ok(());
+        }
         let json = serde_json::to_string_pretty(&filtered)?;
         gpui_util::atomic_file::atomic_write_str(path, &json)?;
         Ok(())
@@ -1068,6 +1085,27 @@ impl AiConnectionRegistry {
             reg.mcp_servers.insert(connection_key.to_owned(), servers);
             reg.generation = reg.generation.wrapping_add(1);
         });
+    }
+
+    /// Removes both the saved provider connection and MCP server configs for `connection_key`
+    /// from memory and disk (used during host factory reset).
+    pub fn clear(connection_key: &str, cx: &mut App) {
+        if !cx.has_global::<Self>() {
+            return;
+        }
+        let disk_path = cx
+            .global::<Self>()
+            .disk_dir
+            .as_ref()
+            .map(|d| d.join(format!("{}.connection.json", sanitize_key(connection_key))));
+        cx.update_global::<Self, _>(|reg, _| {
+            reg.connections.remove(connection_key);
+            reg.mcp_servers.remove(connection_key);
+            reg.generation = reg.generation.wrapping_add(1);
+        });
+        if let Some(path) = disk_path {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
