@@ -4475,8 +4475,184 @@ fn activity_badge_states_and_tabs_status_render(cx: &mut TestAppContext) {
 
     let (_view, cx) = cx.add_window_view(|_, _| ActivityDemo);
     cx.run_until_parked();
-    // Animated SVG sprites (spin + bell ring) should register zero-relayout scene animations.
+    // Animated SVG sprites (spin + layered bell ring) should register zero-relayout scene animations.
     cx.update(|window, _| {
         assert!(window.rendered_frame.scene.animation_frame_interval().is_some());
     });
+}
+
+#[gpui::test]
+fn activity_badge_attention_uses_layered_zero_relayout_sprites(cx: &mut TestAppContext) {
+    cx.update(init_components);
+    let renders = Rc::new(std::cell::Cell::new(0usize));
+
+    struct BellOnlyView {
+        animated: bool,
+        renders: Rc<std::cell::Cell<usize>>,
+    }
+    impl Render for BellOnlyView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            crate::div().size_full().child(
+                activity_badge(ActivityState::Attention)
+                    .size(IconSize::Md)
+                    .animated(self.animated),
+            )
+        }
+    }
+
+    let (view, cx) = cx.add_window_view({
+        let renders = renders.clone();
+        move |_, _| BellOnlyView {
+            animated: true,
+            renders,
+        }
+    });
+    cx.run_until_parked();
+    let renders_after_mount = renders.get();
+
+    // Animated attention badge paints 3 zero-relayout GPU sprite layers (waves, clapper, bell body).
+    cx.update(|window, cx| {
+        let animated_count = window
+            .rendered_frame
+            .scene
+            .monochrome_sprites
+            .iter()
+            .filter(|s| s.animation != crate::SpriteAnimationId::NONE)
+            .count();
+        assert_eq!(animated_count, 3);
+        window.advance_scene_animations(cx);
+        window.advance_scene_animations(cx);
+    });
+    assert_eq!(renders.get(), renders_after_mount);
+
+    // Static attention badge collapses to a single static SVG sprite with zero scene animations.
+    view.update(cx, |v, cx| {
+        v.animated = false;
+        cx.notify();
+    });
+    cx.run_until_parked();
+    cx.update(|window, _| {
+        let animated_count = window
+            .rendered_frame
+            .scene
+            .monochrome_sprites
+            .iter()
+            .filter(|s| s.animation != crate::SpriteAnimationId::NONE)
+            .count();
+        assert_eq!(animated_count, 0);
+        assert_eq!(window.rendered_frame.scene.monochrome_sprites.len(), 1);
+        assert!(window.rendered_frame.scene.animation_frame_interval().is_none());
+    });
+}
+
+#[gpui::test]
+fn stacked_combobox_menu_click_is_not_eaten_by_combobox_underneath(cx: &mut TestAppContext) {
+    cx.update(init_components);
+    cx.update(|cx| cx.set_reduce_motion(true));
+
+    struct StackedComboBoxes {
+        server: Entity<ComboBoxState<String>>,
+        machine: Entity<ComboBoxState<String>>,
+    }
+
+    impl Render for StackedComboBoxes {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            // 56px gap mirrors a form section header + padding so the open menu's
+            // second option ("localhost:6620") lands directly over the Machine ComboBox trigger.
+            v_stack()
+                .w(px(480.))
+                .p(px(16.))
+                .gap(px(56.))
+                .child(combo_box(&self.server))
+                .child(combo_box(&self.machine))
+        }
+    }
+
+    let (view, cx) = cx.add_window_view(|_, cx| {
+        let server = cx.new(|cx| {
+            ComboBoxState::new(
+                vec![
+                    ComboBoxOption::new("s1".to_string(), "outpost.zoco.cc")
+                        .description("https://outpost.zoco.cc"),
+                    ComboBoxOption::new("s2".to_string(), "localhost:6620")
+                        .description("http://localhost:6620"),
+                ],
+                cx,
+            )
+            .default_values(vec!["s1".to_string()])
+        });
+        let machine = cx.new(|cx| {
+            ComboBoxState::new(
+                vec![
+                    ComboBoxOption::new("m1".to_string(), "dev-box"),
+                    ComboBoxOption::new("m2".to_string(), "prod-box"),
+                ],
+                cx,
+            )
+            .default_values(vec!["m1".to_string()])
+        });
+        StackedComboBoxes { server, machine }
+    });
+    cx.run_until_parked();
+
+    let (server, machine) = view.read_with(cx, |v, _| (v.server.clone(), v.machine.clone()));
+
+    // Open the top ComboBox ("Server") so its second option overlaps the bottom ComboBox ("Machine").
+    cx.update(|window, cx| {
+        server.update(cx, |s, cx| s.open_menu(window, cx));
+    });
+    cx.run_until_parked();
+    assert!(server.read_with(cx, |s, _| s.is_open()));
+    assert!(!machine.read_with(cx, |m, _| m.is_open()));
+
+    // Find a click point that lies inside BOTH the bottom ComboBox trigger AND the top ComboBox menu's
+    // second option row (the exact layout where clicks previously fell through and got eaten).
+    let click_point = cx.update(|window, _| {
+        let hitboxes = &window.rendered_frame.hitboxes;
+        // Find the bottom ComboBox trigger hitbox (lowest main-layer wide bar),
+        // then pick the deferred menu option hitbox that directly overlaps it.
+        let machine_trigger = hitboxes
+            .iter()
+            .filter(|hb| {
+                hb.deferred_layer == 0
+                    && hb.bounds.size.width > px(300.)
+                    && hb.bounds.size.height >= px(28.)
+                    && hb.bounds.size.height <= px(52.)
+            })
+            .max_by(|a, b| a.bounds.origin.y.0.total_cmp(&b.bounds.origin.y.0))
+            .map(|hb| hb.bounds)
+            .expect("expected underlying Machine ComboBox trigger hitbox");
+
+        let overlapping_option = hitboxes
+            .iter()
+            .filter(|hb| {
+                hb.deferred_layer != 0
+                    && hb.bounds.size.width > px(300.)
+                    && hb.bounds.size.height < px(65.)
+                    && hb.bounds.intersects(&machine_trigger)
+            })
+            .last()
+            .map(|hb| hb.bounds)
+            .expect("test setup must position second option directly over the underlying ComboBox trigger");
+
+        overlapping_option.intersect(&machine_trigger).center()
+    });
+
+    cx.simulate_click(click_point, crate::Modifiers::none());
+    cx.run_until_parked();
+
+    assert_eq!(
+        server.read_with(cx, |s, _| s.selected_value().cloned()),
+        Some("s2".to_string()),
+        "clicking overlapping option must select it in the open ComboBox"
+    );
+    assert!(
+        !server.read_with(cx, |s, _| s.is_open()),
+        "selecting an option should close the top ComboBox"
+    );
+    assert!(
+        !machine.read_with(cx, |m, _| m.is_open()),
+        "underlying ComboBox must NOT open or steal focus when clicking the menu above it"
+    );
 }

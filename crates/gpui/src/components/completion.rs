@@ -12,7 +12,7 @@ use std::time::Duration;
 use crate::icons::{Icon, IconSize, LucideIcon};
 use crate::{
     Anchor, Animation, AnimationExt, AnyElement, App, AsyncApp, Bounds, Context, Div, Entity,
-    FontWeight, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, ScrollStrategy,
+    FontWeight, IntoElement, KeyDownEvent, MouseDownEvent, Pixels, ScrollStrategy,
     SharedString, StyleRefinement, Task, UniformListScrollHandle, WeakEntity, Window, anchored,
     canvas, deferred, div, ease_out_quint, point, prelude::*, px, transparent_black, uniform_list,
 };
@@ -1046,6 +1046,7 @@ impl CompletionController {
 
         let mut panel = div()
             .id((id_prefix, entity_id))
+            .occlude()
             .flex()
             .flex_col()
             .min_w(menu_min_w)
@@ -1057,8 +1058,12 @@ impl CompletionController {
             .border_color(theme.border)
             .shadow_lg()
             .overflow_hidden()
-            // Clicking inside the suggestion popover keeps focus in the host text input.
-            .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
+            // Clicking inside the suggestion popover keeps focus in the host text input
+            // and never leaks mouse-down events to elements underneath.
+            .on_any_mouse_down(|_, window, cx| {
+                window.prevent_default();
+                cx.stop_propagation();
+            })
             .on_mouse_down_out({
                 let anchor_bounds = self.anchor_bounds.clone();
                 let entity_out = entity.clone();

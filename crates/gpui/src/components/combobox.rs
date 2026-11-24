@@ -1394,6 +1394,8 @@ impl<T: Clone + PartialEq + 'static> Render for ComboBoxState<T> {
             }
 
             let panel = div()
+                .id(("gpui-combobox-menu", entity_id))
+                .occlude()
                 .flex()
                 .flex_col()
                 .min_w(menu_min_w)
@@ -1404,8 +1406,12 @@ impl<T: Clone + PartialEq + 'static> Render for ComboBoxState<T> {
                 .border_1()
                 .border_color(theme.border)
                 .shadow_lg()
-                // Clicking an option keeps focus in the inline search field.
-                .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
+                // Clicking inside the popup keeps focus in the inline search field
+                // and never leaks mouse-down events to elements underneath.
+                .on_any_mouse_down(|_, window, cx| {
+                    window.prevent_default();
+                    cx.stop_propagation();
+                })
                 .on_mouse_down_out(cx.listener(|this, ev: &MouseDownEvent, _, cx| {
                     if this
                         .trigger_bounds

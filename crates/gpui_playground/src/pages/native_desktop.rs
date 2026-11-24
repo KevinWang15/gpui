@@ -1018,7 +1018,7 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
                             .spacing(px(2.))
                             .child(card_title("ActivityBadge — GPU-Animated Status Icons"))
                             .child(card_description(
-                                "Compact zero-relayout GPU status icons (spin, top-pivoted bell ring, idle, alert, unknown, ready, disconnected) for tabs, pane headers, and session lists.",
+                                "Compact zero-relayout GPU status icons (spin, layered cubic-bezier bell ring with inertial clapper & radiating sound waves, idle, error, unknown, ready, disconnected).",
                             )),
                     )
                     .child(
@@ -1030,6 +1030,7 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
                                         (IconSize::Sm, "14px"),
                                         (IconSize::Md, "16px"),
                                         (IconSize::Lg, "20px"),
+                                        (IconSize::Xl, "24px"),
                                     ]
                                     .into_iter()
                                     .enumerate()

@@ -673,6 +673,7 @@ fn main() {
             cx.open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    inactive_frame_interval: Some(std::time::Duration::from_micros(16_667)),
                     ..Default::default()
                 },
                 |window, cx| {

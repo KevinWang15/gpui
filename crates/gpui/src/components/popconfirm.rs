@@ -214,6 +214,7 @@ impl RenderOnce for Popconfirm {
         let popup = if is_open {
             let mut card = div()
                 .id((self.id.clone(), "popconfirm-card"))
+                .occlude()
                 .track_focus(&focus_handle)
                 // Modal while open: Tab cycles its buttons.
                 .focus_trap()

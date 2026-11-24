@@ -279,6 +279,7 @@ impl Render for TreeSelectState {
                 .unwrap_or(px(300.));
             let panel = div()
                 .id(("ts-popover", entity_id))
+                .occlude()
                 .flex()
                 .flex_col()
                 .w(pop_w)
@@ -802,6 +803,7 @@ impl Render for CascaderState {
 
             let panel = div()
                 .id(("casc-popover", entity_id))
+                .occlude()
                 .flex()
                 .flex_row()
                 .max_w(px(560.))

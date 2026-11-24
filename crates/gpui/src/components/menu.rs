@@ -724,6 +724,7 @@ impl Render for MenuState {
                                 let ent_key = entity.clone();
                                 let card = div()
                                     .id((ElementId::from("hmenu-pop"), key.clone()))
+                                    .occlude()
                                     // Up and Down move through the items, wrapping.
                                     .track_focus(&self.dropdown_focus)
                                     .focus_trap()

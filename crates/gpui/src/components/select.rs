@@ -675,8 +675,9 @@ impl<T: Clone + PartialEq + 'static> Render for SelectState<T> {
 
         let menu = if self.open {
             let reduce_motion = cx.reduce_motion();
+            let entity_id = cx.entity_id();
             let mut list = div()
-                .id("gpui-select-menu")
+                .id(("gpui-select-menu", entity_id))
                 .occlude()
                 .flex()
                 .flex_col()
@@ -691,8 +692,12 @@ impl<T: Clone + PartialEq + 'static> Render for SelectState<T> {
                 .border_1()
                 .border_color(theme.border)
                 .shadow_lg()
-                // Clicking an option keeps focus on the trigger, as a native select does.
-                .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
+                // Clicking an option keeps focus on the trigger, as a native select does,
+                // and never leaks mouse-down events to elements underneath.
+                .on_any_mouse_down(|_, window, cx| {
+                    window.prevent_default();
+                    cx.stop_propagation();
+                })
                 .on_mouse_down_out(cx.listener(|this, ev: &crate::MouseDownEvent, _, cx| {
                     if this
                         .trigger_bounds
@@ -852,7 +857,7 @@ impl<T: Clone + PartialEq + 'static> Render for SelectState<T> {
                 list.into_any_element()
             } else {
                 list.with_animation(
-                    "gpui-select-menu-anim",
+                    ("gpui-select-menu-anim", entity_id),
                     Animation::new(ANIM_FAST).with_easing(ease_out_quint()),
                     |el, delta| el.opacity(delta).mt(px(-6.0 * (1.0 - delta))),
                 )

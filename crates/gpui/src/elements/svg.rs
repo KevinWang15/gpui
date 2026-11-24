@@ -9,9 +9,10 @@ use std::{
 
 use crate::{
     App, Asset, Bounds, Element, GlobalElementId, Hitbox, InspectorElementId, InteractiveElement,
-    Interactivity, LayoutId, Pixels, Point, Radians, SharedString, Size, SpriteAnimation,
-    StyleRefinement, Styled, TransformationMatrix, Window, bell_ring, ease_in_out, ease_out_quint,
-    heartbeat, linear, point, px, quadratic, radians, size,
+    Interactivity, LayoutId, Pixels, Point, Radians, ScaledPixels, SharedString, Size,
+    SpriteAnimation, StyleRefinement, Styled, TransformationMatrix, Window, bell_clapper,
+    bell_ring, bell_wave, cubic_bezier_ease_in_out, ease_in_out, ease_out_quint, heartbeat, linear,
+    point, px, quadratic, radians, size,
 };
 use gpui_util::ResultExt;
 
@@ -184,7 +185,7 @@ impl Element for Svg {
                 let animation = self
                     .transformation
                     .filter(|timed| timed.is_animated() && !cx.reduce_motion())
-                    .map(|timed| SpriteAnimation::new(timed, pivot, scale_factor));
+                    .map(|timed| SpriteAnimation::new(timed, pivot.scale(scale_factor), scale_factor));
                 // Without an animation, such as with reduced motion, the SVG is
                 // drawn at its starting transformation.
                 let pose = self.transformation.map(|timed| timed.from);
@@ -351,12 +352,20 @@ impl Transformation {
         center: Point<Pixels>,
         scale_factor: f32,
     ) -> TransformationMatrix {
+        self.into_matrix_scaled(center.scale(scale_factor), scale_factor)
+    }
+
+    pub(crate) fn into_matrix_scaled(
+        self,
+        center: Point<ScaledPixels>,
+        scale_factor: f32,
+    ) -> TransformationMatrix {
         //Note: if you read this as a sequence of matrix multiplications, start from the bottom
         TransformationMatrix::unit()
-            .translate(center.scale(scale_factor) + self.translate.scale(scale_factor))
+            .translate(center + self.translate.scale(scale_factor))
             .rotate(self.rotate)
             .scale(self.scale)
-            .translate(center.scale(-scale_factor))
+            .translate(point(-center.x, -center.y))
     }
 }
 
@@ -370,16 +379,24 @@ pub enum Easing {
     Quadratic,
     /// Starts and ends slowly, and speeds up in the middle.
     EaseInOut,
+    /// Exact CSS `ease-in-out` (`cubic-bezier(0.42, 0.0, 0.58, 1.0)`).
+    CubicEaseInOut,
     /// Starts quickly and decelerates to a stop.
     EaseOutQuint,
     /// Two quick beats, a strong one then a weaker one, followed by a rest.
     /// Unlike the other easings it ends where it started, so the value
     /// reaches `to` at the first beat and is back at `from` by the end.
     Heartbeat,
-    /// A damped bell/attention oscillation swinging symmetrically between `+1.0`
-    /// and `-1.0` with decreasing amplitude over the first 28% of the period,
-    /// then resting at `0.0` (`from`).
+    /// A fine-grained damped bell/attention oscillation swinging symmetrically
+    /// between `+1.0` and `-1.0` with decreasing amplitude over the first 37%
+    /// of the period using cubic ease-in-out transitions, then resting at `0.0` (`from`).
     BellRing,
+    /// Phase-lagged pendulum oscillation paired with [`Easing::BellRing`] for an
+    /// inner bell clapper that trails the bell shell with realistic inertia.
+    BellClapper,
+    /// Smooth acoustic wave pulse envelope in `[0.0, 1.0]` synchronized with
+    /// [`Easing::BellRing`], radiating on strikes and calming to `0.0` at rest.
+    BellWave,
 }
 
 impl Easing {
@@ -388,9 +405,12 @@ impl Easing {
             Easing::Linear => linear(delta),
             Easing::Quadratic => quadratic(delta),
             Easing::EaseInOut => ease_in_out(delta),
+            Easing::CubicEaseInOut => cubic_bezier_ease_in_out(delta),
             Easing::EaseOutQuint => ease_out_quint()(delta),
             Easing::Heartbeat => heartbeat(delta),
             Easing::BellRing => bell_ring(delta),
+            Easing::BellClapper => bell_clapper(delta),
+            Easing::BellWave => bell_wave(delta),
         }
     }
 }
@@ -451,6 +471,34 @@ impl TimedTransformation {
             .with_origin(point(0.5, 0.2))
     }
 
+    /// Create a timed transformation for a phase-lagged bell clapper paired
+    /// with [`Self::bell_ring`], swinging around the top-center pivot `(0.5, 0.2)`
+    /// with subtle inertial lag.
+    pub fn bell_clapper(period: Duration, amplitude: Radians, from: Transformation) -> Self {
+        Self::new(period)
+            .from(from)
+            .to(from.with_rotation(radians(from.rotate.0 + amplitude.0)))
+            .with_rotation_easing(Easing::BellClapper)
+            .with_origin(point(0.5, 0.2))
+    }
+
+    /// Create a timed transformation for flanking acoustic sound-wave arcs paired
+    /// with [`Self::bell_ring`]: softly tucked at rest (`0.96×` scale, `0.52` alpha)
+    /// and radiating crisply outward (`1.11×` scale, `1.0` alpha) during each strike.
+    pub fn bell_wave(period: Duration, from: Transformation) -> Self {
+        Self::new(period)
+            .from(
+                from.with_scaling(size(from.scale.width * 0.96, from.scale.height * 0.96))
+                    .with_alpha(from.alpha * 0.52),
+            )
+            .to(from
+                .with_scaling(size(from.scale.width * 1.11, from.scale.height * 1.11))
+                .with_alpha(from.alpha))
+            .with_scale_easing(Easing::BellWave)
+            .with_alpha_easing(Easing::BellWave)
+            .with_origin(point(0.5, 0.35))
+    }
+
     /// Create a timed transformation that gently pulses `from` in scale and
     /// opacity using [`Easing::Heartbeat`], returning to `from` between beats.
     pub fn pulse(period: Duration, scale: f32, min_alpha: f32, from: Transformation) -> Self {
@@ -468,6 +516,10 @@ impl TimedTransformation {
     pub fn with_origin(mut self, origin: Point<f32>) -> Self {
         self.origin = origin;
         self
+    }
+
+    pub(crate) fn origin(&self) -> Point<f32> {
+        self.origin
     }
 
     pub(crate) fn pivot(&self, bounds: Bounds<Pixels>) -> Point<Pixels> {
@@ -810,6 +862,53 @@ mod tests {
         assert!((resting.rotation_scale[0][0] - 1.0).abs() < 1e-5);
         assert!(resting.rotation_scale[1][0].abs() < 1e-5);
         assert_eq!(renders.get(), renders_before_frames);
+    }
+
+    #[crate::test]
+    fn test_bell_clapper_lags_and_rests_without_rerendering(cx: &mut TestAppContext) {
+        let amplitude = crate::radians(19.5_f32.to_radians());
+        let (mut clapper_after, clapper_renders) = animate(
+            TimedTransformation::bell_clapper(
+                Duration::from_millis(2400),
+                amplitude,
+                Transformation::default(),
+            ),
+            cx,
+        );
+        let clapper_before = clapper_renders.get();
+
+        // Still upright at t=0 and near rest at 1% (24ms) due to inertial phase lag.
+        assert!(clapper_after(Duration::ZERO).rotation_scale[1][0].abs() < 1e-5);
+        assert!(clapper_after(Duration::from_millis(24)).rotation_scale[1][0].abs() < 1e-5);
+        // Swings strongly around ~5.5% (+108ms = 132ms).
+        assert!(clapper_after(Duration::from_millis(108)).rotation_scale[1][0] > 0.25);
+        // Settles back upright by 50% (+1068ms = 1200ms).
+        assert!(clapper_after(Duration::from_millis(1068)).rotation_scale[1][0].abs() < 1e-5);
+        assert_eq!(clapper_renders.get(), clapper_before);
+    }
+
+    #[crate::test]
+    fn test_bell_wave_pulses_and_rests_without_rerendering(cx: &mut TestAppContext) {
+        let (mut wave_after, wave_renders) = animate(
+            TimedTransformation::bell_wave(Duration::from_millis(2400), Transformation::default()),
+            cx,
+        );
+        let wave_before = wave_renders.get();
+
+        let wave_rest = wave_after(Duration::ZERO);
+        assert!((wave_rest.rotation_scale[0][0] - 0.96).abs() < 1e-3);
+        assert!((wave_rest.alpha - 0.52).abs() < 1e-3);
+
+        // At 4% (96ms) the acoustic wave flares outward to 1.11x scale and full opacity.
+        let wave_peak = wave_after(Duration::from_millis(96));
+        assert!((wave_peak.rotation_scale[0][0] - 1.11).abs() < 1e-3);
+        assert!((wave_peak.alpha - 1.0).abs() < 1e-3);
+
+        // By 50% (+1104ms = 1200ms) it returns calmly to its resting tuck.
+        let wave_calm = wave_after(Duration::from_millis(1104));
+        assert!((wave_calm.rotation_scale[0][0] - 0.96).abs() < 1e-3);
+        assert!((wave_calm.alpha - 0.52).abs() < 1e-3);
+        assert_eq!(wave_renders.get(), wave_before);
     }
 
     #[crate::test]

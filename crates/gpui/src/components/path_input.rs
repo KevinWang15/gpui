@@ -1130,6 +1130,7 @@ impl PathInputState {
 
         let mut panel = div()
             .id(("gpui-path-input-popover", entity_id))
+            .occlude()
             .flex()
             .flex_col()
             .min_w(menu_min_w)
@@ -1141,8 +1142,12 @@ impl PathInputState {
             .border_color(theme.border)
             .shadow_lg()
             .overflow_hidden()
-            // Keep focus in the embedded Input while clicking suggestions or Retry.
-            .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
+            // Keep focus in the embedded Input while clicking suggestions or Retry
+            // and never leak mouse-down events to elements underneath.
+            .on_any_mouse_down(|_, window, cx| {
+                window.prevent_default();
+                cx.stop_propagation();
+            })
             .on_mouse_down_out({
                 let bounds_cell = self.trigger_bounds.clone();
                 let entity_out = entity.clone();

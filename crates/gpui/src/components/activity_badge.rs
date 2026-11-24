@@ -1,9 +1,10 @@
 //! Compact, GPU-animated iconic status badge ([`ActivityBadge`]) for tabs,
 //! pane headers, lists, and status bars.
 //!
-//! Each [`ActivityState`] maps to a clear Lucide outline icon, semantic theme color,
+//! Each [`ActivityState`] maps to a clear outline icon, semantic theme color,
 //! and optional zero-relayout GPU animation (`Spin` for [`ActivityState::Pending`] and
-//! [`ActivityState::Working`], top-pivoted `Ring` for [`ActivityState::Attention`]).
+//! [`ActivityState::Working`], layered fine-grained bell ring with damped shell,
+//! inertial clapper, and radiating sound waves for [`ActivityState::Attention`]).
 //! Animations are phase-locked to GPUI's shared scene clock so metadata updates never
 //! restart a running spinner or ringing bell, and [`App::reduce_motion`] is respected
 //! automatically.
@@ -12,11 +13,38 @@ use std::time::Duration;
 
 use crate::icons::{Icon, IconAnimation, IconSize, LucideIcon};
 use crate::{
-    App, FontWeight, Hsla, IntoElement, RenderOnce, SharedString, StyleRefinement, Styled, Window,
-    div, prelude::*, px, radians,
+    AnyElement, App, FontWeight, Hsla, IntoElement, Pixels, RenderOnce, SharedString,
+    StyleRefinement, Styled, Svg, TimedTransformation, Transformation, Window, div, prelude::*, px,
+    radians, svg,
 };
 
 use super::theme::{ActiveTheme, Theme};
+
+const BELL_STATIC_SVG: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9Z"/><path d="M10.3 21a2 2 0 0 0 3.4 0"/><path d="M2 8c0-2 1-4 3-5m17 5c0-2-1-4-3-5"/></svg>"#;
+const BELL_BODY_SVG: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9Z"/></svg>"#;
+const BELL_CLAPPER_SVG: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.3 21a2 2 0 0 0 3.4 0"/></svg>"#;
+const BELL_WAVES_SVG: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 8c0-2 1-4 3-5m17 5c0-2-1-4-3-5"/></svg>"#;
+
+fn bell_layer_svg(
+    cache_key: &'static str,
+    raw: &'static str,
+    stroke_width: Option<f32>,
+    px_size: Pixels,
+    color: Hsla,
+) -> Svg {
+    let element = match stroke_width {
+        Some(width) if (width - 2.0).abs() > f32::EPSILON => {
+            let customized = raw.replace("stroke-width=\"2\"", &format!("stroke-width=\"{width}\""));
+            svg().data(customized.as_bytes())
+        }
+        _ => svg().static_data(SharedString::new_static(cache_key), raw.as_bytes()),
+    };
+    element
+        .flex_shrink_0()
+        .w(px_size)
+        .h(px_size)
+        .text_color(color)
+}
 
 /// Semantic lifecycle / activity state displayed by [`ActivityBadge`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -241,15 +269,93 @@ impl RenderOnce for ActivityBadge {
                 .unwrap_or_else(|| self.state.default_animation())
         };
 
-        let mut icon = Icon::new(glyph).size(self.size).color(color);
-        if let Some(width) = self.stroke_width {
-            icon = icon.stroke_width(width);
-        }
-        if let Some(animation) = resolved_animation {
-            icon = icon.animation(animation);
-        }
-
         let px_size = self.size.pixels();
+        let glyph_element: AnyElement = if self.state == ActivityState::Attention
+            && self.icon_override.is_none()
+        {
+            match resolved_animation {
+                Some(IconAnimation::Ring { period, amplitude }) if !cx.reduce_motion() => {
+                    let body = bell_layer_svg(
+                        "__gpui_activity_bell_body__",
+                        BELL_BODY_SVG,
+                        self.stroke_width,
+                        px_size,
+                        color,
+                    )
+                    .absolute()
+                    .inset_0()
+                    .with_timed_transformation(TimedTransformation::bell_ring(
+                        period,
+                        amplitude,
+                        Transformation::default(),
+                    ));
+                    let clapper = bell_layer_svg(
+                        "__gpui_activity_bell_clapper__",
+                        BELL_CLAPPER_SVG,
+                        self.stroke_width,
+                        px_size,
+                        color,
+                    )
+                    .absolute()
+                    .inset_0()
+                    .with_timed_transformation(TimedTransformation::bell_clapper(
+                        period,
+                        radians(amplitude.0 * 1.22),
+                        Transformation::default(),
+                    ));
+                    let waves = bell_layer_svg(
+                        "__gpui_activity_bell_waves__",
+                        BELL_WAVES_SVG,
+                        self.stroke_width,
+                        px_size,
+                        color,
+                    )
+                    .absolute()
+                    .inset_0()
+                    .with_timed_transformation(TimedTransformation::bell_wave(
+                        period,
+                        Transformation::default(),
+                    ));
+                    div()
+                        .relative()
+                        .flex_shrink_0()
+                        .w(px_size)
+                        .h(px_size)
+                        .child(waves)
+                        .child(clapper)
+                        .child(body)
+                        .into_any_element()
+                }
+                None | Some(IconAnimation::Ring { .. }) => bell_layer_svg(
+                    "__gpui_activity_bell_static__",
+                    BELL_STATIC_SVG,
+                    self.stroke_width,
+                    px_size,
+                    color,
+                )
+                .into_any_element(),
+                Some(other_animation) => {
+                    let mut icon = Icon::new(glyph)
+                        .size(self.size)
+                        .color(color)
+                        .animation(other_animation);
+                    if let Some(width) = self.stroke_width {
+                        icon = icon.stroke_width(width);
+                    }
+                    icon.into_any_element()
+                }
+            }
+        } else {
+            let mut icon = Icon::new(glyph).size(self.size).color(color);
+            if let Some(width) = self.stroke_width {
+                icon = icon.stroke_width(width);
+            }
+            if let Some(animation) = resolved_animation {
+                icon = icon.animation(animation);
+            }
+            icon.into_any_element()
+        };
+
         let mut el = if self.label.is_some() || self.pill {
             let mut row = div()
                 .flex()
@@ -261,7 +367,7 @@ impl RenderOnce for ActivityBadge {
                 .text_size(px(12.))
                 .font_weight(FontWeight::MEDIUM)
                 .whitespace_nowrap()
-                .child(icon);
+                .child(glyph_element);
             if self.pill {
                 row = row
                     .px(px(8.))
@@ -283,7 +389,7 @@ impl RenderOnce for ActivityBadge {
                 .justify_center()
                 .w(px_size)
                 .h(px_size)
-                .child(icon)
+                .child(glyph_element)
         };
 
         crate::Refineable::refine(el.style(), &self.style);

@@ -308,4 +308,112 @@ mod tests {
             })
             .unwrap();
     }
+
+    #[gpui::test]
+    fn test_deferred_layer_isolates_clicks_from_underlying_elements(cx: &mut TestAppContext) {
+        use crate::{Modifiers, MouseButton};
+
+        let deferred_clicks = Rc::new(Cell::new(0usize));
+        let behind_down = Rc::new(Cell::new(0usize));
+        let behind_clicks = Rc::new(Cell::new(0usize));
+        let gap_clicks = Rc::new(Cell::new(0usize));
+
+        struct OverlayView {
+            deferred_clicks: Rc<Cell<usize>>,
+            behind_down: Rc<Cell<usize>>,
+            behind_clicks: Rc<Cell<usize>>,
+            gap_clicks: Rc<Cell<usize>>,
+        }
+
+        impl Render for OverlayView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let d_clicks = self.deferred_clicks.clone();
+                let b_down = self.behind_down.clone();
+                let b_clicks = self.behind_clicks.clone();
+                let g_clicks = self.gap_clicks.clone();
+
+                // Even without `.occlude()` on the deferred popup, clicking an item in the
+                // deferred layer must NOT leak mouse-down or click events to unrelated
+                // elements underneath, while transparent gaps in the deferred wrapper still
+                // pass through to elements behind.
+                div()
+                    .size_full()
+                    .relative()
+                    .child(
+                        div()
+                            .id("behind-button")
+                            .absolute()
+                            .left(px(20.))
+                            .top(px(20.))
+                            .w(px(160.))
+                            .h(px(40.))
+                            .on_mouse_down(MouseButton::Left, move |_, _, _| {
+                                b_down.set(b_down.get() + 1);
+                            })
+                            .on_click(move |_, _, _| {
+                                b_clicks.set(b_clicks.get() + 1);
+                            }),
+                    )
+                    .child(
+                        div()
+                            .id("gap-button")
+                            .absolute()
+                            .left(px(20.))
+                            .top(px(120.))
+                            .w(px(160.))
+                            .h(px(40.))
+                            .on_click(move |_, _, _| {
+                                g_clicks.set(g_clicks.get() + 1);
+                            }),
+                    )
+                    .child(
+                        deferred(
+                            anchored()
+                                .position(point(px(20.), px(20.)))
+                                .child(
+                                    div()
+                                        .w(px(160.))
+                                        .h(px(160.))
+                                        .child(
+                                            div()
+                                                .id("deferred-item")
+                                                .w(px(160.))
+                                                .h(px(40.))
+                                                .on_click(move |_, _, _| {
+                                                    d_clicks.set(d_clicks.get() + 1);
+                                                }),
+                                        ),
+                                ),
+                        )
+                        .priority(20),
+                    )
+            }
+        }
+
+        let (_, cx) = cx.add_window_view({
+            let deferred_clicks = deferred_clicks.clone();
+            let behind_down = behind_down.clone();
+            let behind_clicks = behind_clicks.clone();
+            let gap_clicks = gap_clicks.clone();
+            move |_, _| OverlayView {
+                deferred_clicks,
+                behind_down,
+                behind_clicks,
+                gap_clicks,
+            }
+        });
+        cx.run_until_parked();
+
+        // Click on the deferred item directly overlapping `behind-button`.
+        cx.simulate_click(point(px(60.), px(40.)), Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(deferred_clicks.get(), 1);
+        assert_eq!(behind_down.get(), 0);
+        assert_eq!(behind_clicks.get(), 0);
+
+        // Click on `gap-button` through the transparent non-interactive area of the deferred wrapper.
+        cx.simulate_click(point(px(60.), px(140.)), Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(gap_clicks.get(), 1);
+    }
 }

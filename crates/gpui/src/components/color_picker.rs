@@ -1001,9 +1001,14 @@ impl Render for ColorPickerState {
         let popover = (self.open && !self.disabled).then(|| {
             let panel = self
                 .render_panel(window, cx)
+                .occlude()
                 .on_key_down(cx.listener(Self::on_key_down))
-                // A click on the popup's background keeps focus where it was.
-                .on_any_mouse_down(|_, window, _| window.prevent_default())
+                // A click on the popup's background keeps focus where it was
+                // and never leaks mouse-down events to elements underneath.
+                .on_any_mouse_down(|_, window, cx| {
+                    window.prevent_default();
+                    cx.stop_propagation();
+                })
                 .on_mouse_down_out(cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
                     if bounds_for_out
                         .get()

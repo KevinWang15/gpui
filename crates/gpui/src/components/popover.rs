@@ -105,6 +105,7 @@ impl RenderOnce for Popover {
                 .border_1()
                 .border_color(theme.border)
                 .shadow_lg()
+                .on_any_mouse_down(|_, _, cx| cx.stop_propagation())
                 .when_some(on_close, |el, cb| {
                     el.on_mouse_down_out(move |_, window, cx| cb(&(), window, cx))
                 })

@@ -891,6 +891,9 @@ pub struct Hitbox {
     /// The focusable element this hitbox is inside, itself included: what a
     /// mouse down on it focuses (see [`Window::dispatch_event`]).
     pub focus_owner: Option<FocusId>,
+    /// Deferred stacking layer id (`0` for the main tree, `1..` for each
+    /// `deferred(...)` draw prepainted above it).
+    pub(crate) deferred_layer: u32,
 }
 
 impl Hitbox {
@@ -1253,9 +1256,23 @@ impl Frame {
     pub(crate) fn hit_test(&self, position: Point<Pixels>) -> HitTest {
         let mut set_hover_hitbox_count = false;
         let mut hit_test = HitTest::default();
+        let mut top_deferred_layer: Option<u32> = None;
         for hitbox in self.hitboxes.iter().rev() {
             let bounds = hitbox.bounds.intersect(&hitbox.content_mask.bounds);
             if bounds.contains(&position) {
+                // Once a deferred overlay layer (popup, menu, dialog, toast card, etc.)
+                // owns a hitbox under the pointer, do not leak mouse/hover/click targets
+                // into lower deferred layers or the underlying page behind it unless
+                // `BlockMouseExceptScroll` explicitly allowed scroll-only fallthrough.
+                if let Some(layer) = top_deferred_layer
+                    && hitbox.deferred_layer != layer
+                    && !set_hover_hitbox_count
+                {
+                    break;
+                }
+                if hitbox.deferred_layer != 0 && top_deferred_layer.is_none() {
+                    top_deferred_layer = Some(hitbox.deferred_layer);
+                }
                 hit_test.ids.push(hitbox.id);
                 if !set_hover_hitbox_count
                     && hitbox.behavior == HitboxBehavior::BlockMouseExceptScroll
@@ -1339,6 +1356,8 @@ pub struct Window {
     pub(crate) rendered_frame: Frame,
     pub(crate) next_frame: Frame,
     next_hitbox_id: HitboxId,
+    current_deferred_layer: u32,
+    next_deferred_layer: u32,
     pub(crate) next_tooltip_id: TooltipId,
     pub(crate) tooltip_bounds: Option<TooltipBounds>,
     pub(crate) next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>>,
@@ -2539,6 +2558,8 @@ impl Window {
             next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame_callbacks,
             next_hitbox_id: HitboxId(0),
+            current_deferred_layer: 0,
+            next_deferred_layer: 0,
             next_tooltip_id: TooltipId::default(),
             tooltip_bounds: None,
             dirty_views: FxHashSet::default(),
@@ -4748,6 +4769,8 @@ impl Window {
             .as_mut()
             .unwrap()
             .stretch_auto_size_to_fill(root_layout_id, root_size, scale_factor);
+        self.current_deferred_layer = 0;
+        self.next_deferred_layer = 0;
         root_element.prepaint_as_root(Point::default(), root_size.into(), self, cx);
 
         #[cfg(any(feature = "inspector", debug_assertions))]
@@ -4945,6 +4968,8 @@ impl Window {
             traversal_order.sort_by_key(|ix| self.next_frame.deferred_draws[*ix].priority);
 
             for deferred_draw_ix in traversal_order {
+                self.next_deferred_layer = self.next_deferred_layer.wrapping_add(1).max(1);
+                self.current_deferred_layer = self.next_deferred_layer;
                 let (element, parent_node, current_view, rem_size, absolute_offset, prepaint_range) = {
                     let deferred_draw = &mut self.next_frame.deferred_draws[deferred_draw_ix];
                     self.element_id_stack
@@ -4994,6 +5019,7 @@ impl Window {
             self.text_style_stack.clear();
             round_start = round_end;
         }
+        self.current_deferred_layer = 0;
     }
 
     fn paint_deferred_draws(&mut self, cx: &mut App) {
@@ -5057,10 +5083,15 @@ impl Window {
     }
 
     pub(crate) fn reuse_prepaint(&mut self, range: Range<PrepaintStateIndex>) {
+        let deferred_layer = self.current_deferred_layer;
         self.next_frame.hitboxes.extend(
             self.rendered_frame.hitboxes[range.start.hitboxes_index..range.end.hitboxes_index]
                 .iter()
-                .cloned(),
+                .cloned()
+                .map(|mut hitbox| {
+                    hitbox.deferred_layer = deferred_layer;
+                    hitbox
+                }),
         );
         self.next_frame.tooltip_requests.extend(
             self.rendered_frame.tooltip_requests
@@ -6335,10 +6366,18 @@ impl Window {
             transformation,
         };
         match animation {
-            Some(animation) => self
-                .next_frame
-                .scene
-                .insert_animated_sprite(sprite, animation),
+            Some(mut animation) => {
+                // Align the animation pivot directly to the snapped sprite bounds so
+                // subpixel layout or fractional DPI scaling never introduces rotation wobble.
+                let origin = animation.origin();
+                animation.set_center(Point::new(
+                    final_bounds.origin.x + final_bounds.size.width * origin.x,
+                    final_bounds.origin.y + final_bounds.size.height * origin.y,
+                ));
+                self.next_frame
+                    .scene
+                    .insert_animated_sprite(sprite, animation);
+            }
             None => self.next_frame.scene.insert_primitive(sprite),
         }
 
@@ -6634,6 +6673,7 @@ impl Window {
                 .dispatch_tree
                 .active_node_id()
                 .and_then(|node| self.next_frame.dispatch_tree.focus_owner(node)),
+            deferred_layer: self.current_deferred_layer,
         };
         self.next_frame.hitboxes.push(hitbox.clone());
         hitbox

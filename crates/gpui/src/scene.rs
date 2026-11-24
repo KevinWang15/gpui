@@ -248,7 +248,8 @@ impl Scene {
                     continue;
                 };
                 let pose = animation.transformation.at(elapsed);
-                sprite.transformation = pose.into_matrix(animation.center, animation.scale_factor);
+                sprite.transformation =
+                    pose.into_matrix_scaled(animation.center, animation.scale_factor);
                 sprite.color = animation.base_color.opacity(pose.alpha_factor());
                 mutated = true;
             }
@@ -1685,7 +1686,7 @@ impl Default for SpriteAnimationId {
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct SpriteAnimation {
     transformation: TimedTransformation,
-    center: Point<Pixels>,
+    center: Point<ScaledPixels>,
     scale_factor: f32,
     base_color: Hsla,
     sprite_index: usize,
@@ -1694,7 +1695,7 @@ pub(crate) struct SpriteAnimation {
 impl SpriteAnimation {
     pub(crate) fn new(
         transformation: TimedTransformation,
-        center: Point<Pixels>,
+        center: Point<ScaledPixels>,
         scale_factor: f32,
     ) -> Self {
         Self {
@@ -1704,6 +1705,14 @@ impl SpriteAnimation {
             base_color: Hsla::default(),
             sprite_index: usize::MAX,
         }
+    }
+
+    pub(crate) fn origin(&self) -> Point<f32> {
+        self.transformation.origin()
+    }
+
+    pub(crate) fn set_center(&mut self, center: Point<ScaledPixels>) {
+        self.center = center;
     }
 }
 

@@ -511,6 +511,32 @@ mod easing {
         move |delta| 1.0 - (1.0 - delta).powi(5)
     }
 
+    /// The exact CSS `ease-in-out` timing function (`cubic-bezier(0.42, 0.0, 0.58, 1.0)`),
+    /// providing C∞-smooth acceleration and deceleration without a midpoint jerk discontinuity.
+    pub fn cubic_bezier_ease_in_out(delta: f32) -> f32 {
+        let t = delta.clamp(0.0, 1.0);
+        if t <= 0.0 {
+            return 0.0;
+        }
+        if t >= 1.0 {
+            return 1.0;
+        }
+        // X(u) for P1=(0.42, 0.0), P2=(0.58, 1.0):
+        //   c = 3 * 0.42 = 1.26
+        //   b = 3 * (0.58 - 0.42) - 1.26 = -0.78
+        //   a = 1.0 - b - c = 0.52
+        // X'(u) = 1.56*u^2 - 1.56*u + 1.26 >= 0.87 everywhere on [0, 1],
+        // so 4 Newton-Raphson iterations converge to f32 machine precision.
+        let mut u = t;
+        for _ in 0..4 {
+            let x = ((0.52 * u - 0.78) * u + 1.26) * u;
+            let dx = (1.56 * u - 1.56) * u + 1.26;
+            u = (u - (x - t) / dx).clamp(0.0, 1.0);
+        }
+        // Y(u) for P1y=0.0, P2y=1.0 simplifies to smoothstep: 3u^2 - 2u^3.
+        u * u * (3.0 - 2.0 * u)
+    }
+
     /// A heartbeat: a strong beat, a weaker one, then a rest. Starts and ends at 0 and peaks at 1.
     pub fn heartbeat(delta: f32) -> f32 {
         let beat = |center: f32, width: f32, height: f32| {
@@ -520,31 +546,79 @@ mod easing {
         beat(0.2, 0.06, 1.0) + beat(0.4, 0.05, 0.58)
     }
 
-    /// A damped bell-ring oscillation: swings `+1.0 -> -1.0 -> +0.75 -> -0.75 -> +0.375 -> -0.375 -> 0.0`
-    /// over the first 28% of the cycle with smooth ease-in-out between peaks, then rests at `0.0`.
-    pub fn bell_ring(delta: f32) -> f32 {
-        const KEYS: &[(f32, f32)] = &[
-            (0.00, 0.0),
-            (0.04, 1.0),
-            (0.08, -1.0),
-            (0.12, 0.75),
-            (0.16, -0.75),
-            (0.20, 0.375),
-            (0.24, -0.375),
-            (0.28, 0.0),
-        ];
-        if delta <= 0.0 || delta >= 0.28 {
+    fn eval_cubic_keyframes(delta: f32, keys: &[(f32, f32)]) -> f32 {
+        let Some(&(first_t, first_v)) = keys.first() else {
             return 0.0;
+        };
+        let Some(&(last_t, last_v)) = keys.last() else {
+            return 0.0;
+        };
+        if delta <= first_t {
+            return first_v;
         }
-        for pair in KEYS.windows(2) {
+        if delta >= last_t {
+            return last_v;
+        }
+        for pair in keys.windows(2) {
             let (t0, v0) = pair[0];
             let (t1, v1) = pair[1];
             if delta <= t1 {
                 let local = ((delta - t0) / (t1 - t0)).clamp(0.0, 1.0);
-                return v0 + (v1 - v0) * ease_in_out(local);
+                return v0 + (v1 - v0) * cubic_bezier_ease_in_out(local);
             }
         }
-        0.0
+        last_v
+    }
+
+    /// A fine-grained damped bell-ring oscillation using CSS `cubic-bezier(0.42, 0, 0.58, 1)`
+    /// transitions: opens strongly (`+1.0 -> -1.0 -> +0.75 -> -0.75`) and decays gracefully
+    /// through subtle micro-settle swings to `0.0` by `37%` of the cycle, then rests calmly.
+    pub fn bell_ring(delta: f32) -> f32 {
+        const KEYS: &[(f32, f32)] = &[
+            (0.000, 0.000),
+            (0.040, 1.000),
+            (0.080, -1.000),
+            (0.120, 0.750),
+            (0.160, -0.750),
+            (0.200, 0.450),
+            (0.240, -0.420),
+            (0.280, 0.220),
+            (0.315, -0.160),
+            (0.345, 0.070),
+            (0.370, 0.000),
+        ];
+        eval_cubic_keyframes(delta, KEYS)
+    }
+
+    /// Inertial phase-lagged oscillation for a bell clapper paired with [`bell_ring`]:
+    /// trails the bell shell by ~`1.4%` of the period and settles smoothly by `40%`.
+    pub fn bell_clapper(delta: f32) -> f32 {
+        const LAG: f32 = 0.014;
+        const END: f32 = 0.400;
+        if delta <= LAG || delta >= END {
+            return 0.0;
+        }
+        let shifted = (delta - LAG) * (0.370 / (END - LAG));
+        let ramp = ((delta - LAG) / 0.025).clamp(0.0, 1.0);
+        bell_ring(shifted) * (0.3 + 0.7 * cubic_bezier_ease_in_out(ramp))
+    }
+
+    /// Smooth acoustic sound-wave pulse envelope in `[0.0, 1.0]` synchronized with [`bell_ring`]:
+    /// flares outward during the active ring strikes and softens calmly to `0.0` during rest.
+    pub fn bell_wave(delta: f32) -> f32 {
+        const KEYS: &[(f32, f32)] = &[
+            (0.000, 0.000),
+            (0.040, 1.000),
+            (0.080, 0.760),
+            (0.120, 0.940),
+            (0.160, 0.660),
+            (0.200, 0.780),
+            (0.245, 0.480),
+            (0.300, 0.240),
+            (0.365, 0.070),
+            (0.420, 0.000),
+        ];
+        eval_cubic_keyframes(delta, KEYS)
     }
 
     /// Apply the given easing function, first in the forward direction and then in the reverse direction
@@ -1044,5 +1118,41 @@ mod tests {
 
         assert_eq!(simulate_next_frame(&window, cx), 0);
         assert_eq!(*rendered_deltas.borrow(), vec![0.0]);
+    }
+
+    #[test]
+    fn test_cubic_bezier_and_bell_easing_curves() {
+        // Exact CSS ease-in-out endpoints, midpoint, and symmetry.
+        assert_eq!(cubic_bezier_ease_in_out(0.0), 0.0);
+        assert_eq!(cubic_bezier_ease_in_out(1.0), 1.0);
+        assert!((cubic_bezier_ease_in_out(0.5) - 0.5).abs() < 1e-6);
+        assert!((cubic_bezier_ease_in_out(0.25) + cubic_bezier_ease_in_out(0.75) - 1.0).abs() < 1e-5);
+        assert!((cubic_bezier_ease_in_out(0.25) - 0.129).abs() < 2e-3);
+
+        // bell_ring hits the opening peaks, decays smoothly, and rests cleanly at 0.
+        assert_eq!(bell_ring(0.0), 0.0);
+        assert!((bell_ring(0.04) - 1.0).abs() < 1e-5);
+        assert!((bell_ring(0.08) + 1.0).abs() < 1e-5);
+        assert!((bell_ring(0.12) - 0.75).abs() < 1e-5);
+        assert!(bell_ring(0.28) > 0.15 && bell_ring(0.28) < 0.30);
+        assert_eq!(bell_ring(0.5), 0.0);
+        assert_eq!(bell_ring(1.0), 0.0);
+
+        // bell_clapper lags behind bell_ring: still near 0 at 0.01, peaks after 0.04.
+        assert_eq!(bell_clapper(0.01), 0.0);
+        assert!(bell_clapper(0.04) < bell_ring(0.04));
+        assert!(bell_clapper(0.056) > 0.9);
+        assert_eq!(bell_clapper(0.5), 0.0);
+
+        // bell_wave flares during the ring burst and stays within [0, 1].
+        assert_eq!(bell_wave(0.0), 0.0);
+        assert!((bell_wave(0.04) - 1.0).abs() < 1e-5);
+        assert!(bell_wave(0.12) > 0.9);
+        assert_eq!(bell_wave(0.5), 0.0);
+        for step in 0..=200 {
+            let t = step as f32 / 200.0;
+            let w = bell_wave(t);
+            assert!((0.0..=1.0).contains(&w), "bell_wave({t}) = {w} out of range");
+        }
     }
 }

@@ -296,6 +296,7 @@ impl Render for DatePickerState {
 
             let panel = div()
                 .id(("dp-popover", entity_id))
+                .occlude()
                 .flex()
                 .flex_col()
                 .gap(px(10.))
@@ -1182,6 +1183,7 @@ impl Render for TimePickerState {
 
             let panel = div()
                 .id(("tp-popover", entity_id))
+                .occlude()
                 .flex()
                 .flex_col()
                 .gap(px(8.))
