@@ -757,6 +757,40 @@ impl Theme {
         self
     }
 
+    /// Crisp neutral light theme using achromatic zinc/neutral grays (free of blue-slate tint)
+    /// for calm, paper-clean daytime readability.
+    pub fn light_neutral() -> Self {
+        let mut t = Self::light();
+        t.background = palette::ZINC_50.into();
+        t.sidebar_bg = palette::WHITE.into();
+        t.sidebar_border = palette::ZINC_200.into();
+        t.surface = palette::WHITE.into();
+        t.input_bg = palette::WHITE.into();
+        t.surface_muted = palette::ZINC_100.into();
+        t.surface_hover = palette::ZINC_100.into();
+        t.surface_active = palette::ZINC_200.into();
+        t.foreground = palette::ZINC_900.into();
+        t.muted_foreground = palette::ZINC_600.into();
+        t.placeholder = palette::ZINC_500.into();
+        t.secondary = palette::WHITE.into();
+        t.secondary_hover = palette::ZINC_50.into();
+        t.secondary_foreground = palette::ZINC_900.into();
+        t.border = palette::ZINC_200.into();
+        t.input_border = palette::ZINC_300.into();
+        t.input_border_hover = palette::ZINC_400.into();
+        t.popover_foreground = palette::ZINC_900.into();
+        t.backdrop = Hsla::from(palette::ZINC_950).opacity(0.42);
+        t.disabled_bg = palette::ZINC_100.into();
+        t.disabled_foreground = palette::ZINC_400.into();
+        t.toggle_track_off = palette::ZINC_200.into();
+        t.slider_track = palette::ZINC_200.into();
+        t.tooltip_bg = palette::ZINC_900.into();
+        t.tooltip_border = palette::ZINC_800.into();
+        t.chart_baseline = palette::ZINC_400.into();
+        t.chart_gridline = Hsla::from(palette::ZINC_200).opacity(0.85);
+        t
+    }
+
     /// Translucent matte-glass dark theme designed for Windows 11 `MicaBackdrop` or `Blurred`
     /// frosted floating panes and Spotlight launchers (keeps inputs and popovers highly legible).
     pub fn dark_glass() -> Self {
@@ -811,6 +845,17 @@ impl Theme {
         preference.resolve(window.appearance())
     }
 
+    /// Synchronizes native platform window chrome and backdrop materials (such as Windows 11
+    /// Mica / `DWMWA_USE_IMMERSIVE_DARK_MODE`) with this theme's [`ThemePreference`].
+    pub fn sync_window_appearance(&self, window: &Window) {
+        let override_app = match self.preference {
+            ThemePreference::System => None,
+            ThemePreference::Light => Some(WindowAppearance::Light),
+            ThemePreference::Dark => Some(WindowAppearance::Dark),
+        };
+        window.set_appearance_override(override_app);
+    }
+
     /// Switches to `next_theme`, running a GPU-composited circular reveal originating from `origin`
     /// (or a cross-fade when `origin` is `None`) whenever the resolved [`ThemeMode`] changes.
     pub fn switch_with_transition(
@@ -839,12 +884,14 @@ impl Theme {
     ) {
         let current_mode = Self::active(cx).mode;
         if current_mode == next_theme.mode {
+            next_theme.sync_window_appearance(window);
             Self::set_global(next_theme, cx);
             cx.refresh_windows();
             return;
         }
         let transition = style.to_view_transition(origin, window);
-        window.start_view_transition(transition, cx, move |_, cx| {
+        window.start_view_transition(transition, cx, move |window, cx| {
+            next_theme.sync_window_appearance(window);
             Self::set_global(next_theme, cx);
             cx.refresh_windows();
         });

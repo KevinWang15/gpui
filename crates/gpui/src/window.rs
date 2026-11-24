@@ -4062,6 +4062,13 @@ impl Window {
         self.platform_window.set_backdrop_corner_radius(radius);
     }
 
+    /// Overrides the native platform window chrome and backdrop appearance (for example, switching
+    /// Windows 11 Mica / `DWMWA_USE_IMMERSIVE_DARK_MODE` between Light and Dark when the user
+    /// selects an explicit in-app theme). Pass `None` to follow the OS system appearance.
+    pub fn set_appearance_override(&self, appearance: Option<WindowAppearance>) {
+        self.platform_window.set_appearance_override(appearance);
+    }
+
     /// Mark the window as dirty at the platform level.
     pub fn set_window_edited(&mut self, edited: bool) {
         self.platform_window.set_edited(edited);

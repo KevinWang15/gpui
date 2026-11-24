@@ -169,10 +169,9 @@ impl RenderOnce for BlurContainer {
         let blur_radius = self.blur_radius;
         let corner_radii = self.style.corner_radii.clone();
 
-        let mut root = div()
-            .relative()
-            .overflow_hidden()
-            .children(self.children);
+        // Keep the outer wrapper unclipped so elevated child cards retain their outer drop
+        // shadows and focus rings cleanly (clipping belongs only on the active overlay layer).
+        let mut root = div().relative().children(self.children);
 
         if self.active {
             let has_overlay_click = self.on_overlay_click.is_some();
@@ -185,6 +184,7 @@ impl RenderOnce for BlurContainer {
                 .id((click_id, "scrim"))
                 .absolute()
                 .inset_0()
+                .overflow_hidden()
                 .bg(scrim_color)
                 .flex()
                 .flex_col()

@@ -1282,7 +1282,12 @@ impl WindowsWindowInner {
 
                     callback();
                     self.state.callbacks.appearance_changed.set(Some(callback));
-                    configure_dwm_dark_mode(handle, new_appearance);
+                    let effective = self
+                        .state
+                        .appearance_override
+                        .get()
+                        .unwrap_or(new_appearance);
+                    configure_dwm_dark_mode(handle, effective);
                 }
             }
         }

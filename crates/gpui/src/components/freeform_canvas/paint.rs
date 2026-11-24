@@ -36,12 +36,15 @@ pub(super) fn paint_dot_grid(
     let ox = bounds.origin.x.0;
     let oy = bounds.origin.y.0;
 
-    // Draw uniform dots at the exact resolved `step` so a finer step (e.g. 4px) is
-    // unambiguously denser than a coarser step (e.g. 8px).
-    let dot_size = if step < 8.0 { 1.1 } else { 1.4 };
-    let half = dot_size * 0.5;
-    let mut dot_col = color;
-    dot_col.a = (color.a * if step < 8.0 { 0.85 } else { 1.05 }).clamp(0.0, 0.45);
+    // On fine grids (< 8px), distinguish major 2x intersections from whisper-soft minor sub-dots
+    // so dense steps stay readable without creating harsh visual dot-matrix noise on light surfaces.
+    let fine = step < 8.0;
+    let major_size = if fine { 1.2 } else { 1.25 };
+    let minor_size = 1.0;
+    let mut major_col = color;
+    major_col.a = (color.a * if fine { 0.90 } else { 0.95 }).clamp(0.0, 0.40);
+    let mut minor_col = color;
+    minor_col.a = (color.a * 0.36).clamp(0.0, 0.20);
 
     let mut ix: usize = 1;
     loop {
@@ -55,6 +58,10 @@ pub(super) fn paint_dot_grid(
             if y >= h - 2.0 {
                 break;
             }
+            let is_major = !fine || (ix.is_multiple_of(2) && iy.is_multiple_of(2));
+            let dot_size = if is_major { major_size } else { minor_size };
+            let half = dot_size * 0.5;
+            let dot_col = if is_major { major_col } else { minor_col };
             window.paint_quad(fill(
                 Bounds::new(
                     point(px(ox + x - half), px(oy + y - half)),

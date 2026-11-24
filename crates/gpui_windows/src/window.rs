@@ -51,6 +51,7 @@ pub struct WindowsWindowState {
     pub fullscreen_restore_bounds: Cell<Bounds<Pixels>>,
     pub border_offset: WindowBorderOffset,
     pub appearance: Cell<WindowAppearance>,
+    pub appearance_override: Cell<Option<WindowAppearance>>,
     pub background_appearance: Cell<WindowBackgroundAppearance>,
     pub backdrop_corner_radius: Cell<Pixels>,
     pub backdrop_blur_radius: Cell<Pixels>,
@@ -171,6 +172,7 @@ impl WindowsWindowState {
             fullscreen_restore_bounds: Cell::new(fullscreen_restore_bounds),
             border_offset,
             appearance: Cell::new(appearance),
+            appearance_override: Cell::new(None),
             background_appearance: Cell::new(WindowBackgroundAppearance::Opaque),
             backdrop_corner_radius: Cell::new(px(0.)),
             backdrop_blur_radius: Cell::new(px(DEFAULT_HOST_BLUR_SIGMA)),
@@ -1308,6 +1310,12 @@ impl PlatformWindow for WindowsWindow {
         if let Ok(mut renderer) = self.state.renderer.try_borrow_mut() {
             renderer.sync_backdrop(blur_enabled, radius_px);
         }
+    }
+
+    fn set_appearance_override(&self, appearance: Option<WindowAppearance>) {
+        self.state.appearance_override.set(appearance);
+        let effective = appearance.unwrap_or_else(|| self.state.appearance.get());
+        configure_dwm_dark_mode(self.0.hwnd, effective);
     }
 
     fn minimize(&self) {

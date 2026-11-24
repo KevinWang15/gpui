@@ -1561,6 +1561,10 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     /// Hints the platform backdrop blur (e.g. Windows frosted glass) to clip cleanly
     /// to a custom corner radius rather than the OS's fixed default window rounding.
     fn set_backdrop_corner_radius(&self, _radius: Pixels) {}
+    /// Requests that native platform window chrome and backdrop materials (such as Windows 11
+    /// Mica / `DWMWA_USE_IMMERSIVE_DARK_MODE`) match `appearance`, or follow the OS system
+    /// appearance when `None`.
+    fn set_appearance_override(&self, _appearance: Option<WindowAppearance>) {}
     fn minimize(&self);
     fn zoom(&self);
     fn toggle_fullscreen(&self);

@@ -2415,12 +2415,39 @@ fn blur_container_loading_overlay_spinners_and_progress_ring(cx: &mut TestAppCon
     });
     assert_eq!(renders.get(), renders_loaded);
 
-    // Turning loading off cleanly removes overlay
+    // Turning loading off cleanly removes overlay and leaves wrapped card shadows unclipped.
     view.update(cx, |v, cx| {
         v.loading = false;
         cx.notify();
     });
     cx.run_until_parked();
+
+    // Verify wrapped Cards keep unclipped outer drop shadows (BlurContainer must not clamp
+    // child shadows to a tight rectangular content mask at the card's outer corners).
+    cx.update(|window, _| {
+        let shadows = &window.rendered_frame.scene.shadows;
+        assert!(
+            !shadows.is_empty(),
+            "expected elevated Cards inside BlurContainer/LoadingOverlay to emit drop shadows"
+        );
+        for shadow in shadows {
+            assert!(
+                shadow.content_mask.bounds.origin.x < shadow.bounds.origin.x
+                    && shadow.content_mask.bounds.origin.y < shadow.bounds.origin.y,
+                "wrapped Card shadow must not be hard-clipped to the card's own bounds: shadow={:?}, mask={:?}",
+                shadow.bounds,
+                shadow.content_mask.bounds
+            );
+        }
+        // Theme::light_neutral() uses achromatic neutral grays and syncs window appearance cleanly.
+        let neutral = Theme::light_neutral().with_preference(ThemePreference::Light);
+        assert!(neutral.background.s <= 0.05);
+        assert!(neutral.surface_muted.s <= 0.05);
+        neutral.sync_window_appearance(window);
+        Theme::dark()
+            .with_preference(ThemePreference::System)
+            .sync_window_appearance(window);
+    });
 }
 
 #[gpui::test]

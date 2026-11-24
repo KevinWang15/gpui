@@ -386,7 +386,7 @@ impl RenderOnce for Card {
             .rounded(theme.radius_xl)
             .overflow_hidden()
             .when(self.elevated && theme.elevation_shadows, |el| {
-                el.shadow_sm()
+                el.shadow_xs()
             })
             .when(self.padded, |el| el.p(px(20.)))
             .children(self.children);

@@ -921,6 +921,7 @@ pub fn freeform_canvas(
         canvas_radius: px(10.),
         canvas_bg: None,
         canvas_border: None,
+        grid_color: None,
         canvas_backdrop_blur: px(0.),
         show_focus_border: None,
         editable: true,
@@ -946,6 +947,7 @@ pub struct FreeformCanvas {
     canvas_radius: Pixels,
     canvas_bg: Option<Hsla>,
     canvas_border: Option<Hsla>,
+    grid_color: Option<Hsla>,
     canvas_backdrop_blur: Pixels,
     show_focus_border: Option<bool>,
     editable: bool,
@@ -992,6 +994,13 @@ impl FreeformCanvas {
     /// [`FreeformCanvas::show_focus_border`].
     pub fn canvas_border(mut self, color: Hsla) -> Self {
         self.canvas_border = Some(color);
+        self
+    }
+
+    /// Overrides the alignment dot grid color (defaults to a subtle theme-mode-aware tint of
+    /// `theme.muted_foreground`).
+    pub fn grid_color(mut self, color: Hsla) -> Self {
+        self.grid_color = Some(color);
         self
     }
 
@@ -1493,7 +1502,14 @@ impl RenderOnce for FreeformCanvas {
 
         // Background dot grid + smart alignment guides layer
         let grid_step = snap_cfg.grid.max(4.0);
-        let grid_dot_color = theme.muted_foreground.opacity(0.24);
+        let grid_dot_color = self.grid_color.unwrap_or_else(|| {
+            let alpha = if theme.mode == super::theme::ThemeMode::Dark {
+                0.18
+            } else {
+                0.10
+            };
+            theme.muted_foreground.opacity(alpha)
+        });
         let guide_edge_color: Hsla = rgb(0xf43f5e).into();
         let guide_center_color = theme.primary;
         let guide_gap_color: Hsla = rgb(0x10b981).into();
