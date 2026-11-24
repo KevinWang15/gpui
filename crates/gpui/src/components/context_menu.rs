@@ -436,10 +436,12 @@ impl RenderOnce for PopupMenu {
                     s.last_position = None;
                     s.previous.take()
                 });
-                let focus_handle = handle.clone();
-                window.defer(cx, move |window, cx| {
-                    restore_previous_focus(&focus_handle, previous, window, cx);
-                });
+                if previous.is_some() || handle.contains_focused(window, cx) {
+                    let focus_handle = handle.clone();
+                    window.defer(cx, move |window, cx| {
+                        restore_previous_focus(&focus_handle, previous, window, cx);
+                    });
+                }
             }
             _ => {}
         }
@@ -448,10 +450,27 @@ impl RenderOnce for PopupMenu {
             return div().id(self.id).size_0().into_any_element();
         };
 
-        let on_close_item = self.on_close.clone();
+        let on_close_item_cb = self.on_close.clone();
+        let state_item = state.clone();
+        let handle_item = handle.clone();
+        let on_close_item: Option<Rc<dyn Fn(&(), &mut Window, &mut App)>> =
+            Some(Rc::new(move |_, window, cx| {
+                if let Some(close) = &on_close_item_cb {
+                    close(&(), window, cx);
+                }
+                // Restore previous focus synchronously before the menu unmounts on the next
+                // frame so host widgets don't receive a spurious focus-out when a menu item
+                // (such as "Select All") completes without moving focus elsewhere.
+                if handle_item.contains_focused(window, cx) {
+                    let previous = state_item.update(cx, |s, _| s.previous.take());
+                    restore_previous_focus(&handle_item, previous, window, cx);
+                }
+            }));
+
         let on_close_out = self.on_close.clone();
         let on_close_key = self.on_close;
         let state_key = state;
+        let handle_key = handle.clone();
 
         let panel = render_positioned_menu_panel(
             self.id.clone(),
@@ -471,10 +490,13 @@ impl RenderOnce for PopupMenu {
                     close(&(), window, cx);
                 }
                 if is_tab {
-                    let previous = state_key.read(cx).previous.clone();
+                    let previous = state_key.update(cx, |s, _| s.previous.take());
                     if let Some(previous) = previous {
                         window.focus(&previous, cx);
                     }
+                } else if handle_key.contains_focused(window, cx) {
+                    let previous = state_key.update(cx, |s, _| s.previous.take());
+                    restore_previous_focus(&handle_key, previous, window, cx);
                 }
             },
             Some(&self.style),

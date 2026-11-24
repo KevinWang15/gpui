@@ -2456,5 +2456,59 @@ fn markdown_multi_block_selection_copy_double_click_streaming_and_links(cx: &mut
             opened_links.lock().unwrap().as_slice(),
             &["https://example.com/docs".to_owned()]
         );
+
+        // 7. Right-click -> click "Select All" in the context menu must keep the entire document
+        //    selected after the menu closes and all deferred focus/animation ticks complete!
+        let menu_anchor = crate::point(px(120.), px(90.));
+        vcx.simulate_event(crate::MouseDownEvent {
+            position: menu_anchor,
+            button: crate::MouseButton::Right,
+            modifiers: crate::Modifiers::none(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        vcx.simulate_event(crate::MouseUpEvent {
+            position: menu_anchor,
+            button: crate::MouseButton::Right,
+            modifiers: crate::Modifiers::none(),
+            click_count: 1,
+        });
+        vcx.run_until_parked();
+        vcx.executor().advance_clock(std::time::Duration::from_millis(200));
+        vcx.run_until_parked();
+
+        // PopupMenu opens at (120, 90):
+        //   padding top = 4, Copy item height ~34 (y ~ 94..128), gap 2, Select All item (y ~ 130..164).
+        let select_all_pt = crate::point(px(180.), px(146.));
+        vcx.simulate_event(crate::MouseDownEvent {
+            position: select_all_pt,
+            button: crate::MouseButton::Left,
+            modifiers: crate::Modifiers::none(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        vcx.simulate_event(crate::MouseUpEvent {
+            position: select_all_pt,
+            button: crate::MouseButton::Left,
+            modifiers: crate::Modifiers::none(),
+            click_count: 1,
+        });
+        vcx.run_until_parked();
+        // Let any deferred PopupMenu focus-restoration & animations settle completely.
+        vcx.executor().advance_clock(std::time::Duration::from_millis(300));
+        vcx.run_until_parked();
+
+        vcx.write_to_clipboard(crate::ClipboardItem::new_string("empty".into()));
+        vcx.simulate_keystrokes(copy_stroke);
+        vcx.run_until_parked();
+        let after_menu_select_all = vcx
+            .read_from_clipboard()
+            .and_then(|c| c.text())
+            .unwrap_or_default();
+        assert!(
+            after_menu_select_all.contains("Visual Check for pane_render_preview")
+                && after_menu_select_all.ends_with("Streamed trailing paragraph."),
+            "clicking 'Select All' in Markdown's context menu must keep full selection active (not flash and clear): {after_menu_select_all:?}"
+        );
     }
 }

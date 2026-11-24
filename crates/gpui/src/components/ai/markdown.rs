@@ -1401,8 +1401,12 @@ impl MarkdownSelectionState {
         let copy_entity = entity.clone();
         entries.push(
             MenuEntry::item_with_icon("Copy", LucideIcon::Copy, move |_, window, cx| {
-                copy_entity.update(cx, |s, cx| {
+                let focus_handle = copy_entity.update(cx, |s, cx| {
                     s.copy_selection(cx);
+                    s.focus_handle.clone()
+                });
+                window.focus(&focus_handle, cx);
+                copy_entity.update(cx, |s, _| {
                     s.context_menu_position = None;
                     s.context_menu_link = None;
                 });
@@ -1417,8 +1421,12 @@ impl MarkdownSelectionState {
                 "Select All",
                 LucideIcon::SquareDashedMousePointer,
                 move |_, window, cx| {
-                    entity.update(cx, |s, _| {
+                    let focus_handle = entity.update(cx, |s, _| {
                         s.select_all();
+                        s.focus_handle.clone()
+                    });
+                    window.focus(&focus_handle, cx);
+                    entity.update(cx, |s, _| {
                         s.context_menu_position = None;
                         s.context_menu_link = None;
                     });
