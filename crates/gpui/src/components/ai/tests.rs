@@ -2512,3 +2512,184 @@ fn markdown_multi_block_selection_copy_double_click_streaming_and_links(cx: &mut
         );
     }
 }
+
+#[crate::test]
+fn ask_ai_overlay_markdown_context_menu_select_all_and_ctrl_a_persist(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    cx.update(|cx| {
+        init_components(cx);
+        Theme::set_global(Theme::light().with_mono_font_family("Consolas"), cx);
+    });
+
+    let ai = cx.new(|cx| {
+        let mut s = AskAiState::build_with_ai(cx).with_simulated_provider();
+        assert!(s.connect_preset_defaults("simulated", cx).is_none());
+        s
+    });
+    ai.update(cx, |s, cx| {
+        s.set_open(true, cx);
+        s.send_message("Hello Build with AI", cx);
+    });
+    wait_until_idle(cx, &ai);
+
+    struct OverlayHost {
+        ai: crate::Entity<AskAiState>,
+        host_ctrl_a_fired: Arc<AtomicBool>,
+    }
+    impl crate::Render for OverlayHost {
+        fn render(
+            &mut self,
+            _window: &mut crate::Window,
+            _cx: &mut crate::Context<Self>,
+        ) -> impl crate::IntoElement {
+            let fired = self.host_ctrl_a_fired.clone();
+            crate::div()
+                .size_full()
+                .on_key_down(move |ev: &crate::KeyDownEvent, _, _| {
+                    let ctrl = ev.keystroke.modifiers.control || ev.keystroke.modifiers.platform;
+                    if ctrl && ev.keystroke.key.eq_ignore_ascii_case("a") {
+                        fired.store(true, Ordering::SeqCst);
+                    }
+                })
+                .child(build_with_ai_overlay("test-bwa-select-all", &self.ai).show_trigger(false))
+        }
+    }
+
+    let host_ctrl_a_fired = Arc::new(AtomicBool::new(false));
+    let ai_clone = ai.clone();
+    let fired_clone = host_ctrl_a_fired.clone();
+    let window = cx.open_window(size(px(1100.), px(760.)), |_, _| OverlayHost {
+        ai: ai_clone,
+        host_ctrl_a_fired: fired_clone,
+    });
+    cx.run_until_parked();
+
+    let copy_stroke = if cfg!(target_os = "macos") { "cmd-c" } else { "ctrl-c" };
+    let select_all_stroke = if cfg!(target_os = "macos") { "cmd-a" } else { "ctrl-a" };
+
+    // Default floating panel on 1100x760 is 460x600 anchored BottomRight { right: 24, bottom: 24 }
+    // => left = 616, top = 136, right = 1076, bottom = 736.
+    // Find the exact y of the assistant Markdown by trying Ctrl+A at scan points.
+    let mut vcx = crate::VisualTestContext::from_window(window.into(), cx);
+    let mut md_pt = None;
+    for y in (220..=580).step_by(20) {
+        let pt = crate::point(px(720.), px(y as f32));
+        vcx.simulate_event(crate::MouseDownEvent {
+            position: pt,
+            button: crate::MouseButton::Left,
+            modifiers: crate::Modifiers::none(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        vcx.simulate_event(crate::MouseUpEvent {
+            position: pt,
+            button: crate::MouseButton::Left,
+            modifiers: crate::Modifiers::none(),
+            click_count: 1,
+        });
+        vcx.run_until_parked();
+        vcx.write_to_clipboard(crate::ClipboardItem::new_string("empty".into()));
+        vcx.simulate_keystrokes(select_all_stroke);
+        vcx.run_until_parked();
+        vcx.simulate_keystrokes(copy_stroke);
+        vcx.run_until_parked();
+        let txt = vcx
+            .read_from_clipboard()
+            .and_then(|c| c.text())
+            .unwrap_or_default();
+        if txt != "empty" && txt.len() > 20 {
+            md_pt = Some(pt);
+            break;
+        }
+    }
+    let md_pt = md_pt.expect("should locate assistant Markdown inside AskAiOverlay");
+
+    // Clear selection first
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+
+    // 1. Right-click inside assistant Markdown in AskAiOverlay -> click "Select All"
+    vcx.simulate_event(crate::MouseDownEvent {
+        position: md_pt,
+        button: crate::MouseButton::Right,
+        modifiers: crate::Modifiers::none(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    vcx.simulate_event(crate::MouseUpEvent {
+        position: md_pt,
+        button: crate::MouseButton::Right,
+        modifiers: crate::Modifiers::none(),
+        click_count: 1,
+    });
+    vcx.run_until_parked();
+    vcx.executor().advance_clock(std::time::Duration::from_millis(200));
+    vcx.run_until_parked();
+
+    // Note: md_pt.x (720) > 1100 * 0.65 (715), so PopupMenu flips Anchor::TopRight (extends left of 720)!
+    let select_all_item = crate::point(md_pt.x - px(80.), md_pt.y + px(56.));
+    vcx.simulate_event(crate::MouseDownEvent {
+        position: select_all_item,
+        button: crate::MouseButton::Left,
+        modifiers: crate::Modifiers::none(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    vcx.simulate_event(crate::MouseUpEvent {
+        position: select_all_item,
+        button: crate::MouseButton::Left,
+        modifiers: crate::Modifiers::none(),
+        click_count: 1,
+    });
+    vcx.run_until_parked();
+    vcx.executor().advance_clock(std::time::Duration::from_millis(500));
+    vcx.run_until_parked();
+
+    vcx.write_to_clipboard(crate::ClipboardItem::new_string("empty".into()));
+    vcx.simulate_keystrokes(copy_stroke);
+    vcx.run_until_parked();
+    let copied_menu = vcx
+        .read_from_clipboard()
+        .and_then(|c| c.text())
+        .unwrap_or_default();
+    assert!(
+        copied_menu != "empty" && copied_menu.len() > 20,
+        "AskAiOverlay right-click -> Select All must keep full selection active after 500ms: {copied_menu:?}"
+    );
+
+    // 2. Click inside Markdown to clear, then Ctrl/Cmd+A must select all WITHOUT falling through to host!
+    vcx.simulate_event(crate::MouseDownEvent {
+        position: md_pt,
+        button: crate::MouseButton::Left,
+        modifiers: crate::Modifiers::none(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    vcx.simulate_event(crate::MouseUpEvent {
+        position: md_pt,
+        button: crate::MouseButton::Left,
+        modifiers: crate::Modifiers::none(),
+        click_count: 1,
+    });
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes(select_all_stroke);
+    vcx.run_until_parked();
+    vcx.executor().advance_clock(std::time::Duration::from_millis(300));
+    vcx.run_until_parked();
+
+    assert!(
+        !host_ctrl_a_fired.load(Ordering::SeqCst),
+        "Ctrl/Cmd+A inside focused Markdown must not leak to host Dashboard fallback"
+    );
+    vcx.write_to_clipboard(crate::ClipboardItem::new_string("empty".into()));
+    vcx.simulate_keystrokes(copy_stroke);
+    vcx.run_until_parked();
+    let copied_key = vcx
+        .read_from_clipboard()
+        .and_then(|c| c.text())
+        .unwrap_or_default();
+    assert_eq!(
+        copied_key, copied_menu,
+        "Ctrl/Cmd+A and context menu Select All must select identical full Markdown text"
+    );
+}
