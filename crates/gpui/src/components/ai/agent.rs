@@ -1051,7 +1051,12 @@ async fn run_agent_turn_on_tokio(config: AgentRunConfig, tx: async_channel::Send
         && !abort.load(Ordering::Relaxed)
     {
         let raw = err.to_string();
-        let display = if raw.contains("sk-") || raw.contains("Bearer ") || raw.contains("AIza") {
+        let display = if raw.contains("sk-")
+            || raw.contains("vk-")
+            || raw.contains("lg_pat_")
+            || raw.contains("Bearer ")
+            || raw.contains("AIza")
+        {
             FAILURE_MESSAGE.to_owned()
         } else {
             format!("{FAILURE_MESSAGE} ({raw})")

@@ -439,6 +439,9 @@ pub fn ask_demo_simulated_provider(executor: BackgroundExecutor) -> ProviderPres
 /// seamlessly with `AskAi`).
 pub fn canvas_demo_simulated_provider(executor: BackgroundExecutor) -> ProviderPreset {
     let mut preset = simulated_provider();
+    if let Some(field) = preset.fields.first_mut() {
+        field.options = vec!["canvas-demo".into(), "fast-layout".into()];
+    }
     preset.custom_model = Some(Arc::new(move |_| {
         Ok(build_demo_canvas_model(executor.clone()))
     }));

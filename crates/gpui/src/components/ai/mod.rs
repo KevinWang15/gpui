@@ -49,8 +49,8 @@ pub use mcp::{
 };
 pub use providers::{
     LocalCompletionEvent, LocalCompletionHandler, RigCompletionModel, SimulatedModel,
-    ai_tokio_handle, build_completion_model, default_providers, extract_request_summary,
-    local_completion_model, simulated_provider, test_provider_connection,
+    add_extra_ca_certs_pem, ai_tokio_handle, build_completion_model, default_providers,
+    extract_request_summary, local_completion_model, simulated_provider, test_provider_connection,
     validate_compatible_base_url, validate_provider_values,
 };
 pub use rig_agent;

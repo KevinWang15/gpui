@@ -1406,3 +1406,108 @@ async fn live_openai_compatible_streaming_and_tool_calling() {
         "expected final answer to include tool output ORION_RIG_47, got: {tool_reply:?}"
     );
 }
+
+#[test]
+fn add_extra_ca_certs_pem_rejects_empty_and_invalid_bundles() {
+    assert!(super::providers::add_extra_ca_certs_pem(b"").is_err());
+    assert!(super::providers::add_extra_ca_certs_pem(b"not a pem certificate").is_err());
+
+    let presets = default_providers();
+    let openai = presets.iter().find(|p| p.id.as_ref() == "openai").unwrap();
+    let model_field = openai.fields.iter().find(|f| f.key.as_ref() == "model").unwrap();
+    assert!(!model_field.options.is_empty());
+}
+
+#[crate::test]
+fn ask_ai_dynamic_providers_status_banner_and_field_options(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        init_components(cx);
+        Theme::set_global(Theme::dark(), cx);
+    });
+
+    let ai = cx.new(|cx| {
+        AskAiState::build_with_ai(cx).providers(vec![
+            super::types::ProviderPreset {
+                id: "custom-gw".into(),
+                name: "Gateway".into(),
+                description: "Custom OpenAI-compatible gateway".into(),
+                protocol: super::types::ProviderProtocol::OpenAiCompatible,
+                fields: vec![
+                    super::types::ProviderField::url("baseURL", "Base URL"),
+                    super::types::ProviderField::password("apiKey", "API Key"),
+                    super::types::ProviderField::text("model", "Model").options(["model-a"]),
+                ],
+                default_values: std::collections::BTreeMap::from([
+                    ("baseURL".to_owned(), "https://gw.example/v1".to_owned()),
+                    ("model".to_owned(), "model-a".to_owned()),
+                ]),
+                accepts_images: false,
+                validator: None,
+                custom_model: None,
+            },
+        ])
+    });
+
+    ai.update(cx, |state, cx| {
+        let mut vals = ProviderValues::new();
+        vals.insert("baseURL".to_owned(), "https://gw.example/v1".to_owned());
+        vals.insert("apiKey".to_owned(), "vk-test".to_owned());
+        vals.insert("model".to_owned(), "model-a".to_owned());
+        assert!(state.connect("custom-gw", vals, cx).is_none());
+
+        state.set_status_banner(Some("Provisioning key...".into()), true, cx);
+        assert_eq!(
+            state.status_banner().map(|(m, l)| (m.as_ref(), l)),
+            Some(("Provisioning key...", true))
+        );
+
+        state.set_providers(
+            vec![super::types::ProviderPreset {
+                id: "custom-gw".into(),
+                name: "Gateway".into(),
+                description: "Updated".into(),
+                protocol: super::types::ProviderProtocol::OpenAiCompatible,
+                fields: vec![
+                    super::types::ProviderField::url("baseURL", "Base URL"),
+                    super::types::ProviderField::password("apiKey", "API Key"),
+                    super::types::ProviderField::text("model", "Model")
+                        .options(["model-a", "model-b"]),
+                ],
+                default_values: std::collections::BTreeMap::new(),
+                accepts_images: false,
+                validator: None,
+                custom_model: None,
+            }],
+            cx,
+        );
+        let conn = state.connection().expect("connected");
+        let model_field = conn
+            .preset
+            .fields
+            .iter()
+            .find(|f| f.key.as_ref() == "model")
+            .unwrap();
+        assert_eq!(model_field.options.len(), 2);
+
+        state.set_status_banner(None, false, cx);
+        assert!(state.status_banner().is_none());
+    });
+
+    struct Host(crate::Entity<AskAiState>);
+    impl crate::Render for Host {
+        fn render(
+            &mut self,
+            _window: &mut crate::Window,
+            _cx: &mut crate::Context<Self>,
+        ) -> impl crate::IntoElement {
+            AskAi::new(&self.0)
+        }
+    }
+
+    let ai_for_win = ai.clone();
+    let window = cx.open_window(size(px(800.), px(600.)), |_, _| Host(ai_for_win));
+    cx.run_until_parked();
+    let _ = window.update(cx, |_, window, cx| {
+        assert!(!ai.read(cx).is_text_input_focused(window, cx));
+    });
+}

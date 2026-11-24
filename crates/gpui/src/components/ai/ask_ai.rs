@@ -21,9 +21,10 @@ use serde_json::Value;
 use crate::icons::{Icon, IconSize, LucideIcon};
 use crate::{
     AnyElement, App, ClipboardItem, Context, CursorStyle, ElementId, Entity, EventEmitter,
-    FileFilter, FontWeight, IntoElement, MouseButton, MouseDownEvent, OpenPromptOptions, Pixels,
-    Render, RenderOnce, ScrollEvent, ScrollHandle, ScrollbarVisibility, SharedString,
-    StyleRefinement, Styled, Task, Window, anchored, deferred, div, point, prelude::*, px, size,
+    FileFilter, Focusable as _, FontWeight, IntoElement, MouseButton, MouseDownEvent,
+    OpenPromptOptions, Pixels, Render, RenderOnce, ScrollEvent, ScrollHandle, ScrollbarVisibility,
+    SharedString, StyleRefinement, Styled, Task, Window, anchored, deferred, div, point,
+    prelude::*, px, size,
 };
 
 use super::agent::{
@@ -209,6 +210,7 @@ pub struct AskAiState {
     busy: bool,
     activity: AiActivity,
     error: Option<SharedString>,
+    status_banner: Option<(SharedString, bool)>,
     abort: Option<Arc<AtomicBool>>,
     _run_task: Option<Task<()>>,
     _ui_tool_task: Option<Task<()>>,
@@ -392,6 +394,7 @@ impl AskAiState {
             busy: false,
             activity: AiActivity::Idle,
             error: None,
+            status_banner: None,
             abort: None,
             _run_task: None,
             _ui_tool_task: None,
@@ -609,6 +612,54 @@ impl AskAiState {
     /// Returns whether the floating overlay is currently open.
     pub fn is_open(&self) -> bool {
         self.open
+    }
+
+    /// Replaces the offered provider presets at runtime (for example after async model or endpoint
+    /// discovery) and refreshes the active connection's preset metadata when its ID still matches.
+    pub fn set_providers(&mut self, providers: Vec<ProviderPreset>, cx: &mut Context<Self>) {
+        self.providers = providers;
+        if let Some(ref mut conn) = self.connection
+            && let Some(updated) = self.providers.iter().find(|p| p.id == conn.preset.id).cloned()
+        {
+            conn.preset = updated;
+        }
+        cx.notify();
+    }
+
+    /// Displays or clears a calm status notice banner (optionally with a loading spinner) across
+    /// Chat and Settings — useful while the host app asynchronously provisions or refreshes
+    /// provider credentials.
+    pub fn set_status_banner(
+        &mut self,
+        message: Option<SharedString>,
+        loading: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.status_banner = message.map(|m| (m, loading));
+        cx.notify();
+    }
+
+    /// Returns the active status banner `(message, loading)`, if any.
+    pub fn status_banner(&self) -> Option<(&SharedString, bool)> {
+        self.status_banner.as_ref().map(|(m, l)| (m, *l))
+    }
+
+    /// Returns `true` if any text input inside the assistant (composer, inline message editor,
+    /// history search, provider settings, or MCP settings) currently has keyboard focus.
+    /// Useful for host editors to avoid intercepting `Ctrl+A` / `Ctrl+Z` while the user types
+    /// inside a non-blocking **Build with AI** overlay.
+    pub fn is_text_input_focused(&self, window: &Window, cx: &App) -> bool {
+        self.composer_input.read(cx).focus_handle(cx).is_focused(window)
+            || self.edit_input.read(cx).focus_handle(cx).is_focused(window)
+            || self.history_search.read(cx).focus_handle(cx).is_focused(window)
+            || self.mcp_id_input.read(cx).focus_handle(cx).is_focused(window)
+            || self.mcp_name_input.read(cx).focus_handle(cx).is_focused(window)
+            || self.mcp_endpoint_input.read(cx).focus_handle(cx).is_focused(window)
+            || self.mcp_auth_input.read(cx).focus_handle(cx).is_focused(window)
+            || self
+                .draft_inputs
+                .values()
+                .any(|inp| inp.read(cx).focus_handle(cx).is_focused(window))
     }
 
     /// Returns the underlying reusable [`FloatingWindowState`] controlling overlay geometry,
@@ -1880,6 +1931,57 @@ impl AskAiState {
                                 )
                             }),
                     );
+                    if !field.options.is_empty() {
+                        let current_val = inp.read(cx).value().trim().to_owned();
+                        let mut chips = div()
+                            .flex()
+                            .flex_row()
+                            .flex_wrap()
+                            .gap(px(4.))
+                            .pt(px(2.));
+                        for (opt_idx, opt) in field.options.iter().enumerate() {
+                            let inp_pick = inp.clone();
+                            let opt_val = opt.clone();
+                            let selected = current_val == opt.as_ref();
+                            let chip_bg = if selected {
+                                theme.primary_soft
+                            } else {
+                                theme.surface_muted.opacity(0.75)
+                            };
+                            let chip_border = if selected {
+                                theme.primary
+                            } else {
+                                theme.border
+                            };
+                            let chip_fg = if selected {
+                                theme.primary
+                            } else {
+                                theme.muted_foreground
+                            };
+                            let hover_bg = theme.surface_hover;
+                            chips = chips.child(
+                                div()
+                                    .id(SharedString::from(format!("opt-{key_str}-{opt_idx}")))
+                                    .px(px(7.))
+                                    .py(px(2.))
+                                    .rounded(theme.radius_sm)
+                                    .bg(chip_bg)
+                                    .border_1()
+                                    .border_color(chip_border)
+                                    .text_size(px(11.))
+                                    .text_color(chip_fg)
+                                    .cursor_pointer()
+                                    .hover(move |s| s.bg(hover_bg))
+                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                        let next = opt_val.to_string();
+                                        inp_pick.update(cx, |s, cx| s.set_value(next, cx));
+                                        cx.notify();
+                                    }))
+                                    .child(opt.clone()),
+                            );
+                        }
+                        field_box = field_box.child(chips);
+                    }
                 }
                 fields_col = fields_col.child(field_box);
             }
@@ -2329,6 +2431,7 @@ impl AskAiState {
                     .pr(px(18.))
                     .py(px(16.))
                     .spacing(px(16.))
+                    .when_some(self.render_status_banner(cx), |el, b| el.child(b))
                     .child(provider_section)
                     .child(divider())
                     .child(mcp_section),
@@ -2803,6 +2906,43 @@ impl AskAiState {
             .into_any_element()
     }
 
+    fn render_status_banner(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let (msg, loading) = self.status_banner.as_ref()?;
+        let theme = cx.theme();
+        Some(
+            h_stack()
+                .w_full()
+                .spacing(px(8.))
+                .px(px(10.))
+                .py(px(7.))
+                .rounded(theme.radius_md)
+                .bg(theme.primary_soft.opacity(0.45))
+                .border_1()
+                .border_color(theme.primary.opacity(0.35))
+                .child(if *loading {
+                    Icon::new(LucideIcon::LoaderCircle)
+                        .size(IconSize::Xs)
+                        .color(theme.primary)
+                        .spin()
+                        .into_any_element()
+                } else {
+                    Icon::new(LucideIcon::Info)
+                        .size(IconSize::Xs)
+                        .color(theme.primary)
+                        .into_any_element()
+                })
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_size(px(12.))
+                        .text_color(theme.foreground)
+                        .child(msg.clone()),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn render_chat(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let eid = cx.entity_id();
@@ -3053,6 +3193,9 @@ impl AskAiState {
             .flex_1()
             .min_h_0()
             .w_full()
+            .when_some(self.render_status_banner(cx), |el, b| {
+                el.child(div().px(px(12.)).pt(px(10.)).child(b))
+            })
             .child(
                 div()
                     .relative()

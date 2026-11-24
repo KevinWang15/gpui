@@ -4,9 +4,11 @@
 //! [`rig_agent::Agent`].
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+use parking_lot::RwLock;
 
 use anyhow::{Result, anyhow, bail};
 use futures::StreamExt as _;
@@ -57,12 +59,47 @@ pub fn ai_tokio_handle() -> &'static tokio::runtime::Handle {
         .handle()
 }
 
-/// Builds a [`reqwest::Client`] configured with system roots plus any optional extra PEM root
-/// bundle supplied via `SSL_CERT_FILE`, `CODEX_CA_CERTIFICATE`, or `NODE_EXTRA_CA_CERTS`.
+static EXTRA_CA_BUNDLES: LazyLock<RwLock<Vec<Vec<u8>>>> = LazyLock::new(|| RwLock::new(Vec::new()));
+static SHARED_RIG_HTTP: LazyLock<RwLock<Option<ReqwestClient>>> =
+    LazyLock::new(|| RwLock::new(None));
+
+/// Registers additional PEM-encoded root CA certificates trusted by GPUI's AI HTTP clients
+/// (all `rig-core` provider requests, connectivity probes, and Streamable HTTP MCP servers).
+///
+/// Validates the bundle immediately and returns the number of certificates parsed. Duplicate
+/// bundles are ignored.
+pub fn add_extra_ca_certs_pem(pem: &[u8]) -> Result<usize> {
+    let parsed = reqwest::Certificate::from_pem_bundle(pem)
+        .map_err(|e| anyhow!("invalid PEM root certificate bundle: {e}"))?;
+    if parsed.is_empty() {
+        bail!("PEM bundle contains no certificates");
+    }
+    let count = parsed.len();
+    {
+        let mut bundles = EXTRA_CA_BUNDLES.write();
+        if !bundles.iter().any(|existing| existing.as_slice() == pem) {
+            bundles.push(pem.to_vec());
+            *SHARED_RIG_HTTP.write() = None;
+        }
+    }
+    Ok(count)
+}
+
+/// Builds a [`reqwest::Client`] configured with system roots plus any registered PEM root
+/// bundles ([`add_extra_ca_certs_pem`]) and optional env bundles (`SSL_CERT_FILE`,
+/// `CODEX_CA_CERTIFICATE`, or `NODE_EXTRA_CA_CERTS`).
 pub(crate) fn build_reqwest_client() -> reqwest::Client {
     let mut builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .user_agent(concat!("gpui-ai/", env!("CARGO_PKG_VERSION")));
+
+    for pem in EXTRA_CA_BUNDLES.read().iter() {
+        if let Ok(certs) = reqwest::Certificate::from_pem_bundle(pem) {
+            for cert in certs {
+                builder = builder.add_root_certificate(cert);
+            }
+        }
+    }
 
     for env_var in ["SSL_CERT_FILE", "CODEX_CA_CERTIFICATE", "NODE_EXTRA_CA_CERTS"] {
         if let Ok(path) = std::env::var(env_var)
@@ -81,11 +118,14 @@ pub(crate) fn build_reqwest_client() -> reqwest::Client {
 
 /// Shared [`DynHttpClient`] backed by [`build_reqwest_client`] for all Rig providers.
 pub(crate) fn shared_rig_http() -> DynHttpClient {
-    static CLIENT: OnceLock<ReqwestClient> = OnceLock::new();
-    let reqwest_client = CLIENT
-        .get_or_init(|| ReqwestClient::from(build_reqwest_client()))
+    if let Some(cached) = SHARED_RIG_HTTP.read().as_ref() {
+        return DynHttpClient::new(cached.clone());
+    }
+    let mut guard = SHARED_RIG_HTTP.write();
+    let client = guard
+        .get_or_insert_with(|| ReqwestClient::from(build_reqwest_client()))
         .clone();
-    DynHttpClient::new(reqwest_client)
+    DynHttpClient::new(client)
 }
 
 // ---------------------------------------------------------------------------
@@ -138,7 +178,9 @@ pub fn default_providers() -> Vec<ProviderPreset> {
             protocol: ProviderProtocol::OpenAi,
             fields: vec![
                 ProviderField::password("apiKey", "API Key").placeholder("sk-..."),
-                ProviderField::text("model", "Model").placeholder("gpt-4.1-mini"),
+                ProviderField::text("model", "Model")
+                    .placeholder("gpt-4.1-mini")
+                    .options(["gpt-4.1-mini", "gpt-4.1", "o4-mini"]),
             ],
             default_values: BTreeMap::from([("model".to_owned(), "gpt-4.1-mini".to_owned())]),
             accepts_images: true,
@@ -153,7 +195,9 @@ pub fn default_providers() -> Vec<ProviderPreset> {
             protocol: ProviderProtocol::Anthropic,
             fields: vec![
                 ProviderField::password("apiKey", "API Key").placeholder("sk-ant-..."),
-                ProviderField::text("model", "Model").placeholder("claude-sonnet-4-5"),
+                ProviderField::text("model", "Model")
+                    .placeholder("claude-sonnet-4-5")
+                    .options(["claude-sonnet-4-5", "claude-haiku-4-5"]),
             ],
             default_values: BTreeMap::from([(
                 "model".to_owned(),
@@ -170,7 +214,9 @@ pub fn default_providers() -> Vec<ProviderPreset> {
             protocol: ProviderProtocol::GoogleGemini,
             fields: vec![
                 ProviderField::password("apiKey", "API Key").placeholder("AIza..."),
-                ProviderField::text("model", "Model").placeholder("gemini-2.5-flash"),
+                ProviderField::text("model", "Model")
+                    .placeholder("gemini-2.5-flash")
+                    .options(["gemini-2.5-flash", "gemini-2.5-pro"]),
             ],
             default_values: BTreeMap::from([("model".to_owned(), "gemini-2.5-flash".to_owned())]),
             accepts_images: true,

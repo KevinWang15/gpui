@@ -120,6 +120,8 @@ pub struct ProviderField {
     pub placeholder: Option<SharedString>,
     /// Whether this field must be non-empty before connecting.
     pub required: bool,
+    /// Optional quick-pick suggestions rendered as clickable chips below the input.
+    pub options: Vec<SharedString>,
 }
 
 impl ProviderField {
@@ -131,6 +133,7 @@ impl ProviderField {
             kind: ProviderFieldKind::Text,
             placeholder: None,
             required: true,
+            options: Vec::new(),
         }
     }
 
@@ -142,6 +145,7 @@ impl ProviderField {
             kind: ProviderFieldKind::Password,
             placeholder: None,
             required: true,
+            options: Vec::new(),
         }
     }
 
@@ -153,6 +157,7 @@ impl ProviderField {
             kind: ProviderFieldKind::Url,
             placeholder: None,
             required: true,
+            options: Vec::new(),
         }
     }
 
@@ -165,6 +170,12 @@ impl ProviderField {
     /// Sets whether this field is required.
     pub fn required(mut self, required: bool) -> Self {
         self.required = required;
+        self
+    }
+
+    /// Attaches clickable quick-pick suggestion chips (e.g. recommended model IDs) beneath the input.
+    pub fn options(mut self, options: impl IntoIterator<Item = impl Into<SharedString>>) -> Self {
+        self.options = options.into_iter().map(Into::into).collect();
         self
     }
 }
