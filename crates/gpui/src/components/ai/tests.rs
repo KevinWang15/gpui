@@ -2130,3 +2130,331 @@ fn ask_ai_history_delete_click_and_clear_conversations(cx: &mut TestAppContext) 
 
     let _ = std::fs::remove_dir_all(&tmp_root);
 }
+
+#[test]
+fn markdown_nested_inline_parsing_and_compilation() {
+    use super::markdown::{
+        MdBlock, compute_inline_code_pill_vertical_bounds, compile_inline_text, parse_blocks,
+    };
+    use crate::{FontStyle, FontWeight, SharedString, hsla, px};
+
+    let fg = hsla(0., 0., 0.1, 1.);
+    let primary = hsla(0.65, 0.7, 0.5, 1.);
+    let muted = hsla(0., 0., 0.45, 1.);
+    let mono = SharedString::from("Consolas");
+
+    // 1. Nested inline code inside bold (no leaked backticks, bold + mono + pill!)
+    let compiled = compile_inline_text(
+        "**3. `warnings: []` does not mean visually clean.**",
+        FontWeight::NORMAL,
+        fg,
+        primary,
+        muted,
+        Some(&mono),
+        &None,
+    );
+    assert_eq!(compiled.text, "3. warnings: [] does not mean visually clean.");
+    assert_eq!(compiled.code_ranges.len(), 1);
+    assert_eq!(&compiled.text[compiled.code_ranges[0].clone()], "warnings: []");
+    assert_eq!(compiled.font_family_overrides.len(), 1);
+    assert_eq!(compiled.font_family_overrides[0].0, compiled.code_ranges[0]);
+    assert_eq!(compiled.font_family_overrides[0].1.as_ref(), "Consolas");
+    // Every range inside bold carries SEMIBOLD, including the nested inline code range.
+    assert!(compiled
+        .highlights
+        .iter()
+        .all(|(_, hl)| hl.font_weight == Some(FontWeight::SEMIBOLD)));
+
+    // 2. Snake_case & arithmetic asterisks must NOT spuriously italicize, while word-bounded
+    //    underscores, multi-backticks, balanced link URLs, escapes, and blocked images work.
+    let tricky = concat!(
+        "Call `pane_render_preview` with ``a `b` c`` for 3 * 4 * 5 = 60, ",
+        "snake_case_name, _italic_, \\*escaped\\*, ",
+        "[**`Docs` (v1)**](https://example.com/Rust_(lang)), ",
+        "[bad](javascript:alert(1)), and ![pic](https://evil.test/x.png)."
+    );
+    let c2 = compile_inline_text(
+        tricky,
+        FontWeight::NORMAL,
+        fg,
+        primary,
+        muted,
+        Some(&mono),
+        &None,
+    );
+    assert_eq!(
+        c2.text,
+        concat!(
+            "Call pane_render_preview with a `b` c for 3 * 4 * 5 = 60, ",
+            "snake_case_name, italic, *escaped*, ",
+            "Docs (v1), ",
+            "bad, and [Image not shown: pic]."
+        )
+    );
+    assert_eq!(c2.code_ranges.len(), 3);
+    assert_eq!(&c2.text[c2.code_ranges[0].clone()], "pane_render_preview");
+    assert_eq!(&c2.text[c2.code_ranges[1].clone()], "a `b` c");
+    assert_eq!(&c2.text[c2.code_ranges[2].clone()], "Docs");
+    assert_eq!(c2.link_ranges.len(), 1);
+    assert_eq!(&c2.text[c2.link_ranges[0].0.clone()], "Docs (v1)");
+    assert_eq!(c2.link_ranges[0].1, "https://example.com/Rust_(lang)");
+    // Verify strictly sorted, non-overlapping highlights on UTF-8 char boundaries.
+    let mut prev_end = 0usize;
+    for (r, _) in &c2.highlights {
+        assert!(r.start >= prev_end && r.start < r.end && r.end <= c2.text.len());
+        assert!(c2.text.is_char_boundary(r.start) && c2.text.is_char_boundary(r.end));
+        prev_end = r.end;
+    }
+    assert!(c2
+        .highlights
+        .iter()
+        .any(|(r, hl)| &c2.text[r.clone()] == "italic" && hl.font_style == Some(FontStyle::Italic)));
+
+    // 3. List continuation lines stay joined into their parent item.
+    let blocks = parse_blocks("- **Alignment:**\n  the clock sits on the optical baseline.\n- Next");
+    assert_eq!(blocks.len(), 1);
+    let MdBlock::List { ordered, items } = &blocks[0] else {
+        panic!("expected list block");
+    };
+    assert!(!ordered);
+    assert_eq!(items.len(), 2);
+    assert_eq!(
+        items[0].text,
+        "**Alignment:** the clock sits on the optical baseline."
+    );
+
+    // 4. Compact inline-code pill height strictly smaller than line_height with breathing room.
+    let (top, bottom) = compute_inline_code_pill_vertical_bounds(px(10.), px(21.), px(11.5), px(3.2));
+    let pill_h = bottom - top;
+    assert!(top > px(11.5), "top should leave inset below line top: {top:?}");
+    assert!(bottom < px(29.5), "bottom should leave inset above line bottom: {bottom:?}");
+    assert!(
+        pill_h >= px(15.) && pill_h <= px(18.),
+        "inline code pill height should be compact (~16-17.5px on 21px line): {pill_h:?}"
+    );
+}
+
+#[crate::test]
+fn markdown_multi_block_selection_copy_double_click_streaming_and_links(cx: &mut TestAppContext) {
+    use crate::SharedString;
+    cx.update(|cx| {
+        init_components(cx);
+        Theme::set_global(Theme::light().with_mono_font_family("Consolas"), cx);
+    });
+
+    let opened_links: Arc<std::sync::Mutex<Vec<String>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let opened_links_ref = opened_links.clone();
+
+    struct MdHost {
+        source: SharedString,
+        opened_links: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl crate::Render for MdHost {
+        fn render(
+            &mut self,
+            _window: &mut crate::Window,
+            _cx: &mut crate::Context<Self>,
+        ) -> impl crate::IntoElement {
+            let log = self.opened_links.clone();
+            crate::div()
+                .size_full()
+                .p(px(16.))
+                .child(
+                    markdown("test-selectable-md", self.source.clone()).on_open_link(
+                        move |href, _, _| {
+                            log.lock().unwrap().push(href.to_owned());
+                        },
+                    ),
+                )
+        }
+    }
+
+    let initial_md = concat!(
+        "### Visual Check for `pane_render_preview`\n\n",
+        "**What I actually received:** `pane_render_preview` returned a PNG with `dataSource: \"live\"`, see [Open Docs](https://example.com/docs).\n\n",
+        "- **Truncation:** no ellipsis — the `+7877%` pill fits.\n\n",
+        "```rust\n",
+        "let x = 1;\n",
+        "let y = 2;\n",
+        "```"
+    );
+
+    let host_window = cx.open_window(size(px(620.), px(520.)), |_, _| MdHost {
+        source: SharedString::from(initial_md),
+        opened_links: opened_links_ref,
+    });
+    cx.run_until_parked();
+
+    let copy_stroke = if cfg!(target_os = "macos") {
+        "cmd-c"
+    } else {
+        "ctrl-c"
+    };
+    let select_all_stroke = if cfg!(target_os = "macos") {
+        "cmd-a"
+    } else {
+        "ctrl-a"
+    };
+
+    {
+        let mut vcx = crate::VisualTestContext::from_window(host_window.into(), cx);
+
+        // 1. Click & drag from top-left of heading down to bottom-right of fenced code block.
+        vcx.simulate_event(crate::MouseDownEvent {
+            position: crate::point(px(18.), px(24.)),
+            button: crate::MouseButton::Left,
+            modifiers: crate::Modifiers::none(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        vcx.run_until_parked();
+        vcx.simulate_event(crate::MouseMoveEvent {
+            position: crate::point(px(560.), px(360.)),
+            pressed_button: Some(crate::MouseButton::Left),
+            modifiers: crate::Modifiers::none(),
+        });
+        vcx.run_until_parked();
+        vcx.simulate_event(crate::MouseUpEvent {
+            position: crate::point(px(560.), px(360.)),
+            button: crate::MouseButton::Left,
+            modifiers: crate::Modifiers::none(),
+            click_count: 1,
+        });
+        vcx.run_until_parked();
+
+        // Dragging across the link must NOT have opened it.
+        assert!(
+            opened_links.lock().unwrap().is_empty(),
+            "dragging across a Markdown link must select text, not open the link"
+        );
+
+        vcx.simulate_keystrokes(copy_stroke);
+        vcx.run_until_parked();
+        let copied = vcx
+            .read_from_clipboard()
+            .and_then(|c| c.text())
+            .expect("Ctrl/Cmd+C after drag-selecting Markdown must copy text");
+        assert!(
+            copied.contains("Visual Check for pane_render_preview"),
+            "copied text should contain heading with inline code (no fake spaces): {copied:?}"
+        );
+        assert!(
+            copied.contains("dataSource: \"live\", see Open Docs."),
+            "copied text should preserve exact punctuation around inline code: {copied:?}"
+        );
+        assert!(
+            copied.contains("Truncation: no ellipsis — the +7877% pill fits."),
+            "copied text should include bullet list text: {copied:?}"
+        );
+        assert!(
+            copied.contains("let x = 1;\nlet y = 2;"),
+            "copied text should include fenced code lines without line numbers: {copied:?}"
+        );
+        assert!(
+            !copied.contains("1let x") && !copied.contains("1 let x"),
+            "code block line numbers must never leak into copied text: {copied:?}"
+        );
+
+        // 2. Streaming update while selection is active preserves selection cleanly!
+        host_window
+            .update(&mut vcx, |host, _, cx| {
+                host.source =
+                    SharedString::from(format!("{initial_md}\n\nStreamed trailing paragraph."));
+                cx.notify();
+            })
+            .unwrap();
+        vcx.run_until_parked();
+        vcx.write_to_clipboard(crate::ClipboardItem::new_string("sentinel".into()));
+        vcx.simulate_keystrokes(copy_stroke);
+        vcx.run_until_parked();
+        let copied_after_stream = vcx
+            .read_from_clipboard()
+            .and_then(|c| c.text())
+            .unwrap_or_default();
+        assert_eq!(
+            copied_after_stream, copied,
+            "streaming additional Markdown must preserve an active selection"
+        );
+
+        // 3. Ctrl/Cmd+A selects everything including the newly streamed paragraph.
+        vcx.simulate_keystrokes(select_all_stroke);
+        vcx.run_until_parked();
+        vcx.simulate_keystrokes(copy_stroke);
+        vcx.run_until_parked();
+        let all_copied = vcx
+            .read_from_clipboard()
+            .and_then(|c| c.text())
+            .unwrap_or_default();
+        assert!(
+            all_copied.ends_with("Streamed trailing paragraph."),
+            "Ctrl/Cmd+A must select the entire Markdown document: {all_copied:?}"
+        );
+
+        // 4. Escape clears selection (and subsequent Ctrl+C does not overwrite clipboard).
+        vcx.simulate_keystrokes("escape");
+        vcx.run_until_parked();
+        vcx.write_to_clipboard(crate::ClipboardItem::new_string("keep-me".into()));
+        vcx.simulate_keystrokes(copy_stroke);
+        vcx.run_until_parked();
+        assert_eq!(
+            vcx.read_from_clipboard().and_then(|c| c.text()).as_deref(),
+            Some("keep-me")
+        );
+
+        // 5. Double-click selects a single word ("Visual").
+        let word_pt = crate::point(px(28.), px(26.));
+        vcx.simulate_event(crate::MouseDownEvent {
+            position: word_pt,
+            button: crate::MouseButton::Left,
+            modifiers: crate::Modifiers::none(),
+            click_count: 2,
+            first_mouse: false,
+        });
+        vcx.simulate_event(crate::MouseUpEvent {
+            position: word_pt,
+            button: crate::MouseButton::Left,
+            modifiers: crate::Modifiers::none(),
+            click_count: 2,
+        });
+        vcx.run_until_parked();
+        vcx.simulate_keystrokes(copy_stroke);
+        vcx.run_until_parked();
+        assert_eq!(
+            vcx.read_from_clipboard().and_then(|c| c.text()).as_deref(),
+            Some("Visual")
+        );
+
+        // 6. Plain click on the `[Open Docs]` link invokes `on_open_link`.
+        let mut clicked_link = false;
+        'scan: for y in (50..=110).step_by(6) {
+            for x in (20..=590).step_by(18) {
+                let pt = crate::point(px(x as f32), px(y as f32));
+                vcx.simulate_event(crate::MouseDownEvent {
+                    position: pt,
+                    button: crate::MouseButton::Left,
+                    modifiers: crate::Modifiers::none(),
+                    click_count: 1,
+                    first_mouse: false,
+                });
+                vcx.simulate_event(crate::MouseUpEvent {
+                    position: pt,
+                    button: crate::MouseButton::Left,
+                    modifiers: crate::Modifiers::none(),
+                    click_count: 1,
+                });
+                vcx.run_until_parked();
+                if !opened_links.lock().unwrap().is_empty() {
+                    clicked_link = true;
+                    break 'scan;
+                }
+            }
+        }
+        assert!(clicked_link, "clicking a Markdown link must invoke on_open_link");
+        assert_eq!(
+            opened_links.lock().unwrap().as_slice(),
+            &["https://example.com/docs".to_owned()]
+        );
+    }
+}

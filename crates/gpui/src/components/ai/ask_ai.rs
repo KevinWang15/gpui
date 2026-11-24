@@ -4174,7 +4174,7 @@ impl AskAiState {
                 AiMessagePart::Text { text } => {
                     content_col = content_col.child(
                         markdown(
-                            SharedString::from(format!("md-{m_idx}-{idx}")),
+                            SharedString::from(format!("md-{}-{idx}", msg.id)),
                             text.clone(),
                         )
                         .streaming(is_streaming)

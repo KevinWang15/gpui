@@ -1008,6 +1008,7 @@ pub fn init_components(cx: &mut App) {
     super::input::bind_input_keys(cx);
     super::textbox::bind_textbox_keys(cx);
     super::selectable_text::bind_selectable_text_keys(cx);
+    super::ai::markdown::bind_markdown_keys(cx);
 }
 
 /// Convenience wrapper for the standard non-invalid focus ring shadow.

@@ -478,24 +478,57 @@ impl StyledText {
     }
 
     fn apply_font_family_overrides(
-        runs: &mut [TextRun],
+        runs: &mut Vec<TextRun>,
         overrides: &[(Range<usize>, SharedString)],
     ) {
-        let mut byte_offset = 0;
-        let mut override_idx = 0;
-        for run in runs.iter_mut() {
+        if overrides.is_empty() {
+            return;
+        }
+        let mut out = Vec::with_capacity(runs.len() + overrides.len() * 2);
+        let mut byte_offset = 0usize;
+        let mut override_idx = 0usize;
+
+        for run in runs.drain(..) {
             let run_end = byte_offset + run.len;
             while override_idx < overrides.len() && overrides[override_idx].0.end <= byte_offset {
                 override_idx += 1;
             }
-            if override_idx < overrides.len() {
-                let (ref range, ref family) = overrides[override_idx];
-                if byte_offset >= range.start && run_end <= range.end {
-                    run.font.family = family.clone();
+
+            let mut cursor = byte_offset;
+            let mut idx = override_idx;
+            while idx < overrides.len() && overrides[idx].0.start < run_end {
+                let (ref range, ref family) = overrides[idx];
+                let overlap_start = range.start.max(cursor);
+                let overlap_end = range.end.min(run_end);
+                if overlap_start < overlap_end {
+                    if cursor < overlap_start {
+                        let mut prefix = run.clone();
+                        prefix.len = overlap_start - cursor;
+                        out.push(prefix);
+                    }
+                    let mut overridden = run.clone();
+                    overridden.len = overlap_end - overlap_start;
+                    overridden.font.family = family.clone();
+                    out.push(overridden);
+                    cursor = overlap_end;
+                }
+                if range.end <= run_end {
+                    idx += 1;
+                } else {
+                    break;
                 }
             }
+
+            if cursor < run_end {
+                let mut suffix = run;
+                suffix.len = run_end - cursor;
+                out.push(suffix);
+            }
+            override_idx = idx;
             byte_offset = run_end;
         }
+
+        *runs = out;
     }
 
     /// Set the text runs for this piece of text.
@@ -1416,5 +1449,64 @@ mod tests {
             make_text_unstable_id(false).id,
             make_text_unstable_id(true).id
         );
+    }
+
+    #[test]
+    fn apply_font_family_overrides_splits_partial_runs() {
+        use crate::FontWeight;
+        let base_style = TextStyle {
+            font_family: "Inter".into(),
+            ..TextStyle::default()
+        };
+        let text = "Hello `code` and **bold `mix`**!";
+        let mut runs = vec![base_style.to_run(text.len())];
+        let overrides = vec![
+            (6..12, SharedString::from("JetBrains Mono")),
+            (24..29, SharedString::from("JetBrains Mono")),
+        ];
+        StyledText::apply_font_family_overrides(&mut runs, &overrides);
+
+        let summary: Vec<(usize, &str)> = runs
+            .iter()
+            .map(|r| (r.len, r.font.family.as_ref()))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (6, "Inter"),
+                (6, "JetBrains Mono"),
+                (12, "Inter"),
+                (5, "JetBrains Mono"),
+                (3, "Inter"),
+            ]
+        );
+        assert_eq!(runs.iter().map(|r| r.len).sum::<usize>(), text.len());
+
+        // Also verify splitting across an existing highlight run preserves its weight.
+        let mut highlighted = StyledText::compute_runs(
+            "bold code end",
+            &base_style,
+            vec![(
+                0..9,
+                HighlightStyle {
+                    font_weight: Some(FontWeight::BOLD),
+                    ..Default::default()
+                },
+            )],
+        );
+        StyledText::apply_font_family_overrides(
+            &mut highlighted,
+            &[(5..9, SharedString::from("Consolas"))],
+        );
+        assert_eq!(highlighted.len(), 3);
+        assert_eq!(highlighted[0].len, 5);
+        assert_eq!(highlighted[0].font.family.as_ref(), "Inter");
+        assert_eq!(highlighted[0].font.weight, FontWeight::BOLD);
+        assert_eq!(highlighted[1].len, 4);
+        assert_eq!(highlighted[1].font.family.as_ref(), "Consolas");
+        assert_eq!(highlighted[1].font.weight, FontWeight::BOLD);
+        assert_eq!(highlighted[2].len, 4);
+        assert_eq!(highlighted[2].font.family.as_ref(), "Inter");
+        assert_eq!(highlighted[2].font.weight, FontWeight::NORMAL);
     }
 }

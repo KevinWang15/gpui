@@ -450,13 +450,13 @@ pub fn canvas_demo_simulated_provider(executor: BackgroundExecutor) -> ProviderP
 
 const SAMPLE_MARKDOWN: &str = r#"### Quarterly Component Summary
 
-Pure-GPUI **Markdown** with inline `code`, ~~strikethrough~~, [safe links](https://github.com/KevinWang15/gpui), and prompt-injection guards for external images: ![blocked remote image](https://example.com/pixel.png)
+Pure-GPUI **Markdown** with inline `code`, **bold `nested_code`**, ~~strikethrough~~, [safe links](https://github.com/KevinWang15/gpui), and prompt-injection guards for external images: ![blocked remote image](https://example.com/pixel.png). Drag across paragraphs, lists, and code blocks to select and copy (`Ctrl/Cmd+C` or right-click).
 
 > Generative `component:<name>` fences render directly as native GPUI widgets alongside standard GFM tables, lists, and code blocks.
 
-- [x] `rig-core` providers (OpenAI Responses API, Anthropic, Google Gemini, OpenAI-compatible)
-- [x] Official `rmcp` + `rig-rmcp` MCP client over Streamable HTTP and local Stdio
-- [x] `rig-agent` multi-step agent loop with foreground `AppTool` live UI bridge
+- [x] **Streaming & wrapping:** `rig-core` providers (`OpenAI`, `Anthropic`, `Gemini`, OpenAI-compatible) wrap seamlessly across mixed bold, inline code, and punctuation.
+- [x] **MCP client:** official `rmcp` + `rig-rmcp` over Streamable HTTP and local Stdio.
+- [x] **Live editor bridge:** `rig-agent` multi-step loop with foreground `AppTool` bindings.
 
 ```component:stat-card
 {"label": "Built-in Components", "value": "7 widgets", "delta": "Zero JS runtime", "trend": "up"}
@@ -652,7 +652,7 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
                                 .child(badge("Markdown").color(BadgeColor::Gray)),
                         )
                         .child(card_description(
-                            "Native GPUI Markdown renderer with code copy, GFM tables, task lists, safe link validation, blocked remote images, and extensible component:<name> renderers.",
+                            "Native GPUI Markdown renderer with single-flow text wrapping, compact inline-code pills, multi-block selection & copy (Ctrl/Cmd+C & context menu), GFM tables, task lists, safe links, and extensible component:<name> renderers.",
                         )),
                 )
                 .child(
