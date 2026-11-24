@@ -6,7 +6,7 @@
 //! frameless window chrome (`WindowTitleBar`, `StatusBar`, `KeyHint`), and compact utility widgets.
 
 use gpui::components::*;
-use gpui::icons::LucideIcon;
+use gpui::icons::{IconSize, LucideIcon};
 use gpui::{
     App, Context, FileFilter, FontWeight, OpenPromptOptions, SavePromptOptions, SharedString,
     TrayMenuItem, div, prelude::*, px, rgb,
@@ -1006,6 +1006,203 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
                 ),
         );
 
+    let activity_card = card()
+        .child(
+            card_header().bordered().child(
+                h_stack()
+                    .justify_between()
+                    .flex_wrap()
+                    .spacing(px(8.))
+                    .child(
+                        v_stack()
+                            .spacing(px(2.))
+                            .child(card_title("ActivityBadge — GPU-Animated Status Icons"))
+                            .child(card_description(
+                                "Compact zero-relayout GPU status icons (spin, top-pivoted bell ring, idle, alert, unknown, ready, disconnected) for tabs, pane headers, and session lists.",
+                            )),
+                    )
+                    .child(
+                        h_stack()
+                            .spacing(px(8.))
+                            .child(
+                                h_stack().spacing(px(4.)).children(
+                                    [
+                                        (IconSize::Sm, "14px"),
+                                        (IconSize::Md, "16px"),
+                                        (IconSize::Lg, "20px"),
+                                    ]
+                                    .into_iter()
+                                    .enumerate()
+                                    .map(|(i, (sz, title))| {
+                                        button(("ab-sz", i))
+                                            .size(ComponentSize::Xs)
+                                            .outline()
+                                            .selected(app.activity_badge_size == sz)
+                                            .label(title)
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.activity_badge_size = sz;
+                                                cx.notify();
+                                            }))
+                                    }),
+                                ),
+                            )
+                            .child(
+                                toggle("ab-anim-toggle", app.activity_badge_animated)
+                                    .size(ComponentSize::Sm)
+                                    .label("Animated")
+                                    .on_change(cx.listener(|this, v: &bool, _, cx| {
+                                        this.activity_badge_animated = *v;
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            ),
+        )
+        .child(
+            card_content().child(
+                v_stack()
+                    .spacing(px(14.))
+                    .child(
+                        h_stack().flex_wrap().spacing(px(10.)).children(
+                            ActivityState::ALL.iter().enumerate().map(|(i, &st)| {
+                                let selected = app.activity_badge_selected == st;
+                                div()
+                                    .id(("ab-state", i))
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(8.))
+                                    .px(px(10.))
+                                    .py(px(6.))
+                                    .rounded(theme.radius_md)
+                                    .bg(if selected {
+                                        theme.primary_soft.opacity(0.65)
+                                    } else {
+                                        theme.surface_muted
+                                    })
+                                    .border_1()
+                                    .border_color(if selected {
+                                        theme.primary
+                                    } else {
+                                        theme.border
+                                    })
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.activity_badge_selected = st;
+                                        this.log_event(
+                                            "ActivityBadge",
+                                            format!("state -> {:?}", st),
+                                            cx,
+                                        );
+                                    }))
+                                    .child(
+                                        activity_badge(st)
+                                            .size(app.activity_badge_size)
+                                            .animated(app.activity_badge_animated),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(12.5))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(theme.foreground)
+                                            .child(st.default_label()),
+                                    )
+                            }),
+                        ),
+                    )
+                    .child(
+                        h_stack().flex_wrap().spacing(px(8.)).children(
+                            ActivityState::ALL.iter().map(|&st| {
+                                activity_badge(st)
+                                    .size(IconSize::Sm)
+                                    .animated(app.activity_badge_animated)
+                                    .with_default_label()
+                                    .pill(true)
+                            }),
+                        ),
+                    )
+                    .child(divider())
+                    .child(
+                        v_stack()
+                            .spacing(px(6.))
+                            .child(label("Tab Strip Preview (leading animated status badges)"))
+                            .child(
+                                h_stack()
+                                    .flex_wrap()
+                                    .spacing(px(4.))
+                                    .p(px(6.))
+                                    .rounded(theme.radius_lg)
+                                    .bg(theme.surface_muted)
+                                    .border_1()
+                                    .border_color(theme.border)
+                                    .children(
+                                        [
+                                            ("Working", ActivityState::Working),
+                                            ("Attention", ActivityState::Attention),
+                                            ("Ready", ActivityState::Ready),
+                                            ("Connecting", ActivityState::Pending),
+                                            ("Idle", ActivityState::Idle),
+                                            ("Error", ActivityState::Error),
+                                            ("Unknown", ActivityState::Unknown),
+                                            ("Disconnected", ActivityState::Disconnected),
+                                        ]
+                                        .into_iter()
+                                        .enumerate()
+                                        .map(|(i, (name, st))| {
+                                            let active = app.activity_badge_selected == st;
+                                            div()
+                                                .id(("ab-tab-demo", i))
+                                                .flex()
+                                                .flex_row()
+                                                .items_center()
+                                                .gap(px(6.))
+                                                .px(px(10.))
+                                                .py(px(6.))
+                                                .rounded(theme.radius_md)
+                                                .bg(if active {
+                                                    theme.surface
+                                                } else {
+                                                    gpui::transparent_black()
+                                                })
+                                                .border_1()
+                                                .border_color(if active {
+                                                    theme.border
+                                                } else {
+                                                    gpui::transparent_black()
+                                                })
+                                                .cursor_pointer()
+                                                .hover(|s| s.bg(theme.surface_hover))
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.activity_badge_selected = st;
+                                                    cx.notify();
+                                                }))
+                                                .child(
+                                                    activity_badge(st)
+                                                        .size(app.activity_badge_size)
+                                                        .animated(app.activity_badge_animated),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_size(px(12.5))
+                                                        .font_weight(if active {
+                                                            FontWeight::MEDIUM
+                                                        } else {
+                                                            FontWeight::NORMAL
+                                                        })
+                                                        .text_color(if active {
+                                                            theme.foreground
+                                                        } else {
+                                                            theme.muted_foreground
+                                                        })
+                                                        .child(name),
+                                                )
+                                        }),
+                                    ),
+                            ),
+                    ),
+            ),
+        );
+
     v_stack()
         .w_full()
         .spacing(px(18.))
@@ -1045,6 +1242,7 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
         )
         .child(system_card)
         .child(chrome_glass_card)
+        .child(activity_card)
         .child(controls_grid)
 }
 

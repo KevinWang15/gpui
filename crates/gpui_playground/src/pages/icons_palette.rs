@@ -56,26 +56,36 @@ pub fn render_icons(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> imp
         if (app.icon_stroke - 2.0).abs() > 0.01 {
             s.push_str(&format!("\n    .stroke_width({:.1})", app.icon_stroke));
         }
-        if app.icon_spin {
-            s.push_str("\n    .spin()");
+        match app.icon_anim_mode {
+            "spin" => s.push_str("\n    .spin()"),
+            "ring" => s.push_str("\n    .ring()"),
+            "pulse" => s.push_str("\n    .pulse()"),
+            _ => {}
         }
         s
+    };
+
+    let apply_anim = |icon: Icon, mode: &str| match mode {
+        "spin" => icon.spin(),
+        "ring" => icon.ring(),
+        "pulse" => icon.pulse(),
+        _ => icon,
     };
 
     let mut icon_grid = grid(6).spacing(px(10.));
     for icon in page_icons {
         let is_selected = icon == selected;
-        let mut glyph = Icon::new(icon)
-            .size(app.icon_size)
-            .stroke_width(app.icon_stroke)
-            .color(if is_selected {
-                theme.primary
-            } else {
-                theme.foreground
-            });
-        if app.icon_spin {
-            glyph = glyph.spin();
-        }
+        let glyph = apply_anim(
+            Icon::new(icon)
+                .size(app.icon_size)
+                .stroke_width(app.icon_stroke)
+                .color(if is_selected {
+                    theme.primary
+                } else {
+                    theme.foreground
+                }),
+            app.icon_anim_mode,
+        );
 
         icon_grid = icon_grid.child(
             div()
@@ -163,16 +173,13 @@ pub fn render_icons(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> imp
                             .bg(theme.primary_soft)
                             .border_1()
                             .border_color(theme.primary.opacity(0.3))
-                            .child({
-                                let mut preview = Icon::new(selected)
+                            .child(apply_anim(
+                                Icon::new(selected)
                                     .size(IconSize::TwoXl)
                                     .stroke_width(app.icon_stroke)
-                                    .color(theme.primary);
-                                if app.icon_spin {
-                                    preview = preview.spin();
-                                }
-                                preview
-                            }),
+                                    .color(theme.primary),
+                                app.icon_anim_mode,
+                            )),
                     )
                     .child(
                         v_stack()
@@ -262,13 +269,27 @@ pub fn render_icons(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> imp
                                 ),
                             )
                             .child(
-                                toggle("ic-spin", app.icon_spin)
-                                    .size(ComponentSize::Sm)
-                                    .label("Spin")
-                                    .on_change(cx.listener(|this, v, _, cx| {
-                                        this.icon_spin = *v;
-                                        cx.notify();
-                                    })),
+                                h_stack().spacing(px(4.)).children(
+                                    [
+                                        ("none", "Static"),
+                                        ("spin", "Spin"),
+                                        ("ring", "Ring"),
+                                        ("pulse", "Pulse"),
+                                    ]
+                                    .into_iter()
+                                    .enumerate()
+                                    .map(|(i, (mode, title))| {
+                                        button(("ianim", i))
+                                            .size(ComponentSize::Xs)
+                                            .outline()
+                                            .selected(app.icon_anim_mode == mode)
+                                            .label(title)
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.icon_anim_mode = mode;
+                                                cx.notify();
+                                            }))
+                                    }),
+                                ),
                             ),
                     )
                     .child(

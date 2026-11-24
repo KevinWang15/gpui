@@ -70,7 +70,7 @@ impl Page {
                 "ai ask build byok llm openai anthropic gemini ollama mcp tool agent loop markdown answer components chat assistant"
             }
             Self::NativeDesktop => {
-                "native windows desktop app builder spotlight alfred launcher floating frosted glass pane tray global hotkey shortcut recorder autostart launch login detached tooltip titlebar statusbar keyhint confirm button compact stepper status indicator trend badge string list swatch popover toolbar simulated backdrop"
+                "native windows desktop app builder spotlight alfred launcher floating frosted glass pane tray global hotkey shortcut recorder autostart launch login detached tooltip titlebar statusbar keyhint confirm button compact stepper status indicator activity badge bell ring spin idle unknown trend badge string list swatch popover toolbar simulated backdrop"
             }
             Self::InteractiveBlur => {
                 "blur container loading overlay spinner dots bars pulse progress ring command palette drawer sheet context menu right click split pane resizable number input stepper wizard rating stars copy clipboard pin otp"
@@ -96,7 +96,7 @@ impl Page {
                 "select listbox dropdown combobox autocomplete tags multiselect cascading dynamic leading swatch"
             }
             Self::LayoutNavigation => {
-                "layout container grid stack scroll area scrollarea overflow scrollbar card divider tabs accordion disclosure breadcrumb pagination drag drop freeform canvas snap align resize palette studio"
+                "layout container grid stack scroll area scrollarea overflow scrollbar card divider tabs activity badge status accordion disclosure breadcrumb pagination drag drop freeform canvas snap align resize palette studio"
             }
             Self::OverlaysData => {
                 "dialog modal native os window popup popover dropdown menu toast notification tooltip table sort badge avatar alert progress spinner skeleton empty"
@@ -243,6 +243,7 @@ pub struct PlaygroundApp {
     pub tabs_underline_idx: usize,
     pub tabs_pills_idx: usize,
     pub tabs_seg_idx: usize,
+    pub tabs_activity_idx: usize,
     pub accordion_open: [bool; 3],
     pub active_crumb: SharedString,
     pub current_page: usize,
@@ -286,7 +287,7 @@ pub struct PlaygroundApp {
     pub icon_category: &'static str,
     pub icon_size: IconSize,
     pub icon_stroke: f32,
-    pub icon_spin: bool,
+    pub icon_anim_mode: &'static str,
     pub icon_page: usize,
     pub selected_icon: LucideIcon,
 
@@ -337,6 +338,9 @@ pub struct PlaygroundApp {
     pub native_backdrop_kind: SimulatedBackdropKind,
     pub native_toolbar_tool: SharedString,
     pub native_status_pulsing: bool,
+    pub activity_badge_animated: bool,
+    pub activity_badge_size: IconSize,
+    pub activity_badge_selected: ActivityState,
 
     // Interactive & Blur showcase state
     pub command_palette: Entity<CommandPaletteState>,
@@ -3438,6 +3442,7 @@ impl PlaygroundApp {
             tabs_underline_idx: 0,
             tabs_pills_idx: 0,
             tabs_seg_idx: 0,
+            tabs_activity_idx: 0,
             accordion_open: [true, false, false],
             active_crumb: SharedString::new_static("Layout & Nav"),
             current_page: 3,
@@ -3479,7 +3484,7 @@ impl PlaygroundApp {
             icon_category: "all",
             icon_size: IconSize::Xl,
             icon_stroke: 2.0,
-            icon_spin: false,
+            icon_anim_mode: "none",
             icon_page: 1,
             selected_icon: LucideIcon::Sparkles,
 
@@ -3528,6 +3533,9 @@ impl PlaygroundApp {
             native_backdrop_kind: SimulatedBackdropKind::Wallpaper,
             native_toolbar_tool: "heading".into(),
             native_status_pulsing: true,
+            activity_badge_animated: true,
+            activity_badge_size: IconSize::Md,
+            activity_badge_selected: ActivityState::Attention,
 
             command_palette,
             demo_floating_window,

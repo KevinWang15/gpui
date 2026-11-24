@@ -1227,6 +1227,45 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
                                         cx.notify();
                                     })),
                                 ),
+                        )
+                        .child(divider())
+                        .child(
+                            v_stack()
+                                .spacing(px(8.))
+                                .child(label("Tabs with Animated Activity Badges"))
+                                .child(
+                                    tabs(
+                                        "pg-tabs-activity",
+                                        vec![
+                                            TabItem::new("Working")
+                                                .activity(ActivityState::Working),
+                                            TabItem::new("Attention")
+                                                .activity(ActivityState::Attention),
+                                            TabItem::new("Ready")
+                                                .activity(ActivityState::Ready),
+                                            TabItem::new("Connecting")
+                                                .activity(ActivityState::Pending),
+                                            TabItem::new("Idle")
+                                                .activity(ActivityState::Idle),
+                                            TabItem::new("Error")
+                                                .activity(ActivityState::Error),
+                                            TabItem::new("Unknown")
+                                                .activity(ActivityState::Unknown),
+                                            TabItem::new("Disconnected")
+                                                .activity(ActivityState::Disconnected),
+                                        ],
+                                    )
+                                    .pills()
+                                    .selected_index(app.tabs_activity_idx)
+                                    .on_change(cx.listener(|this, idx, _, cx| {
+                                        this.tabs_activity_idx = *idx;
+                                        this.log_event(
+                                            "Tabs(Activity)",
+                                            format!("tab -> {idx}"),
+                                            cx,
+                                        );
+                                    })),
+                                ),
                         ),
                 ),
         )

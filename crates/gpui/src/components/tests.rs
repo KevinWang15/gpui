@@ -4405,3 +4405,51 @@ fn scroll_area_fill_viewport_and_flex_height_charts_adapt_without_unnecessary_sc
         outer_scroll.max_offset()
     );
 }
+
+#[gpui::test]
+fn activity_badge_states_and_tabs_status_render(cx: &mut TestAppContext) {
+    cx.update(init_components);
+    struct ActivityDemo;
+    impl Render for ActivityDemo {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let mut row = crate::div().flex().flex_row().gap(px(8.));
+            for &state in ActivityState::ALL {
+                row = row
+                    .child(activity_badge(state))
+                    .child(activity_badge(state).size(IconSize::Sm).with_default_label().pill(true));
+            }
+            v_stack()
+                .spacing(px(12.))
+                .child(row)
+                .child(activity_badge(ActivityState::Attention).animated(false))
+                .child(
+                    tabs(
+                        "activity-tabs",
+                        vec![
+                            TabItem::new("Build").activity(ActivityState::Working),
+                            TabItem::new("Review").activity(ActivityState::Attention),
+                            TabItem::new("Server").activity(ActivityState::Error),
+                            TabItem::new("Standby").activity(ActivityState::Idle),
+                            TabItem::new("Probe").activity(ActivityState::Unknown),
+                        ],
+                    )
+                    .selected_index(0),
+                )
+        }
+    }
+
+    assert_eq!(ActivityState::ALL.len(), 8);
+    assert!(ActivityState::Working.default_animation().is_some());
+    assert!(ActivityState::Pending.default_animation().is_some());
+    assert!(ActivityState::Attention.default_animation().is_some());
+    assert!(ActivityState::Idle.default_animation().is_none());
+    assert!(ActivityState::Error.default_animation().is_none());
+    assert!(ActivityState::Unknown.default_animation().is_none());
+
+    let (_view, cx) = cx.add_window_view(|_, _| ActivityDemo);
+    cx.run_until_parked();
+    // Animated SVG sprites (spin + bell ring) should register zero-relayout scene animations.
+    cx.update(|window, _| {
+        assert!(window.rendered_frame.scene.animation_frame_interval().is_some());
+    });
+}

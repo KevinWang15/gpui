@@ -520,6 +520,33 @@ mod easing {
         beat(0.2, 0.06, 1.0) + beat(0.4, 0.05, 0.58)
     }
 
+    /// A damped bell-ring oscillation: swings `+1.0 -> -1.0 -> +0.75 -> -0.75 -> +0.375 -> -0.375 -> 0.0`
+    /// over the first 28% of the cycle with smooth ease-in-out between peaks, then rests at `0.0`.
+    pub fn bell_ring(delta: f32) -> f32 {
+        const KEYS: &[(f32, f32)] = &[
+            (0.00, 0.0),
+            (0.04, 1.0),
+            (0.08, -1.0),
+            (0.12, 0.75),
+            (0.16, -0.75),
+            (0.20, 0.375),
+            (0.24, -0.375),
+            (0.28, 0.0),
+        ];
+        if delta <= 0.0 || delta >= 0.28 {
+            return 0.0;
+        }
+        for pair in KEYS.windows(2) {
+            let (t0, v0) = pair[0];
+            let (t1, v1) = pair[1];
+            if delta <= t1 {
+                let local = ((delta - t0) / (t1 - t0)).clamp(0.0, 1.0);
+                return v0 + (v1 - v0) * ease_in_out(local);
+            }
+        }
+        0.0
+    }
+
     /// Apply the given easing function, first in the forward direction and then in the reverse direction
     pub fn bounce(easing: impl Fn(f32) -> f32) -> impl Fn(f32) -> f32 {
         move |delta| {

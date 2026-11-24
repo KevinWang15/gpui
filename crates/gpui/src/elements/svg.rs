@@ -10,8 +10,8 @@ use std::{
 use crate::{
     App, Asset, Bounds, Element, GlobalElementId, Hitbox, InspectorElementId, InteractiveElement,
     Interactivity, LayoutId, Pixels, Point, Radians, SharedString, Size, SpriteAnimation,
-    StyleRefinement, Styled, TransformationMatrix, Window, ease_in_out, ease_out_quint, heartbeat,
-    linear, point, px, quadratic, radians, size,
+    StyleRefinement, Styled, TransformationMatrix, Window, bell_ring, ease_in_out, ease_out_quint,
+    heartbeat, linear, point, px, quadratic, radians, size,
 };
 use gpui_util::ResultExt;
 
@@ -176,17 +176,20 @@ impl Element for Svg {
             window,
             cx,
             |style, window, cx| {
-                let center = bounds.center();
+                let pivot = self
+                    .transformation
+                    .map(|timed| timed.pivot(bounds))
+                    .unwrap_or_else(|| bounds.center());
                 let scale_factor = window.scale_factor();
                 let animation = self
                     .transformation
                     .filter(|timed| timed.is_animated() && !cx.reduce_motion())
-                    .map(|timed| SpriteAnimation::new(timed, center, scale_factor));
+                    .map(|timed| SpriteAnimation::new(timed, pivot, scale_factor));
                 // Without an animation, such as with reduced motion, the SVG is
                 // drawn at its starting transformation.
                 let pose = self.transformation.map(|timed| timed.from);
                 let transformation = pose
-                    .map(|pose| pose.into_matrix(center, scale_factor))
+                    .map(|pose| pose.into_matrix(pivot, scale_factor))
                     .unwrap_or_default();
                 // The scene applies an animated sprite's alpha before each present,
                 // on top of the color it is inserted with.
@@ -373,6 +376,10 @@ pub enum Easing {
     /// Unlike the other easings it ends where it started, so the value
     /// reaches `to` at the first beat and is back at `from` by the end.
     Heartbeat,
+    /// A damped bell/attention oscillation swinging symmetrically between `+1.0`
+    /// and `-1.0` with decreasing amplitude over the first 28% of the period,
+    /// then resting at `0.0` (`from`).
+    BellRing,
 }
 
 impl Easing {
@@ -383,6 +390,7 @@ impl Easing {
             Easing::EaseInOut => ease_in_out(delta),
             Easing::EaseOutQuint => ease_out_quint()(delta),
             Easing::Heartbeat => heartbeat(delta),
+            Easing::BellRing => bell_ring(delta),
         }
     }
 }
@@ -397,6 +405,7 @@ pub struct TimedTransformation {
     period: Duration,
     from: Transformation,
     to: Transformation,
+    origin: Point<f32>,
     scale_easing: Easing,
     translation_easing: Easing,
     rotation_easing: Easing,
@@ -413,6 +422,7 @@ impl TimedTransformation {
             period,
             from: Transformation::default(),
             to: Transformation::default(),
+            origin: point(0.5, 0.5),
             scale_easing: Easing::Linear,
             translation_easing: Easing::Linear,
             rotation_easing: Easing::Linear,
@@ -428,6 +438,43 @@ impl TimedTransformation {
         Self::new(period)
             .from(from)
             .to(from.with_rotation(radians(from.rotate.0 + TAU)))
+    }
+
+    /// Create a timed transformation that swings `from` like a ringing bell
+    /// around the top-center pivot `(0.5, 0.2)`, oscillating up to `±amplitude`
+    /// radians and then resting before repeating.
+    pub fn bell_ring(period: Duration, amplitude: Radians, from: Transformation) -> Self {
+        Self::new(period)
+            .from(from)
+            .to(from.with_rotation(radians(from.rotate.0 + amplitude.0)))
+            .with_rotation_easing(Easing::BellRing)
+            .with_origin(point(0.5, 0.2))
+    }
+
+    /// Create a timed transformation that gently pulses `from` in scale and
+    /// opacity using [`Easing::Heartbeat`], returning to `from` between beats.
+    pub fn pulse(period: Duration, scale: f32, min_alpha: f32, from: Transformation) -> Self {
+        Self::new(period)
+            .from(from)
+            .to(from
+                .with_scaling(size(from.scale.width * scale, from.scale.height * scale))
+                .with_alpha(from.alpha * min_alpha))
+            .with_scale_easing(Easing::Heartbeat)
+            .with_alpha_easing(Easing::Heartbeat)
+    }
+
+    /// Set the normalized transform pivot point within the SVG's bounds
+    /// (default `point(0.5, 0.5)` for center; e.g. `point(0.5, 0.2)` for top-pivoted bell swing).
+    pub fn with_origin(mut self, origin: Point<f32>) -> Self {
+        self.origin = origin;
+        self
+    }
+
+    pub(crate) fn pivot(&self, bounds: Bounds<Pixels>) -> Point<Pixels> {
+        point(
+            bounds.origin.x + bounds.size.width * self.origin.x,
+            bounds.origin.y + bounds.size.height * self.origin.y,
+        )
     }
 
     fn is_animated(&self) -> bool {
@@ -719,6 +766,50 @@ mod tests {
         let second_beat = pose_after(Duration::from_millis(200)).rotation_scale[0][0];
         assert!(second_beat > 1.05 && second_beat < 1.09);
         assert!((pose_after(Duration::from_millis(599)).rotation_scale[0][0] - 1.).abs() < 1e-3);
+    }
+
+    #[crate::test]
+    fn test_bell_ring_swings_around_top_origin_and_rests_without_rerendering(
+        cx: &mut TestAppContext,
+    ) {
+        let amplitude = crate::radians(16.0_f32.to_radians());
+        let (mut pose_after, renders) = animate(
+            TimedTransformation::bell_ring(
+                Duration::from_millis(2400),
+                amplitude,
+                Transformation::default(),
+            ),
+            cx,
+        );
+        let renders_before_frames = renders.get();
+
+        // At 0% the bell is upright.
+        let rest_start = pose_after(Duration::ZERO);
+        assert!((rest_start.rotation_scale[0][0] - 1.0).abs() < 1e-5);
+        assert!(rest_start.rotation_scale[1][0].abs() < 1e-5);
+
+        // At 4% (96ms) the bell reaches +16 deg and its center shifts horizontally
+        // because it pivots at (50%, 20%) rather than (50%, 50%).
+        let peak_pos = pose_after(Duration::from_millis(96));
+        let (sin_p, cos_p) = amplitude.0.sin_cos();
+        assert!((peak_pos.rotation_scale[0][0] - cos_p).abs() < 1e-3);
+        assert!((peak_pos.rotation_scale[1][0] - sin_p).abs() < 1e-3);
+        assert!(
+            peak_pos.center_offset[0].abs() > 0.5,
+            "expected top-pivoted rotation to shift center horizontally, got {:?}",
+            peak_pos.center_offset
+        );
+
+        // At 8% (+96ms = 192ms) it swings symmetrically to -16 deg.
+        let peak_neg = pose_after(Duration::from_millis(96));
+        assert!((peak_neg.rotation_scale[0][0] - cos_p).abs() < 1e-3);
+        assert!((peak_neg.rotation_scale[1][0] + sin_p).abs() < 1e-3);
+
+        // At 50% (+1008ms = 1200ms) it rests calmly upright at 0 deg.
+        let resting = pose_after(Duration::from_millis(1008));
+        assert!((resting.rotation_scale[0][0] - 1.0).abs() < 1e-5);
+        assert!(resting.rotation_scale[1][0].abs() < 1e-5);
+        assert_eq!(renders.get(), renders_before_frames);
     }
 
     #[crate::test]

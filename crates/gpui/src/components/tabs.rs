@@ -10,6 +10,7 @@ use crate::{
 };
 use crate::icons::{Icon, IconSize, LucideIcon};
 
+use super::activity_badge::{ActivityBadge, ActivityState};
 use super::theme::{ActiveTheme, SPRING_SMOOTH};
 
 /// Visual presentation style for [`Tabs`].
@@ -29,6 +30,8 @@ pub enum TabsVariant {
 pub struct TabItem {
     /// Tab title text.
     pub label: SharedString,
+    /// Optional leading animated [`ActivityState`] status badge.
+    pub activity: Option<ActivityState>,
     /// Optional leading [`LucideIcon`].
     pub icon: Option<LucideIcon>,
     /// Optional trailing count pill badge.
@@ -42,10 +45,17 @@ impl TabItem {
     pub fn new(label: impl Into<SharedString>) -> Self {
         Self {
             label: label.into(),
+            activity: None,
             icon: None,
             badge: None,
             disabled: false,
         }
+    }
+
+    /// Adds a leading animated [`ActivityBadge`] to the left of the tab title.
+    pub fn activity(mut self, state: ActivityState) -> Self {
+        self.activity = Some(state);
+        self
     }
 
     /// Adds a leading icon.
@@ -296,6 +306,9 @@ impl RenderOnce for Tabs {
                 }
             }
 
+            if let Some(activity) = item.activity {
+                tab = tab.child(ActivityBadge::new(activity).size(IconSize::Sm));
+            }
             if let Some(icon) = item.icon {
                 tab = tab.child(Icon::new(icon).size(IconSize::Sm).color(fg));
             }

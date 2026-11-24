@@ -9,6 +9,7 @@
 //! [`TextBox`], [`Select`], and [`ComboBox`].
 
 pub mod accordion;
+pub mod activity_badge;
 pub mod ai;
 pub mod alert;
 pub mod app_controls;
@@ -89,6 +90,7 @@ pub mod typography;
 pub mod window_chrome;
 
 pub use accordion::{Accordion, Disclosure, accordion, disclosure};
+pub use activity_badge::{ActivityBadge, ActivityState, activity_badge};
 pub use ai::{
     AgentEvent, AgentLimits, AgentRunConfig, AiActivity, AiAssistantMode, AiConnection,
     AiConnectionRegistry, AiContextProvider, AiImageRef, AiImageStore, AiMessage, AiMessagePart,

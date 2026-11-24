@@ -13,7 +13,7 @@ use std::{borrow::Cow, sync::Arc, time::Duration};
 
 use crate::{
     App, AssetSource, Hsla, IntoElement, Pixels, Radians, RenderOnce, Result, SharedString,
-    StyleRefinement, Styled, TimedTransformation, Transformation, Window, px, svg,
+    StyleRefinement, Styled, TimedTransformation, Transformation, Window, px, radians, svg,
 };
 
 /// Standard icon sizes.
@@ -57,6 +57,42 @@ impl From<Pixels> for IconSize {
     }
 }
 
+/// Continuous zero-relayout GPU animation applied to an [`Icon`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum IconAnimation {
+    /// Continuous clockwise 360° spin (e.g. loading or working indicators).
+    Spin(Duration),
+    /// Top-pivoted damped bell/attention oscillation (`±amplitude` radians, then calm rest).
+    Ring {
+        /// Total cycle duration including the rest interval.
+        period: Duration,
+        /// Peak swing angle in radians.
+        amplitude: Radians,
+    },
+    /// Subtle rhythmic heartbeat scale and opacity pulse.
+    Pulse(Duration),
+}
+
+impl IconAnimation {
+    /// Default clockwise spin animation (`900ms` per revolution).
+    pub const fn spin() -> Self {
+        Self::Spin(Duration::from_millis(900))
+    }
+
+    /// Default top-pivoted bell-ring animation (`2400ms` cycle, `±16°` peak swing).
+    pub fn ring() -> Self {
+        Self::Ring {
+            period: Duration::from_millis(2400),
+            amplitude: radians(16.0_f32.to_radians()),
+        }
+    }
+
+    /// Default subtle breathing/heartbeat pulse animation (`1600ms` cycle).
+    pub const fn pulse() -> Self {
+        Self::Pulse(Duration::from_millis(1600))
+    }
+}
+
 /// A styled GPUI element that renders any [`LucideIcon`].
 ///
 /// By default the icon inherits the current text color (`window.text_style().color`),
@@ -68,7 +104,7 @@ pub struct Icon {
     color: Option<Hsla>,
     stroke_width: Option<f32>,
     rotation: Option<Radians>,
-    spin: Option<Duration>,
+    animation: Option<IconAnimation>,
     style: StyleRefinement,
 }
 
@@ -93,7 +129,7 @@ impl Icon {
             color: None,
             stroke_width: None,
             rotation: None,
-            spin: None,
+            animation: None,
             style: StyleRefinement::default(),
         }
     }
@@ -127,15 +163,48 @@ impl Icon {
         self
     }
 
-    /// Continuously spins the icon clockwise (1 revolution per second, `animate-spin`).
+    /// Applies a continuous GPU [`IconAnimation`] (automatically respects [`App::reduce_motion`]).
+    pub fn animation(mut self, animation: IconAnimation) -> Self {
+        self.animation = Some(animation);
+        self
+    }
+
+    /// Continuously spins the icon clockwise (`900ms` per revolution, `animate-spin`).
     pub fn spin(mut self) -> Self {
-        self.spin = Some(Duration::from_millis(900));
+        self.animation = Some(IconAnimation::spin());
         self
     }
 
     /// Continuously spins the icon clockwise with a custom revolution period.
     pub fn spin_duration(mut self, period: Duration) -> Self {
-        self.spin = Some(period);
+        self.animation = Some(IconAnimation::Spin(period));
+        self
+    }
+
+    /// Periodically swings the icon like a ringing bell around its top-center pivot (`2.4s` cycle, `±16°`).
+    pub fn ring(mut self) -> Self {
+        self.animation = Some(IconAnimation::ring());
+        self
+    }
+
+    /// Periodically swings the icon like a ringing bell with a custom cycle period.
+    pub fn ring_duration(mut self, period: Duration) -> Self {
+        self.animation = Some(IconAnimation::Ring {
+            period,
+            amplitude: radians(16.0_f32.to_radians()),
+        });
+        self
+    }
+
+    /// Gently pulses the icon in scale and opacity (`1.6s` heartbeat cycle).
+    pub fn pulse(mut self) -> Self {
+        self.animation = Some(IconAnimation::pulse());
+        self
+    }
+
+    /// Gently pulses the icon in scale and opacity with a custom cycle period.
+    pub fn pulse_duration(mut self, period: Duration) -> Self {
+        self.animation = Some(IconAnimation::Pulse(period));
         self
     }
 }
@@ -174,14 +243,21 @@ impl RenderOnce for Icon {
             .h(px_size)
             .text_color(color);
 
-        if let Some(period) = self.spin {
+        if let Some(animation) = self.animation {
             let initial = self
                 .rotation
                 .map(Transformation::rotate)
                 .unwrap_or_default();
-            element = element.with_timed_transformation(TimedTransformation::rotation(
-                period, initial,
-            ));
+            let timed = match animation {
+                IconAnimation::Spin(period) => TimedTransformation::rotation(period, initial),
+                IconAnimation::Ring { period, amplitude } => {
+                    TimedTransformation::bell_ring(period, amplitude, initial)
+                }
+                IconAnimation::Pulse(period) => {
+                    TimedTransformation::pulse(period, 1.12, 0.72, initial)
+                }
+            };
+            element = element.with_timed_transformation(timed);
         } else if let Some(rotation) = self.rotation {
             element = element.with_transformation(Transformation::rotate(rotation));
         }
