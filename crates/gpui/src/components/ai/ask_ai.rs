@@ -1644,13 +1644,26 @@ impl AskAiState {
     // Rendering Helpers
     // -----------------------------------------------------------------------
 
+    /// True while disconnected and a loading status banner is active (e.g. host auto-provisioning
+    /// credentials), in which case a clean centered spinner replaces the manual provider picker.
+    fn is_provisioning(&self) -> bool {
+        self.connection.is_none()
+            && self
+                .status_banner
+                .as_ref()
+                .is_some_and(|(_, loading)| *loading)
+    }
+
     fn render_header(&self, show_window_controls: bool, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let connected = self.connection.is_some();
+        let provisioning = self.is_provisioning();
         let subtitle: String = if self.busy {
             self.activity.label().to_owned()
         } else if let Some(ref conn) = self.connection {
             conn.model_label()
+        } else if provisioning {
+            "Setting up…".to_owned()
         } else {
             "Choose a provider to start".to_owned()
         };
@@ -1692,74 +1705,76 @@ impl AskAiState {
         };
 
         let mut actions = h_stack().spacing(px(4.));
-        if connected {
-            actions = actions.child(
-                Button::icon(("ask-new", cx.entity_id()), LucideIcon::SquarePen)
-                    .ghost()
-                    .size(ComponentSize::Xs)
-                    .disabled(self.busy)
-                    .tooltip_text("New conversation")
-                    .on_click(cx.listener(|this, _, _, cx| this.new_conversation(cx))),
-            );
+        if !provisioning {
+            if connected {
+                actions = actions.child(
+                    Button::icon(("ask-new", cx.entity_id()), LucideIcon::SquarePen)
+                        .ghost()
+                        .size(ComponentSize::Xs)
+                        .disabled(self.busy)
+                        .tooltip_text("New conversation")
+                        .on_click(cx.listener(|this, _, _, cx| this.new_conversation(cx))),
+                );
+            }
+            actions = actions
+                .child(
+                    Button::icon(("ask-hist", cx.entity_id()), LucideIcon::Clock)
+                        .variant(if self.page == AskAiPage::History {
+                            ButtonVariant::Soft
+                        } else {
+                            ButtonVariant::Ghost
+                        })
+                        .size(ComponentSize::Xs)
+                        .disabled(self.busy)
+                        .tooltip_text("Conversations")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            let next = if this.page == AskAiPage::History {
+                                AskAiPage::Chat
+                            } else {
+                                AskAiPage::History
+                            };
+                            this.set_page(next, cx);
+                        })),
+                )
+                .child(
+                    Button::icon(("ask-tools", cx.entity_id()), LucideIcon::Wrench)
+                        .variant(if self.page == AskAiPage::Tools {
+                            ButtonVariant::Soft
+                        } else {
+                            ButtonVariant::Ghost
+                        })
+                        .size(ComponentSize::Xs)
+                        .disabled(self.busy)
+                        .tooltip_text("MCP Tools & Workspace")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            let next = if this.page == AskAiPage::Tools {
+                                AskAiPage::Chat
+                            } else {
+                                AskAiPage::Tools
+                            };
+                            this.set_page(next, cx);
+                        })),
+                )
+                .child(
+                    Button::icon(("ask-settings", cx.entity_id()), LucideIcon::Settings)
+                        .variant(if self.page == AskAiPage::Settings {
+                            ButtonVariant::Soft
+                        } else {
+                            ButtonVariant::Ghost
+                        })
+                        .size(ComponentSize::Xs)
+                        .disabled(self.busy)
+                        .tooltip_text("Provider & MCP Settings")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            let next = if this.page == AskAiPage::Settings {
+                                AskAiPage::Chat
+                            } else {
+                                AskAiPage::Settings
+                            };
+                            this.set_page(next, cx);
+                        })),
+                );
         }
-        actions = actions
-            .child(
-                Button::icon(("ask-hist", cx.entity_id()), LucideIcon::Clock)
-                    .variant(if self.page == AskAiPage::History {
-                        ButtonVariant::Soft
-                    } else {
-                        ButtonVariant::Ghost
-                    })
-                    .size(ComponentSize::Xs)
-                    .disabled(self.busy)
-                    .tooltip_text("Conversations")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        let next = if this.page == AskAiPage::History {
-                            AskAiPage::Chat
-                        } else {
-                            AskAiPage::History
-                        };
-                        this.set_page(next, cx);
-                    })),
-            )
-            .child(
-                Button::icon(("ask-tools", cx.entity_id()), LucideIcon::Wrench)
-                    .variant(if self.page == AskAiPage::Tools {
-                        ButtonVariant::Soft
-                    } else {
-                        ButtonVariant::Ghost
-                    })
-                    .size(ComponentSize::Xs)
-                    .disabled(self.busy)
-                    .tooltip_text("MCP Tools & Workspace")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        let next = if this.page == AskAiPage::Tools {
-                            AskAiPage::Chat
-                        } else {
-                            AskAiPage::Tools
-                        };
-                        this.set_page(next, cx);
-                    })),
-            )
-            .child(
-                Button::icon(("ask-settings", cx.entity_id()), LucideIcon::Settings)
-                    .variant(if self.page == AskAiPage::Settings {
-                        ButtonVariant::Soft
-                    } else {
-                        ButtonVariant::Ghost
-                    })
-                    .size(ComponentSize::Xs)
-                    .disabled(self.busy)
-                    .tooltip_text("Provider & MCP Settings")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        let next = if this.page == AskAiPage::Settings {
-                            AskAiPage::Chat
-                        } else {
-                            AskAiPage::Settings
-                        };
-                        this.set_page(next, cx);
-                    })),
-            );
 
         let (is_maximized, is_dragging) = {
             let w = self.floating_window.read(cx);
@@ -1868,6 +1883,8 @@ impl AskAiState {
                                     .child(div().w(px(6.)).h(px(6.)).rounded_full().bg(
                                         if connected {
                                             theme.success
+                                        } else if provisioning {
+                                            theme.primary
                                         } else {
                                             theme.muted_foreground.opacity(0.5)
                                         },
@@ -1889,6 +1906,38 @@ impl AskAiState {
     fn render_settings(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let eid = cx.entity_id();
+
+        if self.connection.is_none()
+            && let Some((msg, true)) = &self.status_banner
+        {
+            return div()
+                .id(("ask-provisioning", eid))
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .px(px(24.))
+                .py(px(32.))
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap(px(12.))
+                .child(
+                    Icon::new(LucideIcon::LoaderCircle)
+                        .size(IconSize::Custom(px(24.)))
+                        .color(theme.primary)
+                        .spin(),
+                )
+                .child(
+                    div()
+                        .text_size(px(13.5))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(theme.foreground)
+                        .text_center()
+                        .child(msg.clone()),
+                )
+                .into_any_element();
+        }
 
         let provider_section = if let Some(ref draft_id) = self.draft_provider_id
             && let Some(preset) = self.providers.iter().find(|p| p.id == *draft_id)
@@ -3982,7 +4031,9 @@ impl AskAiState {
     fn render_panel_inner(&mut self, show_window_controls: bool, cx: &mut Context<Self>) -> AnyElement {
         self.sync_from_registry(cx);
         let theme = cx.theme();
-        let active_page = if self.connection.is_none() && self.page == AskAiPage::Chat {
+        let active_page = if self.is_provisioning()
+            || (self.connection.is_none() && self.page == AskAiPage::Chat)
+        {
             AskAiPage::Settings
         } else {
             self.page

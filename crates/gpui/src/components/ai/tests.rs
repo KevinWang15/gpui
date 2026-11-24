@@ -1511,6 +1511,20 @@ fn ask_ai_dynamic_providers_status_banner_and_field_options(cx: &mut TestAppCont
     let _ = window.update(cx, |_, window, cx| {
         assert!(!ai.read(cx).is_text_input_focused(window, cx));
     });
+
+    // Disconnected + loading status banner renders the centered provisioning spinner view cleanly.
+    ai.update(cx, |state, cx| {
+        state.disconnect(cx);
+        state.set_status_banner(Some("Setting up your Virtual Key…".into()), true, cx);
+    });
+    cx.run_until_parked();
+    ai.read_with(cx, |state, _| {
+        assert!(state.connection().is_none());
+        assert_eq!(
+            state.status_banner().map(|(m, l)| (m.as_ref(), l)),
+            Some(("Setting up your Virtual Key…", true))
+        );
+    });
 }
 
 /// Generates a minimal valid `w×h` solid-color PNG in memory for multimodal tool tests.
