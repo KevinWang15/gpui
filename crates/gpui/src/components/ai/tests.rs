@@ -2133,8 +2133,8 @@ fn ask_ai_history_delete_click_and_clear_conversations(cx: &mut TestAppContext) 
 
 #[test]
 fn markdown_nested_inline_parsing_and_compilation() {
-    use super::markdown::{
-        MdBlock, compute_inline_code_pill_vertical_bounds, compile_inline_text, parse_blocks,
+    use crate::components::markdown::{
+        MdBlock, compile_inline_text, compute_inline_code_pill_vertical_bounds, parse_blocks,
     };
     use crate::{FontStyle, FontWeight, SharedString, hsla, px};
 
@@ -2213,14 +2213,16 @@ fn markdown_nested_inline_parsing_and_compilation() {
     // 3. List continuation lines stay joined into their parent item.
     let blocks = parse_blocks("- **Alignment:**\n  the clock sits on the optical baseline.\n- Next");
     assert_eq!(blocks.len(), 1);
-    let MdBlock::List { ordered, items } = &blocks[0] else {
+    let MdBlock::List { start, items } = &blocks[0] else {
         panic!("expected list block");
     };
-    assert!(!ordered);
+    assert_eq!(*start, None);
     assert_eq!(items.len(), 2);
-    assert_eq!(
-        items[0].text,
-        "**Alignment:** the clock sits on the optical baseline."
+    assert_eq!(items[0].blocks.len(), 1);
+    assert!(
+        matches!(&items[0].blocks[0], MdBlock::Paragraph(inlines) if inlines.len() >= 2),
+        "continuation line must remain joined in the first list item paragraph: {:?}",
+        items[0].blocks
     );
 
     // 4. Compact inline-code pill height strictly smaller than line_height with breathing room.

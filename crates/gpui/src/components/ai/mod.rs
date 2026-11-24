@@ -45,7 +45,8 @@ pub use ask_ai::{
     AskAiSuggestion, ask_ai, ask_ai_overlay, build_with_ai_overlay,
 };
 pub use markdown::{
-    LinkOpenHandler, LinkResolver, Markdown, bind_markdown_keys, is_safe_link_url, markdown,
+    LinkOpenHandler, LinkResolver, Markdown, MarkdownImageRenderer, MarkdownMathRenderer,
+    MdAlertKind, bind_markdown_keys, is_safe_link_url, markdown,
 };
 pub use mcp::{
     McpClient, WORKSPACE_SERVER_ID, format_mcp_tool_name, friendly_tool_label, split_mcp_tool_name,

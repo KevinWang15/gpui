@@ -2,22 +2,21 @@
 //! [`EditableText`], expandable [`TruncatedText`], and syntax-framed copyable [`CodeBlock`].
 
 use std::ops::Range;
-use std::rc::Rc;
 
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::icons::{Icon, IconSize, LucideIcon};
 use crate::{
     App, Context, ElementId, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, IntoElement,
-    KeyDownEvent, Pixels, Render, RenderOnce, SharedString, StyleRefinement, Styled, Window, div,
-    prelude::*, px, uniform_list,
+    KeyDownEvent, Pixels, Render, RenderOnce, SharedString, StyleRefinement, Styled, StyledText,
+    Window, div, prelude::*, px, uniform_list,
 };
 
-use super::button::{ButtonVariant, button};
+use super::button::{Button, ButtonVariant, button};
 use super::input::{Input, InputEvent, InputState};
 use super::interactive::copy_button;
-use super::palette;
-use super::theme::{ActiveTheme, ComponentSize, ThemeMode, tabular_numerals};
+use super::syntax::{SyntaxTheme, friendly_language_label, highlight_code_cached};
+use super::theme::{ActiveTheme, ComponentSize, tabular_numerals};
 
 // ============================================================================
 // Heading
@@ -700,7 +699,9 @@ pub struct CodeBlock {
     code: SharedString,
     language: Option<SharedString>,
     show_line_numbers: bool,
+    wrap: bool,
     max_height: Pixels,
+    syntax_theme: Option<SyntaxTheme>,
     style: StyleRefinement,
 }
 
@@ -717,7 +718,9 @@ impl CodeBlock {
             code: code.into(),
             language: None,
             show_line_numbers: true,
+            wrap: false,
             max_height: px(460.),
+            syntax_theme: None,
             style: StyleRefinement::default(),
         }
     }
@@ -731,6 +734,18 @@ impl CodeBlock {
     /// Shows or hides line numbers along the left gutter (default `true`).
     pub fn line_numbers(mut self, show: bool) -> Self {
         self.show_line_numbers = show;
+        self
+    }
+
+    /// Enables or disables initial soft line wrapping (default `false`, scrolls horizontally).
+    pub fn wrap(mut self, wrap: bool) -> Self {
+        self.wrap = wrap;
+        self
+    }
+
+    /// Overrides the active [`SyntaxTheme`] palette for this code block.
+    pub fn syntax_theme(mut self, syntax_theme: SyntaxTheme) -> Self {
+        self.syntax_theme = Some(syntax_theme);
         self
     }
 
@@ -751,54 +766,58 @@ impl Styled for CodeBlock {
     }
 }
 
-fn line_byte_ranges(text: &str) -> Vec<Range<usize>> {
-    let mut ranges = Vec::new();
-    let base = text.as_ptr() as usize;
-    for line in text.lines() {
-        let start = line.as_ptr() as usize - base;
-        ranges.push(start..start + line.len());
-    }
-    if ranges.is_empty() {
-        ranges.push(0..0);
-    }
-    ranges
-}
-
 impl RenderOnce for CodeBlock {
-    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
-        let is_dark = theme.mode == ThemeMode::Dark;
-        let bg = if is_dark {
-            palette::SLATE_950
-        } else {
-            palette::SLATE_900
-        };
-        let header_bg = palette::SLATE_800;
+        let syntax = self
+            .syntax_theme
+            .unwrap_or_else(|| theme.syntax.clone());
+        let bg = syntax.code_bg;
+        let header_bg = syntax.code_header_bg;
+        let border = syntax.code_border;
         let code_copy = self.code.clone();
-        let ranges = Rc::new(line_byte_ranges(self.code.as_ref()));
-        let line_count = ranges.len();
+        let lang_raw = self.language.as_deref().unwrap_or("");
+        let lang_label = friendly_language_label(lang_raw);
+        let highlighted = highlight_code_cached(lang_raw, self.code.as_ref());
+        let line_count = highlighted.len();
         let digits = ((line_count.max(1) as f32).log10().floor() as usize) + 1;
         let gutter_w = px((digits.max(2) as f32 * 8.5 + 8.0).ceil());
         let show_nums = self.show_line_numbers;
         let mono_font = theme.mono_font_family.clone();
 
-        let body_el: crate::AnyElement = if line_count > 32 {
-            // Virtualize large snippets so 400+ line code blocks render at constant O(visible lines).
+        let initial_wrap = self.wrap;
+        let wrap_state = window.use_keyed_state(
+            (self.id.clone(), "cb-wrap-state"),
+            cx,
+            |_, _| initial_wrap,
+        );
+        let is_wrapped = *wrap_state.read(cx);
+
+        let body_el: crate::AnyElement = if !is_wrapped && line_count > 32 {
+            // Virtualize large snippets so 400+ line code blocks render at constant O(visible lines)
+            // with zero per-frame re-lexing thanks to the cached `Arc<Vec<HighlightedLine>>`.
             let list_h = px((line_count as f32 * CODE_LINE_HEIGHT + 16.0).min(self.max_height.0));
-            let code_shared = self.code;
+            let lines_shared = highlighted;
+            let syntax_for_list = syntax.clone();
             uniform_list(
                 (self.id.clone(), "cb-vlines"),
                 line_count,
                 move |range: Range<usize>, _window, _cx| {
-                    let src = code_shared.as_ref();
                     range
                         .map(|idx| {
-                            let span = ranges[idx].clone();
-                            let slice = &src[span];
-                            let text: SharedString = if slice.is_empty() {
-                                SharedString::new_static(" ")
+                            let line = &lines_shared[idx];
+                            let row_bg = line
+                                .diff_kind
+                                .map(|kind| syntax_for_list.diff_line_bg(kind));
+                            let rendered_text: crate::AnyElement = if line.text.is_empty() {
+                                SharedString::new_static(" ").into_any_element()
                             } else {
-                                SharedString::from(slice.to_owned())
+                                let hls = line.to_highlights(&syntax_for_list);
+                                let mut st = StyledText::new(line.text.clone());
+                                if !hls.is_empty() {
+                                    st = st.with_highlights(hls);
+                                }
+                                st.into_any_element()
                             };
                             div()
                                 .flex()
@@ -808,9 +827,10 @@ impl RenderOnce for CodeBlock {
                                 .w_full()
                                 .h(px(CODE_LINE_HEIGHT))
                                 .px(px(12.))
+                                .when_some(row_bg, |el, fill| el.bg(fill))
                                 .text_size(px(12.5))
                                 .line_height(px(CODE_LINE_HEIGHT))
-                                .text_color(palette::SLATE_100)
+                                .text_color(syntax_for_list.plain)
                                 .when_some(mono_font.clone(), |el, f| el.font_family(f))
                                 .when(show_nums, |el| {
                                     el.child(
@@ -819,7 +839,7 @@ impl RenderOnce for CodeBlock {
                                             .flex_shrink_0()
                                             .text_right()
                                             .font_features(tabular_numerals())
-                                            .text_color(palette::SLATE_500)
+                                            .text_color(syntax_for_list.gutter_foreground)
                                             .child(format!("{}", idx + 1)),
                                     )
                                 })
@@ -829,7 +849,7 @@ impl RenderOnce for CodeBlock {
                                         .min_w_0()
                                         .whitespace_nowrap()
                                         .truncate()
-                                        .child(text),
+                                        .child(rendered_text),
                                 )
                         })
                         .collect()
@@ -841,48 +861,66 @@ impl RenderOnce for CodeBlock {
             .bg(bg)
             .into_any_element()
         } else {
-            let src = self.code.as_ref();
-            div()
+            let mut body = div()
                 .id((self.id.clone(), "cb-body-scroll"))
                 .flex()
                 .flex_col()
                 .gap(px(2.))
                 .w_full()
-                .p(px(12.))
+                .py(px(10.))
                 .bg(bg)
-                .overflow_x_scroll()
                 .text_size(px(12.5))
                 .line_height(px(CODE_LINE_HEIGHT))
-                .text_color(palette::SLATE_100)
-                .when_some(mono_font, |el, f| el.font_family(f))
-                .children(ranges.iter().enumerate().map(|(idx, span)| {
-                    let slice = &src[span.clone()];
-                    let text: SharedString = if slice.is_empty() {
-                        SharedString::new_static(" ")
-                    } else {
-                        SharedString::from(slice.to_owned())
-                    };
-                    div()
-                        .flex()
-                        .flex_row()
-                        .gap(px(12.))
-                        .w_full()
-                        .when(show_nums, |el| {
-                            el.child(
-                                div()
-                                    .w(gutter_w)
-                                    .flex_shrink_0()
-                                    .text_right()
-                                    .font_features(tabular_numerals())
-                                    .text_color(palette::SLATE_500)
-                                    .child(format!("{}", idx + 1)),
-                            )
-                        })
-                        .child(div().flex_1().whitespace_nowrap().child(text))
-                }))
-                .into_any_element()
+                .text_color(syntax.plain)
+                .when_some(mono_font, |el, f| el.font_family(f));
+
+            if is_wrapped {
+                body = body.max_h(self.max_height).overflow_y_scroll();
+            } else {
+                body = body.overflow_x_scroll();
+            }
+
+            body.children(highlighted.iter().enumerate().map(|(idx, line)| {
+                let row_bg = line.diff_kind.map(|kind| syntax.diff_line_bg(kind));
+                let rendered_text: crate::AnyElement = if line.text.is_empty() {
+                    SharedString::new_static(" ").into_any_element()
+                } else {
+                    let hls = line.to_highlights(&syntax);
+                    let mut st = StyledText::new(line.text.clone());
+                    if !hls.is_empty() {
+                        st = st.with_highlights(hls);
+                    }
+                    st.into_any_element()
+                };
+                let mut text_cell = div().flex_1().min_w_0();
+                if !is_wrapped {
+                    text_cell = text_cell.whitespace_nowrap();
+                }
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_start()
+                    .gap(px(12.))
+                    .w_full()
+                    .px(px(12.))
+                    .when_some(row_bg, |el, fill| el.bg(fill))
+                    .when(show_nums, |el| {
+                        el.child(
+                            div()
+                                .w(gutter_w)
+                                .flex_shrink_0()
+                                .text_right()
+                                .font_features(tabular_numerals())
+                                .text_color(syntax.gutter_foreground)
+                                .child(format!("{}", idx + 1)),
+                        )
+                    })
+                    .child(text_cell.child(rendered_text))
+            }))
+            .into_any_element()
         };
 
+        let wrap_state_click = wrap_state;
         let mut root = div()
             .id(self.id.clone())
             .flex()
@@ -890,11 +928,7 @@ impl RenderOnce for CodeBlock {
             .w_full()
             .rounded(theme.radius_lg)
             .border_1()
-            .border_color(if is_dark {
-                theme.border
-            } else {
-                palette::SLATE_800.into()
-            })
+            .border_color(border)
             .overflow_hidden()
             .child(
                 div()
@@ -903,8 +937,10 @@ impl RenderOnce for CodeBlock {
                     .items_center()
                     .justify_between()
                     .px(px(12.))
-                    .py(px(7.))
+                    .py(px(6.))
                     .bg(header_bg)
+                    .border_b_1()
+                    .border_color(border)
                     .child(
                         div()
                             .flex()
@@ -914,22 +950,40 @@ impl RenderOnce for CodeBlock {
                             .child(
                                 Icon::new(LucideIcon::CodeXml)
                                     .size(IconSize::Sm)
-                                    .color(palette::INDIGO_400),
+                                    .color(theme.primary),
                             )
                             .child(
                                 div()
                                     .text_size(px(12.))
                                     .font_weight(FontWeight::MEDIUM)
-                                    .text_color(palette::SLATE_200)
-                                    .child(self.language.unwrap_or_else(|| "code".into())),
+                                    .text_color(syntax.plain)
+                                    .child(lang_label),
                             ),
                     )
                     .child(
-                        copy_button((self.id, "cb-copy"), code_copy)
-                            .size(ComponentSize::Xs)
-                            .variant(ButtonVariant::Ghost)
-                            .text_color(palette::SLATE_100)
-                            .hover_bg(palette::SLATE_700),
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(4.))
+                            .child(
+                                Button::icon((self.id.clone(), "cb-wrap"), LucideIcon::TextWrap)
+                                    .size(ComponentSize::Xs)
+                                    .variant(if is_wrapped {
+                                        ButtonVariant::Soft
+                                    } else {
+                                        ButtonVariant::Ghost
+                                    })
+                                    .on_click(move |_, window, cx| {
+                                        wrap_state_click.update(cx, |w, _| *w = !*w);
+                                        window.refresh();
+                                    }),
+                            )
+                            .child(
+                                copy_button((self.id, "cb-copy"), code_copy)
+                                    .size(ComponentSize::Xs)
+                                    .variant(ButtonVariant::Ghost),
+                            ),
                     ),
             )
             .child(body_el);

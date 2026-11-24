@@ -56,6 +56,7 @@ pub mod layout;
 pub mod liquid_glass;
 pub mod list;
 pub mod loading_overlay;
+pub mod markdown;
 pub mod menu;
 pub mod navigation;
 pub mod number_input;
@@ -73,6 +74,7 @@ pub mod slider;
 pub mod split_pane;
 pub mod stat;
 pub mod stepper;
+pub mod syntax;
 pub mod table;
 pub mod tabs;
 pub mod textbox;
@@ -98,13 +100,13 @@ pub use ai::{
     AiMessageStatus, AiRole, AiTokenUsage, AnswerComponentRegistry, AnswerComponentSpec, AppTool,
     AppToolHandler, AskAi, AskAiEvent, AskAiOverlay, AskAiPage, AskAiState, AskAiSuggestion,
     BranchInfo, BuiltinScriptRunner, ClientTool, Conversation, ConversationWorkspace, ImageLimits,
-    LocalCompletionEvent, LocalCompletionHandler, Markdown, McpClient, McpServerConfig,
+    LocalCompletionEvent, LocalCompletionHandler, McpClient, McpServerConfig,
     McpTransport, ProviderField, ProviderFieldKind, ProviderPreset, ProviderProtocol,
     ProviderValues, RigCompletionModel, ScriptOutcome, SimulatedModel, StoredConnection,
     StoredConversations, ToolCallStatus, ToolDefinition, WorkspaceFileInfo, WorkspaceLimits,
     WorkspaceScriptRunner, answer_component_instructions, ask_ai, ask_ai_overlay,
     build_completion_model, build_with_ai_overlay, default_answer_components, default_providers,
-    local_completion_model, markdown, simulated_provider,
+    local_completion_model, simulated_provider,
 };
 pub use alert::{Alert, AlertVariant, alert};
 pub use app_controls::{
@@ -215,6 +217,10 @@ pub use liquid_glass::{
 pub use crate::{LiquidGlassOptions, ProgressiveBlur};
 pub use list::{List, ListItem, VirtualList, list, virtual_list};
 pub use loading_overlay::{BlurContainer, LoadingOverlay, blur_container, loading_overlay};
+pub use markdown::{
+    LinkOpenHandler, LinkResolver, Markdown, MarkdownImageRenderer, MarkdownMathRenderer,
+    MdAlertKind, bind_markdown_keys, is_safe_link_url, markdown,
+};
 pub use menu::{Menu, MenuEvent, MenuMode, MenuNode, MenuState, nav_menu};
 pub use navigation::{Breadcrumb, BreadcrumbItem, Pagination, breadcrumb, pagination};
 pub use number_input::{NumberInput, NumberInputEvent, NumberInputState, number_input};
@@ -242,6 +248,11 @@ pub use slider::{
 pub use split_pane::{SplitDirection, SplitPane, SplitPaneEvent, SplitPaneState, split_pane};
 pub use stat::{StatDelta, StatDeltaTone, StatGroup, StatItem, TrendPolarity, stat_group};
 pub use stepper::{StepItem, StepStatus, Stepper, StepperOrientation, stepper};
+pub use syntax::{
+    DefaultSyntaxBackend, DiffLineKind, HighlightedLine, IncrementalSyntaxHighlighter,
+    SyntaxBackend, SyntaxTheme, SyntaxToken, friendly_language_label, highlight_code,
+    highlight_code_cached, normalize_language_key, supports_language,
+};
 pub use table::{
     SortDirection, Table, TableAlign, TableColumn, TableRow, VirtualTable, table, virtual_table,
 };

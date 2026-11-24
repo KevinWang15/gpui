@@ -9,6 +9,7 @@ use crate::{
 };
 
 use super::palette;
+use super::syntax::SyntaxTheme;
 
 /// Returns a shared [`FontFeatures`] instance enabling OpenType tabular numerals (`tnum`).
 ///
@@ -266,6 +267,9 @@ pub struct Theme {
     pub font_family: Option<SharedString>,
     /// Optional monospace font family applied on [`Kbd`](super::Kbd) and code surfaces.
     pub mono_font_family: Option<SharedString>,
+    /// Syntax highlighting color palette shared by [`Markdown`](super::Markdown) and
+    /// [`CodeBlock`](super::CodeBlock).
+    pub syntax: SyntaxTheme,
     /// Spread width for focus ring shadows (`px(0.)` produces a crisp border-only focus state).
     pub focus_ring_width: Pixels,
     /// Whether cards, inputs, buttons, and strips apply subtle drop shadows (`false` for flat chrome).
@@ -470,6 +474,7 @@ impl Theme {
             chart_gridline: Hsla::from(palette::SLATE_200).opacity(0.85),
             font_family: None,
             mono_font_family: None,
+            syntax: SyntaxTheme::light(),
             focus_ring_width: px(3.),
             elevation_shadows: true,
             radius_sm: px(4.),
@@ -551,6 +556,7 @@ impl Theme {
             chart_gridline: Hsla::from(palette::SLATE_700).opacity(0.65),
             font_family: None,
             mono_font_family: None,
+            syntax: SyntaxTheme::dark(),
             focus_ring_width: px(3.),
             elevation_shadows: true,
             radius_sm: px(4.),
@@ -745,6 +751,13 @@ impl Theme {
     /// Sets the default monospace font family applied on [`Kbd`](super::Kbd) and code surfaces.
     pub fn with_mono_font_family(mut self, family: impl Into<SharedString>) -> Self {
         self.mono_font_family = Some(family.into());
+        self
+    }
+
+    /// Overrides the [`SyntaxTheme`] palette used by [`Markdown`](super::Markdown) and
+    /// [`CodeBlock`](super::CodeBlock).
+    pub fn with_syntax_theme(mut self, syntax: SyntaxTheme) -> Self {
+        self.syntax = syntax;
         self
     }
 
@@ -1008,7 +1021,7 @@ pub fn init_components(cx: &mut App) {
     super::input::bind_input_keys(cx);
     super::textbox::bind_textbox_keys(cx);
     super::selectable_text::bind_selectable_text_keys(cx);
-    super::ai::markdown::bind_markdown_keys(cx);
+    super::markdown::bind_markdown_keys(cx);
 }
 
 /// Convenience wrapper for the standard non-invalid focus ring shadow.
