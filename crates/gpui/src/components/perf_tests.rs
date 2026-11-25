@@ -52,11 +52,11 @@ fn print_stats(label: &str, iters: usize, stats: &TimingStats) {
 // 1. Dense Line CartesianPlot Hover Scrub (4 series × 2,500 points = 10,000 points)
 // ============================================================================
 
-struct DenseLineChartView {
+struct DenseLinePlotView {
     layers: Vec<LineLayer>,
 }
 
-impl Render for DenseLineChartView {
+impl Render for DenseLinePlotView {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         let mut plot = cartesian_plot("perf-dense-line")
             .x_axis(
@@ -81,7 +81,7 @@ impl Render for DenseLineChartView {
 
 #[gpui::test]
 #[ignore]
-fn perf_line_chart_dense_hover_scrub(cx: &mut TestAppContext) {
+fn perf_cartesian_line_dense_hover_scrub(cx: &mut TestAppContext) {
     cx.update(init_components);
     let make_layer = |label: &'static str, phase: f64, dashed: bool, fill_area: bool| {
         let pts: Vec<(f64, f64)> = (0..2_500)
@@ -105,7 +105,7 @@ fn perf_line_chart_dense_hover_scrub(cx: &mut TestAppContext) {
         make_layer("Budget pace", 3.1, true, false),
     ];
 
-    let (_view, cx) = cx.add_window_view(|_, _| DenseLineChartView { layers });
+    let (_view, cx) = cx.add_window_view(|_, _| DenseLinePlotView { layers });
     cx.run_until_parked();
 
     // Warm up
@@ -194,7 +194,7 @@ fn perf_stacked_bar_hover_and_brush(cx: &mut TestAppContext) {
         hover_samples.push(t0.elapsed());
     }
     print_stats(
-        "StackedBarChart hover (90d x 6 series)",
+        "CartesianPlot bar hover (90d x 6 series)",
         hover_iters,
         &summarize(&mut hover_samples),
     );
@@ -220,7 +220,7 @@ fn perf_stacked_bar_hover_and_brush(cx: &mut TestAppContext) {
     cx.run_until_parked();
     let renders_during_brush = render_count.get() - renders_before;
     print_stats(
-        &format!("StackedBarChart 2px brush (renders={renders_during_brush})"),
+        &format!("CartesianPlot bar 2px brush (renders={renders_during_brush})"),
         brush_iters,
         &summarize(&mut brush_samples),
     );

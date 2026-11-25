@@ -36,15 +36,15 @@ Measured in `--release` on Linux (x86_64, Rust 1.99, Lavapipe Vulkan ICD for WGP
 
 | Workload | Baseline (Before) | Optimized (After) | Improvement |
 | --- | --- | --- | --- |
-| **`LineChart` hover scrub** (4 series × 2,500 = 10,000 pts, 60 frames) | 1,209.7 µs med · 74.44 ms total | **103.5 µs med · 6.68 ms total** | **11.7× faster** (-91.4%) |
+| **`CartesianPlot` line hover scrub** (4 `LineLayer`s × 2,500 = 10,000 pts, 60f) | 1,209.7 µs med · 74.44 ms total | **103.5 µs med · 6.68 ms total** | **11.7× faster** (-91.4%) |
 | **GPU Scene `QuadAnimation` advance** (120-row settings page, 60 frames) | 2,674.9 µs med (full relayout) | **0.2 µs med · 0.02 ms total** | **Zero relayout (>10,000× CPU)** |
 | **WGPU `prepare_instances` upload** (4,000 quads + 400 shadows) | 242.2 µs/frame (full + 7 BindGroups) | **4.4 µs/frame (delta, 0 BindGroups)** | **55.4× faster** (~550 KB → ~128 B) |
 | **`FilterBar` open popover nav** (10 active chips, 120 facet opts, 40 frames) | 2,384.5 µs med · 99.60 ms total | **393.2 µs med · 16.09 ms total** | **6.06× faster** (-83.5%) |
-| **`StackedBarChart` 2 px drag-brush** (90d × 6 series, 60 moves) | 488.0 µs med · 29.88 ms (62 renders) | **0.4 µs med · 5.38 ms (16 renders)** | **5.55× faster** (-82.0%, -74% renders) |
+| **`CartesianPlot` bar 2 px drag-brush** (90d × 6 series, 60 moves) | 488.0 µs med · 29.88 ms (62 renders) | **0.4 µs med · 5.38 ms (16 renders)** | **5.55× faster** (-82.0%, -74% renders) |
 | **WGPU `ViewTransition` composite** (1280×800, 2,500 quads + 250 shadows, 30f) | 5.61 ms steady · 176.96 ms total | **1.13 ms steady · 45.09 ms total** | **5.0× faster steady** / **3.93× total** |
 | **WGPU Dual-Kawase `BackdropBlur`** (1280×800 over 4,000 quads + 400 shadows) | *(Previously flat scrim only)* | **9.40 ms/f (Lavapipe SW Vulkan)** | Hardware GPU frosted glass |
 | **`FilterClause::matches_value` (`Contains`)** (100,000 evaluations) | 0.082 µs/op · 8.25 ms total | **0.027 µs/op · 2.69 ms total** | **3.07× faster** (-67.4%) |
-| **`StackedBarChart` hover** (90d × 6 series, 60 frames) | 596.6 µs med · 37.81 ms total | **422.5 µs med · 26.61 ms total** | **1.41× faster** (-29.2%) |
+| **`CartesianPlot` bar hover** (90d × 6 series, 60 frames) | 596.6 µs med · 37.81 ms total | **422.5 µs med · 26.61 ms total** | **1.41× faster** (-29.2%) |
 | **Settings parent re-render** (120 `SettingRow`s + 120 `Styled` `Input`s, 50f) | 3,684.4 µs med · 196.71 ms total | **2,615.0 µs med · 134.01 ms total** | **1.41× faster** (-29.0%) |
 | **Full Analytics dashboard re-render** (all widgets combined, 60f) | 765.0 µs med · 47.63 ms total | **727.3 µs med · 44.22 ms total** | **1.05×** (~8.7% of 120 Hz budget) |
 | **`CalendarDate` epoch + add + weekday** (200,000 ops) | 0.007 µs/op · 1.48 ms total | **0.007 µs/op · 1.48 ms total** | ~135M ops/sec (zero-alloc) |
@@ -61,13 +61,13 @@ Measured in `--release` on Linux (x86_64, Rust 1.99, Lavapipe Vulkan ICD for WGP
   - Static transition frames now submit **only** a 32-byte uniform write and a single 3-vertex fullscreen composite pass, while dynamic updates/spinners invalidate immediately.
 - **Impact**: **5.0× faster** steady transition frames (`5.61 ms` → `1.13 ms` on Lavapipe; `176.96 ms` → `45.09 ms` across 30 frames).
 
-### 2. Core `gpui::Path` Tile-Binning Cache + `LineChart` Geometry Cache & Decimation (`path_builder.rs`, `path_winding.rs`, `scene.rs`, `charts/line.rs`)
-- **Problem**: Every `on_mouse_move` crosshair scrub on a 10,000-point `LineChart` previously cloned all `Vec<LineSeries>`, ran Lyon `PathBuilder` stroke/dash/fill tessellation from scratch, ran CPU tile-binning (`path_winding::bin`) inside `PaintedPath::new`, and performed `O(N)` linear interpolation scans.
+### 2. Core `gpui::Path` Tile-Binning Cache + `CartesianPlot` Geometry Cache & Decimation (`path_builder.rs`, `path_winding.rs`, `scene.rs`, `charts/plot.rs`, `charts/core.rs`)
+- **Problem**: Every `on_mouse_move` crosshair scrub on a 10,000-point line plot previously cloned all series data, ran Lyon `PathBuilder` stroke/dash/fill tessellation from scratch, ran CPU tile-binning (`path_winding::bin`) inside `PaintedPath::new`, and performed `O(N)` linear interpolation scans.
 - **Fix**:
   - Added a lazy scale-keyed `binned_tiles` cache directly on `gpui::Path` (`Arc<PathTiles>`) with an `O(1)` visibility fast-path (`PathTiles::all_tiles_visible`) so unclipped repainted paths share binned tiles zero-copy.
-  - Cached tessellated area and stroke `Path`s inside `LineChartInteractionState`, keyed by an exact `FxHasher` fingerprint of `(plot_rect, x_domain, nice_max, series data/style)`.
+  - Cached tessellated area, casing halo, stroke, and reference-line `Path`s inside `PlotInteractionState`, keyed by an exact `FxHasher` fingerprint of `(plot_rect, x_domain, y_domain, layer data/style)`.
   - Added per-pixel-column min/max envelope decimation (`decimate_monotonic_points`) for dense monotonic-X series (`> 2× plot_width`) so peaks and valleys remain pixel-accurate while bounding curve count to `O(plot_width)`.
-  - Replaced `O(N)` linear interpolation with `O(log N)` binary search (`LineSeries::sample_at`) and shared series/colors via `Rc<[T]>`.
+  - Replaced `O(N)` linear interpolation with `O(log N)` binary search (`LineLayer::sample_at`) and shared layers/colors via `Rc<[T]>`.
 - **Impact**: **11.7× faster** hover scrub (`1,209.7 µs` → `103.5 µs` median on 10,000 points).
 
 ### 3. `FilterBar` Virtualized Popover, Facet Caching & Zero-Alloc `Contains` (`filter_bar.rs`)
@@ -78,11 +78,11 @@ Measured in `--release` on Linux (x86_64, Rust 1.99, Lavapipe Vulkan ICD for WGP
   - Added an allocation-free ASCII case-insensitive substring matcher (`contains_case_insensitive`) with Unicode fallback.
 - **Impact**: **6.06× faster** popover navigation (`2,384.5 µs` → `393.2 µs`) and **3.07× faster** `Contains` matching (`8.25 ms` → `2.69 ms` / 100k).
 
-### 4. `StackedBarChart` Snapped-Column Brush Dirty Check & Quad Reduction (`charts/stacked_bar.rs`)
-- **Problem**: Drag-brushing across discrete bars triggered `cx.notify()` on every sub-column mouse movement even when the snapped column index range `lo..=hi` did not change, cloned `Vec<StackedBarPoint>` on every render, and painted an extra opaque `surface_bg` separator quad between every stacked segment.
+### 4. `CartesianPlot` Snapped-Column Brush Dirty Check & Quad Reduction (`charts/plot.rs`)
+- **Problem**: Drag-brushing across discrete bars triggered `cx.notify()` on every sub-column mouse movement even when the snapped column index range `lo..=hi` did not change, cloned column data on every render, and painted an extra opaque `surface_bg` separator quad between every stacked segment.
 - **Fix**:
   - Compared `prev_brush != next_brush` in `on_mouse_move` so renders occur only when the brushed column range changes.
-  - Shared `Rc<[StackedBarPoint]>` between paint and tooltip closures and removed redundant opaque separator quads (leaving the 0.75 px hairline gap directly, which also lets the translucent brush band show cleanly between segments).
+  - Shared `Rc<[PlotLayer]>` between paint and tooltip closures and removed redundant opaque separator quads (leaving the 0.75 px hairline gap directly, which also lets the translucent brush band show cleanly between segments).
 - **Impact**: **5.55× faster** drag-brush total (`29.88 ms` → `5.38 ms`, **62 → 16 renders**) and **1.41× faster** hover (`596.6 µs` → `422.5 µs`).
 
 ### 5. `Input`/`TextBox` Listener Gating, Paint Cache & `Styled` Read-Before-Write (`input.rs`, `textbox.rs`, `select.rs`, `combobox.rs`, `slider.rs`)

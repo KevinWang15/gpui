@@ -2262,7 +2262,7 @@ fn chart_drag_selection_updates_time_range_when_selectable(cx: &mut TestAppConte
     let initial_span = view.read_with(cx, |v, cx| v.time_range.read(cx).range().span_days());
     assert_eq!(initial_span, 30);
 
-    // Drag horizontally across the StackedBarChart (y ~= 150 inside 200px tall chart)
+    // Drag horizontally across the category StackedBarLayer CartesianPlot (y ~= 150 inside 200px tall chart)
     cx.simulate_mouse_down(
         crate::point(px(220.), px(150.)),
         crate::MouseButton::Left,
@@ -2283,7 +2283,7 @@ fn chart_drag_selection_updates_time_range_when_selectable(cx: &mut TestAppConte
     let brushed = brushed_cols.borrow().clone();
     assert!(
         brushed.is_some(),
-        "dragging across selectable StackedBarChart should emit on_brush_select"
+        "dragging across selectable category CartesianPlot should emit on_category_brush"
     );
     let new_range = view.read_with(cx, |v, cx| v.time_range.read(cx).range());
     assert!(
@@ -2292,7 +2292,7 @@ fn chart_drag_selection_updates_time_range_when_selectable(cx: &mut TestAppConte
         new_range.span_days()
     );
 
-    // Drag horizontally across the LineChart (y ~= 360)
+    // Drag horizontally across the continuous LineLayer CartesianPlot (y ~= 360)
     cx.simulate_mouse_down(
         crate::point(px(240.), px(360.)),
         crate::MouseButton::Left,
@@ -2313,7 +2313,7 @@ fn chart_drag_selection_updates_time_range_when_selectable(cx: &mut TestAppConte
     let line_span = *brushed_line.borrow();
     assert!(
         line_span.is_some_and(|(a, b)| b > a + 1.0),
-        "dragging across selectable LineChart should emit normalized (a, b), got {line_span:?}"
+        "dragging across selectable continuous CartesianPlot should emit normalized (a, b), got {line_span:?}"
     );
 
     // Disable selectable(false) and verify dragging no longer triggers selection
@@ -4749,7 +4749,7 @@ fn scroll_area_fill_viewport_and_flex_height_charts_adapt_without_unnecessary_sc
     let tall_chart_h = chart_bounds.get().expect("chart bounds").size.height;
     assert!(
         tall_chart_h > px(360.),
-        "StackedBarChart::fill_height should expand in spacious viewport, got {:?}",
+        "CartesianPlot::fill_height (bars) should expand in spacious viewport, got {:?}",
         tall_chart_h
     );
     let left_h = chart_card_bounds.get().expect("left card bounds").size.height;
@@ -4764,7 +4764,7 @@ fn scroll_area_fill_viewport_and_flex_height_charts_adapt_without_unnecessary_sc
         inner_scroll.max_offset()
     );
 
-    // 2. Switch to LineChart::fill_height(true): stretches identically with zero outer scroll.
+    // 2. Switch to line CartesianPlot::fill_height(true): stretches identically with zero outer scroll.
     view.update(cx, |v, cx| {
         v.use_line = true;
         cx.notify();
@@ -4774,7 +4774,7 @@ fn scroll_area_fill_viewport_and_flex_height_charts_adapt_without_unnecessary_sc
     let line_h = chart_bounds.get().expect("line bounds").size.height;
     assert!(
         (line_h.0 - tall_chart_h.0).abs() <= 2.0,
-        "LineChart::fill_height ({line_h:?}) should match StackedBarChart ({tall_chart_h:?})"
+        "CartesianPlot::fill_height line ({line_h:?}) should match bars ({tall_chart_h:?})"
     );
 
     // 3. Constrained viewport (540px): chart clamps at its 170px min_h and outer ScrollArea scrolls.
