@@ -183,12 +183,15 @@ pub use floating_window::{
 };
 pub use form::{FormRule, FormState};
 pub use freeform_canvas::{
-    AlignAction, CanvasContextMenuBuilder, CanvasContextMenuTarget, CanvasHistory, CanvasItemSpec,
-    CanvasPaletteItem, CanvasRect, CanvasSize, FreeformCanvas, FreeformCanvasEvent,
-    FreeformCanvasState, GuideAxis, GuideKind, ResizeHandle, SnapConfig, SnapGuide, align_item,
-    align_items, bounding_rect, bring_forward_many, bring_to_front_many, canvas_palette_item,
-    duplicate_rects, freeform_canvas, nudge_rects, paste_rects, send_backward_many,
-    send_to_back_many, snap_canvas_resize, snap_move, snap_resize, snap_resize_aspect,
+    AlignAction, CanvasContextMenuBuilder, CanvasContextMenuTarget, CanvasHitTarget, CanvasHistory,
+    CanvasItemSpec, CanvasPaletteItem, CanvasRect, CanvasSize, FreeformCanvas, FreeformCanvasEvent,
+    FreeformCanvasState, GuideAxis, GuideKind, RESIZE_HANDLE_VISUAL_SIZE, ResizeHandle, SnapConfig,
+    SnapGuide, align_item, align_items, bounding_rect, bring_forward_many, bring_to_front_many,
+    canvas_palette_item, cycle_overlapping_selection, duplicate_rects, freeform_canvas,
+    hit_test_canvas, hit_test_items_at, nudge_rects, paste_rects, resize_handle_center,
+    resize_handle_hit_rect, resize_handle_hit_size, resize_handle_visible,
+    resize_handle_visual_rect, send_backward_many, send_to_back_many, snap_canvas_resize,
+    snap_move, snap_resize, snap_resize_aspect,
 };
 pub use hierarchical_select::{
     Cascader, CascaderEvent, CascaderOption, CascaderState, TreeSelect, TreeSelectEvent,

@@ -1421,3 +1421,556 @@ fn canvas_history_bounds_redo_stack_and_supports_peek() {
     hist.record(2);
     assert_eq!(hist.undo_len(), 2);
 }
+
+#[test]
+fn hit_test_prioritizes_active_selection_handles_over_higher_z_items_and_picks_topmost_body() {
+    let back = CanvasRect::new(12.0, 60.0, 180.0, 50.0); // right=192, top=60
+    let front = CanvasRect::new(110.0, 20.0, 100.0, 80.0); // covers back's NE corner (192, 60)
+    let items: Vec<(SharedString, CanvasRect)> =
+        vec![("back".into(), back), ("front".into(), front)];
+
+    // Overlap order is front-to-back (highest z-index first)
+    assert_eq!(
+        hit_test_items_at((150.0, 80.0), &items),
+        vec![SharedString::from("front"), SharedString::from("back")]
+    );
+
+    // Unselected: overlap picks topmost item ("front"), non-overlapping picks "back"
+    assert_eq!(
+        hit_test_canvas((150.0, 80.0), &items, &[], &[], true),
+        Some(CanvasHitTarget::Item("front".into()))
+    );
+    assert_eq!(
+        hit_test_canvas((192.0, 60.0), &items, &[], &[], true),
+        Some(CanvasHitTarget::Item("front".into()))
+    );
+    assert_eq!(
+        hit_test_canvas((40.0, 85.0), &items, &[], &[], true),
+        Some(CanvasHitTarget::Item("back".into()))
+    );
+
+    // When "back" (lower z-index) is selected, its NE resize handle at (192, 60) MUST beat
+    // "front" (higher z-index), including within its forgiving 13x13 hit zone (+/-6.5px).
+    let sel_back = vec![SharedString::from("back")];
+    assert_eq!(
+        hit_test_canvas((192.0, 60.0), &items, &sel_back, &[], true),
+        Some(CanvasHitTarget::ResizeHandle {
+            id: "back".into(),
+            handle: ResizeHandle::NorthEast,
+        })
+    );
+    assert_eq!(
+        hit_test_canvas((196.0, 56.0), &items, &sel_back, &[], true),
+        Some(CanvasHitTarget::ResizeHandle {
+            id: "back".into(),
+            handle: ResizeHandle::NorthEast,
+        })
+    );
+
+    // Away from "back"'s handles, overlapping body still picks topmost item ("front")
+    assert_eq!(
+        hit_test_canvas((150.0, 80.0), &items, &sel_back, &[], true),
+        Some(CanvasHitTarget::Item("front".into()))
+    );
+
+    // Locked or read-only mode disables resize handles, falling back to topmost item
+    assert_eq!(
+        hit_test_canvas((192.0, 60.0), &items, &sel_back, &sel_back, true),
+        Some(CanvasHitTarget::Item("front".into()))
+    );
+    assert_eq!(
+        hit_test_canvas((192.0, 60.0), &items, &sel_back, &[], false),
+        Some(CanvasHitTarget::Item("front".into()))
+    );
+
+    // Compact items clamp handle hit size to 9px and hide edge midpoints so interior stays draggable
+    let tiny = CanvasRect::new(20.0, 20.0, 24.0, 16.0);
+    assert_eq!(resize_handle_hit_size(tiny), RESIZE_HANDLE_VISUAL_SIZE);
+    assert!(!resize_handle_visible(tiny, ResizeHandle::North));
+    assert!(!resize_handle_visible(tiny, ResizeHandle::East));
+    assert!(resize_handle_visible(tiny, ResizeHandle::NorthWest));
+    assert_eq!(
+        hit_test_canvas(
+            (32.0, 28.0),
+            &[("tiny".into(), tiny)],
+            &["tiny".into()],
+            &[],
+            true,
+        ),
+        Some(CanvasHitTarget::Item("tiny".into()))
+    );
+
+    // Layer cycling walks front-to-back and wraps cleanly
+    let stack = vec![
+        SharedString::from("top"),
+        SharedString::from("mid"),
+        SharedString::from("bot"),
+    ];
+    assert_eq!(cycle_overlapping_selection(&stack, &[]), Some("top".into()));
+    assert_eq!(
+        cycle_overlapping_selection(&stack, &["top".into()]),
+        Some("mid".into())
+    );
+    assert_eq!(
+        cycle_overlapping_selection(&stack, &["mid".into()]),
+        Some("bot".into())
+    );
+    assert_eq!(
+        cycle_overlapping_selection(&stack, &["bot".into()]),
+        Some("top".into())
+    );
+}
+
+#[crate::test]
+fn selected_lower_z_item_resize_handle_beats_higher_z_overlapping_sibling(
+    cx: &mut crate::TestAppContext,
+) {
+    use crate::{Modifiers, MouseDownEvent, MouseMoveEvent, MouseUpEvent};
+    cx.update(super::super::init_components);
+    let (view, cx) = cx.add_window_view(|_, cx| {
+        let canvas = cx.new(FreeformCanvasState::new);
+        let sub = cx.subscribe(&canvas, |this: &mut StudioView, _, ev: &FreeformCanvasEvent, cx| {
+            match ev {
+                FreeformCanvasEvent::Resize {
+                    id,
+                    rect,
+                    committed,
+                } => {
+                    if let Some(it) = this.items.iter_mut().find(|(k, _)| k == id) {
+                        it.1 = *rect;
+                    }
+                    if *committed {
+                        this.committed_resizes += 1;
+                    }
+                }
+                FreeformCanvasEvent::DropNew { kind, rect } => {
+                    this.items.push((format!("{kind}-dropped").into(), *rect));
+                }
+                _ => {}
+            }
+            cx.notify();
+        });
+        StudioView {
+            canvas,
+            // "sparkline" is at lower z-index (0); "breakdown" is at higher z-index (1)
+            // and directly overlaps sparkline's top-right resize handle at (192, 60).
+            items: vec![
+                ("sparkline".into(), CanvasRect::new(12.0, 60.0, 180.0, 50.0)),
+                ("breakdown".into(), CanvasRect::new(110.0, 20.0, 100.0, 80.0)),
+            ],
+            size: CanvasSize::new(260.0, 140.0),
+            committed_resizes: 0,
+            committed_canvas_resizes: 0,
+            _sub: sub,
+        }
+    });
+    cx.run_until_parked();
+
+    let cb = view
+        .read_with(cx, |v, cx| v.canvas.read(cx).canvas_bounds.get())
+        .unwrap();
+
+    // 1. Click exposed left side of "sparkline" to select it
+    let spark_exposed = point(cb.origin.x + px(40.), cb.origin.y + px(85.));
+    cx.simulate_event(MouseDownEvent {
+        position: spark_exposed,
+        button: MouseButton::Left,
+        modifiers: Modifiers::none(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    cx.simulate_event(MouseUpEvent {
+        position: spark_exposed,
+        button: MouseButton::Left,
+        modifiers: Modifiers::none(),
+        click_count: 1,
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |v, cx| v.canvas.read(cx).selected().cloned()),
+        Some("sparkline".into())
+    );
+
+    // 2. Hover sparkline's top-right (NorthEast) handle at (192, 60) which lies INSIDE "breakdown"
+    let ne_handle = point(cb.origin.x + px(192.), cb.origin.y + px(60.));
+    cx.simulate_event(MouseMoveEvent {
+        position: ne_handle,
+        pressed_button: None,
+        modifiers: Modifiers::none(),
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |v, cx| v.canvas.read(cx).hovered_target().cloned()),
+        Some(CanvasHitTarget::ResizeHandle {
+            id: "sparkline".into(),
+            handle: ResizeHandle::NorthEast,
+        }),
+        "hovering the selected item's NE handle must target that handle, never the overlapping sibling"
+    );
+
+    // 3. Click and drag that NE handle (+24, -16) -> MUST resize "sparkline", NEVER select "breakdown"!
+    let ne_target = point(cb.origin.x + px(216.), cb.origin.y + px(44.));
+    cx.simulate_event(MouseDownEvent {
+        position: ne_handle,
+        button: MouseButton::Left,
+        modifiers: Modifiers::none(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |v, cx| v.canvas.read(cx).selected().cloned()),
+        Some("sparkline".into()),
+        "clicking the highlighted NE handle must keep 'sparkline' selected"
+    );
+    cx.simulate_event(MouseMoveEvent {
+        position: ne_target,
+        pressed_button: Some(MouseButton::Left),
+        modifiers: Modifiers::none(),
+    });
+    cx.run_until_parked();
+    cx.simulate_event(MouseUpEvent {
+        position: ne_target,
+        button: MouseButton::Left,
+        modifiers: Modifiers::none(),
+        click_count: 1,
+    });
+    cx.run_until_parked();
+
+    let (spark_rect, committed, sel) = view.read_with(cx, |v, cx| {
+        (
+            v.items[0].1,
+            v.committed_resizes,
+            v.canvas.read(cx).selected().cloned(),
+        )
+    });
+    assert_eq!(sel, Some("sparkline".into()));
+    assert_eq!(committed, 1);
+    assert!(
+        spark_rect.width > 180.0 && spark_rect.y < 60.0,
+        "dragging NE handle must resize sparkline, got {spark_rect:?}"
+    );
+
+    // 4. Hovering the overlapping body away from handles targets ONLY topmost "breakdown"
+    let body_overlap = point(cb.origin.x + px(140.), cb.origin.y + px(75.));
+    cx.simulate_event(MouseMoveEvent {
+        position: body_overlap,
+        pressed_button: None,
+        modifiers: Modifiers::none(),
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |v, cx| v.canvas.read(cx).hovered_target().cloned()),
+        Some(CanvasHitTarget::Item("breakdown".into()))
+    );
+
+    cx.simulate_event(MouseDownEvent {
+        position: body_overlap,
+        button: MouseButton::Left,
+        modifiers: Modifiers::none(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    cx.simulate_event(MouseUpEvent {
+        position: body_overlap,
+        button: MouseButton::Left,
+        modifiers: Modifiers::none(),
+        click_count: 1,
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |v, cx| v.canvas.read(cx).selected().cloned()),
+        Some("breakdown".into())
+    );
+
+    // 5. Dropping a palette item directly on top of an existing overlapping item still succeeds
+    let drop_over_item = point(cb.origin.x + px(150.), cb.origin.y + px(55.));
+    cx.simulate_event(MouseDownEvent {
+        position: point(px(50.), px(15.)),
+        button: MouseButton::Left,
+        modifiers: Modifiers::none(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    cx.simulate_event(MouseMoveEvent {
+        position: point(px(70.), px(20.)),
+        pressed_button: Some(MouseButton::Left),
+        modifiers: Modifiers::none(),
+    });
+    cx.run_until_parked();
+    for &pos in &[drop_over_item, drop_over_item] {
+        cx.simulate_event(MouseMoveEvent {
+            position: pos,
+            pressed_button: Some(MouseButton::Left),
+            modifiers: Modifiers::none(),
+        });
+        cx.run_until_parked();
+    }
+    cx.simulate_event(MouseUpEvent {
+        position: drop_over_item,
+        button: MouseButton::Left,
+        modifiers: Modifiers::none(),
+        click_count: 1,
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |v, _| v.items.len()),
+        3,
+        "dropping a palette item directly over an existing item must still succeed"
+    );
+}
+
+#[crate::test]
+fn alt_click_cycles_overlapping_layers_without_breaking_alt_drag_and_menu_lists_layers(
+    cx: &mut crate::TestAppContext,
+) {
+    use crate::{Modifiers, MouseDownEvent, MouseMoveEvent, MouseUpEvent};
+    cx.update(super::super::init_components);
+
+    struct StackHost {
+        canvas: Entity<FreeformCanvasState>,
+        items: Vec<(SharedString, SharedString, CanvasRect)>,
+        layer_menu_labels: Rc<std::cell::RefCell<Vec<SharedString>>>,
+        _sub: crate::Subscription,
+    }
+
+    impl Render for StackHost {
+        fn render(&mut self, _: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let captured = self.layer_menu_labels.clone();
+            let mut fc = freeform_canvas("stack-canvas", &self.canvas)
+                .canvas_size(240.0, 140.0)
+                .context_menu_builder(move |_target, _sel, defaults, _w, _cx| {
+                    let mut labels = Vec::new();
+                    let mut in_select_layer = false;
+                    for entry in &defaults {
+                        match entry {
+                            MenuEntry::Label(lbl) if lbl.as_ref() == "Select Layer" => {
+                                in_select_layer = true;
+                            }
+                            MenuEntry::Separator if in_select_layer => {
+                                in_select_layer = false;
+                            }
+                            MenuEntry::Item { label, .. } if in_select_layer => {
+                                labels.push(label.clone());
+                            }
+                            _ => {}
+                        }
+                    }
+                    *captured.borrow_mut() = labels;
+                    defaults
+                });
+            for (id, label, rect) in &self.items {
+                fc = fc.item(
+                    CanvasItemSpec::new(id.clone(), *rect, div().size_full().bg(rgb(0x3b82f6)))
+                        .label(label.clone()),
+                );
+            }
+            fc
+        }
+    }
+
+    let (view, cx) = cx.add_window_view(|_, cx| {
+        let canvas = cx.new(FreeformCanvasState::new);
+        let sub = cx.subscribe(&canvas, |this: &mut StackHost, _, ev: &FreeformCanvasEvent, cx| {
+            if let FreeformCanvasEvent::Move(moves) = ev {
+                for (id, rect) in moves {
+                    if let Some(it) = this.items.iter_mut().find(|(k, _, _)| k == id) {
+                        it.2 = *rect;
+                    }
+                }
+            }
+            cx.notify();
+        });
+        StackHost {
+            canvas,
+            items: vec![
+                (
+                    "bottom".into(),
+                    "Bottom Plot".into(),
+                    CanvasRect::new(20.0, 20.0, 120.0, 80.0),
+                ),
+                (
+                    "middle".into(),
+                    "Middle Card".into(),
+                    CanvasRect::new(36.0, 28.0, 100.0, 68.0),
+                ),
+                (
+                    "top".into(),
+                    "Top Badge".into(),
+                    CanvasRect::new(48.0, 36.0, 80.0, 52.0),
+                ),
+            ],
+            layer_menu_labels: Rc::new(std::cell::RefCell::new(Vec::new())),
+            _sub: sub,
+        }
+    });
+    cx.run_until_parked();
+
+    let cb = view
+        .read_with(cx, |v, cx| v.canvas.read(cx).canvas_bounds.get())
+        .unwrap();
+    let pt = point(cb.origin.x + px(70.), cb.origin.y + px(56.));
+
+    // 1. Plain click picks topmost ("top")
+    cx.simulate_event(MouseDownEvent {
+        position: pt,
+        button: MouseButton::Left,
+        modifiers: Modifiers::none(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    cx.simulate_event(MouseUpEvent {
+        position: pt,
+        button: MouseButton::Left,
+        modifiers: Modifiers::none(),
+        click_count: 1,
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |v, cx| v.canvas.read(cx).selected().cloned()),
+        Some("top".into())
+    );
+
+    // 2. Repeated Alt+Click cycles front-to-back: top -> middle -> bottom -> top
+    for expected in ["middle", "bottom", "top"] {
+        cx.simulate_event(MouseDownEvent {
+            position: pt,
+            button: MouseButton::Left,
+            modifiers: Modifiers::alt(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        cx.simulate_event(MouseUpEvent {
+            position: pt,
+            button: MouseButton::Left,
+            modifiers: Modifiers::alt(),
+            click_count: 1,
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |v, cx| v.canvas.read(cx).selected().cloned()),
+            Some(expected.into())
+        );
+    }
+
+    // 3. Alt+Drag moves "top" snap-free WITHOUT cycling selection to "middle"
+    let drag_mid = point(cb.origin.x + px(78.), cb.origin.y + px(60.));
+    let drag_end = point(cb.origin.x + px(110.), cb.origin.y + px(76.));
+    cx.simulate_event(MouseDownEvent {
+        position: pt,
+        button: MouseButton::Left,
+        modifiers: Modifiers::alt(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    for &pos in &[drag_mid, drag_end, drag_end] {
+        cx.simulate_event(MouseMoveEvent {
+            position: pos,
+            pressed_button: Some(MouseButton::Left),
+            modifiers: Modifiers::alt(),
+        });
+        cx.run_until_parked();
+    }
+    cx.simulate_event(MouseUpEvent {
+        position: drag_end,
+        button: MouseButton::Left,
+        modifiers: Modifiers::alt(),
+        click_count: 1,
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |v, cx| v.canvas.read(cx).selected().cloned()),
+        Some("top".into()),
+        "Alt+Drag must NOT cycle selection away from the dragged item"
+    );
+    assert!(
+        view.read_with(cx, |v, _| v.items[2].2.x > 60.0),
+        "Alt+Drag must still move the selected item"
+    );
+
+    // 4. Right-clicking where "middle" and "bottom" overlap lists both under "Select Layer"
+    let overlap_two = point(cb.origin.x + px(50.), cb.origin.y + px(42.));
+    cx.simulate_event(MouseDownEvent {
+        position: overlap_two,
+        button: MouseButton::Right,
+        modifiers: Modifiers::none(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    cx.run_until_parked();
+    let layer_labels = view.read_with(cx, |v, _| v.layer_menu_labels.borrow().clone());
+    assert_eq!(
+        layer_labels,
+        vec![
+            SharedString::from("Middle Card"),
+            SharedString::from("Bottom Plot"),
+        ],
+        "right-click context menu must list overlapping layers front-to-back under 'Select Layer'"
+    );
+}
+
+#[crate::test]
+fn nested_interactive_preview_child_cannot_steal_canvas_item_click(
+    cx: &mut crate::TestAppContext,
+) {
+    use crate::{Modifiers, MouseDownEvent, MouseUpEvent};
+    cx.update(super::super::init_components);
+
+    struct PreviewHost {
+        canvas: Entity<FreeformCanvasState>,
+        inner_clicked: Rc<Cell<bool>>,
+    }
+
+    impl Render for PreviewHost {
+        fn render(&mut self, _: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let clicked = self.inner_clicked.clone();
+            freeform_canvas("preview-shield-canvas", &self.canvas)
+                .canvas_size(240.0, 120.0)
+                .item(CanvasItemSpec::new(
+                    "card-with-btn",
+                    CanvasRect::new(20.0, 20.0, 100.0, 40.0),
+                    div()
+                        .size_full()
+                        .bg(rgb(0x3b82f6))
+                        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                            clicked.set(true);
+                            cx.stop_propagation();
+                        }),
+                ))
+        }
+    }
+
+    let (view, cx) = cx.add_window_view(|_, cx| PreviewHost {
+        canvas: cx.new(FreeformCanvasState::new),
+        inner_clicked: Rc::new(Cell::new(false)),
+    });
+    cx.run_until_parked();
+
+    let cb = view
+        .read_with(cx, |v, cx| v.canvas.read(cx).canvas_bounds.get())
+        .unwrap();
+    let pt = point(cb.origin.x + px(60.), cb.origin.y + px(40.));
+    cx.simulate_event(MouseDownEvent {
+        position: pt,
+        button: MouseButton::Left,
+        modifiers: Modifiers::none(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    cx.simulate_event(MouseUpEvent {
+        position: pt,
+        button: MouseButton::Left,
+        modifiers: Modifiers::none(),
+        click_count: 1,
+    });
+    cx.run_until_parked();
+
+    assert_eq!(
+        view.read_with(cx, |v, cx| v.canvas.read(cx).selected().cloned()),
+        Some("card-with-btn".into())
+    );
+    assert!(
+        !view.read_with(cx, |v, _| v.inner_clicked.get()),
+        "preview element's internal mouse_down listener must not hijack canvas item selection"
+    );
+}

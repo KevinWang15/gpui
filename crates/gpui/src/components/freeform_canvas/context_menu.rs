@@ -44,6 +44,7 @@ pub(super) struct DefaultContextMenuParams<'a> {
     pub target: &'a CanvasContextMenuTarget,
     pub selected: &'a [SharedString],
     pub all_ids: &'a [SharedString],
+    pub overlapping_ids: &'a [SharedString],
     pub locked_ids: &'a [SharedString],
     pub item_labels: &'a [(SharedString, Option<SharedString>)],
     pub show_grid: bool,
@@ -121,6 +122,43 @@ pub(super) fn build_default_context_menu_entries(
             .and_then(|(_, lbl)| lbl.clone())
         {
             entries.push(MenuEntry::Label(lbl));
+        }
+
+        // Overlapping layer picker (front-to-back), matching Figma / Sketch "Select Layer"
+        if params.overlapping_ids.len() >= 2 {
+            let resolved_labels: Vec<SharedString> = params
+                .overlapping_ids
+                .iter()
+                .map(|layer_id| {
+                    params
+                        .item_labels
+                        .iter()
+                        .find(|(id, _)| id == layer_id)
+                        .and_then(|(_, lbl)| lbl.clone())
+                        .unwrap_or_else(|| layer_id.clone())
+                })
+                .collect();
+            entries.push(MenuEntry::Label("Select Layer".into()));
+            for (idx, layer_id) in params.overlapping_ids.iter().enumerate() {
+                let base_label = &resolved_labels[idx];
+                let duplicate_label = resolved_labels
+                    .iter()
+                    .filter(|lbl| *lbl == base_label)
+                    .count()
+                    > 1;
+                let display_name: SharedString = if duplicate_label && base_label != layer_id {
+                    format!("{base_label} ({layer_id})").into()
+                } else {
+                    base_label.clone()
+                };
+                let is_sel = params.selected.contains(layer_id);
+                let st = state.clone();
+                let lid = layer_id.clone();
+                entries.push(MenuEntry::checkbox_item(display_name, is_sel, move |_, _, cx| {
+                    st.update(cx, |s, cx| s.select(Some(lid.clone()), cx));
+                }));
+            }
+            entries.push(MenuEntry::Separator);
         }
 
         // Clipboard actions

@@ -24,10 +24,13 @@ mod tests;
 
 pub use context_menu::{CanvasContextMenuBuilder, CanvasContextMenuTarget};
 pub use geometry::{
-    AlignAction, CanvasRect, CanvasSize, GuideAxis, GuideKind, ResizeHandle, SnapConfig, SnapGuide,
-    align_item, align_items, bounding_rect, bring_forward_many, bring_to_front_many,
-    duplicate_rects, nudge_rects, paste_rects, send_backward_many, send_to_back_many,
-    snap_canvas_resize, snap_move, snap_resize, snap_resize_aspect,
+    AlignAction, CanvasHitTarget, CanvasRect, CanvasSize, GuideAxis, GuideKind,
+    RESIZE_HANDLE_VISUAL_SIZE, ResizeHandle, SnapConfig, SnapGuide, align_item, align_items,
+    bounding_rect, bring_forward_many, bring_to_front_many, cycle_overlapping_selection,
+    duplicate_rects, hit_test_canvas, hit_test_items_at, nudge_rects, paste_rects,
+    resize_handle_center, resize_handle_hit_rect, resize_handle_hit_size, resize_handle_visible,
+    resize_handle_visual_rect, send_backward_many, send_to_back_many, snap_canvas_resize,
+    snap_move, snap_resize, snap_resize_aspect,
 };
 pub use history::CanvasHistory;
 
@@ -37,15 +40,17 @@ use std::rc::Rc;
 use crate::icons::{Icon, IconSize, LucideIcon};
 use crate::{
     AnyElement, App, AppContext as _, Bounds, Context, CursorStyle, DispatchPhase, DragMoveEvent,
-    ElementId, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Hsla, IntoElement,
-    KeyDownEvent, MouseButton, MouseMoveEvent, MouseUpEvent, PaintSnapshot, ParentElement, Pixels,
-    Point, Render, RenderOnce, SharedString, Size, SnapshotSource, StyleRefinement, Styled, Window,
-    canvas, div, painted_snapshot, point, prelude::*, px, rgb, size, snapshot_source,
-    transparent_black,
+    ElementId, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, HitboxBehavior, Hsla,
+    IntoElement, KeyDownEvent, MouseButton, MouseExitEvent, MouseMoveEvent, MouseUpEvent,
+    PaintSnapshot, ParentElement, Pixels, Point, Render, RenderOnce, SharedString, Size,
+    SnapshotSource, StyleRefinement, Styled, Window, canvas, div, painted_snapshot, point,
+    prelude::*, px, rgb, size, snapshot_source,
 };
 
 use self::context_menu::{DefaultContextMenuParams, build_default_context_menu_entries};
-use self::geometry::CanvasResizeHandle;
+use self::geometry::{
+    CanvasResizeHandle, RESIZE_HANDLES_PAINT_ORDER, is_over_canvas_resize_handle,
+};
 use self::paint::{
     build_guide_badges, paint_dashed_rect, paint_dot_grid, paint_marquee_rect, paint_snap_guides,
 };
@@ -300,6 +305,9 @@ pub struct FreeformCanvasState {
     focus_handle: FocusHandle,
     selected: Vec<SharedString>,
     pending_narrow_click: Option<SharedString>,
+    pending_cycle_click: Option<Vec<SharedString>>,
+    hovered_target: Option<CanvasHitTarget>,
+    pointer_inside_root: bool,
     snap: SnapConfig,
     show_grid: bool,
     drag_out_to_remove: bool,
@@ -327,6 +335,9 @@ impl FreeformCanvasState {
             focus_handle: cx.focus_handle(),
             selected: Vec::new(),
             pending_narrow_click: None,
+            pending_cycle_click: None,
+            hovered_target: None,
+            pointer_inside_root: false,
             snap: SnapConfig::default(),
             show_grid: true,
             drag_out_to_remove: true,
@@ -443,6 +454,14 @@ impl FreeformCanvasState {
             || self.active_marquee.as_ref().is_some_and(|m| m.dragging)
     }
 
+    /// Current interactive canvas target under the pointer, if any.
+    ///
+    /// Evaluated in design-editor priority order: active selection resize handles first
+    /// (regardless of z-order), followed by the topmost placed component in z-order.
+    pub fn hovered_target(&self) -> Option<&CanvasHitTarget> {
+        self.hovered_target.as_ref()
+    }
+
     /// Returns `true` when this [`FreeformCanvas`] currently has keyboard focus (active editor).
     pub fn is_focused(&self, window: &Window) -> bool {
         self.focus_handle.is_focused(window)
@@ -505,6 +524,8 @@ impl FreeformCanvasState {
 
     /// Programmatically opens the right-click context menu at `target`.
     pub fn open_context_menu(&mut self, target: CanvasContextMenuTarget, cx: &mut Context<Self>) {
+        self.pending_cycle_click = None;
+        self.hovered_target = None;
         self.context_menu = Some(target);
         cx.notify();
     }
@@ -525,6 +546,8 @@ impl FreeformCanvasState {
     ) {
         self.context_menu = None;
         self.pending_narrow_click = None;
+        self.pending_cycle_click = None;
+        self.hovered_target = None;
         let base_selection = if additive {
             self.selected.clone()
         } else {
@@ -611,6 +634,8 @@ impl FreeformCanvasState {
     fn start_item_resize(&mut self, params: StartItemResize, cx: &mut Context<Self>) {
         self.context_menu = None;
         self.pending_narrow_click = None;
+        self.pending_cycle_click = None;
+        self.hovered_target = None;
         self.set_selection(vec![params.id.clone()], cx);
         self.active_resize = Some(ActiveResize {
             id: params.id,
@@ -697,6 +722,9 @@ impl FreeformCanvasState {
         cx: &mut Context<Self>,
     ) {
         self.context_menu = None;
+        self.pending_narrow_click = None;
+        self.pending_cycle_click = None;
+        self.hovered_target = None;
         self.active_canvas_resize = Some(ActiveCanvasResize {
             handle,
             start_mouse: mouse,
@@ -807,6 +835,7 @@ impl RenderOnce for CanvasPaletteItem {
                         .map_or_else(|| size(px(default_size.0), px(default_size.1)), |b| b.size);
                     payload.state.update(cx, |s, cx| {
                         s.context_menu = None;
+                        s.hovered_target = None;
                         s.active_drag = Some(ActiveDrag {
                             kind: DragKind::New {
                                 kind: kind.clone(),
@@ -1387,6 +1416,8 @@ impl RenderOnce for FreeformCanvas {
         let (
             focus_handle,
             selected,
+            hovered_target,
+            pointer_inside_root,
             snap_cfg,
             show_grid,
             drag_out_to_remove,
@@ -1402,6 +1433,8 @@ impl RenderOnce for FreeformCanvas {
             (
                 s.focus_handle.clone(),
                 s.selected.clone(),
+                s.hovered_target.clone(),
+                s.pointer_inside_root,
                 s.snap,
                 s.show_grid,
                 s.drag_out_to_remove,
@@ -1415,6 +1448,10 @@ impl RenderOnce for FreeformCanvas {
             )
         };
         let is_focused = focus_handle.is_focused(window);
+        let is_interacting = active_drag.is_some()
+            || active_resize.is_some()
+            || active_canvas_resize.is_some()
+            || active_marquee.as_ref().is_some_and(|m| m.dragging);
 
         let canvas_size = active_canvas_resize
             .as_ref()
@@ -1525,42 +1562,81 @@ impl RenderOnce for FreeformCanvas {
             DragKind::New { .. } => None,
         });
 
-        // Build placed item elements & live selected rects (for the dashed multi-select group frame)
+        // Compute live rects (accounting for in-flight drag or resize) and resolve the single
+        // authoritative hover target so visual hover highlights always match click priority 1:1.
+        let live_rects: Vec<(SharedString, CanvasRect)> = self
+            .items
+            .iter()
+            .map(|item| {
+                let moved_start = active_drag.as_ref().and_then(|d| match &d.kind {
+                    DragKind::Move { items, .. } => items
+                        .iter()
+                        .find(|(id, _)| id == &item.id)
+                        .map(|(_, r)| *r),
+                    DragKind::New { .. } => None,
+                });
+                let rect = if let (Some(start_r), Some((dx, dy))) = (moved_start, move_delta) {
+                    CanvasRect::new(
+                        start_r.x + dx,
+                        start_r.y + dy,
+                        start_r.width,
+                        start_r.height,
+                    )
+                } else if let Some(r) = active_resize.as_ref().filter(|r| r.id == item.id) {
+                    r.live_rect
+                } else {
+                    item.rect
+                };
+                (item.id.clone(), rect)
+            })
+            .collect();
+
+        let effective_hover: Option<CanvasHitTarget> =
+            if pointer_inside_root && !is_interacting && context_menu_target.is_none() {
+                canvas_bounds_cell
+                    .get()
+                    .map(|cb| {
+                        let mouse = window.mouse_position();
+                        let rx = (mouse.x - cb.origin.x).0;
+                        let ry = (mouse.y - cb.origin.y).0;
+                        if editable && is_over_canvas_resize_handle(rx, ry, canvas_size) {
+                            None
+                        } else {
+                            hit_test_canvas((rx, ry), &live_rects, &selected, &locked_ids, editable)
+                        }
+                    })
+                    .unwrap_or(hovered_target)
+            } else {
+                None
+            };
+
+        // Layer separation (standard vector/layout editor model):
+        //   1. Content layer (`placed_elements`) in document z-order (back-to-front)
+        //   2. Single-target hover outline (`hover_overlay`, at most one unselected item)
+        //   3. Always-on-top selection outlines & lock badges (`selection_overlays`)
+        //   4. Always-on-top 8-way resize handles (`resize_handle_overlays`, Priority #1)
         let mut placed_elements: Vec<AnyElement> = Vec::with_capacity(self.items.len());
+        let mut hover_overlay: Option<AnyElement> = None;
+        let mut selection_overlays: Vec<AnyElement> = Vec::new();
+        let mut resize_handle_overlays: Vec<AnyElement> = Vec::new();
         let mut live_selected_rects: Vec<CanvasRect> = Vec::new();
         let is_empty = self.items.is_empty()
             && !active_drag.as_ref().is_some_and(|d| d.inside_canvas);
         let single_selected = selected.len() == 1;
+        let hover_border = theme.primary.opacity(0.45);
 
-        for item in self.items {
+        for (item, rect) in self.items.into_iter().zip(live_rects.iter().map(|(_, r)| *r)) {
             let item_id = item.id.clone();
             let item_locked = item.locked || !editable;
             let is_selected = selected.iter().any(|s| s == &item_id);
-            let moved_start = active_drag.as_ref().and_then(|d| match &d.kind {
-                DragKind::Move { items, .. } => items
-                    .iter()
-                    .find(|(id, _)| id == &item_id)
-                    .map(|(_, r)| *r),
-                DragKind::New { .. } => None,
+            let is_moving = active_drag.as_ref().is_some_and(|d| match &d.kind {
+                DragKind::Move { items, .. } => items.iter().any(|(id, _)| id == &item_id),
+                DragKind::New { .. } => false,
             });
-            let is_moving = moved_start.is_some();
             let moving_outside = is_moving
                 && active_drag
                     .as_ref()
                     .is_some_and(|d| !d.inside_canvas);
-
-            let rect = if let (Some(start_r), Some((dx, dy))) = (moved_start, move_delta) {
-                CanvasRect::new(
-                    start_r.x + dx,
-                    start_r.y + dy,
-                    start_r.width,
-                    start_r.height,
-                )
-            } else if let Some(r) = active_resize.as_ref().filter(|r| r.id == item_id) {
-                r.live_rect
-            } else {
-                item.rect
-            };
 
             if is_selected && !moving_outside {
                 live_selected_rects.push(rect);
@@ -1580,9 +1656,10 @@ impl RenderOnce for FreeformCanvas {
             let drag_id = item_id.clone();
             let select_id = item_id.clone();
             let up_id = item_id.clone();
+            let click_all_rects = all_rects.clone();
+            let click_bounds = canvas_bounds_cell.clone();
             let drag_all_rects = all_rects.clone();
             let drag_locked_ids = locked_ids.clone();
-            let hover_border = theme.primary.opacity(0.45);
             let sel_border = if item_locked {
                 theme.muted_foreground.opacity(0.85)
             } else {
@@ -1595,13 +1672,12 @@ impl RenderOnce for FreeformCanvas {
             let rclick_bounds = canvas_bounds_cell.clone();
             let rclick_menu_enabled = self.context_menu_enabled;
 
-            let mut item_box = div()
-                .id(ElementId::Name(format!("fc-item-{}", item_id).into()))
+            // Transparent top hit surface inside the item container so nested preview widgets
+            // cannot hijack canvas selection, drag-moving, or cursor styling.
+            let mut hit_surface = div()
+                .id(ElementId::Name(format!("fc-item-hit-{}", item_id).into()))
                 .absolute()
-                .left(px(rect.x))
-                .top(px(rect.y))
-                .w(px(rect.width))
-                .h(px(rect.height))
+                .inset_0()
                 .cursor(if item_locked {
                     CursorStyle::PointingHand
                 } else if is_moving {
@@ -1609,17 +1685,42 @@ impl RenderOnce for FreeformCanvas {
                 } else {
                     CursorStyle::OpenHand
                 })
-                .when(moving_outside, |el| el.opacity(0.18))
                 .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
                     window.focus(&focus_on_click, cx);
                     let additive =
                         ev.modifiers.shift || ev.modifiers.control || ev.modifiers.platform;
+                    let alt_cycle = ev.modifiers.alt && !additive;
+                    let click_stack = if alt_cycle {
+                        click_bounds
+                            .get()
+                            .map(|cb| {
+                                let pt = (
+                                    (ev.position.x - cb.origin.x).0,
+                                    (ev.position.y - cb.origin.y).0,
+                                );
+                                hit_test_items_at(pt, &click_all_rects)
+                            })
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
                     select_state.update(cx, |s, cx| {
                         s.close_context_menu(cx);
                         if additive {
                             s.pending_narrow_click = None;
+                            s.pending_cycle_click = None;
                             s.toggle_select(select_id.clone(), cx);
+                        } else if alt_cycle
+                            && click_stack.len() > 1
+                            && s.selected.len() == 1
+                            && click_stack.contains(&s.selected[0])
+                        {
+                            // Defer layer cycling to mouse-up so Alt+Drag still moves the active
+                            // item snap-free without switching layers mid-gesture.
+                            s.pending_narrow_click = None;
+                            s.pending_cycle_click = Some(click_stack);
                         } else if s.is_selected(select_id.as_ref()) {
+                            s.pending_cycle_click = None;
                             if s.selected.len() > 1 {
                                 s.pending_narrow_click = Some(select_id.clone());
                             } else {
@@ -1627,6 +1728,7 @@ impl RenderOnce for FreeformCanvas {
                             }
                         } else {
                             s.pending_narrow_click = None;
+                            s.pending_cycle_click = None;
                             s.select(Some(select_id.clone()), cx);
                         }
                     });
@@ -1642,6 +1744,7 @@ impl RenderOnce for FreeformCanvas {
                     });
                     rclick_state.update(cx, |s, cx| {
                         s.pending_narrow_click = None;
+                        s.pending_cycle_click = None;
                         if !s.is_selected(rclick_id.as_ref()) {
                             s.set_selection(vec![rclick_id.clone()], cx);
                         }
@@ -1661,17 +1764,25 @@ impl RenderOnce for FreeformCanvas {
                 })
                 .on_mouse_up(MouseButton::Left, move |_, _, cx| {
                     up_state.update(cx, |s, cx| {
-                        if s.pending_narrow_click.as_ref() == Some(&up_id)
-                            && s.active_drag.is_none()
-                        {
-                            s.pending_narrow_click = None;
-                            s.select(Some(up_id.clone()), cx);
+                        if s.active_drag.is_none() {
+                            if let Some(stack) = s.pending_cycle_click.take() {
+                                if let Some(next_id) =
+                                    cycle_overlapping_selection(&stack, &s.selected)
+                                {
+                                    s.select(Some(next_id), cx);
+                                }
+                            } else if s.pending_narrow_click.as_ref() == Some(&up_id) {
+                                s.pending_narrow_click = None;
+                                s.select(Some(up_id.clone()), cx);
+                            }
+                        } else {
+                            s.pending_cycle_click = None;
                         }
                     });
                 });
 
             if !item_locked {
-                item_box = item_box.on_drag(
+                hit_surface = hit_surface.on_drag(
                     CanvasDragPayload { state: drag_state },
                     move |payload, offset, window, cx| {
                         let snapshot = source_for_drag.snapshot(window);
@@ -1679,6 +1790,8 @@ impl RenderOnce for FreeformCanvas {
                         payload.state.update(cx, |s, cx| {
                             s.context_menu = None;
                             s.pending_narrow_click = None;
+                            s.pending_cycle_click = None;
+                            s.hovered_target = None;
                             if !s.is_selected(drag_id.as_ref()) {
                                 s.set_selection(vec![drag_id.clone()], cx);
                             }
@@ -1754,34 +1867,64 @@ impl RenderOnce for FreeformCanvas {
                 );
             }
 
-            item_box = item_box
+            let item_box = div()
+                .id(ElementId::Name(format!("fc-item-{}", item_id).into()))
+                .absolute()
+                .left(px(rect.x))
+                .top(px(rect.y))
+                .w(px(rect.width))
+                .h(px(rect.height))
+                .when(moving_outside, |el| el.opacity(0.18))
                 .child(
                     div()
                         .size_full()
                         .overflow_hidden()
                         .child(snapshot_source(&source, item.element)),
                 )
-                // Selection / hover outline overlay (doesn't shift inner geometry)
-                .child(
+                .child(hit_surface);
+
+            placed_elements.push(item_box.into_any_element());
+
+            // Single-target hover outline (never rendered on two overlapping items at once,
+            // and suppressed whenever a resize handle is hovered).
+            if !is_selected
+                && matches!(&effective_hover, Some(CanvasHitTarget::Item(hid)) if hid == &item_id)
+            {
+                hover_overlay = Some(
                     div()
                         .absolute()
-                        .inset_0()
+                        .left(px(rect.x))
+                        .top(px(rect.y))
+                        .w(px(rect.width))
+                        .h(px(rect.height))
                         .rounded(px(4.))
                         .border_1()
-                        .when(item_locked && is_selected, |el| el.border_dashed())
-                        .border_color(if is_selected {
-                            sel_border
-                        } else {
-                            transparent_black()
-                        })
-                        .when(!is_selected, |el| el.hover(move |s| s.border_color(hover_border))),
-                )
-                .when(item_locked && is_selected, |el| {
-                    el.child(
+                        .border_color(hover_border)
+                        .into_any_element(),
+                );
+            }
+
+            // Always-on-top selection outline & lock badge (rendered above all placed items)
+            if is_selected && !moving_outside {
+                selection_overlays.push(
+                    div()
+                        .absolute()
+                        .left(px(rect.x))
+                        .top(px(rect.y))
+                        .w(px(rect.width))
+                        .h(px(rect.height))
+                        .rounded(px(4.))
+                        .border_1()
+                        .when(item_locked, |el| el.border_dashed())
+                        .border_color(sel_border)
+                        .into_any_element(),
+                );
+                if item_locked {
+                    selection_overlays.push(
                         div()
                             .absolute()
-                            .top(px(-7.))
-                            .right(px(-7.))
+                            .left(px(rect.right() - 9.0))
+                            .top(px(rect.y - 7.0))
                             .size(px(16.))
                             .rounded_full()
                             .bg(theme.surface)
@@ -1794,42 +1937,30 @@ impl RenderOnce for FreeformCanvas {
                                 Icon::new(LucideIcon::Lock)
                                     .size(IconSize::Custom(px(9.)))
                                     .color(theme.muted_foreground),
-                            ),
-                    )
-                });
-
-            // 8-direction resize handles when a single unlocked component is selected (hidden while moving)
-            if is_selected && single_selected && !is_moving && !item_locked {
-                let handle_size = 9.0_f32;
-                let half = handle_size * 0.5;
-                for handle in ResizeHandle::ALL {
-                    let (hx, hy) = match handle {
-                        ResizeHandle::NorthWest => (-half, -half),
-                        ResizeHandle::North => (rect.width * 0.5 - half, -half),
-                        ResizeHandle::NorthEast => (rect.width - half, -half),
-                        ResizeHandle::East => (rect.width - half, rect.height * 0.5 - half),
-                        ResizeHandle::SouthEast => (rect.width - half, rect.height - half),
-                        ResizeHandle::South => (rect.width * 0.5 - half, rect.height - half),
-                        ResizeHandle::SouthWest => (-half, rect.height - half),
-                        ResizeHandle::West => (-half, rect.height * 0.5 - half),
-                    };
-                    // Hide midpoint edge handles on very small items so corners stay easy to grab
-                    let is_edge_mid = matches!(
-                        handle,
-                        ResizeHandle::North
-                            | ResizeHandle::South
-                            | ResizeHandle::East
-                            | ResizeHandle::West
+                            )
+                            .into_any_element(),
                     );
-                    if is_edge_mid {
-                        let span = match handle {
-                            ResizeHandle::North | ResizeHandle::South => rect.width,
-                            _ => rect.height,
-                        };
-                        if span < 30.0 {
-                            continue;
-                        }
+                }
+            }
+
+            // Always-on-top 8-direction resize handles when a single unlocked component is selected
+            // (hidden while moving). Painted edge-midpoints first, corners last so corners always
+            // win both cursor styling and click dispatch on compact items.
+            if is_selected && single_selected && !is_moving && !item_locked {
+                for handle in RESIZE_HANDLES_PAINT_ORDER {
+                    if !resize_handle_visible(rect, handle) {
+                        continue;
                     }
+                    let hit_rect = resize_handle_hit_rect(rect, handle);
+                    let is_handle_hovered = matches!(
+                        &effective_hover,
+                        Some(CanvasHitTarget::ResizeHandle { id, handle: h })
+                            if id == &item_id && *h == handle
+                    );
+                    let is_handle_active = active_resize
+                        .as_ref()
+                        .is_some_and(|r| r.id == item_id && r.handle == handle);
+
                     let st_resize = self.state.clone();
                     let resize_focus = focus_handle.clone();
                     let r_id = item_id.clone();
@@ -1837,22 +1968,25 @@ impl RenderOnce for FreeformCanvas {
                     let r_min = item.min_size;
                     let r_max = item.max_size;
                     let cursor = handle.cursor();
-                    let hover_bg = theme.primary;
-                    item_box = item_box.child(
+                    let st_rclick = self.state.clone();
+                    let rc_focus = focus_handle.clone();
+                    let rc_id = item_id.clone();
+                    let rc_bounds = canvas_bounds_cell.clone();
+                    let rc_menu_enabled = self.context_menu_enabled;
+
+                    resize_handle_overlays.push(
                         div()
                             .id(ElementId::Name(
                                 format!("fc-h-{}-{:?}", item_id, handle).into(),
                             ))
                             .absolute()
-                            .left(px(hx))
-                            .top(px(hy))
-                            .w(px(handle_size))
-                            .h(px(handle_size))
-                            .rounded(px(2.5))
-                            .bg(crate::white())
-                            .border_1()
-                            .border_color(theme.primary)
-                            .hover(move |s| s.bg(hover_bg))
+                            .left(px(hit_rect.x))
+                            .top(px(hit_rect.y))
+                            .w(px(hit_rect.width))
+                            .h(px(hit_rect.height))
+                            .flex()
+                            .items_center()
+                            .justify_center()
                             .cursor(cursor)
                             .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
                                 window.focus(&resize_focus, cx);
@@ -1872,12 +2006,52 @@ impl RenderOnce for FreeformCanvas {
                                     );
                                 });
                                 cx.stop_propagation();
-                            }),
+                            })
+                            .on_mouse_down(MouseButton::Right, move |ev, window, cx| {
+                                window.focus(&rc_focus, cx);
+                                let canvas_position = rc_bounds.get().map(|cb| {
+                                    (
+                                        ((ev.position.x - cb.origin.x).0).clamp(0.0, cw),
+                                        ((ev.position.y - cb.origin.y).0).clamp(0.0, ch),
+                                    )
+                                });
+                                st_rclick.update(cx, |s, cx| {
+                                    s.pending_narrow_click = None;
+                                    s.pending_cycle_click = None;
+                                    if !s.is_selected(rc_id.as_ref()) {
+                                        s.set_selection(vec![rc_id.clone()], cx);
+                                    }
+                                    if rc_menu_enabled {
+                                        s.open_context_menu(
+                                            CanvasContextMenuTarget {
+                                                window_position: ev.position,
+                                                canvas_position,
+                                                item_id: Some(rc_id.clone()),
+                                            },
+                                            cx,
+                                        );
+                                    }
+                                });
+                                window.refresh();
+                                cx.stop_propagation();
+                            })
+                            .child(
+                                div()
+                                    .w(px(RESIZE_HANDLE_VISUAL_SIZE))
+                                    .h(px(RESIZE_HANDLE_VISUAL_SIZE))
+                                    .rounded(px(2.5))
+                                    .bg(if is_handle_hovered || is_handle_active {
+                                        theme.primary
+                                    } else {
+                                        crate::white()
+                                    })
+                                    .border_1()
+                                    .border_color(theme.primary),
+                            )
+                            .into_any_element(),
                     );
                 }
             }
-
-            placed_elements.push(item_box.into_any_element());
         }
 
         // Live drop preview box when dragging a NEW component from the palette into the canvas
@@ -1958,6 +2132,9 @@ impl RenderOnce for FreeformCanvas {
                 .inset_0(),
             )
             .children(placed_elements)
+            .when_some(hover_overlay, |el, ov| el.child(ov))
+            .children(selection_overlays)
+            .children(resize_handle_overlays)
             .when_some(new_drop_preview, |el, preview| el.child(preview))
             .when(is_empty, |el| {
                 el.when_some(self.empty, |el, empty| {
@@ -2032,6 +2209,10 @@ impl RenderOnce for FreeformCanvas {
         let root_bounds_measure = root_bounds_cell;
 
         // Outer workbench container hosting the canvas, canvas resize grips, HUD readout, and DnD listeners
+        let hover_state = self.state.clone();
+        let hover_canvas_bounds = canvas_bounds_cell.clone();
+        let hover_live_rects = live_rects;
+        let hover_locked_ids = locked_ids.clone();
         let dnd_move_state = self.state.clone();
         let dnd_drop_state = self.state.clone();
         let dnd_drop_focus = focus_handle.clone();
@@ -2052,11 +2233,16 @@ impl RenderOnce for FreeformCanvas {
             (Some(target), true) => {
                 let all_ids: Vec<SharedString> =
                     all_rects.iter().map(|(id, _)| id.clone()).collect();
+                let overlapping_ids: Vec<SharedString> = target
+                    .canvas_position
+                    .map(|pos| hit_test_items_at(pos, &all_rects))
+                    .unwrap_or_default();
                 let defaults = build_default_context_menu_entries(DefaultContextMenuParams {
                     state: &self.state,
                     target,
                     selected: &selected,
                     all_ids: &all_ids,
+                    overlapping_ids: &overlapping_ids,
                     locked_ids: &locked_ids,
                     item_labels: &item_labels,
                     show_grid,
@@ -2310,13 +2496,15 @@ impl RenderOnce for FreeformCanvas {
             })
             .child(frame_wrapper)
             .child(context_popup)
-            // Window-level pointer capture + top-most marquee rubber-band overlay
+            // Window-level pointer capture, single-target hover tracker, and top-most marquee
+            // rubber-band overlay
             .child(
                 canvas(
-                    move |bounds, _, _| {
+                    move |bounds, window, _| {
                         root_bounds_measure.set(Some(bounds));
+                        window.insert_hitbox(bounds, HitboxBehavior::Normal)
                     },
-                    move |bounds, _, window, _| {
+                    move |bounds, root_hitbox, window, _| {
                         if let Some((start_pt, cur_pt)) = marquee_paint {
                             paint_marquee_rect(
                                 bounds,
@@ -2330,6 +2518,72 @@ impl RenderOnce for FreeformCanvas {
                         if let Some(cursor) = active_cursor {
                             window.set_window_cursor_style(cursor);
                         }
+                        let st_hover = hover_state.clone();
+                        let st_exit = hover_state;
+                        let hb_bounds = hover_canvas_bounds;
+                        let h_rects = hover_live_rects;
+                        let h_locked = hover_locked_ids;
+                        window.on_mouse_event(move |ev: &MouseMoveEvent, phase, window, cx| {
+                            if phase != DispatchPhase::Capture {
+                                return;
+                            }
+                            let inside = root_hitbox.is_hovered(window);
+                            let (prev_inside, prev_target, suppress, selected_snapshot) = {
+                                let s = st_hover.read(cx);
+                                (
+                                    s.pointer_inside_root,
+                                    s.hovered_target.clone(),
+                                    s.is_interacting() || s.is_context_menu_open(),
+                                    s.selected.clone(),
+                                )
+                            };
+                            let next = if inside && !suppress {
+                                hb_bounds.get().and_then(|cb| {
+                                    let rx = (ev.position.x - cb.origin.x).0;
+                                    let ry = (ev.position.y - cb.origin.y).0;
+                                    if editable
+                                        && is_over_canvas_resize_handle(rx, ry, canvas_size)
+                                    {
+                                        None
+                                    } else {
+                                        hit_test_canvas(
+                                            (rx, ry),
+                                            &h_rects,
+                                            &selected_snapshot,
+                                            &h_locked,
+                                            editable,
+                                        )
+                                    }
+                                })
+                            } else {
+                                None
+                            };
+                            if prev_inside != inside || prev_target != next {
+                                st_hover.update(cx, |s, cx| {
+                                    s.pointer_inside_root = inside;
+                                    if s.hovered_target != next {
+                                        s.hovered_target = next;
+                                        cx.notify();
+                                    }
+                                });
+                            }
+                        });
+                        window.on_mouse_event(move |_: &MouseExitEvent, phase, _, cx| {
+                            if phase == DispatchPhase::Capture {
+                                let needs_clear = {
+                                    let s = st_exit.read(cx);
+                                    s.pointer_inside_root || s.hovered_target.is_some()
+                                };
+                                if needs_clear {
+                                    st_exit.update(cx, |s, cx| {
+                                        s.pointer_inside_root = false;
+                                        if s.hovered_target.take().is_some() {
+                                            cx.notify();
+                                        }
+                                    });
+                                }
+                            }
+                        });
                         if is_item_resizing {
                             let st_m = capture_state.clone();
                             let st_u = capture_state;

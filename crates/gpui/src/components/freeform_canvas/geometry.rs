@@ -84,6 +84,12 @@ impl CanvasRect {
             && self.y < other.bottom()
             && self.bottom() > other.y
     }
+
+    /// Returns `true` if `(x, y)` lies inside this rectangle (inclusive of edges).
+    #[inline]
+    pub fn contains_point(self, x: f32, y: f32) -> bool {
+        x >= self.x && x <= self.right() && y >= self.y && y <= self.bottom()
+    }
 }
 
 /// Computes the tightest [`CanvasRect`] enclosing all rectangles in `rects`, or `None` if empty.
@@ -1300,4 +1306,198 @@ pub fn paste_rects(
         None => (offset, offset),
     };
     nudge_rects(rects, dx, dy, canvas)
+}
+
+/// Visual width and height (in logical pixels) of each item resize knob.
+pub const RESIZE_HANDLE_VISUAL_SIZE: f32 = 9.0;
+
+/// Maximum interactive hit-target width and height (in logical pixels) centered on each resize knob.
+const RESIZE_HANDLE_MAX_HIT_SIZE: f32 = 13.0;
+
+/// Minimum span (in logical pixels) along an edge before its midpoint resize handle is displayed.
+const RESIZE_EDGE_MIDPOINT_MIN_SPAN: f32 = 30.0;
+
+/// Corners tested before edge midpoints so corner grabs always win on compact items.
+pub(super) const RESIZE_HANDLES_CORNER_FIRST: [ResizeHandle; 8] = [
+    ResizeHandle::NorthWest,
+    ResizeHandle::NorthEast,
+    ResizeHandle::SouthEast,
+    ResizeHandle::SouthWest,
+    ResizeHandle::North,
+    ResizeHandle::East,
+    ResizeHandle::South,
+    ResizeHandle::West,
+];
+
+/// Edge midpoints painted before corners so GPUI reverse-order dispatch prioritizes corners.
+pub(super) const RESIZE_HANDLES_PAINT_ORDER: [ResizeHandle; 8] = [
+    ResizeHandle::North,
+    ResizeHandle::East,
+    ResizeHandle::South,
+    ResizeHandle::West,
+    ResizeHandle::NorthWest,
+    ResizeHandle::NorthEast,
+    ResizeHandle::SouthEast,
+    ResizeHandle::SouthWest,
+];
+
+/// Result of hit-testing a canvas-local pointer position against the canvas's interactive layers.
+///
+/// Mirrors standard vector/layout editor priority: active selection transform handles live in an
+/// always-on-top overlay above all items, followed by the topmost (highest z-index) item body.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CanvasHitTarget {
+    /// One of the 8 resize handles belonging to the currently selected unlocked single item.
+    ResizeHandle {
+        /// Selected component ID owning this handle.
+        id: SharedString,
+        /// Which resize handle is targeted.
+        handle: ResizeHandle,
+    },
+    /// A placed component body (strictly the topmost item in z-order at this position).
+    Item(SharedString),
+}
+
+/// Returns `true` if `handle` should be shown and interactive for an item of size `rect`.
+///
+/// Corner handles are always visible; midpoint edge handles hide when that edge is shorter than
+/// 30 logical pixels so corners remain effortless to grab.
+#[inline]
+pub fn resize_handle_visible(rect: CanvasRect, handle: ResizeHandle) -> bool {
+    match handle {
+        ResizeHandle::North | ResizeHandle::South => rect.width >= RESIZE_EDGE_MIDPOINT_MIN_SPAN,
+        ResizeHandle::East | ResizeHandle::West => rect.height >= RESIZE_EDGE_MIDPOINT_MIN_SPAN,
+        ResizeHandle::NorthWest
+        | ResizeHandle::NorthEast
+        | ResizeHandle::SouthEast
+        | ResizeHandle::SouthWest => true,
+    }
+}
+
+/// Canvas-local center `(x, y)` of `handle` on `rect`.
+#[inline]
+pub fn resize_handle_center(rect: CanvasRect, handle: ResizeHandle) -> (f32, f32) {
+    match handle {
+        ResizeHandle::NorthWest => (rect.x, rect.y),
+        ResizeHandle::North => (rect.center_x(), rect.y),
+        ResizeHandle::NorthEast => (rect.right(), rect.y),
+        ResizeHandle::East => (rect.right(), rect.center_y()),
+        ResizeHandle::SouthEast => (rect.right(), rect.bottom()),
+        ResizeHandle::South => (rect.center_x(), rect.bottom()),
+        ResizeHandle::SouthWest => (rect.x, rect.bottom()),
+        ResizeHandle::West => (rect.x, rect.center_y()),
+    }
+}
+
+/// Interactive hit-box size (in logical pixels) for resize handles on `rect`.
+///
+/// Provides a forgiving 13×13 px grab target around the 9×9 px visual knob on normal items,
+/// smoothly clamping down toward 9×9 px on very compact items so their draggable interior stays
+/// easy to grab.
+#[inline]
+pub fn resize_handle_hit_size(rect: CanvasRect) -> f32 {
+    (rect.width.min(rect.height) * 0.5)
+        .clamp(RESIZE_HANDLE_VISUAL_SIZE, RESIZE_HANDLE_MAX_HIT_SIZE)
+}
+
+/// Canvas-local visual rectangle (9×9 px) of `handle` on `rect`.
+#[inline]
+pub fn resize_handle_visual_rect(rect: CanvasRect, handle: ResizeHandle) -> CanvasRect {
+    let (cx, cy) = resize_handle_center(rect, handle);
+    let half = RESIZE_HANDLE_VISUAL_SIZE * 0.5;
+    CanvasRect::new(
+        cx - half,
+        cy - half,
+        RESIZE_HANDLE_VISUAL_SIZE,
+        RESIZE_HANDLE_VISUAL_SIZE,
+    )
+}
+
+/// Canvas-local interactive hit rectangle of `handle` on `rect`.
+#[inline]
+pub fn resize_handle_hit_rect(rect: CanvasRect, handle: ResizeHandle) -> CanvasRect {
+    let (cx, cy) = resize_handle_center(rect, handle);
+    let sz = resize_handle_hit_size(rect);
+    let half = sz * 0.5;
+    CanvasRect::new(cx - half, cy - half, sz, sz)
+}
+
+/// Returns every item ID whose rectangle contains `point`, ordered **front-to-back**
+/// (highest z-index first, matching reverse slice order of `items`).
+pub fn hit_test_items_at(
+    point: (f32, f32),
+    items: &[(SharedString, CanvasRect)],
+) -> Vec<SharedString> {
+    items
+        .iter()
+        .rev()
+        .filter(|(_, r)| r.contains_point(point.0, point.1))
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
+/// Single-source-of-truth hit test for a canvas-local `point`.
+///
+/// Evaluation order:
+/// 1. **Active selection resize handles** (when `editable` and exactly one unlocked item is
+///    selected), checked corners-first above all placed items regardless of z-order.
+/// 2. **Topmost placed item body** in z-order (`items.iter().rev()`).
+/// 3. `None` (empty canvas).
+pub fn hit_test_canvas(
+    point: (f32, f32),
+    items: &[(SharedString, CanvasRect)],
+    selected: &[SharedString],
+    locked_ids: &[SharedString],
+    editable: bool,
+) -> Option<CanvasHitTarget> {
+    if editable
+        && selected.len() == 1
+        && let Some(sel_id) = selected.first()
+        && !locked_ids.contains(sel_id)
+        && let Some((_, sel_rect)) = items.iter().find(|(id, _)| id == sel_id)
+    {
+        for handle in RESIZE_HANDLES_CORNER_FIRST {
+            if resize_handle_visible(*sel_rect, handle)
+                && resize_handle_hit_rect(*sel_rect, handle).contains_point(point.0, point.1)
+            {
+                return Some(CanvasHitTarget::ResizeHandle {
+                    id: sel_id.clone(),
+                    handle,
+                });
+            }
+        }
+    }
+
+    items
+        .iter()
+        .rev()
+        .find(|(_, r)| r.contains_point(point.0, point.1))
+        .map(|(id, _)| CanvasHitTarget::Item(id.clone()))
+}
+
+/// Advances selection through an overlapping stack of items under the cursor (ordered
+/// front-to-back), wrapping from the bottommost item back to the topmost item.
+pub fn cycle_overlapping_selection(
+    stack_front_to_back: &[SharedString],
+    current_selected: &[SharedString],
+) -> Option<SharedString> {
+    let first = stack_front_to_back.first()?;
+    if current_selected.len() == 1
+        && let Some(idx) = stack_front_to_back
+            .iter()
+            .position(|id| id == &current_selected[0])
+    {
+        return Some(stack_front_to_back[(idx + 1) % stack_front_to_back.len()].clone());
+    }
+    Some(first.clone())
+}
+
+/// Returns `true` if canvas-local `(x, y)` falls inside one of the three outer canvas-frame
+/// resize grips (East, South, SouthEast).
+pub(super) fn is_over_canvas_resize_handle(x: f32, y: f32, canvas: CanvasSize) -> bool {
+    let (cw, ch) = (canvas.width, canvas.height);
+    let east = CanvasRect::new(cw + 4.0, (ch * 0.5 - 16.0).max(0.0), 10.0, 32.0_f32.min(ch));
+    let south = CanvasRect::new((cw * 0.5 - 16.0).max(0.0), ch + 4.0, 32.0_f32.min(cw), 10.0);
+    let se = CanvasRect::new(cw + 3.0, ch + 3.0, 12.0, 12.0);
+    east.contains_point(x, y) || south.contains_point(x, y) || se.contains_point(x, y)
 }
