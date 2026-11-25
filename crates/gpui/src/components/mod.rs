@@ -124,7 +124,8 @@ pub use charts::{
     BandScale, BreakdownItem, BreakdownList, ChartCard, ChartLegendItem, ChartPalette,
     ChartValueFormat, CubicSegment, GroupedSparkline, GroupedSparklineSeries, LegendSwatch,
     LineChart, LineSeries, LineStyle, LinearScale, Sparkline, SparklineHover, SparklineKind,
-    StackedBarChart, StackedBarPoint, StackedBarSeries, breakdown_list, chart_card,
+    StackedBarBaseline, StackedBarChart, StackedBarPoint, StackedBarSeries, breakdown_list,
+    chart_card,
     compute_sparkline_y_range, format_compact, grouped_sparkline, line_chart, monotone, nice_ticks,
     sample_monotone, sparkline, stacked_bar_chart,
 };

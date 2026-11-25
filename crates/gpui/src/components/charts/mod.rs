@@ -20,4 +20,6 @@ pub use sparkline::{
     SparklineKind, compute_sparkline_y_range, grouped_sparkline, monotone, sample_monotone,
     sparkline,
 };
-pub use stacked_bar::{StackedBarChart, StackedBarPoint, StackedBarSeries, stacked_bar_chart};
+pub use stacked_bar::{
+    StackedBarBaseline, StackedBarChart, StackedBarPoint, StackedBarSeries, stacked_bar_chart,
+};

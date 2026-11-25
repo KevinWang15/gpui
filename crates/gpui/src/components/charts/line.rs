@@ -17,9 +17,9 @@ use crate::{
 };
 
 use super::core::{
-    ChartLegendItem, ChartMargins, ChartPalette, ChartTooltipRow, ChartValueFormat, LinearScale,
-    PlotRect, nice_ticks, paint_brush_band, paint_chart_marker, paint_chart_text, paint_y_gridlines,
-    render_brush_pill, render_chart_tooltip,
+    ChartLegendItem, ChartMargins, ChartPalette, ChartTooltipRow, ChartValueFormat, LegendSwatch,
+    LinearScale, PlotRect, nice_ticks, paint_brush_band, paint_chart_marker, paint_chart_text,
+    paint_y_gridlines, render_brush_pill, render_chart_tooltip,
 };
 use crate::components::theme::ActiveTheme;
 
@@ -959,6 +959,11 @@ impl RenderOnce for LineChart {
                     color: resolved_colors[idx],
                     label: s.label.clone(),
                     value: self.value_format.format_detail(val),
+                    swatch: match s.style {
+                        LineStyle::Solid => LegendSwatch::SolidLine,
+                        LineStyle::Dashed => LegendSwatch::DashedLine,
+                    },
+                    separator_before: false,
                 })
             });
             container = container.child(render_chart_tooltip(

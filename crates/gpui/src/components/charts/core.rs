@@ -504,6 +504,8 @@ pub(crate) struct ChartTooltipRow {
     pub color: Hsla,
     pub label: SharedString,
     pub value: String,
+    pub swatch: LegendSwatch,
+    pub separator_before: bool,
 }
 
 /// Renders a floating edge-flipping hover tooltip card anchored near `anchor_x`.
@@ -557,6 +559,34 @@ pub(crate) fn render_chart_tooltip(
         .child(div().w_full().h(px(1.)).bg(theme.border));
 
     for row in rows {
+        if row.separator_before {
+            tooltip = tooltip.child(div().w_full().h(px(1.)).bg(theme.border.opacity(0.65)));
+        }
+        let swatch = match row.swatch {
+            LegendSwatch::Dot => div()
+                .w(px(7.))
+                .h(px(7.))
+                .flex_shrink_0()
+                .rounded_full()
+                .bg(row.color)
+                .into_any_element(),
+            LegendSwatch::SolidLine => div()
+                .w(px(11.))
+                .h(px(2.))
+                .flex_shrink_0()
+                .rounded_full()
+                .bg(row.color)
+                .into_any_element(),
+            LegendSwatch::DashedLine => div()
+                .flex()
+                .flex_shrink_0()
+                .items_center()
+                .gap(px(1.5))
+                .child(div().w(px(3.)).h(px(2.)).rounded_full().bg(row.color))
+                .child(div().w(px(3.)).h(px(2.)).rounded_full().bg(row.color))
+                .child(div().w(px(3.)).h(px(2.)).rounded_full().bg(row.color))
+                .into_any_element(),
+        };
         tooltip = tooltip.child(
             div()
                 .flex()
@@ -570,7 +600,7 @@ pub(crate) fn render_chart_tooltip(
                         .items_center()
                         .gap(px(6.))
                         .min_w_0()
-                        .child(div().w(px(7.)).h(px(7.)).rounded_full().bg(row.color))
+                        .child(swatch)
                         .child(
                             div()
                                 .text_color(theme.muted_foreground)
@@ -580,6 +610,7 @@ pub(crate) fn render_chart_tooltip(
                 )
                 .child(
                     div()
+                        .flex_shrink_0()
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(theme.foreground)
                         .child(row.value),

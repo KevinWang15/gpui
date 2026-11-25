@@ -1,23 +1,28 @@
-//! GPU-batched [`StackedBarChart`] with top-segment corner rounding, nice Y ticks,
-//! auto-thinned X labels, interactive hover tooltip, bar click callbacks, and optional
-//! horizontal drag-to-select brushing.
+//! GPU-batched [`StackedBarChart`] with top-segment corner rounding, optional comparison
+//! baseline line overlay ([`StackedBarBaseline`]), nice Y ticks, auto-thinned X labels,
+//! interactive hover tooltip, bar click callbacks, and optional horizontal drag-to-select
+//! brushing.
 
 use std::cell::RefCell;
+use std::hash::{Hash, Hasher};
 use std::ops::RangeInclusive;
 use std::rc::Rc;
 
+use collections::FxHasher;
+
 use crate::{
     App, BorderStyle, Bounds, Corners, CursorStyle, Edges, ElementId, FontWeight, Hsla,
-    IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
-    RenderOnce, SharedString, StyleRefinement, Styled, TextAlign, Window, canvas, div, fill, point,
-    prelude::*, px, quad, size, transparent_black,
+    IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Path,
+    PathBuilder, Pixels, RenderOnce, SharedString, StyleRefinement, Styled, TextAlign, Window,
+    canvas, div, fill, point, prelude::*, px, quad, size, transparent_black,
 };
 
 use super::core::{
     BandScale, ChartLegendItem, ChartMargins, ChartPalette, ChartTooltipRow, ChartValueFormat,
-    LinearScale, PlotRect, nice_ticks, paint_brush_band, paint_chart_text, paint_y_gridlines,
-    render_brush_pill, render_chart_tooltip,
+    LegendSwatch, LinearScale, PlotRect, nice_ticks, paint_brush_band, paint_chart_marker,
+    paint_chart_text, paint_y_gridlines, render_brush_pill, render_chart_tooltip,
 };
+use super::line::LineStyle;
 use crate::components::theme::ActiveTheme;
 
 const STACKED_BAR_MARGINS: ChartMargins = ChartMargins {
@@ -78,12 +83,206 @@ impl StackedBarPoint {
     }
 }
 
+/// Optional comparison / baseline line overlaid across [`StackedBarChart`] columns
+/// (for example, previous-period totals drawn as a dashed curve).
+#[derive(Clone, Debug)]
+pub struct StackedBarBaseline {
+    /// Legend & tooltip label (e.g. `"Previous 30 days"`).
+    pub label: SharedString,
+    /// Per-column comparison values aligned 1-to-1 with [`StackedBarChart::points`].
+    /// `None` (or non-finite) entries split the curve cleanly without bridging missing buckets.
+    pub values: Vec<Option<f64>>,
+    /// Stroke pattern (defaults to [`LineStyle::Dashed`]).
+    pub style: LineStyle,
+    /// Optional explicit stroke color (defaults to `palette.baseline`).
+    pub color: Option<Hsla>,
+    /// Stroke thickness in pixels (defaults to `1.75` for dashed, `2.0` for solid).
+    pub stroke_width: Option<f32>,
+    /// Whether to smooth the curve using Fritsch–Carlson monotone cubic interpolation
+    /// (defaults to `true`, matching sparkline baselines with zero overshoot).
+    pub smooth: bool,
+}
+
+impl StackedBarBaseline {
+    /// Creates a new dashed, smoothed [`StackedBarBaseline`].
+    pub fn new(label: impl Into<SharedString>, values: impl Into<Vec<Option<f64>>>) -> Self {
+        Self {
+            label: label.into(),
+            values: values.into(),
+            style: LineStyle::Dashed,
+            color: None,
+            stroke_width: None,
+            smooth: true,
+        }
+    }
+
+    /// Configures solid or dashed stroke style.
+    pub fn line_style(mut self, style: LineStyle) -> Self {
+        self.style = style;
+        self
+    }
+
+    /// Overrides the baseline stroke color.
+    pub fn color(mut self, color: Hsla) -> Self {
+        self.color = Some(color);
+        self
+    }
+
+    /// Overrides the baseline stroke thickness in pixels.
+    pub fn stroke_width(mut self, width: f32) -> Self {
+        self.stroke_width = Some(width);
+        self
+    }
+
+    /// Enables or disables Fritsch–Carlson monotone cubic smoothing.
+    pub fn smooth(mut self, smooth: bool) -> Self {
+        self.smooth = smooth;
+        self
+    }
+
+    /// Returns the finite non-negative comparison value at column `idx`, if present.
+    fn value_at(&self, idx: usize) -> Option<f64> {
+        let v = (*self.values.get(idx)?)?;
+        v.is_finite().then(|| v.max(0.0))
+    }
+
+    /// Maximum finite non-negative value across `count` columns.
+    fn max_value(&self, count: usize) -> f64 {
+        self.values
+            .iter()
+            .take(count)
+            .flatten()
+            .copied()
+            .filter(|v| v.is_finite())
+            .fold(0.0_f64, f64::max)
+    }
+}
+
+struct CachedBaselineGeometry {
+    key: u64,
+    casings: Vec<Path>,
+    strokes: Vec<Path>,
+}
+
+fn compute_baseline_geometry_key(
+    plot: PlotRect,
+    nice_max: f64,
+    point_count: usize,
+    baseline: &StackedBarBaseline,
+) -> u64 {
+    let mut hasher = FxHasher::default();
+    plot.left.to_bits().hash(&mut hasher);
+    plot.right.to_bits().hash(&mut hasher);
+    plot.top.to_bits().hash(&mut hasher);
+    plot.bottom.to_bits().hash(&mut hasher);
+    nice_max.to_bits().hash(&mut hasher);
+    point_count.hash(&mut hasher);
+    baseline.style.hash(&mut hasher);
+    baseline.smooth.hash(&mut hasher);
+    baseline.stroke_width.map(f32::to_bits).hash(&mut hasher);
+    let len = point_count.min(baseline.values.len());
+    len.hash(&mut hasher);
+    for slot in &baseline.values[..len] {
+        match slot.filter(|v| v.is_finite()) {
+            Some(v) => {
+                1u8.hash(&mut hasher);
+                v.max(0.0).to_bits().hash(&mut hasher);
+            }
+            None => 0u8.hash(&mut hasher),
+        }
+    }
+    hasher.finish()
+}
+
+/// Splits baseline values into contiguous finite runs in pixel coordinates.
+fn baseline_pixel_runs(
+    baseline: &StackedBarBaseline,
+    point_count: usize,
+    band_scale: BandScale,
+    y_scale: LinearScale,
+    plot: PlotRect,
+) -> Vec<Vec<(f32, f32)>> {
+    let len = point_count.min(baseline.values.len());
+    let mut runs: Vec<Vec<(f32, f32)>> = Vec::new();
+    let mut current: Vec<(f32, f32)> = Vec::new();
+
+    for idx in 0..len {
+        if let Some(val) = baseline.value_at(idx) {
+            current.push((band_scale.band_center(idx), y_scale.map(val)));
+        } else if !current.is_empty() {
+            runs.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        runs.push(current);
+    }
+
+    // For isolated 1-point runs (including 1-day ranges), draw a crisp horizontal reference
+    // segment across the bar column so the comparison level remains clearly visible.
+    let half_span = (band_scale.bandwidth() * 0.62).max(8.0);
+    for run in &mut runs {
+        if run.len() == 1 {
+            let (cx, cy) = run[0];
+            let x0 = (cx - half_span).max(plot.left);
+            let x1 = (cx + half_span).min(plot.right);
+            if x1 > x0 + 0.5 {
+                *run = vec![(x0, cy), (x1, cy)];
+            }
+        }
+    }
+    runs
+}
+
+fn build_baseline_geometry(
+    key: u64,
+    baseline: &StackedBarBaseline,
+    point_count: usize,
+    band_scale: BandScale,
+    y_scale: LinearScale,
+    plot: PlotRect,
+) -> CachedBaselineGeometry {
+    let is_dashed = baseline.style == LineStyle::Dashed;
+    let width = baseline
+        .stroke_width
+        .unwrap_or(if is_dashed { 1.75 } else { 2.0 });
+    let runs = baseline_pixel_runs(baseline, point_count, band_scale, y_scale, plot);
+    let mut casings = Vec::with_capacity(runs.len());
+    let mut strokes = Vec::with_capacity(runs.len());
+
+    for run in &runs {
+        if run.len() < 2 {
+            continue;
+        }
+        let mut casing_pb = PathBuilder::stroke(px(width + 2.0));
+        let mut stroke_pb = PathBuilder::stroke(px(width));
+        if is_dashed {
+            casing_pb = casing_pb.dash_array(&[px(5.0), px(4.0)]);
+            stroke_pb = stroke_pb.dash_array(&[px(5.0), px(4.0)]);
+        }
+        super::sparkline::push_curve_points(&mut casing_pb, run, baseline.smooth, false);
+        super::sparkline::push_curve_points(&mut stroke_pb, run, baseline.smooth, false);
+        if let Ok(path) = casing_pb.build() {
+            casings.push(path);
+        }
+        if let Ok(path) = stroke_pb.build() {
+            strokes.push(path);
+        }
+    }
+
+    CachedBaselineGeometry {
+        key,
+        casings,
+        strokes,
+    }
+}
+
 #[derive(Default)]
 struct StackedBarInteractionState {
     hovered_index: Option<usize>,
     plot_bounds: Option<Bounds<Pixels>>,
     drag_anchor_x: Option<f32>,
     drag_current_x: Option<f32>,
+    cached_baseline: Option<CachedBaselineGeometry>,
 }
 
 impl StackedBarInteractionState {
@@ -118,6 +317,7 @@ pub struct StackedBarChart {
     id: ElementId,
     series: Vec<StackedBarSeries>,
     points: Vec<StackedBarPoint>,
+    baseline: Option<StackedBarBaseline>,
     height: Pixels,
     fill_height: bool,
     value_format: ChartValueFormat,
@@ -142,6 +342,7 @@ impl StackedBarChart {
             id: id.into(),
             series: Vec::new(),
             points: Vec::new(),
+            baseline: None,
             height: px(220.),
             fill_height: false,
             value_format: ChartValueFormat::Currency,
@@ -164,6 +365,12 @@ impl StackedBarChart {
     /// Sets the bar columns.
     pub fn points(mut self, points: impl IntoIterator<Item = StackedBarPoint>) -> Self {
         self.points = points.into_iter().collect();
+        self
+    }
+
+    /// Overlays a comparison / baseline line across the bar columns (e.g. previous period totals).
+    pub fn baseline(mut self, baseline: StackedBarBaseline) -> Self {
+        self.baseline = Some(baseline);
         self
     }
 
@@ -278,11 +485,16 @@ impl RenderOnce for StackedBarChart {
         };
         let active_selection = live_brush.clone().or(self.selected_range);
 
-        let max_total = self
+        let max_bars = self
             .points
             .iter()
             .map(StackedBarPoint::total)
             .fold(0.0_f64, f64::max);
+        let max_baseline = self
+            .baseline
+            .as_ref()
+            .map_or(0.0, |b| b.max_value(point_count));
+        let max_total = max_bars.max(max_baseline);
         let (nice_max, y_ticks) = nice_ticks(max_total, 4);
 
         let series_colors: Rc<[Hsla]> = self
@@ -292,22 +504,29 @@ impl RenderOnce for StackedBarChart {
             .map(|(i, s)| s.color.unwrap_or_else(|| palette.color(i)))
             .collect();
 
-        // Share points & colors via Rc slice to eliminate deep Vec<f64> cloning per hover frame.
+        // Share points, baseline & colors via Rc to eliminate deep Vec cloning per hover frame.
         let points_rc: Rc<[StackedBarPoint]> = Rc::from(self.points);
+        let baseline_rc: Option<Rc<StackedBarBaseline>> = self.baseline.map(Rc::new);
+        let baseline_color = baseline_rc
+            .as_ref()
+            .map(|b| b.color.unwrap_or(palette.baseline));
         let points_paint = points_rc.clone();
+        let baseline_paint = baseline_rc.clone();
         let colors_paint = series_colors.clone();
         let ticks_paint = y_ticks;
         let format_paint = self.value_format.clone();
         let palette_paint = palette.clone();
+        let surface_bg = theme.surface;
         let accent_color = theme.primary;
         let bar_radius = self.bar_radius;
+        let interaction_prepaint = interaction_rc.clone();
         let interaction_paint = interaction_rc.clone();
         let active_selection_paint = active_selection;
         let is_live_brushing = live_brush.is_some();
 
         let plot_canvas = canvas(
             move |bounds, _, _| {
-                interaction_paint.borrow_mut().plot_bounds = Some(bounds);
+                interaction_prepaint.borrow_mut().plot_bounds = Some(bounds);
                 bounds
             },
             move |bounds, _, window, cx| {
@@ -429,7 +648,63 @@ impl RenderOnce for StackedBarChart {
                     }
                 }
 
-                // 5. Auto-thinned X-axis labels
+                // 5. Optional comparison / baseline curve overlaid cleanly on top of bars
+                if let Some(baseline) = &baseline_paint
+                    && !points_paint.is_empty()
+                {
+                    let b_color = baseline_color.unwrap_or(palette_paint.baseline);
+                    let casing_color = Hsla {
+                        a: 0.78,
+                        ..surface_bg
+                    };
+                    let geom_key = compute_baseline_geometry_key(
+                        plot,
+                        nice_max,
+                        points_paint.len(),
+                        baseline,
+                    );
+                    {
+                        let mut state = interaction_paint.borrow_mut();
+                        let cache_hit = state
+                            .cached_baseline
+                            .as_ref()
+                            .is_some_and(|g| g.key == geom_key);
+                        if !cache_hit {
+                            state.cached_baseline = Some(build_baseline_geometry(
+                                geom_key,
+                                baseline,
+                                points_paint.len(),
+                                band_scale,
+                                y_scale,
+                                plot,
+                            ));
+                        }
+                        if let Some(geom) = &state.cached_baseline {
+                            for path in &geom.casings {
+                                window.paint_path(path.clone(), casing_color);
+                            }
+                            for path in &geom.strokes {
+                                window.paint_path(path.clone(), b_color);
+                            }
+                        }
+                    }
+
+                    if !is_live_brushing
+                        && let Some(h_idx) = hovered_index
+                        && let Some(b_val) = baseline.value_at(h_idx)
+                    {
+                        paint_chart_marker(
+                            band_scale.band_center(h_idx),
+                            y_scale.map(b_val),
+                            3.5,
+                            b_color,
+                            surface_bg,
+                            window,
+                        );
+                    }
+                }
+
+                // 6. Auto-thinned X-axis labels
                 let n = points_paint.len();
                 if n > 0 {
                     let max_labels = ((plot.width() / 68.0).floor() as usize).clamp(2.min(n), n);
@@ -668,21 +943,45 @@ impl RenderOnce for StackedBarChart {
             let local = PlotRect::from_local_bounds(bounds, STACKED_BAR_MARGINS);
             let band_scale =
                 BandScale::new(local.left, local.width(), point_count, BAND_PADDING_INNER);
-            let rows = self.series.iter().enumerate().filter_map(|(s_idx, meta)| {
-                let val = col.values.get(s_idx).copied().unwrap_or(0.0);
-                if val <= 0.0 {
-                    return None;
-                }
-                let color = series_colors
-                    .get(s_idx)
-                    .copied()
-                    .unwrap_or_else(|| palette.color(s_idx));
-                Some(ChartTooltipRow {
-                    color,
-                    label: meta.label.clone(),
-                    value: self.value_format.format_detail(val),
+            let mut rows: Vec<ChartTooltipRow> = self
+                .series
+                .iter()
+                .enumerate()
+                .filter_map(|(s_idx, meta)| {
+                    let val = col.values.get(s_idx).copied().unwrap_or(0.0);
+                    if val <= 0.0 {
+                        return None;
+                    }
+                    let color = series_colors
+                        .get(s_idx)
+                        .copied()
+                        .unwrap_or_else(|| palette.color(s_idx));
+                    Some(ChartTooltipRow {
+                        color,
+                        label: meta.label.clone(),
+                        value: self.value_format.format_detail(val),
+                        swatch: LegendSwatch::Dot,
+                        separator_before: false,
+                    })
                 })
-            });
+                .collect();
+            let mut has_baseline_row = false;
+            if let Some(baseline) = &baseline_rc
+                && let Some(b_val) = baseline.value_at(h_idx)
+            {
+                has_baseline_row = true;
+                rows.push(ChartTooltipRow {
+                    color: baseline_color.unwrap_or(palette.baseline),
+                    label: baseline.label.clone(),
+                    value: self.value_format.format_detail(b_val),
+                    swatch: match baseline.style {
+                        LineStyle::Solid => LegendSwatch::SolidLine,
+                        LineStyle::Dashed => LegendSwatch::DashedLine,
+                    },
+                    separator_before: !rows.is_empty(),
+                });
+            }
+            let tooltip_w = if has_baseline_row { 214.0 } else { 196.0 };
             container = container.child(render_chart_tooltip(
                 col.label.clone(),
                 Some(self.value_format.format_detail(col.total())),
@@ -690,7 +989,7 @@ impl RenderOnce for StackedBarChart {
                 band_scale.band_center(h_idx),
                 local.left,
                 bounds.size.width.0,
-                196.0,
+                tooltip_w,
                 px(8.),
                 &theme,
             ));
@@ -698,5 +997,55 @@ impl RenderOnce for StackedBarChart {
 
         crate::Refineable::refine(container.style(), &self.style);
         container
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stacked_bar_baseline_defaults_and_max_value() {
+        let b = StackedBarBaseline::new(
+            "Previous 7 days",
+            vec![Some(10.0), None, Some(-5.0), Some(f64::NAN), Some(42.5)],
+        );
+        assert_eq!(b.style, LineStyle::Dashed);
+        assert!(b.smooth);
+        assert_eq!(b.value_at(0), Some(10.0));
+        assert_eq!(b.value_at(1), None);
+        assert_eq!(b.value_at(2), Some(0.0));
+        assert_eq!(b.value_at(3), None);
+        assert_eq!(b.value_at(4), Some(42.5));
+        assert_eq!(b.max_value(5), 42.5);
+        assert_eq!(b.max_value(2), 10.0);
+    }
+
+    #[test]
+    fn stacked_bar_baseline_splits_gaps_and_handles_single_point() {
+        let plot = PlotRect {
+            left: 54.0,
+            right: 454.0,
+            top: 10.0,
+            bottom: 210.0,
+        };
+        let band_scale = BandScale::new(plot.left, plot.width(), 5, BAND_PADDING_INNER);
+        let y_scale = LinearScale::new(0.0, 100.0, plot.bottom, plot.top);
+
+        let b = StackedBarBaseline::new(
+            "Previous period",
+            vec![Some(20.0), Some(60.0), None, Some(40.0), None],
+        );
+        let runs = baseline_pixel_runs(&b, 5, band_scale, y_scale, plot);
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].len(), 2);
+        // Isolated single-point bucket expands to a crisp horizontal tick across the column.
+        assert_eq!(runs[1].len(), 2);
+        assert!((runs[1][0].1 - runs[1][1].1).abs() < 1e-4);
+        assert!(runs[1][1].0 > runs[1][0].0);
+
+        let geom = build_baseline_geometry(1, &b, 5, band_scale, y_scale, plot);
+        assert_eq!(geom.casings.len(), 2);
+        assert_eq!(geom.strokes.len(), 2);
     }
 }
