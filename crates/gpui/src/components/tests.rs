@@ -1803,6 +1803,56 @@ fn view_transition_physical_shader_modes_evaluate_cleanly() {
     }
 }
 
+#[test]
+fn theme_native_backdrop_color_and_view_transition_old_backdrop() {
+    use crate::{WindowBackgroundAppearance, rgb};
+
+    assert_eq!(
+        ThemeMode::Dark.native_backdrop_color(WindowBackgroundAppearance::MicaBackdrop),
+        Some(rgb(0x202020))
+    );
+    assert_eq!(
+        ThemeMode::Light.native_backdrop_color(WindowBackgroundAppearance::MicaBackdrop),
+        Some(rgb(0xf3f3f3))
+    );
+    assert_eq!(
+        ThemeMode::Dark.native_backdrop_color(WindowBackgroundAppearance::MicaAltBackdrop),
+        Some(rgb(0x202020))
+    );
+    assert_eq!(
+        ThemeMode::Dark.native_backdrop_color(WindowBackgroundAppearance::Blurred),
+        Some(rgb(0x1c1c1c))
+    );
+    assert_eq!(
+        ThemeMode::Light.native_backdrop_color(WindowBackgroundAppearance::Blurred),
+        Some(rgb(0xf3f3f3))
+    );
+    assert_eq!(
+        ThemeMode::Dark.native_backdrop_color(WindowBackgroundAppearance::Opaque),
+        None
+    );
+    assert_eq!(
+        ThemeMode::Light.native_backdrop_color(WindowBackgroundAppearance::Transparent),
+        None
+    );
+
+    let now = std::time::Instant::now();
+    let vp = size(px(1200.), px(800.));
+    let backdrop = rgb(0x202020);
+    let transition = crate::ViewTransition::radial_reveal(crate::point(px(600.), px(400.)))
+        .with_old_backdrop(backdrop);
+    assert_eq!(transition.old_backdrop, Some(backdrop));
+
+    let active = crate::ActiveViewTransition {
+        started_at: now,
+        transition,
+        viewport_size: vp,
+        scale_factor: 1.0,
+    };
+    let evaluated = active.evaluate(now, vp, 1.0).expect("active at t=0");
+    assert_eq!(evaluated.old_backdrop, Some(backdrop));
+}
+
 struct AdvancedAnalyticsTestView {
     filter: Entity<FilterBarState>,
     time_range: Entity<TimeRangePickerState>,

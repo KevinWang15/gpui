@@ -4,8 +4,8 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use crate::{
-    App, Bounds, FontFeatures, Global, Hsla, Pixels, Point, SharedString, SpringConfig,
-    Subscription, ViewTransition, Window, WindowAppearance, px,
+    App, Bounds, FontFeatures, Global, Hsla, Pixels, Point, Rgba, SharedString, SpringConfig,
+    Subscription, ViewTransition, Window, WindowAppearance, WindowBackgroundAppearance, px, rgb,
 };
 
 use super::palette;
@@ -67,6 +67,29 @@ pub enum ThemeMode {
     Light,
     /// Deep dark aesthetic (slate-950 canvas, slate-900 surfaces, indigo-500 primary).
     Dark,
+}
+
+impl ThemeMode {
+    /// Returns the approximate native OS backdrop color behind translucent window surfaces for
+    /// this theme mode (e.g. WinUI 3 Dark Mica `#202020` / Light Mica `#f3f3f3`), or `None` for
+    /// opaque or purely transparent windows where the OS does not flip a backdrop tint.
+    pub fn native_backdrop_color(
+        self,
+        background_appearance: WindowBackgroundAppearance,
+    ) -> Option<Rgba> {
+        match background_appearance {
+            WindowBackgroundAppearance::MicaBackdrop
+            | WindowBackgroundAppearance::MicaAltBackdrop => Some(match self {
+                Self::Dark => rgb(0x202020),
+                Self::Light => rgb(0xf3f3f3),
+            }),
+            WindowBackgroundAppearance::Blurred => Some(match self {
+                Self::Dark => rgb(0x1c1c1c),
+                Self::Light => rgb(0xf3f3f3),
+            }),
+            WindowBackgroundAppearance::Opaque | WindowBackgroundAppearance::Transparent => None,
+        }
+    }
 }
 
 impl From<WindowAppearance> for ThemeMode {
@@ -902,7 +925,11 @@ impl Theme {
             cx.refresh_windows();
             return;
         }
-        let transition = style.to_view_transition(origin, window);
+        let mut transition = style.to_view_transition(origin, window);
+        if let Some(old_backdrop) = current_mode.native_backdrop_color(window.background_appearance())
+        {
+            transition = transition.with_old_backdrop(old_backdrop);
+        }
         window.start_view_transition(transition, cx, move |window, cx| {
             next_theme.sync_window_appearance(window);
             Self::set_global(next_theme, cx);

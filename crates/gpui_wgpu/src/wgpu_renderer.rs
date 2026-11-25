@@ -108,6 +108,7 @@ struct ViewTransitionParams {
     corner_radii: [f32; 4],
     overlay_pass: u32,
     _pad: [u32; 3],
+    old_backdrop_rgba: [f32; 4],
 }
 
 impl ViewTransitionParams {
@@ -146,6 +147,13 @@ impl ViewTransitionParams {
             ],
             overlay_pass: overlay_pass as u32,
             _pad: [0; 3],
+            old_backdrop_rgba: transition
+                .old_backdrop
+                .map(|c| {
+                    let a = c.a.clamp(0.0, 1.0);
+                    [c.r * a, c.g * a, c.b * a, a]
+                })
+                .unwrap_or([0.0; 4]),
         }
     }
 }
@@ -5122,6 +5130,7 @@ mod tests {
             bounds: chart_card,
             clip_bounds: full_mask.bounds,
             corner_radii: Corners::all(ScaledPixels(16.0)),
+            old_backdrop: None,
         };
         let side_t = SceneTransition {
             id: 102,
@@ -5136,6 +5145,7 @@ mod tests {
             bounds: side_card,
             clip_bounds: full_mask.bounds,
             corner_radii: Corners::all(ScaledPixels(16.0)),
+            old_backdrop: None,
         };
         headless
             .core
@@ -5167,6 +5177,200 @@ mod tests {
                 .save(&path)
                 .expect("save dual component transition preview png");
         }
+    }
+
+    #[test]
+    fn view_transition_old_backdrop_baking_occludes_new_backdrop() {
+        use gpui::{
+            BorderStyle, Bounds, ContentMask, Corners, Edges, FULL_WINDOW_TRANSITION_ID, Hsla,
+            Point, Quad, ScaledPixels, SceneTransition, SceneTransitionKind, Size, rgb, rgba,
+        };
+
+        let Ok(mut headless) = WgpuHeadlessRenderer::new() else {
+            return;
+        };
+        let w = 256;
+        let h = 256;
+        let size = Size {
+            width: DevicePixels(w),
+            height: DevicePixels(h),
+        };
+        headless.ensure_render_target(size).expect("render target");
+        let target_view = headless
+            .render_target
+            .as_ref()
+            .expect("target")
+            .view
+            .clone();
+        let full_bounds = Bounds {
+            origin: Point {
+                x: ScaledPixels(0.0),
+                y: ScaledPixels(0.0),
+            },
+            size: Size {
+                width: ScaledPixels(w as f32),
+                height: ScaledPixels(h as f32),
+            },
+        };
+        let full_mask = ContentMask {
+            bounds: full_bounds,
+            corner_radii: Corners::default(),
+        };
+
+        // Old dark translucent Mica-like scene:
+        // Left half: realistic dark sidebar surface rgba(0x0b0d12d6) (alpha ~0.839).
+        // Right half: 50% translucent panel rgba(0x40608080) (alpha ~0.502) to catch
+        // any double-premultiplication regression immediately.
+        let mut old_scene = Scene::default();
+        old_scene.insert_primitive(Quad {
+            order: 0,
+            border_style: BorderStyle::Solid,
+            bounds: Bounds {
+                origin: Point {
+                    x: ScaledPixels(0.0),
+                    y: ScaledPixels(0.0),
+                },
+                size: Size {
+                    width: ScaledPixels((w / 2) as f32),
+                    height: ScaledPixels(h as f32),
+                },
+            },
+            content_mask: full_mask,
+            background: Hsla::from(rgba(0x0b0d12d6)).into(),
+            border_color: Hsla::transparent_black(),
+            corner_radii: Corners::default(),
+            border_widths: Edges::default(),
+        });
+        old_scene.insert_primitive(Quad {
+            order: 1,
+            border_style: BorderStyle::Solid,
+            bounds: Bounds {
+                origin: Point {
+                    x: ScaledPixels((w / 2) as f32),
+                    y: ScaledPixels(0.0),
+                },
+                size: Size {
+                    width: ScaledPixels((w / 2) as f32),
+                    height: ScaledPixels(h as f32),
+                },
+            },
+            content_mask: full_mask,
+            background: Hsla::from(rgba(0x40608080)).into(),
+            border_color: Hsla::transparent_black(),
+            corner_radii: Corners::default(),
+            border_widths: Edges::default(),
+        });
+        old_scene.finish();
+
+        // New light translucent scene: rgba(0xf7f7f8cc) (alpha 0.80).
+        let mut new_scene = Scene::default();
+        new_scene.insert_primitive(Quad {
+            order: 0,
+            border_style: BorderStyle::Solid,
+            bounds: full_bounds,
+            content_mask: full_mask,
+            background: Hsla::from(rgba(0xf7f7f8cc)).into(),
+            border_color: Hsla::transparent_black(),
+            corner_radii: Corners::default(),
+            border_widths: Edges::default(),
+        });
+        new_scene.finish();
+
+        headless
+            .core
+            .capture_transition_snapshot(FULL_WINDOW_TRANSITION_ID, &old_scene, None, size)
+            .expect("capture old translucent snapshot");
+
+        let origin = Point {
+            x: ScaledPixels(32.0),
+            y: ScaledPixels(32.0),
+        };
+
+        // 1. With old_backdrop = Some(rgb(0x202020)) (Dark Mica), pixels outside the reveal
+        //    circle must be fully opaque (alpha == 255) and equal to old OVER #202020,
+        //    while pixels inside the reveal circle retain the new translucent light alpha!
+        let mut baked_t = SceneTransition::full_viewport(
+            SceneTransitionKind::RadialExpand,
+            origin,
+            ScaledPixels(64.0),
+            ScaledPixels(1.0),
+            0.3,
+            size,
+        );
+        baked_t.old_backdrop = Some(rgb(0x202020));
+        headless
+            .core
+            .render_frame_with_transitions(&new_scene, &[baked_t], &target_view, size)
+            .expect("render baked transition");
+        let baked_img = headless.read_image().expect("read baked image");
+
+        // Outside reveal circle on left half (x=64, y=200):
+        // rgba(0x0b0d12d6) OVER #202020 => (11*0.839 + 32*0.161, 13*0.839 + 32*0.161, 18*0.839 + 32*0.161, 255)
+        //                                 = (14, 16, 20, 255)
+        let dark_outside = baked_img.get_pixel(64, 200);
+        assert_eq!(
+            dark_outside[3], 255,
+            "baked old dark pixel must be opaque to occlude new OS backdrop, got {dark_outside:?}"
+        );
+        assert!(
+            dark_outside[0].abs_diff(14) <= 3
+                && dark_outside[1].abs_diff(16) <= 3
+                && dark_outside[2].abs_diff(20) <= 3,
+            "baked dark sidebar pixel must equal old OVER #202020 ~(14,16,20,255), got {dark_outside:?}"
+        );
+
+        // Outside reveal circle on right half (x=200, y=200):
+        // rgba(0x40608080) OVER #202020 => (64*0.502 + 32*0.498, 96*0.502 + 32*0.498, 128*0.502 + 32*0.498, 255)
+        //                                 = (48, 64, 80, 255)
+        let mid_outside = baked_img.get_pixel(200, 200);
+        assert_eq!(
+            mid_outside[3], 255,
+            "baked 50% translucent pixel must be opaque, got {mid_outside:?}"
+        );
+        assert!(
+            mid_outside[0].abs_diff(48) <= 3
+                && mid_outside[1].abs_diff(64) <= 3
+                && mid_outside[2].abs_diff(80) <= 3,
+            "baked 50% pixel must equal old OVER #202020 ~(48,64,80,255), got {mid_outside:?}"
+        );
+
+        // Inside reveal circle (x=32, y=32): new translucent light scene must NOT be baked!
+        // Alpha should stay ~0xcc (204) so live new Light Mica shows through immediately.
+        let inside_reveal = baked_img.get_pixel(32, 32);
+        assert!(
+            inside_reveal[3].abs_diff(0xcc) <= 3,
+            "new scene inside reveal must preserve translucent alpha ~204, got {inside_reveal:?}"
+        );
+        assert!(
+            inside_reveal[0] > 180 && inside_reveal[1] > 180 && inside_reveal[2] > 180,
+            "new scene inside reveal must be light, got {inside_reveal:?}"
+        );
+
+        // 2. With old_backdrop = None, baking must be an exact no-op (old pixels remain translucent).
+        let unbaked_t = SceneTransition::full_viewport(
+            SceneTransitionKind::RadialExpand,
+            origin,
+            ScaledPixels(64.0),
+            ScaledPixels(1.0),
+            0.3,
+            size,
+        );
+        headless
+            .core
+            .render_frame_with_transitions(&new_scene, &[unbaked_t], &target_view, size)
+            .expect("render unbaked transition");
+        let unbaked_img = headless.read_image().expect("read unbaked image");
+
+        let unbaked_dark = unbaked_img.get_pixel(64, 200);
+        assert!(
+            unbaked_dark[3].abs_diff(0xd6) <= 3,
+            "unbaked old dark pixel must keep original translucent alpha ~214, got {unbaked_dark:?}"
+        );
+        let unbaked_mid = unbaked_img.get_pixel(200, 200);
+        assert!(
+            unbaked_mid[3].abs_diff(0x80) <= 3,
+            "unbaked 50% old pixel must keep original translucent alpha ~128, got {unbaked_mid:?}"
+        );
     }
 
     #[test]

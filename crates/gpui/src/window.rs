@@ -3502,8 +3502,10 @@ impl Window {
         if cx.reduce_motion() {
             if transition.reduce_motion_crossfade {
                 let scope = transition.scope;
+                let old_backdrop = transition.old_backdrop;
                 transition = ViewTransition::cross_fade().duration(Duration::from_millis(140));
                 transition.scope = scope;
+                transition.old_backdrop = old_backdrop;
             } else {
                 if matches!(transition.scope, ViewTransitionScope::Window) {
                     self.cancel_view_transition();
@@ -4283,6 +4285,11 @@ impl Window {
     /// Sets the application identifier.
     pub fn set_app_id(&mut self, app_id: &str) {
         self.platform_window.set_app_id(app_id);
+    }
+
+    /// Returns the active window background appearance (`Opaque`, `Blurred`, `MicaBackdrop`, etc.).
+    pub fn background_appearance(&self) -> WindowBackgroundAppearance {
+        self.platform_window.background_appearance()
     }
 
     /// Sets the window background appearance.

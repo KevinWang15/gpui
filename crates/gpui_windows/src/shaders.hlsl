@@ -1466,6 +1466,7 @@ cbuffer ViewTransitionParams: register(b2) {
     uint vt_pad0;
     uint vt_pad1;
     uint vt_pad2;
+    float4 vt_old_backdrop;
 };
 
 Texture2D<float4> t_transition_old: register(t0);
@@ -1478,13 +1479,25 @@ float4 view_transition_vertex(uint vertex_id: SV_VertexID): SV_Position {
     return float4(p * 2.0 - 1.0, 0.0, 1.0);
 }
 
+float4 vt_bake_old(float4 col) {
+    if (vt_old_backdrop.a <= 0.0001) {
+        return col;
+    }
+    float a = saturate(col.a);
+    float inv_a = 1.0 - a;
+    return float4(
+        col.rgb + inv_a * vt_old_backdrop.rgb,
+        saturate(a + inv_a * vt_old_backdrop.a)
+    );
+}
+
 float4 vt_sample_old(float2 local_uv) {
     uint ow, oh;
     t_transition_old.GetDimensions(ow, oh);
     float2 old_dims = max(float2(float(ow), float(oh)), float2(1.0, 1.0));
     float2 half_tex = float2(0.5, 0.5) / old_dims;
     float2 uv = clamp(local_uv, half_tex, float2(1.0, 1.0) - half_tex);
-    return t_transition_old.SampleLevel(s_transition, uv, 0.0);
+    return vt_bake_old(t_transition_old.SampleLevel(s_transition, uv, 0.0));
 }
 
 float4 vt_sample_new(float2 local_uv) {
@@ -1503,7 +1516,7 @@ float4 vt_load_old(float2 local_pos) {
     float2 local_dims = max(vt_region_size, float2(1.0, 1.0));
     if (abs(old_dims.x - local_dims.x) <= 1.0 && abs(old_dims.y - local_dims.y) <= 1.0) {
         int2 coord = clamp(int2(local_pos), int2(0, 0), old_dims_i - int2(1, 1));
-        return t_transition_old.Load(int3(coord, 0));
+        return vt_bake_old(t_transition_old.Load(int3(coord, 0)));
     }
     return vt_sample_old(local_pos / local_dims);
 }

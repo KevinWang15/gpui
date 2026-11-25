@@ -14,6 +14,7 @@ struct ViewTransitionParams {
     _pad0: u32,
     _pad1: u32,
     _pad2: u32,
+    old_backdrop_rgba: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> params: ViewTransitionParams;
@@ -33,6 +34,18 @@ fn vs_view_transition(@builtin(vertex_index) vertex_index: u32) -> @builtin(posi
     return vec4<f32>(positions[vertex_index], 0.0, 1.0);
 }
 
+fn vt_bake_old(col: vec4<f32>) -> vec4<f32> {
+    if (params.old_backdrop_rgba.a <= 0.0001) {
+        return col;
+    }
+    let a = clamp(col.a, 0.0, 1.0);
+    let inv_a = 1.0 - a;
+    return vec4<f32>(
+        col.rgb + inv_a * params.old_backdrop_rgba.rgb,
+        clamp(a + inv_a * params.old_backdrop_rgba.a, 0.0, 1.0),
+    );
+}
+
 // `t_old` is cropped to the transition's old region (full viewport for window mode, or just the
 // component's captured rectangle for component-scoped mode), so region-local UV in [0, 1]^2 maps
 // directly across `t_old` with half-texel clamping to eliminate edge bleed.
@@ -40,7 +53,7 @@ fn vt_sample_old(local_uv: vec2<f32>) -> vec4<f32> {
     let old_dims = max(vec2<f32>(textureDimensions(t_old, 0)), vec2<f32>(1.0));
     let half_tex = vec2<f32>(0.5) / old_dims;
     let uv = clamp(local_uv, half_tex, vec2<f32>(1.0) - half_tex);
-    return textureSampleLevel(t_old, s_linear, uv, 0.0);
+    return vt_bake_old(textureSampleLevel(t_old, s_linear, uv, 0.0));
 }
 
 // `t_new` holds the full live viewport; remap region-local UV in [0, 1]^2 strictly inside
@@ -64,7 +77,7 @@ fn vt_load_old(local_pos: vec2<f32>, dims_i: vec2<i32>) -> vec4<f32> {
     let local_dims = max(params.region_size, vec2<f32>(dims_i));
     if (abs(old_dims.x - local_dims.x) <= 1.0 && abs(old_dims.y - local_dims.y) <= 1.0) {
         let coord = clamp(vec2<i32>(local_pos), vec2<i32>(0), old_dims_i - vec2<i32>(1));
-        return textureLoad(t_old, coord, 0);
+        return vt_bake_old(textureLoad(t_old, coord, 0));
     }
     return vt_sample_old(local_pos / max(local_dims, vec2<f32>(1.0)));
 }

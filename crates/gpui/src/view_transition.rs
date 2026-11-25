@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::{Bounds, Corners, DevicePixels, Pixels, Point, ScaledPixels, Size, point, px};
+use crate::{Bounds, Corners, DevicePixels, Pixels, Point, Rgba, ScaledPixels, Size, point, px};
 
 /// Reserved transition identifier for full-window transitions started via
 /// [`Window::start_view_transition`](crate::Window::start_view_transition).
@@ -131,6 +131,10 @@ pub struct ViewTransition {
     /// When `true`, falls back to a brief cross-fade instead of snapping instantly when
     /// [`App::reduce_motion`](crate::App::reduce_motion) is enabled.
     pub reduce_motion_crossfade: bool,
+    /// Optional opaque backdrop color composited behind the captured pre-transition frame during
+    /// shader evaluation so translucent windows over an OS-level Dark/Light backdrop (such as
+    /// Windows 11 Mica) keep 100% fidelity at `t = 0` when the window's native appearance flips.
+    pub old_backdrop: Option<Rgba>,
 }
 
 impl ViewTransition {
@@ -146,6 +150,7 @@ impl ViewTransition {
             easing: view_transition_ease_out,
             feather: px(1.5),
             reduce_motion_crossfade: false,
+            old_backdrop: None,
         }
     }
 
@@ -158,6 +163,7 @@ impl ViewTransition {
             easing: view_transition_ease_out,
             feather: px(1.5),
             reduce_motion_crossfade: false,
+            old_backdrop: None,
         }
     }
 
@@ -170,6 +176,7 @@ impl ViewTransition {
             easing: view_transition_ease_out,
             feather: px(1.0),
             reduce_motion_crossfade: false,
+            old_backdrop: None,
         }
     }
 
@@ -182,6 +189,7 @@ impl ViewTransition {
             easing: view_transition_ease_out,
             feather: px(2.0),
             reduce_motion_crossfade: false,
+            old_backdrop: None,
         }
     }
 
@@ -194,6 +202,7 @@ impl ViewTransition {
             easing: view_transition_ease_in_out,
             feather: px(1.5),
             reduce_motion_crossfade: false,
+            old_backdrop: None,
         }
     }
 
@@ -206,6 +215,7 @@ impl ViewTransition {
             easing: view_transition_ease_in_out,
             feather: px(2.0),
             reduce_motion_crossfade: false,
+            old_backdrop: None,
         }
     }
 
@@ -219,6 +229,7 @@ impl ViewTransition {
             easing: view_transition_linear,
             feather: px(1.5),
             reduce_motion_crossfade: false,
+            old_backdrop: None,
         }
     }
 
@@ -231,6 +242,7 @@ impl ViewTransition {
             easing: view_transition_linear,
             feather: px(1.5),
             reduce_motion_crossfade: false,
+            old_backdrop: None,
         }
     }
 
@@ -243,6 +255,7 @@ impl ViewTransition {
             easing: view_transition_linear,
             feather: px(1.5),
             reduce_motion_crossfade: false,
+            old_backdrop: None,
         }
     }
 
@@ -256,6 +269,7 @@ impl ViewTransition {
             easing: view_transition_ease_out,
             feather: px(2.0),
             reduce_motion_crossfade: false,
+            old_backdrop: None,
         }
     }
 
@@ -328,6 +342,14 @@ impl ViewTransition {
         self.reduce_motion_crossfade = enabled;
         self
     }
+
+    /// Composites `color` behind the captured pre-transition snapshot (`old OVER color`) inside
+    /// the transition shader so full-window appearance switches on translucent OS backdrops
+    /// (such as Windows 11 Mica) never flash when the native backdrop flips at `t = 0`.
+    pub fn with_old_backdrop(mut self, color: Rgba) -> Self {
+        self.old_backdrop = Some(color);
+        self
+    }
 }
 
 /// Shader-ready discriminator for [`SceneTransition`].
@@ -382,6 +404,9 @@ pub struct SceneTransition {
     pub clip_bounds: Bounds<ScaledPixels>,
     /// Rounded-rectangle corner radii in device pixels (`0` for sharp or full-window rects).
     pub corner_radii: Corners<ScaledPixels>,
+    /// Optional backdrop color composited behind the old snapshot (`old OVER old_backdrop`)
+    /// during transition shading. `None` leaves the captured old alpha untouched.
+    pub old_backdrop: Option<Rgba>,
 }
 
 impl SceneTransition {
@@ -411,6 +436,7 @@ impl SceneTransition {
             bounds,
             clip_bounds: bounds,
             corner_radii: Corners::default(),
+            old_backdrop: None,
         }
     }
 
@@ -669,6 +695,7 @@ pub(crate) fn evaluate_transition_in_region(
         bounds: scaled_bounds,
         clip_bounds: scaled_clip,
         corner_radii: scaled_radii,
+        old_backdrop: transition.old_backdrop,
     })
 }
 

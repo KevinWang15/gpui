@@ -132,7 +132,7 @@ struct ViewTransitionPipeline {
     clamp_sampler: Option<ID3D11SamplerState>,
 }
 
-/// `ViewTransitionParams` in shaders.hlsl (96 bytes, 16-byte aligned).
+/// `ViewTransitionParams` in shaders.hlsl (112 bytes, 16-byte aligned).
 #[repr(C)]
 struct ViewTransitionParams {
     origin: [f32; 2],
@@ -148,6 +148,7 @@ struct ViewTransitionParams {
     corner_radii: [f32; 4],
     overlay_pass: u32,
     _pad: [u32; 3],
+    old_backdrop_rgba: [f32; 4],
 }
 
 /// Offscreen textures for backdrop blurs (`gpui::backdrop_blur`): `snapshot`
@@ -691,6 +692,13 @@ impl DirectXRenderer {
                     ],
                     overlay_pass: (slot > 0) as u32,
                     _pad: [0; 3],
+                    old_backdrop_rgba: transition
+                        .old_backdrop
+                        .map(|c| {
+                            let a = c.a.clamp(0.0, 1.0);
+                            [c.r * a, c.g * a, c.b * a, a]
+                        })
+                        .unwrap_or([0.0; 4]),
                 }],
             )?;
             unsafe {
