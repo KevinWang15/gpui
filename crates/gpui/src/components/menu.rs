@@ -735,6 +735,7 @@ impl Render for MenuState {
                                     .max_w(px(320.))
                                     .max_h(px(360.))
                                     .overflow_y_scroll()
+                                    .show_scrollbar_always()
                                     .p(px(6.))
                                     .rounded(theme.radius_lg)
                                     .bg(theme.popover)

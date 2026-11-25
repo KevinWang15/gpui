@@ -554,7 +554,7 @@ impl RenderOnce for DropdownMenu {
         )
         .when_some(self.max_width, |el, max_w| el.max_w(max_w))
         .when_some(self.max_height, |el, max_h| {
-            el.max_h(max_h).overflow_y_scroll()
+            el.max_h(max_h).overflow_y_scroll().show_scrollbar_always()
         })
         .track_focus(&handle)
         .focus_trap()

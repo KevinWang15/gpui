@@ -353,6 +353,7 @@ struct ScrollbarDrag {
 
 #[derive(Default)]
 struct AxisRuntimeState {
+    initialized: bool,
     target_stage: ScrollbarStage,
     opacity: f32,
     anim_from: f32,
@@ -367,6 +368,17 @@ struct AxisRuntimeState {
 }
 
 impl AxisRuntimeState {
+    fn snap_to(&mut self, stage: ScrollbarStage, theme: &ScrollbarTheme) {
+        let opacity = stage.target_opacity(theme);
+        self.target_stage = stage;
+        self.opacity = opacity;
+        self.anim_from = opacity;
+        self.anim_to = opacity;
+        self.anim_start = None;
+        self.anim_duration = Duration::ZERO;
+        self.anim_timer_task = None;
+    }
+
     fn evaluate_opacity(&mut self, now: Instant, reduce_motion: bool) -> (f32, bool) {
         if reduce_motion {
             self.opacity = self.anim_to;
@@ -823,7 +835,18 @@ pub(crate) fn paint_overlay_scrollbars<C: ScrollbarController>(
                 mouse_pos,
                 window,
             );
-            axis_state.retarget(stage, now, &theme, reduce_motion);
+            if !axis_state.initialized {
+                axis_state.initialized = true;
+                if visibility == ScrollbarVisibility::Always {
+                    // Render always-visible scrollbars immediately on the very first paint
+                    // (e.g. freshly opened dropdowns) instead of fading in from 0 opacity.
+                    axis_state.snap_to(stage, &theme);
+                } else {
+                    axis_state.retarget(stage, now, &theme, reduce_motion);
+                }
+            } else {
+                axis_state.retarget(stage, now, &theme, reduce_motion);
+            }
             let (op, animating) = axis_state.evaluate_opacity(now, reduce_motion);
             if animating {
                 axis_state.schedule_next_frame(now, current_view, window, cx);
@@ -1471,5 +1494,302 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(hidden_clicks.get(), 1);
         assert_eq!(hidden_scroll.offset().y, px(0.));
+    }
+
+    #[crate::test]
+    fn always_visible_scrollbar_renders_on_first_frame_only_when_overflowing(
+        cx: &mut TestAppContext,
+    ) {
+        struct AlwaysView {
+            overflow_handle: ScrollHandle,
+            overflow_clicks: Rc<std::cell::Cell<usize>>,
+            fitting_clicks: Rc<std::cell::Cell<usize>>,
+        }
+
+        impl Render for AlwaysView {
+            fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+                let overflow_clicks = self.overflow_clicks.clone();
+                let fitting_clicks = self.fitting_clicks.clone();
+                div()
+                    .flex()
+                    .flex_row()
+                    .w(px(400.))
+                    .h(px(100.))
+                    .child(
+                        div()
+                            .id("always-overflow")
+                            .w(px(200.))
+                            .h(px(100.))
+                            .overflow_y_scroll()
+                            .show_scrollbar_always()
+                            .track_scroll(&self.overflow_handle)
+                            .child(
+                                div()
+                                    .id("always-overflow-inner")
+                                    .w_full()
+                                    .h(px(400.))
+                                    .on_click(move |_, _, _| {
+                                        overflow_clicks.set(overflow_clicks.get() + 1);
+                                    }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("always-fitting")
+                            .w(px(200.))
+                            .h(px(100.))
+                            .overflow_y_scroll()
+                            .show_scrollbar_always()
+                            .child(
+                                div()
+                                    .id("always-fitting-inner")
+                                    .w_full()
+                                    .h(px(60.))
+                                    .on_click(move |_, _, _| {
+                                        fitting_clicks.set(fitting_clicks.get() + 1);
+                                    }),
+                            ),
+                    )
+            }
+        }
+
+        let overflow_handle = ScrollHandle::new();
+        let overflow_clicks = Rc::new(std::cell::Cell::new(0));
+        let fitting_clicks = Rc::new(std::cell::Cell::new(0));
+        let (_, cx) = cx.add_window_view({
+            let overflow_handle = overflow_handle.clone();
+            let overflow_clicks = overflow_clicks.clone();
+            let fitting_clicks = fitting_clicks.clone();
+            move |_, _| AlwaysView {
+                overflow_handle,
+                overflow_clicks,
+                fitting_clicks,
+            }
+        });
+        cx.run_until_parked();
+
+        // Even with reduce_motion == false and zero mouse movement or timer ticks,
+        // the overflowing Always scrollbar must already be painted at nearby_opacity (0.50),
+        // while the fitting container paints no scrollbar quad at all.
+        let theme = ScrollbarTheme::default();
+        let (overflow_thumbs, fitting_thumbs) = cx.update(|window, _| {
+            let scale = window.scale_factor();
+            let mut left = Vec::new();
+            let mut right = Vec::new();
+            for quad in &window.rendered_frame.scene.quads {
+                let w = quad.bounds.size.width.0 / scale;
+                let h = quad.bounds.size.height.0 / scale;
+                let x = quad.bounds.origin.x.0 / scale;
+                if (w - theme.thickness.0).abs() < 0.25 && h >= theme.min_thumb_length.0 - 0.5 {
+                    if x < 200.0 {
+                        left.push(quad.background.solid.a);
+                    } else {
+                        right.push(quad.background.solid.a);
+                    }
+                }
+            }
+            (left, right)
+        });
+        assert!(
+            !overflow_thumbs.is_empty(),
+            "overflowing Always container should paint thumb quad immediately on first frame"
+        );
+        assert!(
+            overflow_thumbs
+                .iter()
+                .all(|&a| (a - theme.nearby_opacity).abs() < 0.02),
+            "initial Always thumb opacity should snap to nearby_opacity ({}), got {:?}",
+            theme.nearby_opacity,
+            overflow_thumbs
+        );
+        assert!(
+            fitting_thumbs.is_empty(),
+            "fitting Always container must not paint a scrollbar thumb, got {:?}",
+            fitting_thumbs
+        );
+
+        // Clicking near right edge of the fitting container reaches its child (no hidden hitbox).
+        cx.simulate_mouse_move(point(px(395.), px(30.)), None, Default::default());
+        cx.simulate_mouse_down(point(px(395.), px(30.)), MouseButton::Left, Default::default());
+        cx.simulate_mouse_up(point(px(395.), px(30.)), MouseButton::Left, Default::default());
+        cx.run_until_parked();
+        assert_eq!(fitting_clicks.get(), 1);
+
+        // Hovering the overflowing thumb still smoothly animates up to hover_opacity (0.80).
+        cx.simulate_mouse_move(point(px(195.), px(12.)), None, Default::default());
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(theme.hover_transition_duration + Duration::from_millis(50));
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        let left_quads: Vec<(f32, f32, f32)> = cx.update(|window, _| {
+            let scale = window.scale_factor();
+            window
+                .rendered_frame
+                .scene
+                .quads
+                .iter()
+                .filter(|q| q.bounds.origin.x.0 / scale < 200.0)
+                .map(|q| {
+                    (
+                        q.bounds.size.width.0 / scale,
+                        q.bounds.size.height.0 / scale,
+                        q.background.solid.a,
+                    )
+                })
+                .collect()
+        });
+        let hovered_alpha = left_quads
+            .iter()
+            .find(|(w, _, _)| (*w - theme.hover_thickness.0).abs() < 0.5)
+            .map(|(_, _, a)| *a);
+        assert!(
+            hovered_alpha.is_some_and(|a| (a - theme.hover_opacity).abs() < 0.03),
+            "hovering Always thumb should brighten to hover_opacity ({}), got {:?} (quads={:?})",
+            theme.hover_opacity,
+            hovered_alpha,
+            left_quads
+        );
+
+        // Clicking track scrolls and does not leak to underlying content.
+        cx.simulate_mouse_down(point(px(195.), px(80.)), MouseButton::Left, Default::default());
+        cx.simulate_mouse_up(point(px(195.), px(80.)), MouseButton::Left, Default::default());
+        cx.run_until_parked();
+        assert!(overflow_handle.offset().y < px(-100.));
+        assert_eq!(overflow_clicks.get(), 0);
+    }
+
+    #[cfg(feature = "components")]
+    #[crate::test]
+    fn select_dropdown_shows_scrollbar_only_when_overflowing_and_drags_without_closing(
+        cx: &mut TestAppContext,
+    ) {
+        use crate::components::{Select, SelectOption, SelectState};
+        use crate::{AppContext, Entity, VisualTestContext};
+
+        struct SelectScrollbarView {
+            short_select: Entity<SelectState<usize>>,
+            long_select: Entity<SelectState<usize>>,
+        }
+
+        impl Render for SelectScrollbarView {
+            fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(12.))
+                    .p(px(16.))
+                    .w(px(320.))
+                    .h(px(400.))
+                    .child(Select::new(&self.short_select))
+                    .child(Select::new(&self.long_select))
+            }
+        }
+
+        cx.update(|cx| cx.set_reduce_motion(true));
+
+        let short_select = cx.new(|cx| {
+            SelectState::new(
+                (0..3)
+                    .map(|i| SelectOption::new(i, format!("Short option {i}")))
+                    .collect(),
+                cx,
+            )
+            .max_menu_height(px(280.))
+        });
+        let long_select = cx.new(|cx| {
+            SelectState::new(
+                (0..20)
+                    .map(|i| SelectOption::new(i, format!("Long option {i}")))
+                    .collect(),
+                cx,
+            )
+            .max_menu_height(px(140.))
+        });
+
+        let (_, cx) = cx.add_window_view({
+            let short_select = short_select.clone();
+            let long_select = long_select.clone();
+            move |_, _| SelectScrollbarView {
+                short_select,
+                long_select,
+            }
+        });
+        cx.run_until_parked();
+
+        let theme = ScrollbarTheme::default();
+        let find_thumb = |cx: &mut VisualTestContext| -> Option<(Bounds<Pixels>, f32)> {
+            cx.update(|window, _| {
+                let scale = window.scale_factor();
+                window.rendered_frame.scene.quads.iter().find_map(|q| {
+                    let w = q.bounds.size.width.0 / scale;
+                    let h = q.bounds.size.height.0 / scale;
+                    if w >= theme.thickness.0 - 0.3
+                        && w <= theme.hover_thickness.0 + 0.3
+                        && h >= theme.min_thumb_length.0 - 0.5
+                        && h < 138.0
+                        && (q.corner_radii.top_left.0 / scale - w * 0.5).abs() < 0.3
+                    {
+                        Some((
+                            Bounds::new(
+                                point(
+                                    px(q.bounds.origin.x.0 / scale),
+                                    px(q.bounds.origin.y.0 / scale),
+                                ),
+                                size(px(w), px(h)),
+                            ),
+                            q.background.solid.a,
+                        ))
+                    } else {
+                        None
+                    }
+                })
+            })
+        };
+
+        // 1. Short select (3 items, fits inside 280px) -> NO scrollbar rendered.
+        cx.update(|_, cx| short_select.update(cx, |s, cx| s.open_menu(cx)));
+        cx.run_until_parked();
+        assert!(find_thumb(cx).is_none(), "short Select must not render a scrollbar");
+
+        // 2. Long select (20 items, overflows 140px) -> scrollbar rendered immediately at 50%.
+        cx.update(|_, cx| {
+            short_select.update(cx, |s, cx| s.close_menu(cx));
+            long_select.update(cx, |s, cx| s.open_menu(cx));
+        });
+        cx.run_until_parked();
+        let (thumb_before, alpha_before) = find_thumb(cx)
+            .expect("overflowing Select should immediately render its vertical scrollbar thumb");
+        assert!(
+            (alpha_before - theme.nearby_opacity).abs() < 0.02,
+            "Select scrollbar should open at nearby_opacity ({}), got {}",
+            theme.nearby_opacity,
+            alpha_before
+        );
+
+        // 3. Dragging the scrollbar thumb scrolls the menu and keeps the dropdown open.
+        let grab_pt = thumb_before.center();
+        let drag_to = point(grab_pt.x, grab_pt.y + px(80.));
+        cx.simulate_mouse_move(grab_pt, None, Default::default());
+        cx.run_until_parked();
+        cx.simulate_mouse_down(grab_pt, MouseButton::Left, Default::default());
+        cx.run_until_parked();
+        cx.simulate_mouse_move(drag_to, Some(MouseButton::Left), Default::default());
+        cx.run_until_parked();
+        cx.simulate_mouse_up(drag_to, MouseButton::Left, Default::default());
+        cx.run_until_parked();
+
+        assert!(
+            cx.update(|_, cx| long_select.read(cx).is_open()),
+            "dragging Select scrollbar thumb must not close the dropdown"
+        );
+        let (thumb_after, _) =
+            find_thumb(cx).expect("Select scrollbar thumb should remain visible after drag");
+        assert!(
+            thumb_after.top() > thumb_before.top() + px(30.),
+            "dragging Select scrollbar thumb downward should scroll menu (before={:?}, after={:?})",
+            thumb_before.top(),
+            thumb_after.top()
+        );
     }
 }

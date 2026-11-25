@@ -1743,6 +1743,7 @@ impl FilterBar {
                     .id((self.id.clone(), "filter-field-scroll"))
                     .max_h(px(280.))
                     .overflow_y_scroll()
+                    .show_scrollbar_always()
                     .child(list)
                     .into_any_element()
             }
@@ -1820,6 +1821,7 @@ impl FilterBar {
                             .collect()
                     })
                     .track_scroll(scroll_handle)
+                    .show_scrollbar_always()
                     .w_full()
                     .h(px(280.))
                     .into_any_element()
@@ -1864,6 +1866,7 @@ impl FilterBar {
                             .collect()
                     })
                     .track_scroll(scroll_handle)
+                    .show_scrollbar_always()
                     .w_full()
                     .h(px(280.))
                     .into_any_element()

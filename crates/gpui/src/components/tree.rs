@@ -9,9 +9,9 @@ use std::rc::Rc;
 use crate::icons::{Icon, IconSize, LucideIcon};
 use crate::{
     App, Bounds, Context, ElementId, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
-    IntoElement, KeyDownEvent, Pixels, Render, RenderOnce, ScrollStrategy, SharedString,
-    StyleRefinement, Styled, UniformListScrollHandle, Window, canvas, div, fill, point, prelude::*,
-    px, size, uniform_list,
+    IntoElement, KeyDownEvent, Pixels, Render, RenderOnce, ScrollStrategy, ScrollbarVisibility,
+    SharedString, StyleRefinement, Styled, UniformListScrollHandle, Window, canvas, div, fill,
+    point, prelude::*, px, size, uniform_list,
 };
 
 use super::badge::{BadgeColor, badge};
@@ -131,6 +131,7 @@ pub struct TreeState {
     show_icons: bool,
     searchable: bool,
     max_height: Pixels,
+    scrollbar_visibility: ScrollbarVisibility,
     search_input: Entity<InputState>,
     scroll_handle: UniformListScrollHandle,
     cached_rows: Rc<Vec<FlatTreeRow>>,
@@ -179,6 +180,7 @@ impl TreeState {
             show_icons: true,
             searchable: false,
             max_height: px(420.),
+            scrollbar_visibility: ScrollbarVisibility::Auto,
             search_input,
             scroll_handle: UniformListScrollHandle::new(),
             cached_rows: Rc::new(Vec::new()),
@@ -220,6 +222,12 @@ impl TreeState {
         } else {
             px(420.)
         };
+        self
+    }
+
+    /// Controls scrollbar visibility in the virtualized tree body (default [`ScrollbarVisibility::Auto`]).
+    pub fn scrollbar_visibility(mut self, visibility: ScrollbarVisibility) -> Self {
+        self.scrollbar_visibility = visibility;
         self
     }
 
@@ -1097,6 +1105,7 @@ impl Render for TreeState {
                 },
             )
             .track_scroll(&self.scroll_handle)
+            .scrollbar_visibility(self.scrollbar_visibility)
             .w_full()
             .h(list_h)
             .into_any_element()

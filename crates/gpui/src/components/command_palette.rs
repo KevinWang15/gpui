@@ -967,6 +967,7 @@ impl Render for CommandPaletteState {
                 },
             )
             .track_scroll(&self.scroll_handle)
+            .show_scrollbar_always()
             .w_full()
             .h(list_h)
             .p(px(6.))

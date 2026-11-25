@@ -8,8 +8,8 @@ use std::rc::Rc;
 use crate::{
     Anchor, Animation, AnimationExt, AnyElement, App, Bounds, Context, Entity, EventEmitter,
     FocusHandle, Focusable, FontWeight, IntoElement, KeyDownEvent, MouseButton, Pixels, Render,
-    RenderOnce, ScrollHandle, SharedString, StyleRefinement, Styled, Window, anchored, canvas,
-    deferred, div, ease_out_quint, point, prelude::*, px,
+    RenderOnce, ScrollHandle, ScrollbarVisibility, SharedString, StyleRefinement, Styled, Window,
+    anchored, canvas, deferred, div, ease_out_quint, point, prelude::*, px,
 };
 use crate::icons::{Icon, IconSize, LucideIcon};
 
@@ -128,6 +128,7 @@ pub struct SelectState<T: Clone + PartialEq + 'static> {
     invalid: bool,
     clearable: bool,
     max_menu_height: Pixels,
+    scrollbar_visibility: ScrollbarVisibility,
     scroll_handle: ScrollHandle,
     trigger_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     frame_style: StyleRefinement,
@@ -156,6 +157,7 @@ impl<T: Clone + PartialEq + 'static> SelectState<T> {
             invalid: false,
             clearable: false,
             max_menu_height: px(280.),
+            scrollbar_visibility: ScrollbarVisibility::Always,
             scroll_handle: ScrollHandle::new(),
             trigger_bounds: Rc::new(Cell::new(None)),
             frame_style: StyleRefinement::default(),
@@ -201,6 +203,15 @@ impl<T: Clone + PartialEq + 'static> SelectState<T> {
     /// Sets the maximum scrollable height of the dropdown popover.
     pub fn max_menu_height(mut self, height: Pixels) -> Self {
         self.max_menu_height = height;
+        self
+    }
+
+    /// Controls scrollbar visibility in the dropdown popover.
+    ///
+    /// Defaults to [`ScrollbarVisibility::Always`], which keeps the scrollbar visible whenever the
+    /// options exceed `max_menu_height` and omits it completely when all options fit.
+    pub fn scrollbar_visibility(mut self, visibility: ScrollbarVisibility) -> Self {
+        self.scrollbar_visibility = visibility;
         self
     }
 
@@ -685,6 +696,7 @@ impl<T: Clone + PartialEq + 'static> Render for SelectState<T> {
                 .max_h(self.max_menu_height)
                 .p(px(4.))
                 .overflow_y_scroll()
+                .scrollbar_visibility(self.scrollbar_visibility)
                 .track_scroll(&self.scroll_handle)
                 .rounded(theme.radius_lg)
                 .bg(theme.popover)

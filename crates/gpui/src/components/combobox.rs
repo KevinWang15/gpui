@@ -11,9 +11,9 @@ use crate::icons::{Icon, IconSize, LucideIcon};
 use crate::{
     Anchor, Animation, AnimationExt, AnyElement, App, Bounds, Context, Entity, EventEmitter,
     FocusHandle, Focusable, FontWeight, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
-    Pixels, Render, RenderOnce, ScrollHandle, SharedString, StyleRefinement, Styled, Subscription,
-    Window, anchored, canvas, deferred, div, ease_out_quint, point, prelude::*, px,
-    transparent_black,
+    Pixels, Render, RenderOnce, ScrollHandle, ScrollbarVisibility, SharedString, StyleRefinement,
+    Styled, Subscription, Window, anchored, canvas, deferred, div, ease_out_quint, point,
+    prelude::*, px, transparent_black,
 };
 
 use super::completion::fuzzy_match_score_lower;
@@ -180,6 +180,7 @@ pub struct ComboBoxState<T: Clone + PartialEq + 'static> {
     invalid: bool,
     clearable: bool,
     max_menu_height: Pixels,
+    scrollbar_visibility: ScrollbarVisibility,
     scroll_handle: ScrollHandle,
     trigger_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     frame_style: StyleRefinement,
@@ -267,6 +268,7 @@ impl<T: Clone + PartialEq + 'static> ComboBoxState<T> {
             invalid: false,
             clearable: true,
             max_menu_height: px(280.),
+            scrollbar_visibility: ScrollbarVisibility::Always,
             scroll_handle: ScrollHandle::new(),
             trigger_bounds: Rc::new(Cell::new(None)),
             frame_style: StyleRefinement::default(),
@@ -334,6 +336,15 @@ impl<T: Clone + PartialEq + 'static> ComboBoxState<T> {
     /// Controls whether the inline clear button is shown.
     pub fn clearable(mut self, clearable: bool) -> Self {
         self.clearable = clearable;
+        self
+    }
+
+    /// Controls scrollbar visibility in the dropdown popover.
+    ///
+    /// Defaults to [`ScrollbarVisibility::Always`], which keeps the scrollbar visible whenever
+    /// options overflow and omits it completely when all options fit.
+    pub fn scrollbar_visibility(mut self, visibility: ScrollbarVisibility) -> Self {
+        self.scrollbar_visibility = visibility;
         self
     }
 
@@ -1188,6 +1199,7 @@ impl<T: Clone + PartialEq + 'static> Render for ComboBoxState<T> {
                 .max_h(self.max_menu_height)
                 .p(px(4.))
                 .overflow_y_scroll()
+                .scrollbar_visibility(self.scrollbar_visibility)
                 .track_scroll(&self.scroll_handle);
 
             if filtered.is_empty() {

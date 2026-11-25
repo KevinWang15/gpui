@@ -9,8 +9,8 @@ use crate::icons::{Icon, IconSize, LucideIcon};
 use crate::{
     Anchor, Animation, AnimationExt, App, Bounds, Context, ElementId, Entity, EventEmitter,
     FocusHandle, Focusable, FontWeight, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
-    Pixels, Render, RenderOnce, SharedString, StyleRefinement, Styled, Window, anchored, canvas,
-    deferred, div, ease_out_quint, point, prelude::*, px,
+    Pixels, Render, RenderOnce, ScrollbarVisibility, SharedString, StyleRefinement, Styled, Window,
+    anchored, canvas, deferred, div, ease_out_quint, point, prelude::*, px,
 };
 
 use super::theme::{ANIM_FAST, ActiveTheme, ComponentSize};
@@ -76,6 +76,7 @@ impl TreeSelectState {
             TreeState::new(tree_nodes, cx)
                 .searchable(true)
                 .max_height(px(240.))
+                .scrollbar_visibility(ScrollbarVisibility::Always)
                 .default_expanded(initial_expanded)
         });
         cx.subscribe(&tree, |this, _, ev: &TreeEvent, cx| {
@@ -847,6 +848,7 @@ impl Render for CascaderState {
                         .w(px(164.))
                         .max_h(px(240.))
                         .overflow_y_scroll()
+                        .show_scrollbar_always()
                         .p(px(5.))
                         .gap(px(2.))
                         .when(col_depth > 0, |el| {

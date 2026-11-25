@@ -85,6 +85,7 @@ fn render_positioned_menu_panel(
         .p(px(4.))
         .max_h((vp.height - px(16.)).max(px(120.)))
         .overflow_y_scroll()
+        .show_scrollbar_always()
         .rounded(theme.radius_lg)
         .bg(theme.popover)
         .text_color(theme.popover_foreground)
