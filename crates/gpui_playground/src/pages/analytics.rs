@@ -1,7 +1,8 @@
 //! Interactive Analytics & Charts showcase demonstrating [`TimeRangePicker`],
-//! faceted [`FilterBar`], [`StatGroup`], [`SegmentedControl`], [`StackedBarChart`],
-//! [`LineChart`], [`BreakdownList`], [`ChartCard`] data tables, and click-origin
-//! radial [`ThemeSwitcher`] transitions.
+//! faceted [`FilterBar`], [`StatGroup`], [`SegmentedControl`], composable [`CartesianPlot`]
+//! layers ([`StackedBarLayer`], [`LineLayer`], [`ReferenceLine`], [`ReferenceBand`]),
+//! [`BreakdownList`], [`ChartCard`] data tables, and click-origin radial [`ThemeSwitcher`]
+//! transitions.
 
 use gpui::components::*;
 use gpui::icons::LucideIcon;
@@ -171,7 +172,9 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
         .collect();
 
     // Compute daily series across the selected DateRange.
-    let mut bar_points = Vec::with_capacity(span_days as usize);
+    let mut bar_labels: Vec<SharedString> = Vec::with_capacity(span_days as usize);
+    let mut bar_columns: Vec<Vec<f64>> = Vec::with_capacity(span_days as usize);
+    let mut bar_prev_totals: Vec<Option<f64>> = Vec::with_capacity(span_days as usize);
     let mut model_totals_cost = vec![0.0_f64; active_models.len()];
     let mut model_totals_metric = vec![0.0_f64; active_models.len()];
     let mut total_cost = 0.0_f64;
@@ -188,6 +191,7 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
         };
 
         let mut col_values = Vec::with_capacity(active_models.len());
+        let mut prev_day_total = 0.0_f64;
         for (idx, (_, m)) in active_models.iter().enumerate() {
             let mult = day_multiplier(day_epoch, m.phase, seed) * scope_mult;
             let day_cost = m.base_daily_cost * mult;
@@ -204,11 +208,20 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
                 "requests" => day_reqs,
                 _ => day_cost,
             };
+            let prev_mult = day_multiplier(day_epoch - i64::from(span_days), m.phase, seed) * scope_mult;
+            let prev_cost = m.base_daily_cost * prev_mult;
+            prev_day_total += match metric_key.as_ref() {
+                "tokens" => prev_cost * m.tokens_per_dollar,
+                "requests" => prev_cost * m.requests_per_dollar,
+                _ => prev_cost,
+            };
             model_totals_metric[idx] += metric_val;
             let is_hidden = hidden_models.iter().any(|h| h.as_ref() == m.name);
             col_values.push(if is_hidden { 0.0 } else { metric_val });
         }
-        bar_points.push(StackedBarPoint::new(label, col_values));
+        bar_labels.push(label);
+        bar_columns.push(col_values);
+        bar_prev_totals.push(Some(prev_day_total));
     }
 
     let avg_daily_cost = if span_days > 0 {
@@ -245,29 +258,36 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
         .iter()
         .map(|&(orig_idx, m)| StackedBarSeries::new(m.name).color(palette.color(orig_idx)))
         .collect();
-    let bar_legend: Vec<ChartLegendItem> = active_models
+    let mut bar_legend: Vec<ChartLegendItem> = active_models
         .iter()
         .map(|&(orig_idx, m)| {
             let muted = hidden_models.iter().any(|h| h.as_ref() == m.name);
             ChartLegendItem::dot(m.name, palette.color(orig_idx)).muted(muted)
         })
         .collect();
+    bar_legend.push(ChartLegendItem::dashed_line(
+        format!("Previous {span_days} days"),
+        palette.baseline,
+    ));
     let legend_model_names: Vec<SharedString> = active_models
         .iter()
         .map(|(_, m)| SharedString::from(m.name))
         .collect();
 
-    // Line chart series & legend
-    let line_series = vec![
-        LineSeries::new("Today", today_points)
-            .color(palette.color(0))
-            .fill_area(true)
-            .endpoint_callout("Today"),
-        LineSeries::new("Previous 5 workdays, average", baseline_points)
-            .line_style(LineStyle::Dashed)
-            .color(palette.baseline),
+    // Line chart layers & legend
+    let today_layer = LineLayer::new("Today", today_points)
+        .color(palette.color(0))
+        .smooth(line_smooth)
+        .fill_area(true)
+        .endpoint_callout("Today");
+    let baseline_layer = LineLayer::new("Previous 5 workdays, average", baseline_points)
+        .dashed()
+        .smooth(line_smooth)
+        .color(palette.baseline);
+    let line_legend = vec![
+        today_layer.legend_item(palette.color(0)),
+        baseline_layer.legend_item(palette.baseline),
     ];
-    let line_legend = LineChart::legend_items(&line_series, &palette);
 
     // Breakdown list rows (sorted descending by value)
     let mut breakdown_items: Vec<BreakdownItem> = active_models
@@ -311,20 +331,22 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
         .find(|c| c.field.as_ref() == "model" && c.values.len() == 1)
         .map(|c| c.values[0].clone());
 
-    // Data table backing the StackedBarChart "Show data table" disclosure
-    let daily_table_rows: Vec<TableRow> = bar_points
+    // Data table backing the stacked-bar CartesianPlot "Show data table" disclosure
+    let daily_table_rows: Vec<TableRow> = bar_labels
         .iter()
+        .zip(&bar_columns)
         .rev()
         .take(8)
-        .map(|pt| {
+        .map(|(label, vals)| {
+            let total: f64 = vals.iter().copied().sum();
             let top_share = active_models
                 .first()
                 .map(|(_, m)| m.name.to_string())
                 .unwrap_or_else(|| "—".to_string());
             TableRow::new()
-                .text(pt.label.clone())
-                .text(value_format.format_detail(pt.total()))
-                .text(format!("{}", pt.values.len()))
+                .text(label.clone())
+                .text(value_format.format_detail(total))
+                .text(format!("{}", vals.len()))
                 .text(top_share)
         })
         .collect();
@@ -341,15 +363,15 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
     .striped(true)
     .rows(daily_table_rows);
 
-    // Data table backing the LineChart "Show data table" disclosure
+    // Data table backing the intraday LineLayer CartesianPlot "Show data table" disclosure
     let hourly_table_rows: Vec<TableRow> = [0.0, 6.0, 12.0, 17.5, 24.0]
         .into_iter()
         .map(|hr| {
-            let td = line_series[0]
+            let td = today_layer
                 .sample_at(hr)
                 .map(|y| value_format.format_detail(y))
                 .unwrap_or_else(|| "—".into());
-            let base = line_series[1]
+            let base = baseline_layer
                 .sample_at(hr)
                 .map(|y| value_format.format_detail(y))
                 .unwrap_or_else(|| "—".into());
@@ -500,7 +522,7 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
                         .label("Monotone smooth")
                         .on_change(cx.listener(|this, enabled: &bool, _, cx| {
                             this.analytics_line_smooth = *enabled;
-                            this.log_event("LineChart", format!("smooth -> {}", *enabled), cx);
+                            this.log_event("CartesianPlot", format!("smooth -> {}", *enabled), cx);
                         })),
                 )
                 .child(
@@ -567,15 +589,31 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
             }
         }))
         .content(
-            stacked_bar_chart("analytics-stacked-bar")
-                .series(bar_series)
-                .points(bar_points.clone())
+            cartesian_plot("analytics-stacked-bar")
+                .x_axis(XAxis::category(bar_labels.clone()))
+                .y_axis(YAxis::new(value_format.clone()))
+                .layer(StackedBarLayer::new(bar_series, bar_columns.clone()))
+                .layer(
+                    LineLayer::from_buckets(
+                        format!("Previous {span_days} days"),
+                        bar_prev_totals,
+                    )
+                    .dashed()
+                    .smooth(true)
+                    .halo(true)
+                    .tooltip_separator(true)
+                    .color(palette.baseline),
+                )
+                .layer(
+                    ReferenceLine::horizontal(avg_daily_metric)
+                        .label(format!("Avg {}", value_format.format_tick(avg_daily_metric)))
+                        .color(theme.warning.opacity(0.85)),
+                )
                 .height(px(230.))
-                .value_format(value_format.clone())
-                .on_bar_click(cx.listener(|this, idx, _, cx| {
-                    this.log_event("StackedBarChart", format!("clicked column #{idx}"), cx);
+                .on_category_click(cx.listener(|this, idx, _, cx| {
+                    this.log_event("CartesianPlot", format!("clicked column #{idx}"), cx);
                 }))
-                .on_brush_select(cx.listener(move |this, sel: &std::ops::RangeInclusive<usize>, _, cx| {
+                .on_category_brush(cx.listener(move |this, sel: &std::ops::RangeInclusive<usize>, _, cx| {
                     let start_day = range_start_for_brush.add_days(*sel.start() as i64);
                     let end_day = range_start_for_brush.add_days(*sel.end() as i64);
                     time_range_for_brush.update(cx, |s, cx| {
@@ -614,9 +652,9 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
     };
 
     let line_subtitle = if let Some((a, b)) = line_selection {
-        let delta_str = line_series
-            .first()
-            .and_then(|today| Some((today.sample_at(a)?, today.sample_at(b)?)))
+        let delta_str = today_layer
+            .sample_at(a)
+            .and_then(|y0| Some((y0, today_layer.sample_at(b)?)))
             .map(|(y0, y1)| format!(" · Δ {}", value_format.format_detail((y1 - y0).max(0.0))))
             .unwrap_or_default();
         format!("Window {} – {}{delta_str}", fmt_hour(a), fmt_hour(b))
@@ -630,32 +668,35 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
         .subtitle(line_subtitle)
         .legend(line_legend)
         .content(
-            line_chart("analytics-line-chart")
-                .series(line_series)
-                .smooth(line_smooth)
-                .x_domain(0.0, 24.0)
-                .x_ticks([
-                    (0.0, "00:00".into()),
-                    (6.0, "06:00".into()),
-                    (12.0, "12:00".into()),
-                    (18.0, "18:00".into()),
-                    (24.0, "24:00".into()),
-                ])
-                .x_formatter(fmt_hour)
+            cartesian_plot("analytics-line-chart")
+                .x_axis(
+                    XAxis::continuous()
+                        .domain(0.0, 24.0)
+                        .ticks([
+                            (0.0, "00:00".into()),
+                            (6.0, "06:00".into()),
+                            (12.0, "12:00".into()),
+                            (18.0, "18:00".into()),
+                            (24.0, "24:00".into()),
+                        ])
+                        .formatter(fmt_hour),
+                )
+                .y_axis(YAxis::new(value_format.clone()).ticks(5))
+                .layer(baseline_layer)
+                .layer(today_layer)
                 .height(px(225.))
-                .value_format(value_format.clone())
-                .selected_range(line_selection)
-                .on_brush_select(cx.listener(|this, &(a, b): &(f64, f64), _, cx| {
+                .selected_domain_range(line_selection)
+                .on_domain_brush(cx.listener(|this, &(a, b): &(f64, f64), _, cx| {
                     this.analytics_line_selection = Some((a, b));
                     this.log_event(
-                        "LineChart",
+                        "CartesianPlot",
                         format!("selected {:.1}h – {:.1}h", a, b),
                         cx,
                     );
                 }))
                 .on_selection_clear(cx.listener(|this, _, _, cx| {
                     this.analytics_line_selection = None;
-                    this.log_event("LineChart", "cleared selection", cx);
+                    this.log_event("CartesianPlot", "cleared selection", cx);
                 }))
                 .selectable(drag_zoom_enabled),
         )
@@ -716,8 +757,14 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
     )
     .content(breakdown_widget);
 
-    // Compact Sparkline & GroupedSparkline strip (ported from llm-usage-monitor)
-    let spark_today: Vec<f64> = bar_points.iter().rev().take(14).rev().map(|p| p.total()).collect();
+    // Compact Sparkline & GroupedSparkline strip
+    let spark_today: Vec<f64> = bar_columns
+        .iter()
+        .rev()
+        .take(14)
+        .rev()
+        .map(|vals| vals.iter().copied().sum())
+        .collect();
     let spark_baseline: Vec<f64> = spark_today
         .iter()
         .enumerate()
@@ -732,12 +779,12 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
         .take(3)
         .enumerate()
         .map(|(i, &(orig_idx, m))| {
-            let vals: Vec<f64> = bar_points
+            let vals: Vec<f64> = bar_columns
                 .iter()
                 .rev()
                 .take(12)
                 .rev()
-                .map(|pt| pt.values.get(i).copied().unwrap_or(0.0))
+                .map(|col| col.get(i).copied().unwrap_or(0.0))
                 .collect();
             GroupedSparklineSeries::new(m.name, vals).color(palette.color(orig_idx))
         })
@@ -825,42 +872,33 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
                 ),
         );
 
-    // Responsive flex-height ChartCard showcase (StackedBarChart / LineChart .fill_height(true))
+    // Responsive flex-height ChartCard showcase (CartesianPlot .fill_height(true))
     let resp_bar_series: Vec<StackedBarSeries> = active_models
         .iter()
         .map(|&(orig_idx, m)| StackedBarSeries::new(m.name).color(palette.color(orig_idx)))
         .collect();
-    let resp_line_series: Vec<LineSeries> = active_models
-        .iter()
-        .enumerate()
-        .map(|(i, &(orig_idx, m))| {
-            let pts: Vec<(f64, f64)> = bar_points
-                .iter()
-                .enumerate()
-                .map(|(day_i, pt)| (day_i as f64, pt.values.get(i).copied().unwrap_or(0.0)))
-                .collect();
-            LineSeries::new(m.name, pts)
-                .color(palette.color(orig_idx))
-                .fill_area(active_models.len() == 1)
-        })
-        .collect();
     let resp_chart_body = if app.analytics_responsive_use_line {
-        let n = bar_points.len().max(1);
-        line_chart("analytics-responsive-line")
-            .series(resp_line_series)
-            .smooth(line_smooth)
-            .x_domain(0.0, (n - 1).max(1) as f64)
+        let mut plot = cartesian_plot("analytics-responsive-line")
+            .x_axis(XAxis::category(bar_labels.clone()))
+            .y_axis(YAxis::new(value_format.clone()))
             .fill_height(true)
-            .min_h(px(150.))
-            .value_format(value_format.clone())
-            .into_any_element()
+            .min_h(px(150.));
+        for (i, &(orig_idx, m)) in active_models.iter().enumerate() {
+            plot = plot.layer(
+                LineLayer::from_buckets(m.name, bar_columns.iter().map(|col| col.get(i).copied()))
+                    .color(palette.color(orig_idx))
+                    .smooth(line_smooth)
+                    .fill_area(active_models.len() == 1),
+            );
+        }
+        plot.into_any_element()
     } else {
-        stacked_bar_chart("analytics-responsive-bars")
-            .series(resp_bar_series)
-            .points(bar_points.clone())
+        cartesian_plot("analytics-responsive-bars")
+            .x_axis(XAxis::category(bar_labels))
+            .y_axis(YAxis::new(value_format.clone()))
+            .layer(StackedBarLayer::new(resp_bar_series, bar_columns))
             .fill_height(true)
             .min_h(px(150.))
-            .value_format(value_format.clone())
             .into_any_element()
     };
     let responsive_chart_demo = card()

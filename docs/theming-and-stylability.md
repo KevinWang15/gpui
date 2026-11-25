@@ -161,5 +161,5 @@ section("Shortcuts")
   - `Toggle::{track_off_color, track_on_color, thumb_color}` override switch colors per instance.
 - **`Card`**:
   - `Card::flat()` strips drop shadow while keeping surface background and 1px hairline border.
-- **Charts (`StackedBarChart`, `LineChart`, `BreakdownList`)**:
+- **Charts (`CartesianPlot`, `Sparkline`, `GroupedSparkline`, `BreakdownList`)**:
   - `.palette(ChartPalette)` overrides the theme-derived `ChartPalette` on a per-chart basis.

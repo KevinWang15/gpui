@@ -121,13 +121,13 @@ pub use badge::{Badge, BadgeColor, BadgeVariant, badge};
 pub use button::{Button, ButtonGroup, ButtonVariant, button, button_group};
 pub use carousel::{Carousel, CarouselEvent, CarouselState, carousel};
 pub use charts::{
-    BandScale, BreakdownItem, BreakdownList, ChartCard, ChartLegendItem, ChartPalette,
-    ChartValueFormat, CubicSegment, GroupedSparkline, GroupedSparklineSeries, LegendSwatch,
-    LineChart, LineSeries, LineStyle, LinearScale, Sparkline, SparklineHover, SparklineKind,
-    StackedBarBaseline, StackedBarChart, StackedBarPoint, StackedBarSeries, breakdown_list,
-    chart_card,
-    compute_sparkline_y_range, format_compact, grouped_sparkline, line_chart, monotone, nice_ticks,
-    sample_monotone, sparkline, stacked_bar_chart,
+    BandScale, BreakdownItem, BreakdownList, CartesianPlot, ChartCard, ChartLegendItem,
+    ChartPalette, ChartTooltipRow, ChartValueFormat, CubicSegment, GroupedSparkline,
+    GroupedSparklineSeries, LegendSwatch, LineData, LineLayer, LineStyle, LinearScale, PlotHover,
+    PlotLayer, PlotTooltipData, ReferenceAxis, ReferenceBand, ReferenceLine, Sparkline,
+    SparklineHover, SparklineKind, StackedBarLayer, StackedBarSeries, XAxis, YAxis,
+    breakdown_list, cartesian_plot, chart_card, compute_tight_y_range, format_compact,
+    grouped_sparkline, monotone, nice_ticks, nice_ticks_range, sample_monotone, sparkline,
 };
 pub use checkbox::{CheckState, Checkbox, CheckboxGroup, checkbox, checkbox_group};
 pub use color_picker::{

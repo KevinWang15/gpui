@@ -1,13 +1,16 @@
-//! Shared scales, nice-tick generation, color palettes, legend swatches, GPU text painting,
-//! and [`ChartCard`] framing for `gpui::components::charts`.
+//! Shared scales, nice-tick generation, Fritsch–Carlson monotone splines, color palettes,
+//! swatch & tooltip rendering, GPU text/marker/grid/brush painting, and [`ChartCard`] framing
+//! for `gpui::components::charts`.
 
+use std::borrow::Cow;
 use std::rc::Rc;
 
 use crate::icons::{Icon, IconSize, LucideIcon};
 use crate::{
     AnyElement, App, BorderStyle, Bounds, ClickEvent, Corners, Edges, ElementId, FontWeight, Hsla,
-    IntoElement, ParentElement, Pixels, Point, RenderOnce, SharedString, StyleRefinement, Styled,
-    TextAlign, TextRun, Window, div, fill, point, prelude::*, px, quad, size,
+    IntoElement, ParentElement, PathBuilder, Pixels, Point, RenderOnce, SharedString,
+    StyleRefinement, Styled, TextAlign, TextRun, Window, div, fill, point, prelude::*, px, quad,
+    size,
 };
 
 use crate::components::palette;
@@ -18,7 +21,7 @@ use crate::components::theme::{ActiveTheme, Theme, ThemeMode, tabular_numerals};
 pub struct ChartPalette {
     /// Ordered categorical colors for chart series (indexed modulo length).
     pub colors: Vec<Hsla>,
-    /// Muted neutral baseline stroke (e.g. `"Previous 5 workdays, average"`).
+    /// Muted neutral baseline stroke (e.g. `"Previous 30 days"`).
     pub baseline: Hsla,
     /// Hairline horizontal gridline stroke.
     pub gridline: Hsla,
@@ -123,14 +126,9 @@ pub fn format_compact(value: f64) -> String {
     }
 }
 
-/// Computes visually clean axis ticks spanning `0.0..=nice_max` (Heckbert nice-numbers algorithm).
-pub fn nice_ticks(max_value: f64, target_ticks: usize) -> (f64, Vec<f64>) {
+fn nice_step(span: f64, target_ticks: usize) -> f64 {
     let target = target_ticks.max(2) as f64;
-    if !max_value.is_finite() || max_value <= 0.0 {
-        return (1.0, vec![0.0, 0.5, 1.0]);
-    }
-
-    let rough_step = max_value / (target - 1.0);
+    let rough_step = span / (target - 1.0);
     let exponent = rough_step.log10().floor();
     let magnitude = 10f64.powf(exponent);
     let normalized = rough_step / magnitude;
@@ -145,7 +143,15 @@ pub fn nice_ticks(max_value: f64, target_ticks: usize) -> (f64, Vec<f64>) {
     } else {
         10.0
     };
-    let step = nice_fraction * magnitude;
+    nice_fraction * magnitude
+}
+
+/// Computes visually clean axis ticks spanning `0.0..=nice_max` (Heckbert nice-numbers algorithm).
+pub fn nice_ticks(max_value: f64, target_ticks: usize) -> (f64, Vec<f64>) {
+    if !max_value.is_finite() || max_value <= 0.0 {
+        return (1.0, vec![0.0, 0.5, 1.0]);
+    }
+    let step = nice_step(max_value, target_ticks);
     let nice_max = (max_value / step).ceil() * step;
 
     let mut ticks = Vec::new();
@@ -156,6 +162,95 @@ pub fn nice_ticks(max_value: f64, target_ticks: usize) -> (f64, Vec<f64>) {
         v += step;
     }
     (nice_max.max(step), ticks)
+}
+
+/// Computes visually clean ticks covering `[min_value, max_value]`.
+///
+/// When `snap_bounds` is `true`, expands `[min_value, max_value]` outward to clean multiples of
+/// the chosen nice step; when `false`, preserves the exact caller-specified domain endpoints and
+/// places evenly spaced interior ticks.
+pub fn nice_ticks_range(
+    min_value: f64,
+    max_value: f64,
+    target_ticks: usize,
+    snap_bounds: bool,
+) -> (f64, f64, Vec<f64>) {
+    if !min_value.is_finite() || !max_value.is_finite() || max_value <= min_value {
+        return (0.0, 1.0, vec![0.0, 0.5, 1.0]);
+    }
+    let span = max_value - min_value;
+    if !snap_bounds {
+        let count = target_ticks.max(2);
+        let step = span / (count - 1) as f64;
+        let ticks = (0..count)
+            .map(|i| {
+                let v = if i + 1 == count {
+                    max_value
+                } else {
+                    min_value + step * i as f64
+                };
+                if v.abs() < span * 1e-6 { 0.0 } else { v }
+            })
+            .collect();
+        return (min_value, max_value, ticks);
+    }
+    let step = nice_step(span, target_ticks);
+    let nice_min = (min_value / step).floor() * step;
+    let nice_max = (max_value / step).ceil() * step;
+    let mut ticks = Vec::new();
+    let mut v = nice_min;
+    let eps = step * 1e-4;
+    while v <= nice_max + eps && ticks.len() < 16 {
+        ticks.push(if v.abs() < eps { 0.0 } else { v });
+        v += step;
+    }
+    (nice_min, nice_max.max(nice_min + step), ticks)
+}
+
+/// Computes an adaptive Y domain `(min, max)` for sparklines and tight-range plots.
+///
+/// - When `tight_range` is `false` (additive metrics like spend/requests), anchors at `0.0`.
+/// - When `tight_range` is `true` (ratios, latencies, temperatures), pads tightly around the
+///   observed `[min, max]` so subtle changes remain visually legible, optionally clamped to `clamp`.
+pub fn compute_tight_y_range(
+    values: impl Iterator<Item = f64>,
+    tight_range: bool,
+    clamp: Option<(f64, f64)>,
+) -> (f64, f64) {
+    let mut min_v = f64::INFINITY;
+    let mut max_v = f64::NEG_INFINITY;
+    for v in values {
+        if v.is_finite() {
+            min_v = min_v.min(v);
+            max_v = max_v.max(v);
+        }
+    }
+    if !min_v.is_finite() || !max_v.is_finite() {
+        return clamp.unwrap_or((0.0, 1.0));
+    }
+    if !tight_range {
+        let hi = max_v.max(1e-6) * 1.08;
+        let lo = min_v.min(0.0);
+        return (lo, if (hi - lo).abs() < 1e-6 { lo + 1.0 } else { hi });
+    }
+    let span = (max_v - min_v).abs();
+    let pad = if span < 1e-6 {
+        (max_v.abs() * 0.1).max(0.05)
+    } else {
+        span * 0.16
+    };
+    let mut lo = min_v - pad;
+    let mut hi = max_v + pad;
+    if let Some((c_min, c_max)) = clamp {
+        lo = lo.clamp(c_min, c_max);
+        hi = hi.clamp(c_min, c_max);
+        let min_span = (c_max - c_min) * 0.02;
+        if (hi - lo) < min_span && c_max > c_min {
+            lo = (min_v - min_span).clamp(c_min, (c_max - min_span).max(c_min));
+            hi = (lo + min_span * 2.0).min(c_max);
+        }
+    }
+    (lo, hi.max(lo + 1e-6))
 }
 
 /// Linear mapping from continuous domain `[domain_min, domain_max]` to pixel range `[range_start, range_end]`.
@@ -254,6 +349,11 @@ impl BandScale {
         self.left + ((index as f32) + 0.5) * step
     }
 
+    /// Maps a fractional category coordinate `x` (`0.0` = center of column 0, `1.0` = center of column 1).
+    pub fn map_continuous(&self, x: f64) -> f32 {
+        self.left + ((x as f32) + 0.5) * self.step()
+    }
+
     /// `O(1)` inverse mapping from a pointer X coordinate to the hovered category index.
     pub fn index_at_x(&self, x: f32) -> Option<usize> {
         if self.count == 0 || x < self.left || x > self.left + self.width {
@@ -268,7 +368,283 @@ impl BandScale {
     }
 }
 
+/// One cubic Bezier segment `(p0 -> c1, c2 -> p1)` produced by [`monotone`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CubicSegment {
+    /// Start point.
+    pub p0: (f32, f32),
+    /// First control point.
+    pub c1: (f32, f32),
+    /// Second control point.
+    pub c2: (f32, f32),
+    /// End point.
+    pub p1: (f32, f32),
+}
+
+/// Computes Fritsch–Carlson monotone cubic Hermite segments passing cleanly through `pts`
+/// (sorted in strictly increasing X) without overshooting local extrema or flat plateaus.
+pub fn monotone(pts: &[(f32, f32)]) -> Vec<CubicSegment> {
+    let n = pts.len();
+    if n < 2 {
+        return Vec::new();
+    }
+    if n == 2 {
+        let (x0, y0) = pts[0];
+        let (x1, y1) = pts[1];
+        let dx = (x1 - x0) / 3.0;
+        let dy = (y1 - y0) / 3.0;
+        return vec![CubicSegment {
+            p0: (x0, y0),
+            c1: (x0 + dx, y0 + dy),
+            c2: (x1 - dx, y1 - dy),
+            p1: (x1, y1),
+        }];
+    }
+
+    let mut dx = vec![0.0_f32; n - 1];
+    let mut slope = vec![0.0_f32; n - 1];
+    for i in 0..n - 1 {
+        let d = (pts[i + 1].0 - pts[i].0).max(1e-5);
+        dx[i] = d;
+        slope[i] = (pts[i + 1].1 - pts[i].1) / d;
+    }
+
+    let mut tangents = vec![0.0_f32; n];
+    tangents[0] = slope[0];
+    tangents[n - 1] = slope[n - 2];
+
+    for i in 1..n - 1 {
+        if slope[i - 1] * slope[i] <= 0.0 {
+            tangents[i] = 0.0;
+        } else {
+            let w1 = 2.0 * dx[i] + dx[i - 1];
+            let w2 = dx[i] + 2.0 * dx[i - 1];
+            tangents[i] = (w1 + w2) / (w1 / slope[i - 1] + w2 / slope[i]);
+        }
+    }
+
+    if tangents[0].abs() > 3.0 * slope[0].abs() {
+        tangents[0] = 3.0 * slope[0];
+    }
+    if tangents[n - 1].abs() > 3.0 * slope[n - 2].abs() {
+        tangents[n - 1] = 3.0 * slope[n - 2];
+    }
+
+    for i in 0..n - 1 {
+        let s = slope[i];
+        if s.abs() < 1e-6 {
+            tangents[i] = 0.0;
+            tangents[i + 1] = 0.0;
+        } else {
+            let alpha = tangents[i] / s;
+            let beta = tangents[i + 1] / s;
+            let hypot = (alpha * alpha + beta * beta).sqrt();
+            if hypot > 3.0 {
+                let tau = 3.0 / hypot;
+                tangents[i] = tau * alpha * s;
+                tangents[i + 1] = tau * beta * s;
+            }
+        }
+    }
+
+    let mut out = Vec::with_capacity(n - 1);
+    for i in 0..n - 1 {
+        let (x0, y0) = pts[i];
+        let (x1, y1) = pts[i + 1];
+        let h = dx[i] / 3.0;
+        out.push(CubicSegment {
+            p0: (x0, y0),
+            c1: (x0 + h, y0 + tangents[i] * h),
+            c2: (x1 - h, y1 - tangents[i + 1] * h),
+            p1: (x1, y1),
+        });
+    }
+    out
+}
+
+/// Evaluates the Y coordinate of a monotone cubic spline produced by [`monotone`] at `x`.
+pub fn sample_monotone(segments: &[CubicSegment], x: f32) -> Option<f32> {
+    let first = segments.first()?;
+    let last = segments.last()?;
+    if x <= first.p0.0 {
+        return Some(first.p0.1);
+    }
+    if x >= last.p1.0 {
+        return Some(last.p1.1);
+    }
+    let idx = segments
+        .partition_point(|seg| seg.p1.0 < x)
+        .min(segments.len() - 1);
+    let seg = segments[idx];
+    let span = (seg.p1.0 - seg.p0.0).max(1e-5);
+    let t = ((x - seg.p0.0) / span).clamp(0.0, 1.0);
+    let mt = 1.0 - t;
+    let y = mt * mt * mt * seg.p0.1
+        + 3.0 * mt * mt * t * seg.c1.1
+        + 3.0 * mt * t * t * seg.c2.1
+        + t * t * t * seg.p1.1;
+    Some(y)
+}
+
+/// Appends either Fritsch–Carlson monotone cubic segments or straight line segments to `pb`.
+pub(crate) fn push_curve_points(
+    pb: &mut PathBuilder,
+    pts: &[(f32, f32)],
+    smooth: bool,
+    already_moved: bool,
+) {
+    if pts.is_empty() {
+        return;
+    }
+    if !already_moved {
+        pb.move_to(point(px(pts[0].0), px(pts[0].1)));
+    }
+    if smooth && pts.len() >= 2 {
+        for seg in monotone(pts) {
+            pb.cubic_bezier_to(
+                point(px(seg.p1.0), px(seg.p1.1)),
+                point(px(seg.c1.0), px(seg.c1.1)),
+                point(px(seg.c2.0), px(seg.c2.1)),
+            );
+        }
+    } else {
+        for &(x, y) in &pts[1..] {
+            pb.line_to(point(px(x), px(y)));
+        }
+    }
+}
+
+/// Preserves exact per-pixel-column min/max envelope for dense monotonic-X series so
+/// Lyon tessellation and curve tile-binning stay `O(plot_width)` without missing spikes.
+pub(crate) fn decimate_monotonic_points<'a>(
+    points: &'a [(f64, f64)],
+    max_buckets: usize,
+) -> Cow<'a, [(f64, f64)]> {
+    let buckets = max_buckets.max(64);
+    if points.len() <= buckets.saturating_mul(2) || points.len() < 4 {
+        return Cow::Borrowed(points);
+    }
+    let x_start = points[0].0;
+    let x_end = points[points.len() - 1].0;
+    let x_span = x_end - x_start;
+    if x_span <= f64::EPSILON || !points.windows(2).all(|w| w[1].0 >= w[0].0) {
+        return Cow::Borrowed(points);
+    }
+
+    let mut out = Vec::with_capacity(buckets * 2 + 2);
+    let inv_bucket = (buckets as f64) / x_span;
+    let mut i = 0;
+    while i < points.len() {
+        let bucket = (((points[i].0 - x_start) * inv_bucket).floor() as usize).min(buckets);
+        let first_idx = i;
+        let mut min_idx = i;
+        let mut max_idx = i;
+        let mut min_y = points[i].1;
+        let mut max_y = points[i].1;
+        let mut last_idx = i;
+        i += 1;
+        while i < points.len() {
+            let b = (((points[i].0 - x_start) * inv_bucket).floor() as usize).min(buckets);
+            if b != bucket {
+                break;
+            }
+            let y = points[i].1;
+            if y < min_y {
+                min_y = y;
+                min_idx = i;
+            }
+            if y > max_y {
+                max_y = y;
+                max_idx = i;
+            }
+            last_idx = i;
+            i += 1;
+        }
+
+        let mut indices = [first_idx, min_idx, max_idx, last_idx];
+        indices.sort_unstable();
+        let mut prev = usize::MAX;
+        for idx in indices {
+            if idx != prev {
+                out.push(points[idx]);
+                prev = idx;
+            }
+        }
+    }
+    Cow::Owned(out)
+}
+
+/// Line stroke pattern for line layers and reference lines.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum LineStyle {
+    /// Continuous solid stroke.
+    #[default]
+    Solid,
+    /// Dashed comparison / baseline stroke.
+    Dashed,
+}
+
+impl LineStyle {
+    /// Returns the matching [`LegendSwatch`] for this line style.
+    pub const fn swatch(self) -> LegendSwatch {
+        match self {
+            Self::Solid => LegendSwatch::SolidLine,
+            Self::Dashed => LegendSwatch::DashedLine,
+        }
+    }
+}
+
+/// Swatch indicator style used inside [`ChartLegendItem`] and [`ChartTooltipRow`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LegendSwatch {
+    /// Small circular dot (used for stacked bar and breakdown charts).
+    Dot,
+    /// Solid horizontal line segment (used for primary line series).
+    SolidLine,
+    /// Dashed horizontal line segment (used for comparison/baseline line series).
+    DashedLine,
+}
+
+/// Renders a single legend or tooltip swatch indicator (`Dot`, `SolidLine`, or `DashedLine`).
+pub(crate) fn render_swatch(swatch: LegendSwatch, color: Hsla, compact: bool) -> AnyElement {
+    match swatch {
+        LegendSwatch::Dot => {
+            let d = if compact { 7. } else { 8. };
+            div()
+                .w(px(d))
+                .h(px(d))
+                .flex_shrink_0()
+                .rounded_full()
+                .bg(color)
+                .into_any_element()
+        }
+        LegendSwatch::SolidLine => {
+            let (w, h) = if compact { (11., 2.) } else { (16., 2.5) };
+            div()
+                .w(px(w))
+                .h(px(h))
+                .flex_shrink_0()
+                .rounded_full()
+                .bg(color)
+                .into_any_element()
+        }
+        LegendSwatch::DashedLine => {
+            let (dash_w, gap) = if compact { (3., 1.5) } else { (4., 2.5) };
+            div()
+                .flex()
+                .flex_shrink_0()
+                .items_center()
+                .gap(px(gap))
+                .child(div().w(px(dash_w)).h(px(2.)).rounded_full().bg(color))
+                .child(div().w(px(dash_w)).h(px(2.)).rounded_full().bg(color))
+                .child(div().w(px(dash_w)).h(px(2.)).rounded_full().bg(color))
+                .into_any_element()
+        }
+    }
+}
+
 /// Paints a single tabular-numeral axis or callout label inside a GPUI `canvas` paint callback.
+#[allow(clippy::too_many_arguments)]
 pub fn paint_chart_text(
     text: impl Into<SharedString>,
     origin: Point<Pixels>,
@@ -376,16 +752,19 @@ pub(crate) fn paint_y_gridlines(
     label_width: f32,
     format: &ChartValueFormat,
     palette: &ChartPalette,
+    show_grid: bool,
     window: &mut Window,
     cx: &mut App,
 ) {
     let width = plot.width();
     for &tick in ticks {
         let y = y_scale.map(tick).round();
-        window.paint_quad(fill(
-            Bounds::new(point(px(plot.left), px(y)), size(px(width), px(1.))),
-            palette.gridline,
-        ));
+        if show_grid {
+            window.paint_quad(fill(
+                Bounds::new(point(px(plot.left), px(y)), size(px(width), px(1.))),
+                palette.gridline,
+            ));
+        }
         paint_chart_text(
             format.format_tick(tick),
             point(px(label_origin_x), px(y - 7.0)),
@@ -451,7 +830,7 @@ pub(crate) fn paint_chart_marker(
         Corners::all(px(halo_r)),
         halo_bg,
         Edges::default(),
-        halo_bg,
+        crate::transparent_black(),
         BorderStyle::Solid,
     ));
     window.paint_quad(quad(
@@ -462,7 +841,7 @@ pub(crate) fn paint_chart_marker(
         Corners::all(px(radius)),
         color,
         Edges::default(),
-        color,
+        crate::transparent_black(),
         BorderStyle::Solid,
     ));
 }
@@ -500,12 +879,67 @@ pub(crate) fn render_brush_pill(
 }
 
 /// One swatch + label + value row displayed inside a floating chart hover tooltip.
-pub(crate) struct ChartTooltipRow {
+#[derive(Clone, Debug)]
+pub struct ChartTooltipRow {
+    /// Swatch indicator color.
     pub color: Hsla,
+    /// Series or metric display label.
     pub label: SharedString,
+    /// Formatted right-aligned value text.
     pub value: String,
+    /// Swatch shape (`Dot`, `SolidLine`, or `DashedLine`).
     pub swatch: LegendSwatch,
+    /// When `true`, renders a subtle horizontal divider directly above this row.
     pub separator_before: bool,
+}
+
+impl ChartTooltipRow {
+    /// Creates a tooltip row with a circular dot swatch.
+    pub fn dot(label: impl Into<SharedString>, value: impl Into<String>, color: Hsla) -> Self {
+        Self {
+            color,
+            label: label.into(),
+            value: value.into(),
+            swatch: LegendSwatch::Dot,
+            separator_before: false,
+        }
+    }
+
+    /// Creates a tooltip row with a solid-line swatch.
+    pub fn solid_line(
+        label: impl Into<SharedString>,
+        value: impl Into<String>,
+        color: Hsla,
+    ) -> Self {
+        Self {
+            color,
+            label: label.into(),
+            value: value.into(),
+            swatch: LegendSwatch::SolidLine,
+            separator_before: false,
+        }
+    }
+
+    /// Creates a tooltip row with a dashed-line swatch.
+    pub fn dashed_line(
+        label: impl Into<SharedString>,
+        value: impl Into<String>,
+        color: Hsla,
+    ) -> Self {
+        Self {
+            color,
+            label: label.into(),
+            value: value.into(),
+            swatch: LegendSwatch::DashedLine,
+            separator_before: false,
+        }
+    }
+
+    /// Marks whether to draw a subtle horizontal divider directly above this row.
+    pub fn separator_before(mut self, enabled: bool) -> Self {
+        self.separator_before = enabled;
+        self
+    }
 }
 
 /// Renders a floating edge-flipping hover tooltip card anchored near `anchor_x`.
@@ -532,12 +966,13 @@ pub(crate) fn render_chart_tooltip(
         .flex()
         .items_center()
         .justify_between()
+        .gap(px(8.))
         .text_size(px(11.5))
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(theme.foreground)
         .child(header_left.into());
     if let Some(right) = header_right {
-        header = header.child(right);
+        header = header.child(div().flex_shrink_0().child(right));
     }
 
     let mut tooltip = div()
@@ -562,31 +997,6 @@ pub(crate) fn render_chart_tooltip(
         if row.separator_before {
             tooltip = tooltip.child(div().w_full().h(px(1.)).bg(theme.border.opacity(0.65)));
         }
-        let swatch = match row.swatch {
-            LegendSwatch::Dot => div()
-                .w(px(7.))
-                .h(px(7.))
-                .flex_shrink_0()
-                .rounded_full()
-                .bg(row.color)
-                .into_any_element(),
-            LegendSwatch::SolidLine => div()
-                .w(px(11.))
-                .h(px(2.))
-                .flex_shrink_0()
-                .rounded_full()
-                .bg(row.color)
-                .into_any_element(),
-            LegendSwatch::DashedLine => div()
-                .flex()
-                .flex_shrink_0()
-                .items_center()
-                .gap(px(1.5))
-                .child(div().w(px(3.)).h(px(2.)).rounded_full().bg(row.color))
-                .child(div().w(px(3.)).h(px(2.)).rounded_full().bg(row.color))
-                .child(div().w(px(3.)).h(px(2.)).rounded_full().bg(row.color))
-                .into_any_element(),
-        };
         tooltip = tooltip.child(
             div()
                 .flex()
@@ -600,7 +1010,7 @@ pub(crate) fn render_chart_tooltip(
                         .items_center()
                         .gap(px(6.))
                         .min_w_0()
-                        .child(swatch)
+                        .child(render_swatch(row.swatch, row.color, true))
                         .child(
                             div()
                                 .text_color(theme.muted_foreground)
@@ -619,17 +1029,6 @@ pub(crate) fn render_chart_tooltip(
     }
 
     tooltip
-}
-
-/// Swatch indicator style used inside a [`ChartLegendItem`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LegendSwatch {
-    /// Small circular dot (used for stacked bar and breakdown charts).
-    Dot,
-    /// Solid horizontal line segment (used for primary line series).
-    SolidLine,
-    /// Dashed horizontal line segment (used for comparison/baseline line series).
-    DashedLine,
 }
 
 /// One entry rendered in a chart legend bar.
@@ -710,28 +1109,6 @@ fn render_interactive_chart_legend(
         } else {
             item.color
         };
-        let swatch = match item.swatch {
-            LegendSwatch::Dot => div()
-                .w(px(8.))
-                .h(px(8.))
-                .rounded_full()
-                .bg(swatch_color)
-                .into_any_element(),
-            LegendSwatch::SolidLine => div()
-                .w(px(16.))
-                .h(px(2.5))
-                .rounded_full()
-                .bg(swatch_color)
-                .into_any_element(),
-            LegendSwatch::DashedLine => div()
-                .flex()
-                .items_center()
-                .gap(px(2.5))
-                .child(div().w(px(4.)).h(px(2.)).rounded_full().bg(swatch_color))
-                .child(div().w(px(4.)).h(px(2.)).rounded_full().bg(swatch_color))
-                .child(div().w(px(4.)).h(px(2.)).rounded_full().bg(swatch_color))
-                .into_any_element(),
-        };
 
         let mut pill = div()
             .id(("leg", idx))
@@ -743,7 +1120,7 @@ fn render_interactive_chart_legend(
             .mx(px(-6.))
             .rounded(theme.radius_sm)
             .when(item.muted, |el| el.opacity(0.5))
-            .child(swatch)
+            .child(render_swatch(item.swatch, swatch_color, false))
             .child(
                 div()
                     .text_size(px(12.))
@@ -961,5 +1338,47 @@ impl RenderOnce for ChartCard {
 
         crate::Refineable::refine(card.style(), &self.style);
         card
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn monotone_cubic_never_overshoots_step_plateau() {
+        let pts = [(0.0, 0.0), (10.0, 0.0), (20.0, 100.0), (30.0, 100.0)];
+        let segs = monotone(&pts);
+        assert_eq!(segs.len(), 3);
+        for x_step in 0..=300 {
+            let x = x_step as f32 * 0.1;
+            let y = sample_monotone(&segs, x).unwrap();
+            assert!(
+                (-0.01..=100.01).contains(&y),
+                "overshoot at x={x}: y={y}"
+            );
+        }
+    }
+
+    #[test]
+    fn tight_unit_range_keeps_high_ratios_legible() {
+        let (lo, hi) = compute_tight_y_range(
+            [0.97, 0.985, 0.992, 0.98].into_iter(),
+            true,
+            Some((0.0, 1.0)),
+        );
+        assert!(lo >= 0.95 && hi <= 1.0);
+        assert!(hi > lo);
+    }
+
+    #[test]
+    fn nice_ticks_range_supports_exact_and_snapped_bounds() {
+        let (lo, hi, ticks) = nice_ticks_range(0.0, 100.0, 5, false);
+        assert_eq!((lo, hi), (0.0, 100.0));
+        assert_eq!(ticks, vec![0.0, 25.0, 50.0, 75.0, 100.0]);
+
+        let (slo, shi, sticks) = nice_ticks_range(94.2, 99.8, 4, true);
+        assert!(slo <= 94.2 && shi >= 99.8);
+        assert!(sticks.len() >= 3);
     }
 }

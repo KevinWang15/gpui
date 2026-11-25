@@ -49,29 +49,33 @@ fn print_stats(label: &str, iters: usize, stats: &TimingStats) {
 }
 
 // ============================================================================
-// 1. Dense LineChart Hover Scrub (4 series × 2,500 points = 10,000 points)
+// 1. Dense Line CartesianPlot Hover Scrub (4 series × 2,500 points = 10,000 points)
 // ============================================================================
 
 struct DenseLineChartView {
-    series: Vec<LineSeries>,
+    layers: Vec<LineLayer>,
 }
 
 impl Render for DenseLineChartView {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div().w(px(1000.)).h(px(300.)).p(px(12.)).child(
-            line_chart("perf-dense-line")
-                .series(self.series.clone())
-                .x_domain(0.0, 24.0)
-                .x_ticks([
-                    (0.0, "00:00".into()),
-                    (6.0, "06:00".into()),
-                    (12.0, "12:00".into()),
-                    (18.0, "18:00".into()),
-                    (24.0, "24:00".into()),
-                ])
-                .height(px(260.))
-                .selectable(true),
-        )
+        let mut plot = cartesian_plot("perf-dense-line")
+            .x_axis(
+                XAxis::continuous()
+                    .domain(0.0, 24.0)
+                    .ticks([
+                        (0.0, "00:00".into()),
+                        (6.0, "06:00".into()),
+                        (12.0, "12:00".into()),
+                        (18.0, "18:00".into()),
+                        (24.0, "24:00".into()),
+                    ]),
+            )
+            .height(px(260.))
+            .selectable(true);
+        for layer in &self.layers {
+            plot = plot.layer(layer.clone());
+        }
+        div().w(px(1000.)).h(px(300.)).p(px(12.)).child(plot)
     }
 }
 
@@ -79,7 +83,7 @@ impl Render for DenseLineChartView {
 #[ignore]
 fn perf_line_chart_dense_hover_scrub(cx: &mut TestAppContext) {
     cx.update(init_components);
-    let make_series = |label: &'static str, phase: f64, dashed: bool, fill_area: bool| {
+    let make_layer = |label: &'static str, phase: f64, dashed: bool, fill_area: bool| {
         let pts: Vec<(f64, f64)> = (0..2_500)
             .map(|i| {
                 let x = (i as f64 / 2_499.0) * 24.0;
@@ -87,21 +91,21 @@ fn perf_line_chart_dense_hover_scrub(cx: &mut TestAppContext) {
                 (x, y)
             })
             .collect();
-        let mut s = LineSeries::new(label, pts).fill_area(fill_area);
+        let mut s = LineLayer::new(label, pts).fill_area(fill_area);
         if dashed {
-            s = s.line_style(LineStyle::Dashed);
+            s = s.dashed();
         }
         s
     };
 
-    let series = vec![
-        make_series("Today", 0.2, false, true),
-        make_series("5-workday avg", 1.1, true, false),
-        make_series("P95 ceiling", 2.0, false, false),
-        make_series("Budget pace", 3.1, true, false),
+    let layers = vec![
+        make_layer("Today", 0.2, false, true),
+        make_layer("5-workday avg", 1.1, true, false),
+        make_layer("P95 ceiling", 2.0, false, false),
+        make_layer("Budget pace", 3.1, true, false),
     ];
 
-    let (_view, cx) = cx.add_window_view(|_, _| DenseLineChartView { series });
+    let (_view, cx) = cx.add_window_view(|_, _| DenseLineChartView { layers });
     cx.run_until_parked();
 
     // Warm up
@@ -121,19 +125,20 @@ fn perf_line_chart_dense_hover_scrub(cx: &mut TestAppContext) {
         samples.push(t0.elapsed());
     }
     print_stats(
-        "LineChart hover scrub (4x2500 pts)",
+        "CartesianPlot line hover (4x2500 pts)",
         iters,
         &summarize(&mut samples),
     );
 }
 
 // ============================================================================
-// 2. Dense StackedBarChart Hover + Sub-Column Drag Brush (90 days × 6 series)
+// 2. Dense StackedBar CartesianPlot Hover + Sub-Column Drag Brush (90 days × 6 series)
 // ============================================================================
 
 struct DenseStackedBarView {
+    labels: Vec<SharedString>,
     series: Vec<StackedBarSeries>,
-    points: Vec<StackedBarPoint>,
+    columns: Vec<Vec<f64>>,
     render_count: Rc<Cell<usize>>,
 }
 
@@ -141,9 +146,12 @@ impl Render for DenseStackedBarView {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         self.render_count.set(self.render_count.get() + 1);
         div().w(px(1000.)).h(px(300.)).p(px(12.)).child(
-            stacked_bar_chart("perf-dense-bars")
-                .series(self.series.clone())
-                .points(self.points.clone())
+            cartesian_plot("perf-dense-bars")
+                .x_axis(XAxis::category(self.labels.clone()))
+                .layer(StackedBarLayer::new(
+                    self.series.clone(),
+                    self.columns.clone(),
+                ))
                 .height(px(260.))
                 .selectable(true),
         )
@@ -157,19 +165,20 @@ fn perf_stacked_bar_hover_and_brush(cx: &mut TestAppContext) {
     let series: Vec<StackedBarSeries> = (0..6)
         .map(|i| StackedBarSeries::new(format!("model-tier-{i}")))
         .collect();
-    let points: Vec<StackedBarPoint> = (0..90)
+    let labels: Vec<SharedString> = (0..90).map(|d| format!("Day {}", d + 1).into()).collect();
+    let columns: Vec<Vec<f64>> = (0..90)
         .map(|d| {
-            let vals: Vec<f64> = (0..6)
+            (0..6)
                 .map(|s| 4.0 + ((d * 7 + s * 13) % 19) as f64)
-                .collect();
-            StackedBarPoint::new(format!("Day {}", d + 1), vals)
+                .collect()
         })
         .collect();
 
     let render_count = Rc::new(Cell::new(0));
     let (_view, cx) = cx.add_window_view(|_, _| DenseStackedBarView {
+        labels,
         series,
-        points,
+        columns,
         render_count: render_count.clone(),
     });
     cx.run_until_parked();
@@ -485,14 +494,11 @@ impl Render for FullAnalyticsPerfView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let range = self.time_range.read(cx).range();
         let shift = (self.tick % 5) as f64;
-        let bar_points: Vec<StackedBarPoint> = (0..30)
-            .map(|d| {
-                let day = range.start.add_days(d);
-                StackedBarPoint::new(
-                    day.format_short(),
-                    vec![14.0 + shift, 8.0 + (d % 5) as f64, 4.0, 1.5],
-                )
-            })
+        let bar_labels: Vec<SharedString> = (0..30)
+            .map(|d| range.start.add_days(d).format_short().into())
+            .collect();
+        let bar_columns: Vec<Vec<f64>> = (0..30)
+            .map(|d| vec![14.0 + shift, 8.0 + (d % 5) as f64, 4.0, 1.5])
             .collect();
         let line_pts_a: Vec<(f64, f64)> = (0..200)
             .map(|i| {
@@ -550,14 +556,17 @@ impl Render for FullAnalyticsPerfView {
                         ChartLegendItem::dot("cursor", palette::SKY_500.into()),
                     ])
                     .content(
-                        stacked_bar_chart("p-bars")
-                            .series([
-                                StackedBarSeries::new("sonnet"),
-                                StackedBarSeries::new("gpt"),
-                                StackedBarSeries::new("deepseek"),
-                                StackedBarSeries::new("cursor"),
-                            ])
-                            .points(bar_points)
+                        cartesian_plot("p-bars")
+                            .x_axis(XAxis::category(bar_labels))
+                            .layer(StackedBarLayer::new(
+                                [
+                                    StackedBarSeries::new("sonnet"),
+                                    StackedBarSeries::new("gpt"),
+                                    StackedBarSeries::new("deepseek"),
+                                    StackedBarSeries::new("cursor"),
+                                ],
+                                bar_columns,
+                            ))
                             .selectable(true),
                     ),
             )
@@ -568,21 +577,21 @@ impl Render for FullAnalyticsPerfView {
                     .child(
                         div().flex_1().child(
                             chart_card("p-line-card", "Today vs workdays").content(
-                                line_chart("p-lines")
-                                    .x_domain(0.0, 24.0)
-                                    .x_ticks([
-                                        (0.0, "00:00".into()),
-                                        (12.0, "12:00".into()),
-                                        (24.0, "24:00".into()),
-                                    ])
-                                    .add_series(
-                                        LineSeries::new("Today", line_pts_a)
+                                cartesian_plot("p-lines")
+                                    .x_axis(
+                                        XAxis::continuous()
+                                            .domain(0.0, 24.0)
+                                            .ticks([
+                                                (0.0, "00:00".into()),
+                                                (12.0, "12:00".into()),
+                                                (24.0, "24:00".into()),
+                                            ]),
+                                    )
+                                    .layer(LineLayer::new("Baseline", line_pts_b).dashed())
+                                    .layer(
+                                        LineLayer::new("Today", line_pts_a)
                                             .fill_area(true)
                                             .endpoint_callout("Today"),
-                                    )
-                                    .add_series(
-                                        LineSeries::new("Baseline", line_pts_b)
-                                            .line_style(LineStyle::Dashed),
                                     ),
                             ),
                         ),

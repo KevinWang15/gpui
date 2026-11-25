@@ -1499,13 +1499,13 @@ fn chart_scales_and_nice_ticks_are_well_behaved() {
     assert_eq!(format_compact(36_800_000.0), "36.8M");
     assert_eq!(format_compact(19_700.0), "19.7K");
 
-    // Binary-search LineSeries::sample_at edge cases
-    let empty = LineSeries::new("empty", vec![]);
+    // Binary-search LineLayer::sample_at edge cases
+    let empty = LineLayer::new("empty", vec![]);
     assert_eq!(empty.sample_at(0.0), None);
-    let single = LineSeries::new("single", vec![(5.0, 42.0)]);
+    let single = LineLayer::new("single", vec![(5.0, 42.0)]);
     assert_eq!(single.sample_at(5.0), Some(42.0));
     assert_eq!(single.sample_at(4.0), None);
-    let curve = LineSeries::new("curve", vec![(0.0, 0.0), (10.0, 20.0), (20.0, 60.0)]);
+    let curve = LineLayer::new("curve", vec![(0.0, 0.0), (10.0, 20.0), (20.0, 60.0)]);
     assert!((curve.sample_at(5.0).unwrap() - 10.0).abs() < 1e-6);
     assert!((curve.sample_at(15.0).unwrap() - 40.0).abs() < 1e-6);
     assert_eq!(curve.sample_at(-1.0), None);
@@ -1891,33 +1891,36 @@ impl Render for AdvancedAnalyticsTestView {
                 chart_card("test-bar-card", "Daily cost")
                     .subtitle("30 days")
                     .content(
-                        stacked_bar_chart("test-bars")
-                            .series([
-                                StackedBarSeries::new("sonnet"),
-                                StackedBarSeries::new("gpt"),
-                            ])
-                            .points([
-                                StackedBarPoint::new("Oct 21", vec![18.0, 9.0]),
-                                StackedBarPoint::new("Today", vec![22.0, 14.0]),
-                            ]),
+                        cartesian_plot("test-bars")
+                            .x_axis(XAxis::category(["Oct 21", "Today"]))
+                            .layer(StackedBarLayer::new(
+                                [
+                                    StackedBarSeries::new("sonnet"),
+                                    StackedBarSeries::new("gpt"),
+                                ],
+                                vec![vec![18.0, 9.0], vec![22.0, 14.0]],
+                            )),
                     ),
             )
             .child(
                 chart_card("test-line-card", "Today vs baseline").content(
-                    line_chart("test-lines")
-                        .x_domain(0.0, 24.0)
-                        .x_ticks([(0.0, "00:00".into()), (24.0, "24:00".into())])
-                        .add_series(
-                            LineSeries::new("Today", vec![(0.0, 0.0), (12.0, 20.0), (18.0, 36.21)])
-                                .fill_area(true)
-                                .endpoint_callout("Today"),
+                    cartesian_plot("test-lines")
+                        .x_axis(
+                            XAxis::continuous()
+                                .domain(0.0, 24.0)
+                                .ticks([(0.0, "00:00".into()), (24.0, "24:00".into())]),
                         )
-                        .add_series(
-                            LineSeries::new(
+                        .layer(
+                            LineLayer::new(
                                 "Baseline",
                                 vec![(0.0, 0.0), (12.0, 24.0), (24.0, 48.0)],
                             )
-                            .line_style(LineStyle::Dashed),
+                            .dashed(),
+                        )
+                        .layer(
+                            LineLayer::new("Today", vec![(0.0, 0.0), (12.0, 20.0), (18.0, 36.21)])
+                                .fill_area(true)
+                                .endpoint_callout("Today"),
                         ),
                 ),
             )
@@ -2176,11 +2179,14 @@ impl Render for ChartBrushToTimeRangeTestView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let range = self.time_range.read(cx).range();
         let span = range.span_days();
-        let points: Vec<StackedBarPoint> = (0..span)
-            .map(|i| {
-                let d = range.start.add_days(i64::from(i));
-                StackedBarPoint::new(d.format_short(), vec![10.0 + f64::from(i), 5.0])
-            })
+        let labels: Vec<SharedString> = (0..span)
+            .map(|i| range.start.add_days(i64::from(i)).format_short().into())
+            .collect();
+        let columns: Vec<Vec<f64>> = (0..span)
+            .map(|i| vec![10.0 + f64::from(i), 5.0])
+            .collect();
+        let baseline_vals: Vec<Option<f64>> = (0..span)
+            .map(|i| Some(12.0 + f64::from(i) * 0.8))
             .collect();
 
         let tr = self.time_range.clone();
@@ -2194,11 +2200,22 @@ impl Render for ChartBrushToTimeRangeTestView {
             .spacing(px(16.))
             .child(time_range_picker("brush-test-tr", &self.time_range))
             .child(
-                stacked_bar_chart("brush-test-bars")
-                    .series([StackedBarSeries::new("a"), StackedBarSeries::new("b")])
-                    .points(points)
+                cartesian_plot("brush-test-bars")
+                    .x_axis(XAxis::category(labels))
+                    .layer(StackedBarLayer::new(
+                        [StackedBarSeries::new("a"), StackedBarSeries::new("b")],
+                        columns,
+                    ))
+                    .layer(
+                        LineLayer::from_buckets("Previous", baseline_vals)
+                            .dashed()
+                            .smooth(true)
+                            .halo(true)
+                            .tooltip_separator(true),
+                    )
+                    .layer(ReferenceLine::horizontal(30.0).label("Budget"))
                     .height(px(200.))
-                    .on_brush_select(move |sel, _, cx| {
+                    .on_category_brush(move |sel, _, cx| {
                         *brushed_cols.borrow_mut() = Some(sel.clone());
                         let s = start.add_days(*sel.start() as i64);
                         let e = start.add_days(*sel.end() as i64);
@@ -2207,14 +2224,15 @@ impl Render for ChartBrushToTimeRangeTestView {
                     .selectable(self.selectable),
             )
             .child(
-                line_chart("brush-test-line")
-                    .x_domain(0.0, 24.0)
+                cartesian_plot("brush-test-line")
+                    .x_axis(XAxis::continuous().domain(0.0, 24.0))
                     .height(px(180.))
-                    .add_series(LineSeries::new(
+                    .layer(ReferenceBand::horizontal(0.0, 25.0))
+                    .layer(LineLayer::new(
                         "Today",
                         vec![(0.0, 0.0), (12.0, 20.0), (24.0, 40.0)],
                     ))
-                    .on_brush_select(move |span, _, _| {
+                    .on_domain_brush(move |span, _, _| {
                         *brushed_line.borrow_mut() = Some(*span);
                     })
                     .selectable(self.selectable),
@@ -4505,19 +4523,22 @@ fn scroll_area_fill_viewport_and_flex_height_charts_adapt_without_unnecessary_sc
             let breakdown_card_bounds = self.breakdown_card_bounds.clone();
 
             let chart_el = if self.use_line {
-                line_chart("test-fill-line")
-                    .series([LineSeries::new("Today", vec![(0.0, 10.0), (12.0, 25.0), (24.0, 40.0)])])
-                    .x_domain(0.0, 24.0)
+                cartesian_plot("test-fill-line")
+                    .x_axis(XAxis::continuous().domain(0.0, 24.0))
+                    .layer(LineLayer::new(
+                        "Today",
+                        vec![(0.0, 10.0), (12.0, 25.0), (24.0, 40.0)],
+                    ))
                     .fill_height(true)
                     .min_h(px(170.))
                     .into_any_element()
             } else {
-                stacked_bar_chart("test-fill-bar")
-                    .series([StackedBarSeries::new("Model A")])
-                    .points([
-                        StackedBarPoint::new("D1", vec![12.0]),
-                        StackedBarPoint::new("D2", vec![24.0]),
-                    ])
+                cartesian_plot("test-fill-bar")
+                    .x_axis(XAxis::category(["D1", "D2"]))
+                    .layer(StackedBarLayer::new(
+                        [StackedBarSeries::new("Model A")],
+                        vec![vec![12.0], vec![24.0]],
+                    ))
                     .fill_height(true)
                     .min_h(px(170.))
                     .into_any_element()

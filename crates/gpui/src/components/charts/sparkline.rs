@@ -1,10 +1,10 @@
-//! Compact GPU [`Sparkline`] and [`GroupedSparkline`] components plus Fritsch–Carlson
-//! monotone cubic Bezier smoothing (`monotone` / `sample_monotone`).
+//! Compact GPU [`Sparkline`] and [`GroupedSparkline`] components sharing spline math,
+//! tight Y autoscaling, and marker painting from [`super::core`].
 //!
 //! Designed for KPI cards, table cells, tray popovers, and always-on-top floating meters where
-//! full axis margins don't fit. Supports `Area` (vertical alpha gradient), `Line`, `Bars`,
-//! dashed comparison baselines, ringed live endpoint dots, adaptive tight Y autoscaling, and
-//! external hover/scrub callbacks for driving detached tooltips.
+//! full axis margins don't fit. Supports `Area` (vertical alpha gradient), `Line`, `Bars`
+//! (including dashed comparison baselines cleanly haloed over bars), ringed live endpoint dots,
+//! adaptive tight Y autoscaling, and external hover/scrub callbacks.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -16,173 +16,10 @@ use crate::{
     size,
 };
 
-use super::core::ChartPalette;
+use super::core::{
+    ChartPalette, compute_tight_y_range, paint_chart_marker, push_curve_points,
+};
 use crate::components::theme::ActiveTheme;
-
-/// One cubic Bezier segment `(p0 -> c1, c2 -> p1)` produced by [`monotone`].
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct CubicSegment {
-    /// Start point.
-    pub p0: (f32, f32),
-    /// First control point.
-    pub c1: (f32, f32),
-    /// Second control point.
-    pub c2: (f32, f32),
-    /// End point.
-    pub p1: (f32, f32),
-}
-
-/// Computes Fritsch–Carlson monotone cubic Hermite segments passing cleanly through `pts`
-/// (sorted in strictly increasing X) without overshooting local extrema or flat plateaus.
-pub fn monotone(pts: &[(f32, f32)]) -> Vec<CubicSegment> {
-    let n = pts.len();
-    if n < 2 {
-        return Vec::new();
-    }
-    if n == 2 {
-        let (x0, y0) = pts[0];
-        let (x1, y1) = pts[1];
-        let dx = (x1 - x0) / 3.0;
-        let dy = (y1 - y0) / 3.0;
-        return vec![CubicSegment {
-            p0: (x0, y0),
-            c1: (x0 + dx, y0 + dy),
-            c2: (x1 - dx, y1 - dy),
-            p1: (x1, y1),
-        }];
-    }
-
-    let mut dx = vec![0.0_f32; n - 1];
-    let mut slope = vec![0.0_f32; n - 1];
-    for i in 0..n - 1 {
-        let d = (pts[i + 1].0 - pts[i].0).max(1e-5);
-        dx[i] = d;
-        slope[i] = (pts[i + 1].1 - pts[i].1) / d;
-    }
-
-    let mut tangents = vec![0.0_f32; n];
-    tangents[0] = slope[0];
-    tangents[n - 1] = slope[n - 2];
-
-    for i in 1..n - 1 {
-        if slope[i - 1] * slope[i] <= 0.0 {
-            tangents[i] = 0.0;
-        } else {
-            let w1 = 2.0 * dx[i] + dx[i - 1];
-            let w2 = dx[i] + 2.0 * dx[i - 1];
-            tangents[i] = (w1 + w2) / (w1 / slope[i - 1] + w2 / slope[i]);
-        }
-    }
-
-    // Clamp endpoint tangents so they don't overshoot first/last intervals.
-    if tangents[0].abs() > 3.0 * slope[0].abs() {
-        tangents[0] = 3.0 * slope[0];
-    }
-    if tangents[n - 1].abs() > 3.0 * slope[n - 2].abs() {
-        tangents[n - 1] = 3.0 * slope[n - 2];
-    }
-
-    // Fritsch–Carlson monotonicity constraint on each interval.
-    for i in 0..n - 1 {
-        let s = slope[i];
-        if s.abs() < 1e-6 {
-            tangents[i] = 0.0;
-            tangents[i + 1] = 0.0;
-        } else {
-            let alpha = tangents[i] / s;
-            let beta = tangents[i + 1] / s;
-            let hypot = (alpha * alpha + beta * beta).sqrt();
-            if hypot > 3.0 {
-                let tau = 3.0 / hypot;
-                tangents[i] = tau * alpha * s;
-                tangents[i + 1] = tau * beta * s;
-            }
-        }
-    }
-
-    let mut out = Vec::with_capacity(n - 1);
-    for i in 0..n - 1 {
-        let (x0, y0) = pts[i];
-        let (x1, y1) = pts[i + 1];
-        let h = dx[i] / 3.0;
-        out.push(CubicSegment {
-            p0: (x0, y0),
-            c1: (x0 + h, y0 + tangents[i] * h),
-            c2: (x1 - h, y1 - tangents[i + 1] * h),
-            p1: (x1, y1),
-        });
-    }
-    out
-}
-
-/// Evaluates the Y coordinate of a monotone cubic spline produced by [`monotone`] at `x`.
-pub fn sample_monotone(segments: &[CubicSegment], x: f32) -> Option<f32> {
-    let first = segments.first()?;
-    let last = segments.last()?;
-    if x <= first.p0.0 {
-        return Some(first.p0.1);
-    }
-    if x >= last.p1.0 {
-        return Some(last.p1.1);
-    }
-    let idx = segments
-        .partition_point(|seg| seg.p1.0 < x)
-        .min(segments.len() - 1);
-    let seg = segments[idx];
-    let span = (seg.p1.0 - seg.p0.0).max(1e-5);
-    let t = ((x - seg.p0.0) / span).clamp(0.0, 1.0);
-    let mt = 1.0 - t;
-    let y = mt * mt * mt * seg.p0.1
-        + 3.0 * mt * mt * t * seg.c1.1
-        + 3.0 * mt * t * t * seg.c2.1
-        + t * t * t * seg.p1.1;
-    Some(y)
-}
-
-/// Computes an adaptive Y domain `(min, max)` for sparklines.
-///
-/// - When `tight_range` is `false` (additive metrics like spend/requests), anchors at `0.0`.
-/// - When `tight_range` is `true` (ratios, latencies, temperatures), pads tightly around the
-///   observed `[min, max]` so subtle changes remain visually legible.
-pub fn compute_sparkline_y_range(
-    values: impl Iterator<Item = f64>,
-    tight_range: bool,
-    clamp_unit: bool,
-) -> (f64, f64) {
-    let mut min_v = f64::INFINITY;
-    let mut max_v = f64::NEG_INFINITY;
-    for v in values {
-        if v.is_finite() {
-            min_v = min_v.min(v);
-            max_v = max_v.max(v);
-        }
-    }
-    if !min_v.is_finite() || !max_v.is_finite() {
-        return (0.0, 1.0);
-    }
-    if !tight_range {
-        let hi = max_v.max(1e-6) * 1.08;
-        let lo = min_v.min(0.0);
-        return (lo, if (hi - lo).abs() < 1e-6 { lo + 1.0 } else { hi });
-    }
-    let span = (max_v - min_v).abs();
-    let pad = if span < 1e-6 {
-        (max_v.abs() * 0.1).max(0.05)
-    } else {
-        span * 0.16
-    };
-    let mut lo = min_v - pad;
-    let mut hi = max_v + pad;
-    if clamp_unit {
-        lo = lo.clamp(0.0, 1.0);
-        hi = hi.clamp(0.0, 1.0);
-        if (hi - lo) < 0.02 {
-            lo = (min_v - 0.02).clamp(0.0, 0.98);
-            hi = (lo + 0.04).min(1.0);
-        }
-    }
-    (lo, hi.max(lo + 1e-6))
-}
 
 /// Visual presentation mode for a [`Sparkline`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -364,18 +201,19 @@ impl RenderOnce for Sparkline {
         let kind = self.kind;
         let smooth = self.smooth;
         let tight_range = self.tight_range;
-        let clamp_unit = self.clamp_unit;
+        let clamp = self.clamp_unit.then_some((0.0, 1.0));
         let show_endpoint = self.show_endpoint;
         let show_grid = self.show_grid;
         let stroke_width = self.stroke_width;
 
+        let state_prepaint = state_rc.clone();
         let state_paint = state_rc.clone();
         let values_paint = values.clone();
         let baseline_paint = baseline.clone();
 
         let plot_canvas = canvas(
             move |bounds, _, _| {
-                state_paint.borrow_mut().bounds = Some(bounds);
+                state_prepaint.borrow_mut().bounds = Some(bounds);
                 bounds
             },
             move |bounds, _, window, _cx| {
@@ -395,13 +233,9 @@ impl RenderOnce for Sparkline {
                 if show_grid && n >= 4 {
                     for step in 1..4 {
                         let gx = left + plot_w * (step as f32 / 4.0);
-                        window.paint_quad(quad(
+                        window.paint_quad(fill(
                             Bounds::new(point(px(gx), px(top)), size(px(1.), px(plot_h))),
-                            Corners::default(),
                             grid_color.opacity(0.6),
-                            Edges::default(),
-                            crate::transparent_black(),
-                            BorderStyle::Solid,
                         ));
                     }
                 }
@@ -412,20 +246,66 @@ impl RenderOnce for Sparkline {
                         .into_iter()
                         .flat_map(|b| b.iter().copied()),
                 );
-                let (y_min, y_max) = compute_sparkline_y_range(iter_all, tight_range, clamp_unit);
+                let (y_min, y_max) = compute_tight_y_range(
+                    iter_all,
+                    tight_range && kind != SparklineKind::Bars,
+                    clamp,
+                );
                 let map_y = |v: f64| -> f32 {
                     let frac = ((v - y_min) / (y_max - y_min)).clamp(0.0, 1.0) as f32;
                     bottom - frac * plot_h
                 };
                 let map_x = |i: usize| -> f32 {
-                    if n <= 1 {
+                    if kind == SparklineKind::Bars {
+                        left + ((i as f32) + 0.5) * (plot_w / n as f32)
+                    } else if n <= 1 {
                         left + plot_w * 0.5
                     } else {
                         left + (i as f32 / (n - 1) as f32) * plot_w
                     }
                 };
 
-                let hover_idx = state_rc.borrow().hover_idx;
+                let hover_idx = state_paint.borrow().hover_idx;
+                let paint_baseline = |window: &mut Window, halo: bool| {
+                    let Some(ref base) = baseline_paint else {
+                        return;
+                    };
+                    if base.len() < 2 {
+                        return;
+                    }
+                    let base_pts: Vec<(f32, f32)> = base
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &v)| {
+                            let x = if kind == SparklineKind::Bars && base.len() == n {
+                                map_x(i)
+                            } else {
+                                left + (i as f32 / (base.len() - 1) as f32) * plot_w
+                            };
+                            (x, map_y(v))
+                        })
+                        .collect();
+                    if halo {
+                        let mut casing_pb =
+                            PathBuilder::stroke(px(3.0)).dash_array(&[px(4.), px(3.)]);
+                        push_curve_points(&mut casing_pb, &base_pts, smooth, false);
+                        if let Ok(path) = casing_pb.build() {
+                            window.paint_path(path, Hsla { a: 0.78, ..ring_bg });
+                        }
+                    }
+                    let mut pb = PathBuilder::stroke(px(1.35)).dash_array(&[px(4.), px(3.)]);
+                    push_curve_points(&mut pb, &base_pts, smooth, false);
+                    if let Ok(path) = pb.build() {
+                        window.paint_path(
+                            path,
+                            if halo {
+                                baseline_color
+                            } else {
+                                baseline_color.opacity(0.8)
+                            },
+                        );
+                    }
+                };
 
                 if kind == SparklineKind::Bars {
                     let slot_w = plot_w / n as f32;
@@ -458,27 +338,26 @@ impl RenderOnce for Sparkline {
                             BorderStyle::Solid,
                         ));
                     }
+                    // Overlay haloed dashed baseline cleanly above bars.
+                    paint_baseline(window, true);
+                    if let Some(h_idx) = hover_idx.filter(|&i| i < n)
+                        && let Some(ref base) = baseline_paint
+                        && let Some(&b_val) = base.get(h_idx)
+                    {
+                        paint_chart_marker(
+                            map_x(h_idx),
+                            map_y(b_val),
+                            3.0,
+                            baseline_color,
+                            ring_bg,
+                            window,
+                        );
+                    }
                     return;
                 }
 
-                // Dashed baseline comparison series (under primary curve).
-                if let Some(ref base) = baseline_paint
-                    && base.len() >= 2
-                {
-                    let base_pts: Vec<(f32, f32)> = base
-                        .iter()
-                        .enumerate()
-                        .map(|(i, &v)| {
-                            let x = left + (i as f32 / (base.len() - 1) as f32) * plot_w;
-                            (x, map_y(v))
-                        })
-                        .collect();
-                    let mut pb = PathBuilder::stroke(px(1.25)).dash_array(&[px(4.), px(3.)]);
-                    push_curve_points(&mut pb, &base_pts, smooth, false);
-                    if let Ok(path) = pb.build() {
-                        window.paint_path(path, baseline_color.opacity(0.75));
-                    }
-                }
+                // Dashed baseline under primary curve for Area / Line modes.
+                paint_baseline(window, false);
 
                 let pts: Vec<(f32, f32)> = values_paint
                     .iter()
@@ -513,29 +392,27 @@ impl RenderOnce for Sparkline {
                     }
                 }
 
-                // Hover crosshair + highlighted sample dot, or resting ringed live endpoint dot.
                 if let Some(h_idx) = hover_idx.filter(|&i| i < n) {
                     let (hx, hy) = pts[h_idx];
-                    window.paint_quad(quad(
+                    window.paint_quad(fill(
                         Bounds::new(point(px(hx - 0.5), px(top)), size(px(1.), px(plot_h))),
-                        Corners::default(),
                         primary.opacity(0.35),
-                        Edges::default(),
-                        crate::transparent_black(),
-                        BorderStyle::Solid,
                     ));
-                    paint_ringed_dot(window, hx, hy, 4.0, primary, ring_bg);
+                    if let Some(ref base) = baseline_paint
+                        && let Some(&b_val) = base.get(h_idx)
+                    {
+                        paint_chart_marker(hx, map_y(b_val), 2.75, baseline_color, ring_bg, window);
+                    }
+                    paint_chart_marker(hx, hy, 4.0, primary, ring_bg, window);
                 } else if show_endpoint && let Some(&(ex, ey)) = pts.last() {
-                    paint_ringed_dot(window, ex, ey, 3.25, primary, ring_bg);
+                    paint_chart_marker(ex, ey, 3.25, primary, ring_bg, window);
                 }
             },
         )
         .size_full();
 
-        let state_move = state.read(cx).clone();
-        let state_leave = state.read(cx).clone();
-        let values_move = values.clone();
-        let baseline_move = baseline.clone();
+        let state_move = state_rc.clone();
+        let state_leave = state_rc;
         let on_hover_move = self.on_hover_sample.clone();
         let on_hover_leave = self.on_hover_sample;
 
@@ -545,12 +422,13 @@ impl RenderOnce for Sparkline {
             .h(self.height)
             .cursor(CursorStyle::Crosshair)
             .on_mouse_move(move |ev: &MouseMoveEvent, window, cx| {
-                let n = values_move.len();
+                let n = values.len();
                 if n == 0 {
                     return;
                 }
-                let bounds = state_move.borrow().bounds;
-                let Some(bounds) = bounds else { return };
+                let Some(bounds) = state_move.borrow().bounds else {
+                    return;
+                };
                 let left = f32::from(bounds.origin.x) + 4.0;
                 let width = (f32::from(bounds.size.width) - 8.0).max(1.0);
                 let rel = ((f32::from(ev.position.x) - left) / width).clamp(0.0, 1.0);
@@ -570,8 +448,8 @@ impl RenderOnce for Sparkline {
                     cb(
                         Some(SparklineHover {
                             index: idx,
-                            value: values_move[idx],
-                            baseline: baseline_move.as_ref().and_then(|b| b.get(idx).copied()),
+                            value: values[idx],
+                            baseline: baseline.as_ref().and_then(|b| b.get(idx).copied()),
                             position: ev.position,
                         }),
                         window,
@@ -759,7 +637,7 @@ impl RenderOnce for GroupedSparkline {
                     }
                 } else {
                     let all_vals = series.iter().flat_map(|s| s.values.iter().copied());
-                    let (y_min, y_max) = compute_sparkline_y_range(all_vals, true, false);
+                    let (y_min, y_max) = compute_tight_y_range(all_vals, true, None);
                     for (s_idx, s) in series.iter().enumerate() {
                         if s.values.len() < 2 {
                             continue;
@@ -790,85 +668,5 @@ impl RenderOnce for GroupedSparkline {
         let mut container = div().id(self.id).w_full().h(self.height).child(plot);
         crate::Refineable::refine(container.style(), &self.style);
         container
-    }
-}
-
-pub(crate) fn push_curve_points(
-    pb: &mut PathBuilder,
-    pts: &[(f32, f32)],
-    smooth: bool,
-    already_moved: bool,
-) {
-    if pts.is_empty() {
-        return;
-    }
-    if !already_moved {
-        pb.move_to(point(px(pts[0].0), px(pts[0].1)));
-    }
-    if smooth && pts.len() >= 2 {
-        for seg in monotone(pts) {
-            pb.cubic_bezier_to(
-                point(px(seg.p1.0), px(seg.p1.1)),
-                point(px(seg.c1.0), px(seg.c1.1)),
-                point(px(seg.c2.0), px(seg.c2.1)),
-            );
-        }
-    } else {
-        for &(x, y) in &pts[1..] {
-            pb.line_to(point(px(x), px(y)));
-        }
-    }
-}
-
-fn paint_ringed_dot(window: &mut Window, x: f32, y: f32, radius: f32, fill_color: Hsla, ring_bg: Hsla) {
-    let outer = radius + 1.5;
-    window.paint_quad(quad(
-        Bounds::new(
-            point(px(x - outer), px(y - outer)),
-            size(px(outer * 2.0), px(outer * 2.0)),
-        ),
-        Corners::all(px(outer)),
-        ring_bg,
-        Edges::default(),
-        crate::transparent_black(),
-        BorderStyle::Solid,
-    ));
-    window.paint_quad(quad(
-        Bounds::new(
-            point(px(x - radius), px(y - radius)),
-            size(px(radius * 2.0), px(radius * 2.0)),
-        ),
-        Corners::all(px(radius)),
-        fill_color,
-        Edges::default(),
-        crate::transparent_black(),
-        BorderStyle::Solid,
-    ));
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn monotone_cubic_never_overshoots_step_plateau() {
-        let pts = [(0.0, 0.0), (10.0, 0.0), (20.0, 100.0), (30.0, 100.0)];
-        let segs = monotone(&pts);
-        assert_eq!(segs.len(), 3);
-        for x_step in 0..=300 {
-            let x = x_step as f32 * 0.1;
-            let y = sample_monotone(&segs, x).unwrap();
-            assert!(
-                (-0.01..=100.01).contains(&y),
-                "overshoot at x={x}: y={y}"
-            );
-        }
-    }
-
-    #[test]
-    fn tight_unit_range_keeps_high_ratios_legible() {
-        let (lo, hi) = compute_sparkline_y_range([0.97, 0.985, 0.992, 0.98].into_iter(), true, true);
-        assert!(lo >= 0.95 && hi <= 1.0);
-        assert!(hi > lo);
     }
 }

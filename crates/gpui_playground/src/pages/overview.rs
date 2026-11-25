@@ -24,7 +24,7 @@ pub fn render(app: &PlaygroundApp, cx: &mut Context<PlaygroundApp>) -> impl Into
             Page::Analytics,
             LucideIcon::ChartColumnStacked,
             "Analytics & Charts",
-            "StackedBarChart, LineChart, Sparkline, BreakdownList, FilterBar, TimeRangePicker, StatGroup & radial ThemeSwitcher.",
+            "CartesianPlot (StackedBarLayer, LineLayer, ReferenceLine, ReferenceBand), Sparkline, BreakdownList, FilterBar, TimeRangePicker, StatGroup & radial ThemeSwitcher.",
         ),
         (
             Page::NativeDesktop,

@@ -8,7 +8,7 @@ This guide covers the data visualization, time-range selection, KPI display, and
 
 | Module | Path | Key Public Types |
 | --- | --- | --- |
-| **Charts** | `crates/gpui/src/components/charts/` | `ChartCard`, `StackedBarChart`, `StackedBarSeries`, `StackedBarPoint`, `LineChart`, `LineSeries`, `LineStyle`, `BreakdownList`, `BreakdownItem`, `ChartPalette`, `ChartValueFormat`, `ChartLegendItem`, `LegendSwatch`, `LinearScale`, `BandScale`, `nice_ticks`, `format_compact` |
+| **Charts** | `crates/gpui/src/components/charts/` | `ChartCard`, `CartesianPlot`, `XAxis`, `YAxis`, `PlotLayer`, `StackedBarLayer`, `StackedBarSeries`, `LineLayer`, `LineStyle`, `ReferenceLine`, `ReferenceBand`, `PlotHover`, `PlotTooltipData`, `ChartTooltipRow`, `Sparkline`, `GroupedSparkline`, `BreakdownList`, `BreakdownItem`, `ChartPalette`, `ChartValueFormat`, `ChartLegendItem`, `LegendSwatch`, `LinearScale`, `BandScale`, `nice_ticks`, `nice_ticks_range`, `monotone`, `sample_monotone`, `format_compact` |
 | **Time Range** | `crates/gpui/src/components/time_range/` | `TimeRangePicker`, `TimeRangePickerState`, `TimeRangeEvent`, `CalendarGrid`, `CalendarDate`, `DateRange`, `TimeRangePreset`, `TimeRangeUnit` |
 | **Faceted Filter Bar** | `crates/gpui/src/components/filter_bar.rs` | `FilterBar`, `FilterBarState`, `FilterBarEvent`, `FilterFieldDef`, `FilterOperator`, `FilterClause`, `FilterFacetOption`, `FacetProvider` |
 | **KPI Strip** | `crates/gpui/src/components/stat.rs` | `StatGroup`, `StatItem`, `StatDelta`, `StatDeltaTone`, `TrendPolarity` |
@@ -41,61 +41,70 @@ let card = chart_card("daily-spend", "Daily cost by model")
     .data_table(summary_table);
 ```
 
-### `StackedBarChart`
+### `CartesianPlot` & Composable `PlotLayer`s
 
-GPU-batched vertical stacked bar chart with automatic nice Y ticks, top-segment-only corner rounding, auto-thinned X-axis labels, hover column highlight + floating tooltip, click callbacks, and horizontal drag-brush selection.
+Every Cartesian visualization (stacked bars, multi-series lines, area charts, bar + dashed comparison combos, budget/SLA reference lines & bands) is composed from one unified `cartesian_plot(id)` container with:
+- **`XAxis`**: `XAxis::category(labels).tooltip_labels(rich_labels)` (discrete band scale with auto-thinned labels) or `XAxis::continuous().domain(0.0, 24.0).ticks(...).formatter(...)`
+- **`YAxis`**: `YAxis::new(format)` with optional `.domain(min, max)`, `.ticks(n)`, `.tight(true)`, `.clamp(min, max)`, and `.show_grid(bool)`
+- **Stackable layers** painted strictly in declaration order:
+  - `StackedBarLayer::new(series, columns)` — GPU-batched vertical stacked bars with top-segment rounding
+  - `LineLayer::new(label, points)` / `LineLayer::from_buckets(label, values)` — solid/dashed curves (`.dashed()`), Fritsch–Carlson monotone smoothing (`.smooth(true)`), vertical area gradients (`.fill_area(true)`), surface-colored contrast halo over dense layers (`.halo(true)`), automatic gap splitting, single-bucket reference ticks, and endpoint callouts (`.endpoint_callout(...)`)
+  - `ReferenceLine::horizontal(y)` / `ReferenceLine::vertical(x)` — threshold / budget / target line with inline `.label(...)`
+  - `ReferenceBand::horizontal(y0, y1)` / `ReferenceBand::vertical(x0, x1)` — shaded target corridor
+- **Unified interaction & extensible tooltips**: `.on_category_brush(...)`, `.on_domain_brush(...)`, `.on_category_click(...)`, `.on_hover(...)`, `.tooltip_rows(...)`, and `.tooltip_builder(...)`.
 
 ```rust
-stacked_bar_chart("cost-bars")
-    .series([
-        StackedBarSeries::new("sonnet"),
-        StackedBarSeries::new("gpt"),
-    ])
-    .points([
-        StackedBarPoint::new("Oct 21", vec![18.4, 9.2]),
-        StackedBarPoint::new("Today", vec![22.1, 14.0]),
-    ])
+// Stacked bars + dashed previous-period comparison line + horizontal budget threshold
+cartesian_plot("cost-bars")
+    .x_axis(XAxis::category(["Oct 21", "Today"]).tooltip_labels(["Wed, Oct 21", "Today"]))
+    .y_axis(YAxis::new(ChartValueFormat::Currency))
+    .layer(StackedBarLayer::new(
+        [StackedBarSeries::new("sonnet"), StackedBarSeries::new("gpt")],
+        vec![vec![18.4, 9.2], vec![22.1, 14.0]],
+    ))
+    .layer(
+        LineLayer::from_buckets("Previous 30 days", [Some(24.0), Some(31.5)])
+            .dashed()
+            .smooth(true)
+            .halo(true)
+            .tooltip_separator(true),
+    )
+    .layer(ReferenceLine::horizontal(40.0).label("Daily budget"))
     .height(px(230.))
-    .value_format(ChartValueFormat::Currency)
-    .selectable(true)
-    .on_bar_click(cx.listener(|this, idx: &usize, _, cx| {
-        this.inspect_day(*idx, cx);
-    }))
-    .on_brush_select(cx.listener(|this, range: &std::ops::RangeInclusive<usize>, _, cx| {
+    .on_category_brush(cx.listener(|this, range: &std::ops::RangeInclusive<usize>, _, cx| {
         this.zoom_to_bar_columns(range.clone(), cx);
     }))
 ```
 
-- **Drag-brush interaction**: Enabled via `.selectable(true)` (or automatically when `.on_brush_select(...)` is attached). Dragging horizontally >= `4 px` highlights the brushed columns with an accent band, crisp edge guides, dimmed non-selected bars, and a floating summary pill (`"Oct 24 – Nov 2 (10d) · $312.40"`).
-- **Controlled highlight**: Pass `.selected_range(Some(start..=end))` to keep a column range highlighted outside active drags.
-
-### `LineChart`
-
-Multi-series continuous line chart supporting solid & dashed strokes, soft vertical area gradient fills, clamped inline endpoint callouts (`"Today: $36.21"`), interactive vertical crosshair scrubber, and horizontal drag-to-select window measurement.
-
 ```rust
-line_chart("intraday-line")
-    .x_domain(0.0, 24.0)
-    .x_ticks([
-        (0.0, "00:00".into()),
-        (6.0, "06:00".into()),
-        (12.0, "12:00".into()),
-        (18.0, "18:00".into()),
-        (24.0, "24:00".into()),
-    ])
-    .x_formatter(|hr| format!("{:02}:{:02}", hr.floor() as u32, ((hr.fract() * 60.0).round() as u32).min(59)))
-    .add_series(
-        LineSeries::new("Today", today_pts)
+// Continuous multi-series intraday line chart with area gradient & endpoint callout
+cartesian_plot("intraday-line")
+    .x_axis(
+        XAxis::continuous()
+            .domain(0.0, 24.0)
+            .ticks([
+                (0.0, "00:00".into()),
+                (6.0, "06:00".into()),
+                (12.0, "12:00".into()),
+                (18.0, "18:00".into()),
+                (24.0, "24:00".into()),
+            ])
+            .formatter(|hr| format!("{:02}:{:02}", hr.floor() as u32, ((hr.fract() * 60.0).round() as u32).min(59))),
+    )
+    .y_axis(YAxis::new(ChartValueFormat::Currency).ticks(5))
+    .layer(
+        LineLayer::new("Previous 5 workdays, average", baseline_pts)
+            .dashed()
+            .smooth(true),
+    )
+    .layer(
+        LineLayer::new("Today", today_pts)
+            .smooth(true)
             .fill_area(true)
             .endpoint_callout("Today"),
     )
-    .add_series(
-        LineSeries::new("Previous 5 workdays, average", baseline_pts)
-            .line_style(LineStyle::Dashed),
-    )
-    .value_format(ChartValueFormat::Currency)
-    .selected_range(self.window_selection)
-    .on_brush_select(cx.listener(|this, &(a, b): &(f64, f64), _, cx| {
+    .selected_domain_range(self.window_selection)
+    .on_domain_brush(cx.listener(|this, &(a, b): &(f64, f64), _, cx| {
         this.window_selection = Some((a, b));
         cx.notify();
     }))
@@ -105,8 +114,7 @@ line_chart("intraday-line")
     }))
 ```
 
-- **Fast sampling**: `LineSeries::sample_at(&self, x: f64) -> Option<f64>` uses `O(log N)` binary search to interpolate any coordinate along a sorted series—reusable both inside tooltips and in parent subtitles/summaries.
-- **Dense series performance**: `LineChart` automatically caches tessellated `Path` geometry across hover/brush frames and applies per-pixel-column min/max envelope decimation for dense monotonic series (`> 2× plot_width`), keeping 10,000-point hover scrubs near `~0.10 ms/frame`.
+- **Fast sampling & caching**: `LineLayer::sample_at(&self, x: f64) -> Option<f64>` uses `O(log N)` binary search across continuous points or direct indexing on buckets. `CartesianPlot` caches tessellated `Path` geometry across hover/brush frames (`FxHasher` key) and applies per-pixel-column min/max envelope decimation for dense monotonic series (`> 2× plot_width`).
 
 ### `BreakdownList`
 
@@ -254,18 +262,17 @@ Use `.on_change_with_position(|val, click_pos, window, cx| ...)` when you want t
 
 A complete live reference implementation lives in [`crates/gpui_playground/src/pages/analytics.rs`](../crates/gpui_playground/src/pages/analytics.rs):
 
-### Pattern A: `StackedBarChart` Drag-Brush → `TimeRangePicker` Zoom
+### Pattern A: `CartesianPlot` Drag-Brush → `TimeRangePicker` Zoom
 
 ```rust
 let range = self.time_range.read(cx).range();
 let range_start = range.start;
 let time_range = self.time_range.clone();
 
-stacked_bar_chart("daily-bars")
-    .series(series)
-    .points(points)
-    .selectable(true)
-    .on_brush_select(move |cols, _, cx| {
+cartesian_plot("daily-bars")
+    .x_axis(XAxis::category(labels))
+    .layer(StackedBarLayer::new(series, columns))
+    .on_category_brush(move |cols, _, cx| {
         let start = range_start.add_days(*cols.start() as i64);
         let end = range_start.add_days(*cols.end() as i64);
         time_range.update(cx, |s, cx| s.apply_custom_range(start, end, cx));
