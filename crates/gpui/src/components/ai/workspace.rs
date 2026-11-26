@@ -672,7 +672,7 @@ pub fn prepare_image_bytes(
     let (rw, rh) = (resized.width(), resized.height());
 
     let mut encoded = Vec::new();
-    let mut media_type = if format == ImageFormat::Png {
+    let mut media_type = if matches!(format, ImageFormat::Png | ImageFormat::Bmp) {
         resized.write_to(&mut std::io::Cursor::new(&mut encoded), ImageFormat::Png)?;
         "image/png"
     } else {

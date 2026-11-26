@@ -9,7 +9,7 @@
 //! - Multimodal image attachments, History search & deletion, and per-conversation Workspace file viewer.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,11 +20,12 @@ use serde_json::Value;
 
 use crate::icons::{Icon, IconSize, LucideIcon};
 use crate::{
-    AnyElement, App, ClipboardItem, Context, CursorStyle, ElementId, Entity, EventEmitter,
-    FileFilter, Focusable as _, FontWeight, Image, ImageFormat, IntoElement, MouseButton,
-    MouseDownEvent, ObjectFit, OpenPromptOptions, Pixels, Render, RenderOnce, ScrollEvent,
-    ScrollHandle, ScrollbarVisibility, SharedString, StyleRefinement, Styled, Subscription, Task,
-    Window, anchored, deferred, div, img, point, prelude::*, px, size,
+    AnyElement, App, ClipboardEntry, ClipboardItem, Context, CursorStyle, ElementId, Entity,
+    EventEmitter, ExternalPaths, FileFilter, FocusHandle, Focusable as _, FontWeight, Image,
+    ImageFormat, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ObjectFit,
+    OpenPromptOptions, Pixels, Render, RenderOnce, ScrollEvent, ScrollHandle, ScrollbarVisibility,
+    SharedString, StyleRefinement, Styled, Subscription, Task, Window, anchored, deferred, div,
+    img, point, prelude::*, px, size,
 };
 
 use super::agent::{
@@ -58,7 +59,9 @@ use crate::components::floating_window::{
 };
 use crate::components::input::{Input, InputEvent, InputState};
 use crate::components::layout::{divider, h_stack, v_stack};
-use crate::components::textbox::{AutoGrowInputEvent, AutoGrowInputState, auto_grow_input};
+use crate::components::textbox::{
+    AutoGrowInputEvent, AutoGrowInputState, auto_grow_input, textbox_actions,
+};
 use crate::components::theme::{ActiveTheme, ComponentSize, tabular_numerals};
 use crate::components::toggle::toggle;
 
@@ -136,6 +139,53 @@ pub enum AskAiEvent {
     OpenChanged(bool),
 }
 
+struct PendingImage {
+    prepared: PreparedImage,
+    preview: Arc<Image>,
+}
+
+impl PendingImage {
+    fn from_prepared(prepared: PreparedImage) -> Self {
+        let fmt = media_type_to_image_format(&prepared.meta.media_type);
+        let preview = Arc::new(Image::from_bytes(fmt, prepared.bytes.as_ref().clone()));
+        Self { prepared, preview }
+    }
+}
+
+fn media_type_to_image_format(media_type: &str) -> ImageFormat {
+    match media_type {
+        "image/jpeg" => ImageFormat::Jpeg,
+        "image/webp" => ImageFormat::Webp,
+        "image/gif" => ImageFormat::Gif,
+        _ => ImageFormat::Png,
+    }
+}
+
+fn image_format_extension(format: ImageFormat) -> &'static str {
+    match format {
+        ImageFormat::Png => "png",
+        ImageFormat::Jpeg => "jpg",
+        ImageFormat::Webp => "webp",
+        ImageFormat::Gif => "gif",
+        ImageFormat::Bmp => "bmp",
+        ImageFormat::Tiff => "tiff",
+        ImageFormat::Ico => "ico",
+        ImageFormat::Svg => "svg",
+        ImageFormat::Pnm => "pnm",
+    }
+}
+
+fn is_supported_image_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp"
+            )
+        })
+}
+
 /// Entity state backing [`AskAi`] and [`AskAiOverlay`] (both **Ask AI** and **Build with AI**).
 pub struct AskAiState {
     mode: AiAssistantMode,
@@ -178,7 +228,8 @@ pub struct AskAiState {
     active_conversation_id: String,
     composer_input: Entity<AutoGrowInputState>,
     history_search: Entity<InputState>,
-    pending_images: Vec<PreparedImage>,
+    pending_images: Vec<PendingImage>,
+    pasted_image_counter: usize,
     editing_message_id: Option<String>,
     edit_input: Entity<AutoGrowInputState>,
     confirm_delete_conv_id: Option<String>,
@@ -368,6 +419,7 @@ impl AskAiState {
             composer_input,
             history_search,
             pending_images: Vec::new(),
+            pasted_image_counter: 0,
             editing_message_id: None,
             edit_input,
             confirm_delete_conv_id: None,
@@ -1300,6 +1352,232 @@ impl AskAiState {
         }
     }
 
+    /// Returns the currently staged pending image attachments (awaiting the next message send).
+    pub fn pending_images(&self) -> Vec<&AiImageRef> {
+        self.pending_images
+            .iter()
+            .map(|img| &img.prepared.meta)
+            .collect()
+    }
+
+    /// Returns the composer text box's [`FocusHandle`].
+    pub fn composer_focus_handle(&self, cx: &App) -> FocusHandle {
+        self.composer_input.read(cx).focus_handle(cx)
+    }
+
+    /// Returns the latest composer/assistant error message, if any.
+    pub fn error(&self) -> Option<&SharedString> {
+        self.error.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn composer_text(&self, cx: &App) -> String {
+        self.composer_input.read(cx).value().to_owned()
+    }
+
+    fn can_attach_images(&self) -> bool {
+        self.images_enabled
+            && self
+                .connection
+                .as_ref()
+                .is_some_and(|c| c.preset.accepts_images)
+    }
+
+    /// Validates, normalizes, and attaches raw image bytes to the pending composer message.
+    /// Returns `true` if the image was attached, or `false` if rejected (updating `self.error`).
+    pub fn attach_image_bytes(
+        &mut self,
+        name: impl Into<String>,
+        bytes: &[u8],
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.images_enabled || self.busy {
+            return false;
+        }
+        if self
+            .connection
+            .as_ref()
+            .is_some_and(|c| !c.preset.accepts_images)
+        {
+            self.error =
+                Some("The connected model provider does not support image attachments.".into());
+            cx.notify();
+            return false;
+        }
+        if self.pending_images.len() >= self.image_limits.max_per_message {
+            self.error = Some(
+                format!(
+                    "You can attach up to {} images per message.",
+                    self.image_limits.max_per_message
+                )
+                .into(),
+            );
+            cx.notify();
+            return false;
+        }
+        match prepare_image_bytes(name, bytes, self.image_limits) {
+            Ok(prepared) => {
+                self.pending_images.push(PendingImage::from_prepared(prepared));
+                self.error = None;
+                cx.notify();
+                true
+            }
+            Err(err) => {
+                self.error = Some(err.to_string().into());
+                cx.notify();
+                false
+            }
+        }
+    }
+
+    /// Reads and attaches supported raster image files from `paths` to the pending message.
+    /// Returns the number of images successfully attached.
+    pub fn attach_image_paths(&mut self, paths: &[PathBuf], cx: &mut Context<Self>) -> usize {
+        if !self.images_enabled || self.busy {
+            return 0;
+        }
+        let mut attached = 0;
+        for path in paths {
+            if self.pending_images.len() >= self.image_limits.max_per_message {
+                self.error = Some(
+                    format!(
+                        "You can attach up to {} images per message.",
+                        self.image_limits.max_per_message
+                    )
+                    .into(),
+                );
+                break;
+            }
+            let name = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("image")
+                .to_owned();
+            match std::fs::read(path) {
+                Ok(bytes) => {
+                    if self.attach_image_bytes(name, &bytes, cx) {
+                        attached += 1;
+                    }
+                }
+                Err(err) => {
+                    self.error = Some(err.to_string().into());
+                }
+            }
+        }
+        cx.notify();
+        attached
+    }
+
+    fn attach_dropped_image_paths(&mut self, paths: &[PathBuf], cx: &mut Context<Self>) -> bool {
+        if !self.images_enabled || self.busy {
+            return false;
+        }
+        let image_paths: Vec<PathBuf> = paths
+            .iter()
+            .filter(|p| is_supported_image_path(p))
+            .cloned()
+            .collect();
+        if image_paths.is_empty() {
+            return false;
+        }
+        if self
+            .connection
+            .as_ref()
+            .is_some_and(|c| !c.preset.accepts_images)
+        {
+            self.error =
+                Some("The connected model provider does not support image attachments.".into());
+            cx.notify();
+            return true;
+        }
+        self.attach_image_paths(&image_paths, cx);
+        true
+    }
+
+    /// Inspects the OS clipboard for an image (e.g. screenshot / Copy Image) or copied image files
+    /// and attaches them to the pending composer message.
+    ///
+    /// Returns `true` when the paste event was handled as an image attachment (and normal text
+    /// paste should be suppressed), or `false` when normal text paste should proceed.
+    pub fn paste_from_clipboard(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.images_enabled || self.busy {
+            return false;
+        }
+        let Some(item) = cx.read_from_clipboard() else {
+            return false;
+        };
+        self.paste_clipboard_item(&item, cx)
+    }
+
+    fn paste_clipboard_item(&mut self, item: &ClipboardItem, cx: &mut Context<Self>) -> bool {
+        let mut images: Vec<&Image> = Vec::new();
+        let mut external_paths: Vec<PathBuf> = Vec::new();
+        for entry in item.entries() {
+            match entry {
+                ClipboardEntry::Image(img) => images.push(img),
+                ClipboardEntry::ExternalPaths(ep) => {
+                    external_paths.extend(ep.paths().iter().cloned());
+                }
+                ClipboardEntry::String(_) | ClipboardEntry::Custom { .. } => {}
+            }
+        }
+        let has_plain_text = item
+            .text()
+            .is_some_and(|text| !text.trim().is_empty());
+
+        // 1. Direct clipboard image (Snipping Tool, PrintScreen, browser "Copy image", etc.).
+        //    When non-empty plain text is also present (e.g. Excel cells copying both TSV and a
+        //    bitmap preview), yield to normal text paste.
+        if !images.is_empty() && !has_plain_text {
+            if self
+                .connection
+                .as_ref()
+                .is_some_and(|c| !c.preset.accepts_images)
+            {
+                self.error = Some(
+                    "The connected model provider does not support image attachments.".into(),
+                );
+                cx.notify();
+                return true;
+            }
+            for img in images {
+                self.pasted_image_counter += 1;
+                let ext = image_format_extension(img.format);
+                let name = format!("pasted-image-{}.{ext}", self.pasted_image_counter);
+                self.attach_image_bytes(name, img.bytes(), cx);
+                if self.pending_images.len() >= self.image_limits.max_per_message {
+                    break;
+                }
+            }
+            return true;
+        }
+
+        // 2. Copied image file(s) from Windows Explorer (CF_HDROP) or macOS Finder
+        //    (NSFilenamesPboardType, which also puts the filename as plain text).
+        let image_paths: Vec<PathBuf> = external_paths
+            .iter()
+            .filter(|p| is_supported_image_path(p))
+            .cloned()
+            .collect();
+        if !image_paths.is_empty() && image_paths.len() == external_paths.len() {
+            if self
+                .connection
+                .as_ref()
+                .is_some_and(|c| !c.preset.accepts_images)
+            {
+                self.error = Some(
+                    "The connected model provider does not support image attachments.".into(),
+                );
+                cx.notify();
+                return true;
+            }
+            self.attach_image_paths(&image_paths, cx);
+            return true;
+        }
+
+        false
+    }
+
     /// Opens the OS file dialog to attach one or more images to the pending message.
     pub fn pick_images(&mut self, cx: &mut Context<Self>) {
         if !self.images_enabled || self.busy {
@@ -1317,36 +1595,7 @@ impl AskAiState {
         cx.spawn(async move |weak, cx| {
             if let Ok(Ok(Some(paths))) = rx.await {
                 let _ = weak.update(cx, |this, cx| {
-                    for path in paths {
-                        if this.pending_images.len() >= this.image_limits.max_per_message {
-                            this.error = Some(
-                                format!(
-                                    "You can attach up to {} images per message.",
-                                    this.image_limits.max_per_message
-                                )
-                                .into(),
-                            );
-                            break;
-                        }
-                        let name = path
-                            .file_name()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("image")
-                            .to_owned();
-                        match std::fs::read(&path)
-                            .map_err(anyhow::Error::from)
-                            .and_then(|bytes| prepare_image_bytes(name, &bytes, this.image_limits))
-                        {
-                            Ok(prepared) => {
-                                this.pending_images.push(prepared);
-                                this.error = None;
-                            }
-                            Err(err) => {
-                                this.error = Some(err.to_string().into());
-                            }
-                        }
-                    }
-                    cx.notify();
+                    this.attach_image_paths(&paths, cx);
                 });
             }
         })
@@ -1402,9 +1651,13 @@ impl AskAiState {
 
         // Persist pending image bytes into the image store and collect metadata refs.
         let mut image_refs: Vec<AiImageRef> = Vec::with_capacity(self.pending_images.len());
-        for img in self.pending_images.drain(..) {
-            if self.image_store.put(&img.meta.id, img.bytes).is_ok() {
-                image_refs.push(img.meta);
+        for entry in self.pending_images.drain(..) {
+            if self
+                .image_store
+                .put(&entry.prepared.meta.id, entry.prepared.bytes)
+                .is_ok()
+            {
+                image_refs.push(entry.prepared.meta);
             }
         }
 
@@ -3279,11 +3532,7 @@ impl AskAiState {
         let eid = cx.entity_id();
         let conv = self.active_conversation();
         let branch = conv.map(conversation_branch).unwrap_or_default();
-        let can_attach_images = self.images_enabled
-            && self
-                .connection
-                .as_ref()
-                .is_some_and(|c| c.preset.accepts_images);
+        let can_attach_images = self.can_attach_images();
 
         let messages_area = if branch.is_empty() {
             let mut welcome = v_stack()
@@ -3419,26 +3668,30 @@ impl AskAiState {
                     .spacing(px(6.))
                     .px(px(12.))
                     .pb(px(6.))
-                    .children(self.pending_images.iter().enumerate().map(|(idx, img)| {
+                    .children(self.pending_images.iter().enumerate().map(|(idx, entry)| {
+                        let meta = &entry.prepared.meta;
                         h_stack()
                             .spacing(px(6.))
-                            .px(px(8.))
+                            .pl(px(4.))
+                            .pr(px(6.))
                             .py(px(4.))
                             .rounded(theme.radius_md)
                             .bg(theme.surface_muted)
                             .border_1()
                             .border_color(theme.border)
                             .child(
-                                Icon::new(LucideIcon::Image)
-                                    .size(IconSize::Xs)
-                                    .color(theme.primary),
+                                img(entry.preview.clone())
+                                    .size(px(28.))
+                                    .flex_none()
+                                    .rounded(theme.radius_sm)
+                                    .object_fit(ObjectFit::Cover),
                             )
                             .child(
                                 div()
                                     .text_size(px(11.5))
                                     .child(format!(
                                         "{} ({}×{})",
-                                        img.meta.name, img.meta.width, img.meta.height
+                                        meta.name, meta.width, meta.height
                                     )),
                             )
                             .child(
@@ -3454,6 +3707,12 @@ impl AskAiState {
                             )
                     })),
             )
+        };
+
+        let attach_tooltip = if cfg!(target_os = "macos") {
+            "Attach image (or paste with ⌘V)"
+        } else {
+            "Attach image (or paste with Ctrl+V)"
         };
 
         let inner_radius = (theme.radius_xl - px(1.)).max(px(0.));
@@ -3485,12 +3744,24 @@ impl AskAiState {
                                     .outline()
                                     .size(ComponentSize::Sm)
                                     .disabled(self.busy)
-                                    .tooltip_text("Attach image")
+                                    .tooltip_text(attach_tooltip)
                                     .on_click(cx.listener(|this, _, _, cx| this.pick_images(cx))),
                             ),
                         )
                     })
-                    .child(div().flex_1().min_w_0().child(auto_grow_input(&self.composer_input)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .capture_action(cx.listener(
+                                |this, _: &textbox_actions::Paste, _window, cx| {
+                                    if this.paste_from_clipboard(cx) {
+                                        cx.stop_propagation();
+                                    }
+                                },
+                            ))
+                            .child(auto_grow_input(&self.composer_input)),
+                    )
                     .child(
                         div().mb(px(3.)).child(if self.busy {
                             Button::icon(("ask-stop", eid), LucideIcon::Square)
@@ -3520,10 +3791,19 @@ impl AskAiState {
             && self.chat_scroll.max_offset().y > px(40.)
             && (self.chat_scroll.max_offset().y + self.chat_scroll.offset().y) > px(48.);
 
-        v_stack()
+        div()
+            .flex()
+            .flex_col()
             .flex_1()
             .min_h_0()
             .w_full()
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                if this.attach_dropped_image_paths(paths.paths(), cx) {
+                    let focus = this.composer_input.focus_handle(cx);
+                    window.focus(&focus, cx);
+                    cx.stop_propagation();
+                }
+            }))
             .when_some(self.render_status_banner(cx), |el, b| {
                 el.child(div().px(px(12.)).pt(px(10.)).child(b))
             })
@@ -3667,10 +3947,47 @@ impl AskAiState {
                 .spacing(px(4.))
                 .pl(px(36.))
                 .when(!imgs.is_empty(), |el| {
-                    el.child(h_stack().spacing(px(6.)).children(imgs.iter().map(|img| {
-                        badge(format!("{} ({}×{})", img.name, img.width, img.height))
-                            .color(BadgeColor::Gray)
-                    })))
+                    el.child(
+                        h_stack()
+                            .flex_wrap()
+                            .justify_end()
+                            .spacing(px(6.))
+                            .children(imgs.iter().map(|iref| {
+                                if let Some(bytes) = self.image_store.get(&iref.id) {
+                                    let fmt = media_type_to_image_format(&iref.media_type);
+                                    let preview =
+                                        Arc::new(Image::from_bytes(fmt, bytes.as_ref().clone()));
+                                    v_stack()
+                                        .spacing(px(3.))
+                                        .p(px(4.))
+                                        .rounded(theme.radius_md)
+                                        .bg(theme.surface_muted.opacity(0.6))
+                                        .border_1()
+                                        .border_color(theme.border)
+                                        .child(
+                                            img(preview)
+                                                .max_w(px(160.))
+                                                .max_h(px(108.))
+                                                .object_fit(ObjectFit::Contain)
+                                                .rounded(theme.radius_sm),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(10.))
+                                                .text_color(theme.muted_foreground)
+                                                .child(format!(
+                                                    "{} ({}×{})",
+                                                    iref.name, iref.width, iref.height
+                                                )),
+                                        )
+                                        .into_any_element()
+                                } else {
+                                    badge(format!("{} ({}×{})", iref.name, iref.width, iref.height))
+                                        .color(BadgeColor::Gray)
+                                        .into_any_element()
+                                }
+                            })),
+                    )
                 })
                 .child(if is_editing {
                     v_stack()
@@ -3989,12 +4306,7 @@ impl AskAiState {
                                     .iter()
                                     .filter_map(|iref| {
                                         let bytes = self.image_store.get(&iref.id)?;
-                                        let fmt = match iref.media_type.as_str() {
-                                            "image/jpeg" => ImageFormat::Jpeg,
-                                            "image/webp" => ImageFormat::Webp,
-                                            "image/gif" => ImageFormat::Gif,
-                                            _ => ImageFormat::Png,
-                                        };
+                                        let fmt = media_type_to_image_format(&iref.media_type);
                                         Some((
                                             iref.clone(),
                                             Arc::new(Image::from_bytes(fmt, bytes.as_ref().clone())),
@@ -4304,6 +4616,26 @@ impl AskAiState {
             .bg(theme.background)
             .text_color(theme.foreground)
             .overflow_hidden()
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                let mods = &ev.keystroke.modifiers;
+                let primary = if cfg!(target_os = "macos") {
+                    mods.platform
+                } else {
+                    mods.control || mods.platform
+                };
+                if this.page == AskAiPage::Chat
+                    && primary
+                    && !mods.alt
+                    && !mods.shift
+                    && ev.keystroke.key.eq_ignore_ascii_case("v")
+                    && !this.is_text_input_focused(window, cx)
+                    && this.paste_from_clipboard(cx)
+                {
+                    let focus = this.composer_input.focus_handle(cx);
+                    window.focus(&focus, cx);
+                    cx.stop_propagation();
+                }
+            }))
             .child(self.render_header(show_window_controls, cx))
             .child(body)
             .into_any_element()

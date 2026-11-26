@@ -15,7 +15,7 @@ use windows::Win32::{
             SetClipboardData,
         },
         Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock},
-        Ole::{CF_DIB, CF_HDROP, CF_UNICODETEXT},
+        Ole::{CF_DIB, CF_DIBV5, CF_HDROP, CF_UNICODETEXT},
     },
     UI::Shell::{DROPFILES, DragQueryFileW, HDROP},
 };
@@ -38,14 +38,23 @@ static CLIPBOARD_GIF_FORMAT: LazyLock<u32> =
     LazyLock::new(|| register_clipboard_format(windows::core::w!("GIF")));
 static CLIPBOARD_PNG_FORMAT: LazyLock<u32> =
     LazyLock::new(|| register_clipboard_format(windows::core::w!("PNG")));
+static CLIPBOARD_PNG_MIME_FORMAT: LazyLock<u32> =
+    LazyLock::new(|| register_clipboard_format(windows::core::w!("image/png")));
+static CLIPBOARD_WEBP_MIME_FORMAT: LazyLock<u32> =
+    LazyLock::new(|| register_clipboard_format(windows::core::w!("image/webp")));
 static CLIPBOARD_JPG_FORMAT: LazyLock<u32> =
     LazyLock::new(|| register_clipboard_format(windows::core::w!("JFIF")));
+static CLIPBOARD_JPG_MIME_FORMAT: LazyLock<u32> =
+    LazyLock::new(|| register_clipboard_format(windows::core::w!("image/jpeg")));
 
 static IMAGE_FORMATS_MAP: LazyLock<FxHashMap<u32, ImageFormat>> = LazyLock::new(|| {
     let mut map = FxHashMap::default();
     map.insert(*CLIPBOARD_PNG_FORMAT, ImageFormat::Png);
+    map.insert(*CLIPBOARD_PNG_MIME_FORMAT, ImageFormat::Png);
+    map.insert(*CLIPBOARD_WEBP_MIME_FORMAT, ImageFormat::Webp);
     map.insert(*CLIPBOARD_GIF_FORMAT, ImageFormat::Gif);
     map.insert(*CLIPBOARD_JPG_FORMAT, ImageFormat::Jpeg);
+    map.insert(*CLIPBOARD_JPG_MIME_FORMAT, ImageFormat::Jpeg);
     map.insert(*CLIPBOARD_SVG_FORMAT, ImageFormat::Svg);
     map
 });
@@ -99,8 +108,8 @@ pub(crate) fn read_from_clipboard() -> Option<ClipboardItem> {
 
     let mut entries = Vec::new();
     let mut have_text = false;
-    let mut have_image = false;
     let mut have_files = false;
+    let mut image_formats = Vec::new();
 
     let count = unsafe { CountClipboardFormats() };
     let mut format = 0;
@@ -112,11 +121,8 @@ pub(crate) fn read_from_clipboard() -> Option<ClipboardItem> {
                 entries.push(entry);
                 have_text = true;
             }
-        } else if !have_image && is_image_format(format) {
-            if let Some(entry) = read_image(format) {
-                entries.push(entry);
-                have_image = true;
-            }
+        } else if is_image_format(format) {
+            image_formats.push(format);
         } else if !have_files && format == CF_HDROP.0 as u32 {
             if let Some(entry) = read_files() {
                 entries.push(entry);
@@ -130,6 +136,16 @@ pub(crate) fn read_from_clipboard() -> Option<ClipboardItem> {
             if let Some(entry) = read_custom(format) {
                 entries.push(entry);
             }
+        }
+    }
+
+    // Prefer lossless/compressed image formats (PNG, WebP, JPEG, GIF) over raw CF_DIB / CF_DIBV5
+    // so large high-DPI screenshots stay compact and preserve transparency when available.
+    image_formats.sort_by_key(|&fmt| image_format_priority(fmt));
+    for fmt in image_formats {
+        if let Some(entry) = read_image(fmt) {
+            entries.push(entry);
+            break;
         }
     }
 
@@ -186,8 +202,33 @@ fn get_clipboard_string(format: u32) -> Option<String> {
     Some(String::from_utf16_lossy(&slice[..actual_len]))
 }
 
+fn is_dib_format(format: u32) -> bool {
+    format == CF_DIB.0 as u32 || format == CF_DIBV5.0 as u32
+}
+
 fn is_image_format(format: u32) -> bool {
-    IMAGE_FORMATS_MAP.contains_key(&format) || format == CF_DIB.0 as u32
+    IMAGE_FORMATS_MAP.contains_key(&format) || is_dib_format(format)
+}
+
+fn image_format_rank(kind: Option<ImageFormat>, is_dib_v1: bool, is_dib_v5: bool) -> u8 {
+    match kind {
+        Some(ImageFormat::Png) => 0,
+        Some(ImageFormat::Webp) => 1,
+        Some(ImageFormat::Jpeg) => 2,
+        Some(ImageFormat::Gif) => 3,
+        _ if is_dib_v1 => 4,
+        _ if is_dib_v5 => 5,
+        Some(ImageFormat::Svg) => 6,
+        _ => 7,
+    }
+}
+
+fn image_format_priority(format: u32) -> u8 {
+    image_format_rank(
+        IMAGE_FORMATS_MAP.get(&format).copied(),
+        format == CF_DIB.0 as u32,
+        format == CF_DIBV5.0 as u32,
+    )
 }
 
 fn write_string(item: &ClipboardString) -> Result<()> {
@@ -360,7 +401,7 @@ fn read_clipboard_metadata(text: &str) -> Option<String> {
 
 fn read_image(format: u32) -> Option<ClipboardEntry> {
     let locked = get_clipboard_data(format)?;
-    let (bytes, image_format) = if format == CF_DIB.0 as u32 {
+    let (bytes, image_format) = if is_dib_format(format) {
         (convert_dib_to_bmp(locked.as_bytes())?, ImageFormat::Bmp)
     } else {
         let image_format = *IMAGE_FORMATS_MAP.get(&format)?;
@@ -649,5 +690,26 @@ mod tests {
         write_base_header(&mut palette_overflow, 40, 8, 0, 4);
         palette_overflow[32..36].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(convert_dib_to_bmp(&palette_overflow).is_none());
+    }
+
+    #[test]
+    fn image_format_priority_prefers_compressed_formats_over_dib() {
+        use super::image_format_rank;
+        use gpui::ImageFormat;
+
+        let png = image_format_rank(Some(ImageFormat::Png), false, false);
+        let webp = image_format_rank(Some(ImageFormat::Webp), false, false);
+        let jpeg = image_format_rank(Some(ImageFormat::Jpeg), false, false);
+        let gif = image_format_rank(Some(ImageFormat::Gif), false, false);
+        let dib = image_format_rank(None, true, false);
+        let dib_v5 = image_format_rank(None, false, true);
+        let svg = image_format_rank(Some(ImageFormat::Svg), false, false);
+
+        assert!(png < webp);
+        assert!(webp < jpeg);
+        assert!(jpeg < gif);
+        assert!(gif < dib);
+        assert!(dib < dib_v5);
+        assert!(dib_v5 < svg);
     }
 }

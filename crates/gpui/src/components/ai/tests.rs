@@ -2695,3 +2695,189 @@ fn ask_ai_overlay_markdown_context_menu_select_all_and_ctrl_a_persist(cx: &mut T
         "Ctrl/Cmd+A and context menu Select All must select identical full Markdown text"
     );
 }
+
+#[crate::test]
+fn ask_ai_paste_clipboard_images_and_files_preserves_text_paste(cx: &mut crate::TestAppContext) {
+    use crate::components::ai::{AskAi, AskAiState, ProviderPreset, simulated_provider};
+    use crate::prelude::*;
+    use crate::{
+        ClipboardEntry, ClipboardItem, ClipboardString, ExternalPaths, Image, ImageFormat,
+    };
+
+    cx.update(|cx| {
+        crate::components::init_components(cx);
+    });
+
+    fn make_png_bytes(width: u32, height: u32, rgba: [u8; 4]) -> Vec<u8> {
+        let img = image::RgbaImage::from_pixel(width, height, image::Rgba(rgba));
+        let mut out = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+            .expect("encode test png");
+        out
+    }
+
+    struct Host {
+        ai: crate::Entity<AskAiState>,
+    }
+    impl crate::Render for Host {
+        fn render(
+            &mut self,
+            _window: &mut crate::Window,
+            _cx: &mut crate::Context<Self>,
+        ) -> impl IntoElement {
+            crate::div().size_full().child(AskAi::new(&self.ai))
+        }
+    }
+
+    let png_bytes = make_png_bytes(16, 12, [40, 140, 240, 255]);
+    let mut text_only_provider: ProviderPreset = simulated_provider();
+    text_only_provider.id = "sim-no-images".into();
+    text_only_provider.accepts_images = false;
+
+    let (view, vcx) = cx.add_window_view(|_window, cx| {
+        let ai = cx.new(|cx| {
+            let mut state = AskAiState::build_with_ai(cx)
+                .providers(vec![simulated_provider(), text_only_provider.clone()])
+                .images(true);
+            assert!(state.connect_preset_defaults("simulated", cx).is_none());
+            state
+        });
+        Host { ai }
+    });
+    let ai_entity = view.read_with(vcx, |h, _| h.ai.clone());
+    vcx.run_until_parked();
+
+    let paste_stroke = if cfg!(target_os = "macos") {
+        "cmd-v"
+    } else {
+        "ctrl-v"
+    };
+
+    // Focus the composer input inside AskAi / Build with AI.
+    let composer_focus = ai_entity.read_with(vcx, |ai, cx| ai.composer_focus_handle(cx));
+    vcx.update(|window, cx| {
+        window.focus(&composer_focus, cx);
+    });
+    vcx.run_until_parked();
+
+    // 1. Pasting a clipboard image attaches it to pending_images without inserting composer text.
+    let clip_img = Image::from_bytes(ImageFormat::Png, png_bytes.clone());
+    vcx.write_to_clipboard(ClipboardItem::new_image(&clip_img));
+    vcx.simulate_keystrokes(paste_stroke);
+    vcx.run_until_parked();
+
+    ai_entity.read_with(vcx, |ai, cx| {
+        let pending = ai.pending_images();
+        assert_eq!(pending.len(), 1, "expected 1 pasted image attachment");
+        assert_eq!(pending[0].name, "pasted-image-1.png");
+        assert_eq!((pending[0].width, pending[0].height), (16, 12));
+        assert_eq!(ai.composer_text(cx), "");
+    });
+
+    // 2. Pasting plain text still inserts into the composer normally.
+    vcx.write_to_clipboard(ClipboardItem::new_string("Make it taller".into()));
+    vcx.simulate_keystrokes(paste_stroke);
+    vcx.run_until_parked();
+
+    ai_entity.read_with(vcx, |ai, cx| {
+        assert_eq!(ai.pending_images().len(), 1);
+        assert_eq!(ai.composer_text(cx), "Make it taller");
+    });
+
+    // 3. Clipboard containing BOTH non-empty text AND an image (e.g. spreadsheet cells) yields to
+    //    text paste rather than silently attaching a bitmap.
+    vcx.write_to_clipboard(ClipboardItem {
+        entries: vec![
+            ClipboardEntry::String(ClipboardString::new(" please".into())),
+            ClipboardEntry::Image(clip_img.clone()),
+        ],
+    });
+    vcx.simulate_keystrokes(paste_stroke);
+    vcx.run_until_parked();
+
+    ai_entity.read_with(vcx, |ai, cx| {
+        assert_eq!(ai.pending_images().len(), 1);
+        assert_eq!(ai.composer_text(cx), "Make it taller please");
+    });
+
+    // 4. Copying an image file (Explorer CF_HDROP / Finder NSFilenamesPboardType with filename
+    //    string alongside ExternalPaths) attaches the image and suppresses filename text insertion.
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "gpui-ai-paste-test-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp_dir);
+    let img_path = tmp_dir.join("mockup.png");
+    let txt_path = tmp_dir.join("notes.txt");
+    std::fs::write(&img_path, &png_bytes).expect("write temp png");
+    std::fs::write(&txt_path, b"hello").expect("write temp txt");
+
+    vcx.write_to_clipboard(ClipboardItem {
+        entries: vec![
+            ClipboardEntry::ExternalPaths(ExternalPaths(smallvec::smallvec![img_path.clone()])),
+            ClipboardEntry::String(ClipboardString::new("mockup.png".into())),
+        ],
+    });
+    vcx.simulate_keystrokes(paste_stroke);
+    vcx.run_until_parked();
+
+    ai_entity.read_with(vcx, |ai, cx| {
+        let pending = ai.pending_images();
+        assert_eq!(pending.len(), 2, "copied image file must attach");
+        assert_eq!(pending[1].name, "mockup.png");
+        assert_eq!(
+            ai.composer_text(cx),
+            "Make it taller please",
+            "filename text must not be pasted when image file is attached"
+        );
+    });
+
+    // 5. Copying a non-image file does NOT attach an image.
+    vcx.write_to_clipboard(ClipboardItem {
+        entries: vec![ClipboardEntry::ExternalPaths(ExternalPaths(
+            smallvec::smallvec![txt_path.clone()],
+        ))],
+    });
+    vcx.simulate_keystrokes(paste_stroke);
+    vcx.run_until_parked();
+
+    ai_entity.read_with(vcx, |ai, _| {
+        assert_eq!(ai.pending_images().len(), 2);
+    });
+
+    // 6. Enforces max_per_message (default 4) cleanly with an error instead of exceeding limit.
+    vcx.write_to_clipboard(ClipboardItem::new_image(&clip_img));
+    for _ in 0..3 {
+        vcx.simulate_keystrokes(paste_stroke);
+        vcx.run_until_parked();
+    }
+    ai_entity.read_with(vcx, |ai, _| {
+        assert_eq!(ai.pending_images().len(), 4);
+        assert!(
+            ai.error().is_some_and(|e| e.contains("up to 4")),
+            "expected max_per_message error, got {:?}",
+            ai.error()
+        );
+    });
+
+    // 7. Provider with accepts_images == false surfaces an error and blocks image paste.
+    ai_entity.update(vcx, |ai, cx| {
+        assert!(ai.connect_preset_defaults("sim-no-images", cx).is_none());
+    });
+    vcx.write_to_clipboard(ClipboardItem::new_image(&clip_img));
+    vcx.simulate_keystrokes(paste_stroke);
+    vcx.run_until_parked();
+
+    ai_entity.read_with(vcx, |ai, _| {
+        assert_eq!(ai.pending_images().len(), 4);
+        assert!(
+            ai.error()
+                .is_some_and(|e| e.contains("does not support image")),
+            "expected unsupported provider error, got {:?}",
+            ai.error()
+        );
+    });
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
