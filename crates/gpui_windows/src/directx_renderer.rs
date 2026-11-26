@@ -303,6 +303,13 @@ impl DirectXRenderer {
         matches!(self.direct_composition, Some(DirectComposition::WinRt(_)))
     }
 
+    pub(crate) fn drawable_size(&self) -> Size<DevicePixels> {
+        size(
+            DevicePixels(self.width as i32),
+            DevicePixels(self.height as i32),
+        )
+    }
+
     pub(crate) fn sync_backdrop(&mut self, blur_enabled: bool, radius_px: f32) {
         let size_now = (self.width, self.height);
         if self.backdrop_blur_enabled == blur_enabled

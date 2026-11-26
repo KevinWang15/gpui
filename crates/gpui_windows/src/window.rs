@@ -636,6 +636,10 @@ impl WindowsWindow {
                 state: WindowOpenState::Windowed,
             }));
         }
+        // Reconcile cached DPI, logical size, and swapchain size after initial
+        // placement in case `SetWindowPlacement` moved a hidden window to another
+        // monitor without emitting `WM_DPICHANGED` or `WM_SIZE`.
+        this.sync_dpi_and_size(hwnd);
 
         Ok(Self(this))
     }

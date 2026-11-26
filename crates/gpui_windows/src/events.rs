@@ -52,6 +52,10 @@ impl DrawCoordinator {
         }
     }
 
+    pub(crate) fn is_drawing(&self) -> bool {
+        self.drawing.get()
+    }
+
     fn try_begin_draw(&self) -> Option<DrawWindowGuard<'_>> {
         // This only covers the `draw_window` span (which extends past the GPUI
         // draw, through presentation and IME updates). Requests that arrive
@@ -102,7 +106,7 @@ impl WindowsWindowInner {
             WM_ACTIVATE => self.handle_activate_msg(wparam),
             WM_CREATE => self.handle_create_msg(handle),
             WM_MOVE => self.handle_move_msg(handle, lparam),
-            WM_SIZE => self.handle_size_msg(wparam, lparam),
+            WM_SIZE => self.handle_size_msg(handle, wparam, lparam),
             WM_GETMINMAXINFO => self.handle_get_min_max_info_msg(lparam),
             WM_ENTERSIZEMOVE | WM_ENTERMENULOOP => self.handle_size_move_loop(handle),
             WM_EXITSIZEMOVE | WM_EXITMENULOOP => self.handle_size_move_loop_exit(handle),
@@ -224,13 +228,18 @@ impl WindowsWindowInner {
         Some(0)
     }
 
-    fn handle_size_msg(self: &Rc<Self>, wparam: WPARAM, lparam: LPARAM) -> Option<isize> {
+    fn handle_size_msg(
+        self: &Rc<Self>,
+        handle: HWND,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> Option<isize> {
         // Minimizing and restoring both arrive as `WM_SIZE`; the deferred report
         // reads `IsIconic` at delivery, so one call covers both directions.
         self.report_visibility();
 
-        // Don't resize the renderer when the window is minimized, but record that it was minimized so
-        // that on restore the swap chain can be recreated via `update_drawable_size_even_if_unchanged`.
+        // Don't resize the renderer when the window is minimized, and pause frame
+        // delivery until restore arrives.
         if wparam.0 == SIZE_MINIMIZED as usize {
             self.state
                 .restore_from_minimized
@@ -242,19 +251,76 @@ impl WindowsWindowInner {
         let height = lparam.hiword().max(1) as i32;
         let new_size = size(DevicePixels(width), DevicePixels(height));
 
-        let scale_factor = self.state.scale_factor.get();
-        let mut should_resize_renderer = false;
+        // Hidden windows can move across monitors or experience display scale
+        // changes without receiving `WM_DPICHANGED`, so refresh the scale factor
+        // from the live window DPI before converting device size to logical pixels.
+        let (scale_factor, _) = self.sync_scale_factor(handle);
         if let Some(restore_from_minimized) = self.state.restore_from_minimized.take() {
             self.state
                 .callbacks
                 .request_frame
                 .set(Some(restore_from_minimized));
-        } else {
-            should_resize_renderer = true;
         }
 
-        self.handle_size_change(new_size, scale_factor, should_resize_renderer);
+        // `DirectXRenderer::resize` is a no-op when the physical size is unchanged,
+        // so always pass `true` here — including when restoring from minimized at a
+        // different size or DPI.
+        self.handle_size_change(new_size, scale_factor, true);
         Some(0)
+    }
+
+    fn apply_scale_factor(&self, handle: HWND, new_scale_factor: f32) -> bool {
+        let changed = (self.state.scale_factor.get() - new_scale_factor).abs() > f32::EPSILON;
+        self.state.scale_factor.set(new_scale_factor);
+        self.state.border_offset.update(handle).log_err();
+        self.state
+            .direct_manipulation
+            .set_scale_factor(new_scale_factor);
+        changed
+    }
+
+    fn sync_scale_factor(&self, handle: HWND) -> (f32, bool) {
+        let dpi = unsafe { GetDpiForWindow(handle) };
+        if let Some(new_scale_factor) = scale_factor_from_dpi(dpi) {
+            if (self.state.scale_factor.get() - new_scale_factor).abs() > f32::EPSILON {
+                self.apply_scale_factor(handle, new_scale_factor);
+                return (new_scale_factor, true);
+            }
+            return (new_scale_factor, false);
+        }
+        (self.state.scale_factor.get(), false)
+    }
+
+    fn reconcile_client_size(&self, handle: HWND, scale_factor: f32, force_size_change: bool) {
+        let Some(device_size) = client_device_size(handle) else {
+            return;
+        };
+        let renderer_size = self
+            .state
+            .renderer
+            .try_borrow()
+            .ok()
+            .map(|renderer| renderer.drawable_size());
+        if needs_size_reconciliation(
+            device_size,
+            scale_factor,
+            self.state.logical_size.get(),
+            renderer_size,
+            force_size_change,
+        ) {
+            self.handle_size_change(device_size, scale_factor, true);
+        }
+    }
+
+    /// Reconciles cached DPI scale factor, logical client size, and swapchain size
+    /// with the live `HWND`. Needed when a hidden window misses `WM_DPICHANGED` or
+    /// when `SetWindowPos` inside `WM_DPICHANGED` does not change physical size.
+    pub(crate) fn sync_dpi_and_size(&self, handle: HWND) {
+        if !unsafe { IsWindow(Some(handle)) }.as_bool() {
+            return;
+        }
+        let (scale_factor, scale_changed) = self.sync_scale_factor(handle);
+        self.reconcile_client_size(handle, scale_factor, scale_changed);
     }
 
     fn handle_size_change(
@@ -902,16 +968,13 @@ impl WindowsWindowInner {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> Option<isize> {
-        let new_dpi = wparam.loword() as f32;
+        let new_dpi = wparam.loword() as u32;
+        let Some(new_scale_factor) = scale_factor_from_dpi(new_dpi) else {
+            return Some(0);
+        };
 
         let is_maximized = self.state.is_maximized();
-        let new_scale_factor = new_dpi / USER_DEFAULT_SCREEN_DPI as f32;
-        self.state.scale_factor.set(new_scale_factor);
-        self.state.border_offset.update(handle).log_err();
-
-        self.state
-            .direct_manipulation
-            .set_scale_factor(new_scale_factor);
+        let scale_changed = self.apply_scale_factor(handle, new_scale_factor);
 
         if is_maximized {
             // Get the monitor and its work area at the new DPI
@@ -941,7 +1004,8 @@ impl WindowsWindowInner {
 
                 // SetWindowPos may not send WM_SIZE for maximized windows in some cases,
                 // so we manually update the size to ensure proper rendering
-                let device_size = size(DevicePixels(width), DevicePixels(height));
+                let device_size = client_device_size(handle)
+                    .unwrap_or_else(|| size(DevicePixels(width), DevicePixels(height)));
                 self.handle_size_change(device_size, new_scale_factor, true);
             }
         } else {
@@ -949,9 +1013,7 @@ impl WindowsWindowInner {
             let rect = unsafe { &*(lparam.0 as *const RECT) };
             let width = rect.right - rect.left;
             let height = rect.bottom - rect.top;
-            // this will emit `WM_SIZE` and `WM_MOVE` right here
-            // even before this function returns
-            // the new size is handled in `WM_SIZE`
+            let client_size_before = client_device_size(handle);
             unsafe {
                 SetWindowPos(
                     handle,
@@ -965,6 +1027,13 @@ impl WindowsWindowInner {
                 .context("unable to set window position after dpi has changed")
                 .log_err();
             }
+            // `SetWindowPos` does not emit `WM_SIZE` when the physical dimensions are
+            // unchanged (e.g. if the suggested rect matches the current size), which
+            // would otherwise leave `logical_size`, the renderer, and GPUI's `Window`
+            // out of sync with the new `scale_factor`.
+            let client_size_after = client_device_size(handle);
+            let force_sync = scale_changed && client_size_before == client_size_after;
+            self.reconcile_client_size(handle, new_scale_factor, force_sync);
         }
 
         Some(0)
@@ -978,6 +1047,14 @@ impl WindowsWindowInner {
         }
         let new_display = WindowsDisplay::new(WindowsDisplay::display_id_for_monitor(new_monitor))?;
         self.set_display(new_display);
+        // Defer DPI/size reconciliation just like `set_display` so it never collides
+        // with an active GPUI update if `WM_DISPLAYCHANGE` arrived synchronously.
+        let this = self.clone();
+        self.executor
+            .spawn(async move {
+                this.sync_dpi_and_size(handle);
+            })
+            .detach();
         Some(0)
     }
 
@@ -1314,6 +1391,18 @@ impl WindowsWindowInner {
     ) -> Option<isize> {
         self.report_visibility();
         if wparam.0 == 1 {
+            // Re-sync DPI and client size before painting: Windows may skip or
+            // defer `WM_DPICHANGED` while a window is hidden (`SW_HIDE`).
+            if self.state.draw_coordinator.is_drawing() {
+                let this = self.clone();
+                self.executor
+                    .spawn(async move {
+                        this.sync_dpi_and_size(handle);
+                    })
+                    .detach();
+            } else {
+                self.sync_dpi_and_size(handle);
+            }
             self.draw_window(handle, false);
         }
         None
@@ -1851,6 +1940,36 @@ fn get_frame_thicknessy(dpi: u32) -> i32 {
     resize_frame_thickness + padding_thickness
 }
 
+fn scale_factor_from_dpi(dpi: u32) -> Option<f32> {
+    (dpi > 0).then(|| dpi as f32 / USER_DEFAULT_SCREEN_DPI as f32)
+}
+
+fn client_device_size(handle: HWND) -> Option<Size<DevicePixels>> {
+    if unsafe { IsIconic(handle) }.as_bool() {
+        return None;
+    }
+    let mut rect = RECT::default();
+    unsafe { GetClientRect(handle, &mut rect) }.ok()?;
+    let width = rect.right - rect.left;
+    let height = rect.bottom - rect.top;
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+    Some(size(DevicePixels(width), DevicePixels(height)))
+}
+
+fn needs_size_reconciliation(
+    device_size: Size<DevicePixels>,
+    scale_factor: f32,
+    current_logical_size: Size<Pixels>,
+    renderer_size: Option<Size<DevicePixels>>,
+    force_size_change: bool,
+) -> bool {
+    let expected_logical = device_size.to_pixels(scale_factor);
+    let renderer_mismatch = renderer_size.is_some_and(|size| size != device_size);
+    force_size_change || current_logical_size != expected_logical || renderer_mismatch
+}
+
 fn notify_frame_changed(handle: HWND) {
     unsafe {
         SetWindowPos(
@@ -1871,5 +1990,56 @@ fn notify_frame_changed(handle: HWND) {
                 | SWP_NOZORDER,
         )
         .log_err();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{needs_size_reconciliation, scale_factor_from_dpi};
+    use gpui::{DevicePixels, px, size};
+
+    #[test]
+    fn scale_factor_from_dpi_handles_zero_and_standard_scales() {
+        assert_eq!(scale_factor_from_dpi(0), None);
+        assert_eq!(scale_factor_from_dpi(96), Some(1.0));
+        assert_eq!(scale_factor_from_dpi(120), Some(1.25));
+        assert_eq!(scale_factor_from_dpi(144), Some(1.5));
+    }
+
+    #[test]
+    fn reconciliation_triggers_when_dpi_or_renderer_drifts_without_wm_size() {
+        let device = size(DevicePixels(760), DevicePixels(474));
+        // Consistent at 100% scaling: no reconciliation needed.
+        assert!(!needs_size_reconciliation(
+            device,
+            1.0,
+            size(px(760.0), px(474.0)),
+            Some(device),
+            false,
+        ));
+        // Scale changed to 125% without WM_SIZE updating logical_size: must reconcile.
+        assert!(needs_size_reconciliation(
+            device,
+            1.25,
+            size(px(760.0), px(474.0)),
+            Some(device),
+            false,
+        ));
+        // Renderer swapchain size lags behind HWND client size: must reconcile.
+        assert!(needs_size_reconciliation(
+            size(DevicePixels(950), DevicePixels(593)),
+            1.25,
+            size(px(760.0), px(474.4)),
+            Some(device),
+            false,
+        ));
+        // Force flag triggers reconciliation even if logical/renderer already match.
+        assert!(needs_size_reconciliation(
+            device,
+            1.25,
+            device.to_pixels(1.25),
+            Some(device),
+            true,
+        ));
     }
 }
