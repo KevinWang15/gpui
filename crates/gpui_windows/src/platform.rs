@@ -466,22 +466,35 @@ impl WindowsPlatform {
             .name("VSyncProvider".to_owned())
             .spawn(move || {
                 let vsync_provider = VSyncProvider::new();
+                let mut device_lost_pending = false;
                 loop {
                     let signal_source = vsync_provider.wait_for_vsync();
                     let signal_at = PlatformFrameSignal::capture(scheduler::Instant::now);
                     if stop.load(Ordering::Acquire) {
                         break;
                     }
-                    if check_device_lost(&directx_device.device)
+                    if device_lost_pending
+                        || check_device_lost(&directx_device.device)
                         || invalidate_devices.fetch_and(false, Ordering::Acquire)
                     {
-                        if let Err(err) = handle_gpu_device_lost(
+                        match handle_gpu_device_lost(
                             &mut directx_device,
                             platform_window.as_raw(),
                             validation_number,
                             &all_windows,
                         ) {
-                            panic!("Device lost: {err}");
+                            Ok(()) => {
+                                device_lost_pending = false;
+                            }
+                            Err(err) => {
+                                // During RDP connect/disconnect or display driver transitions,
+                                // DXGI/DWM can remain unavailable for several seconds. Keep the
+                                // app alive and retry calmly until the display session recovers.
+                                log::warn!("DirectX device recovery deferred: {err:#}");
+                                device_lost_pending = true;
+                                std::thread::sleep(std::time::Duration::from_millis(500));
+                                continue;
+                            }
                         }
                     }
                     let Some(all_windows) = all_windows.upgrade() else {
@@ -2185,21 +2198,32 @@ fn handle_gpu_device_lost(
     }
 
     if let Some(all_windows) = all_windows.upgrade() {
-        for window in all_windows.read().iter() {
-            unsafe {
+        // Snapshot window handles before calling synchronous `SendMessageW` so holding the
+        // `RwLock` never deadlocks with window creation/destruction on the UI thread.
+        let hwnds: SmallVec<[HWND; 4]> = all_windows.read().iter().map(|w| w.as_raw()).collect();
+        let mut any_window_failed = false;
+        for hwnd in &hwnds {
+            let res = unsafe {
                 SendMessageW(
-                    window.as_raw(),
+                    *hwnd,
                     WM_GPUI_GPU_DEVICE_LOST,
                     Some(WPARAM(validation_number)),
                     Some(lparam),
-                );
+                )
+            };
+            if res.0 != 0 {
+                any_window_failed = true;
             }
         }
+        if any_window_failed {
+            anyhow::bail!("one or more windows could not complete GPU device recovery yet");
+        }
         std::thread::sleep(std::time::Duration::from_millis(200));
-        for window in all_windows.read().iter() {
+        let hwnds: SmallVec<[HWND; 4]> = all_windows.read().iter().map(|w| w.as_raw()).collect();
+        for hwnd in &hwnds {
             unsafe {
                 SendMessageW(
-                    window.as_raw(),
+                    *hwnd,
                     WM_GPUI_FORCE_UPDATE_WINDOW,
                     Some(WPARAM(validation_number)),
                     None,

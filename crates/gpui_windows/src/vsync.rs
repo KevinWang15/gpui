@@ -67,12 +67,18 @@ fn get_dwm_interval() -> Result<Duration> {
     unsafe { DwmGetCompositionTimingInfo(HWND::default(), &mut timing_info) }?;
     let interval = retrieve_duration(timing_info.qpcRefreshPeriod, *QPC_TICKS_PER_SECOND);
     // Check for interval values that are impossibly low. A 29 microsecond
-    // interval was seen (from a qpcRefreshPeriod of 60).
+    // interval was seen (from a qpcRefreshPeriod of 60), and Remote Desktop
+    // can report `qpcRefreshPeriod == 0`.
     if interval < VSYNC_INTERVAL_THRESHOLD {
-        Ok(retrieve_duration(
+        let fallback = retrieve_duration(
             timing_info.rateRefresh.uiDenominator as u64,
             timing_info.rateRefresh.uiNumerator as u64,
-        ))
+        );
+        anyhow::ensure!(
+            fallback >= VSYNC_INTERVAL_THRESHOLD,
+            "DWM reported unusable refresh interval"
+        );
+        Ok(fallback)
     } else {
         Ok(interval)
     }
@@ -80,13 +86,24 @@ fn get_dwm_interval() -> Result<Duration> {
 
 #[inline]
 fn retrieve_duration(counts: u64, ticks_per_second: u64) -> Duration {
-    let ticks_per_microsecond = ticks_per_second / 1_000_000;
-    Duration::from_micros(counts / ticks_per_microsecond)
+    if counts == 0 || ticks_per_second == 0 {
+        return Duration::ZERO;
+    }
+    let micros = (counts as u128).saturating_mul(1_000_000) / (ticks_per_second as u128);
+    Duration::from_micros(micros.min(u64::MAX as u128) as u64)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retrieve_duration_handles_rdp_zero_and_low_rate_denominators() {
+        assert_eq!(retrieve_duration(0, 10_000_000), Duration::ZERO);
+        assert_eq!(retrieve_duration(1, 0), Duration::ZERO);
+        assert_eq!(retrieve_duration(1, 60), Duration::from_micros(16_666));
+        assert_eq!(retrieve_duration(166_666, 10_000_000), Duration::from_micros(16_666));
+    }
 
     #[test]
     fn successful_compositor_wait_reports_native_callback() {

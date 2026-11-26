@@ -1040,12 +1040,18 @@ impl WindowsWindowInner {
     }
 
     fn handle_display_change_msg(self: &Rc<Self>, handle: HWND) -> Option<isize> {
-        let new_monitor = unsafe { MonitorFromWindow(handle, MONITOR_DEFAULTTONULL) };
+        let mut new_monitor = unsafe { MonitorFromWindow(handle, MONITOR_DEFAULTTONULL) };
         if new_monitor.is_invalid() {
-            log::error!("No monitor detected!");
-            return None;
+            new_monitor = unsafe { MonitorFromWindow(handle, MONITOR_DEFAULTTONEAREST) };
         }
-        let new_display = WindowsDisplay::new(WindowsDisplay::display_id_for_monitor(new_monitor))?;
+        let new_display = (!new_monitor.is_invalid())
+            .then(|| WindowsDisplay::new(WindowsDisplay::display_id_for_monitor(new_monitor)))
+            .flatten()
+            .or_else(WindowsDisplay::primary_monitor);
+        let Some(new_display) = new_display else {
+            log::warn!("No monitor detected during WM_DISPLAYCHANGE");
+            return None;
+        };
         self.set_display(new_display);
         // Defer DPI/size reconciliation just like `set_display` so it never collides
         // with an active GPUI update if `WM_DISPLAYCHANGE` arrived synchronously.
@@ -1456,13 +1462,19 @@ impl WindowsWindowInner {
         }
         let devices = lparam.0 as *const DirectXDevices;
         let devices = unsafe { &*devices };
-        if let Err(err) = self
-            .state
-            .renderer
-            .borrow_mut()
-            .handle_device_lost(&devices)
-        {
-            panic!("Device lost: {err}");
+        let Ok(mut renderer) = self.state.renderer.try_borrow_mut() else {
+            log::warn!("Deferring GPU device-lost recovery because renderer is currently busy");
+            self.state
+                .invalidate_devices
+                .store(true, Ordering::Release);
+            return Some(1);
+        };
+        if let Err(err) = renderer.handle_device_lost(devices) {
+            log::error!("GPU device-lost recovery failed for window, will retry: {err:#}");
+            self.state
+                .invalidate_devices
+                .store(true, Ordering::Release);
+            return Some(1);
         }
         // Make sure the first `draw_window` after recovery (whether it comes
         // from the forced WM_GPUI_FORCE_UPDATE_WINDOW or a stray WM_PAINT in

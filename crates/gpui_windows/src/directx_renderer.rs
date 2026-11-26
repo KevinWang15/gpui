@@ -57,7 +57,11 @@ pub(crate) struct DirectXRenderer {
     backdrop_radius_px: f32,
     backdrop_applied_size: (u32, u32),
 
-    /// Whether we want to skip drwaing due to device lost events.
+    /// Whether DirectComposition is disabled for this window (immutable for the renderer's lifetime
+    /// so device-lost retries never accidentally switch swapchain creation mode).
+    disable_direct_composition: bool,
+
+    /// Whether we want to skip drawing due to device lost events.
     ///
     /// In that case we want to discard the first frame that we draw as we got reset in the middle of a frame
     /// meaning we lost all the allocated gpu textures and scene resources.
@@ -295,6 +299,7 @@ impl DirectXRenderer {
             backdrop_blur_enabled: false,
             backdrop_radius_px: 0.0,
             backdrop_applied_size: (0, 0),
+            disable_direct_composition,
             skip_draws: false,
         })
     }
@@ -337,15 +342,18 @@ impl DirectXRenderer {
     }
 
     fn pre_draw(&self, clear_color: &[f32; 4], depth_scale: f32) -> Result<()> {
-        let resources = self.resources.as_ref().expect("resources missing");
+        let resources = self.resources.as_ref().context("resources missing")?;
         let device_context = &self
             .devices
             .as_ref()
-            .expect("devices missing")
+            .context("devices missing")?
             .device_context;
         update_buffer(
             device_context,
-            self.globals.global_params_buffer.as_ref().unwrap(),
+            self.globals
+                .global_params_buffer
+                .as_ref()
+                .context("global params buffer missing")?,
             &[GlobalParams {
                 gamma_ratios: self.font_info.gamma_ratios,
                 viewport_size: [resources.viewport.Width, resources.viewport.Height],
@@ -400,11 +408,21 @@ impl DirectXRenderer {
         let result = unsafe {
             self.resources
                 .as_ref()
-                .expect("resources missing")
+                .context("resources missing")?
                 .swap_chain
                 .Present(0, DXGI_PRESENT(0))
         };
         result.ok().context("Presenting swap chain failed")
+    }
+
+    pub(crate) fn is_device_lost(&self) -> bool {
+        let Some(devices) = &self.devices else {
+            return true;
+        };
+        if self.resources.is_none() {
+            return true;
+        }
+        unsafe { devices.device.GetDeviceRemovedReason() }.is_err()
     }
 
     pub(crate) fn handle_device_lost(&mut self, directx_devices: &DirectXDevices) -> Result<()> {
@@ -415,7 +433,10 @@ impl DirectXRenderer {
     }
 
     fn handle_device_lost_impl(&mut self, directx_devices: &DirectXDevices) -> Result<()> {
-        let disable_direct_composition = self.direct_composition.is_none();
+        let disable_direct_composition = self.disable_direct_composition;
+        // Disable drawing before tearing down GPU objects so a transient failure (for example
+        // during an RDP display switch) never leaves `draw()` touching missing resources.
+        self.skip_draws = true;
 
         unsafe {
             #[cfg(debug_assertions)]
@@ -442,6 +463,11 @@ impl DirectXRenderer {
             self.devices.take();
         }
 
+        if !unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindow(Some(self.hwnd)) }.as_bool()
+        {
+            return Ok(());
+        }
+
         let devices = DirectXRendererDevices::new(directx_devices, disable_direct_composition)
             .context("Recreating DirectX devices")?;
         let resources = DirectXResources::new(
@@ -460,8 +486,11 @@ impl DirectXRenderer {
         let direct_composition = if disable_direct_composition {
             None
         } else {
-            let composition =
-                DirectComposition::new(devices.dxgi_device.as_ref().unwrap(), self.hwnd)?;
+            let dxgi_device = devices
+                .dxgi_device
+                .as_ref()
+                .context("missing DXGI device for DirectComposition")?;
+            let composition = DirectComposition::new(dxgi_device, self.hwnd)?;
             composition.set_swap_chain(&resources.swap_chain)?;
             Some(composition)
         };
@@ -491,9 +520,8 @@ impl DirectXRenderer {
         scene: &Scene,
         background_appearance: WindowBackgroundAppearance,
     ) -> Result<()> {
-        if self.skip_draws {
-            // skip drawing this frame, we just recovered from a device lost event
-            // and so likely do not have the textures anymore that are required for drawing
+        if self.skip_draws || self.resources.is_none() || self.devices.is_none() {
+            // Skip drawing this frame while awaiting or finishing device-lost recovery.
             return Ok(());
         }
         self.render(scene, background_appearance)?;

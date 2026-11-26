@@ -1421,7 +1421,11 @@ impl PlatformWindow for WindowsWindow {
             f32::from(self.state.backdrop_corner_radius.get()) * self.state.scale_factor.get();
         let mut renderer = self.state.renderer.borrow_mut();
         renderer.sync_backdrop(bg == WindowBackgroundAppearance::Blurred, radius_px);
-        renderer.draw(scene, bg).log_err();
+        if renderer.draw(scene, bg).log_err().is_none() && renderer.is_device_lost() {
+            self.state
+                .invalidate_devices
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
     }
 
     fn capture_transition_snapshot(

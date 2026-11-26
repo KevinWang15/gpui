@@ -255,3 +255,12 @@ impl WinRtComposition {
         let _ = self.backdrop_geom.SetCornerRadius(Vector2 { X: r, Y: r });
     }
 }
+
+impl Drop for WinRtComposition {
+    fn drop(&mut self) {
+        // Explicitly close the WinRT DesktopWindowTarget and Compositor so Windows releases
+        // the HWND composition target immediately before device-lost recovery recreates it.
+        let _ = self._target.Close();
+        let _ = self.compositor.Close();
+    }
+}

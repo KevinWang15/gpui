@@ -269,6 +269,15 @@ fn get_scale_factor_for_monitor(monitor: HMONITOR) -> Result<f32> {
     let mut dpi_x = 0;
     let mut dpi_y = 0;
     unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) }?;
-    assert_eq!(dpi_x, dpi_y);
-    Ok(dpi_x as f32 / USER_DEFAULT_SCREEN_DPI as f32)
+    if dpi_x != dpi_y {
+        log::warn!("Monitor reported asymmetric DPI ({dpi_x}x{dpi_y}); using horizontal DPI");
+    }
+    let effective_dpi = if dpi_x > 0 {
+        dpi_x
+    } else if dpi_y > 0 {
+        dpi_y
+    } else {
+        USER_DEFAULT_SCREEN_DPI
+    };
+    Ok(effective_dpi as f32 / USER_DEFAULT_SCREEN_DPI as f32)
 }
