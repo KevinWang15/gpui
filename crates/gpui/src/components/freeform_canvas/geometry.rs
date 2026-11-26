@@ -1492,12 +1492,89 @@ pub fn cycle_overlapping_selection(
     Some(first.clone())
 }
 
+/// Outer rail centerline distance (px) from the canvas right/bottom edge shared by all three
+/// canvas-frame resize grips (East, South, SouthEast).
+pub(super) const CANVAS_HANDLE_RAIL_OFFSET: f32 = 6.0;
+/// Visual stroke / pill thickness (px) shared by all three canvas-frame resize grips.
+pub(super) const CANVAS_HANDLE_THICKNESS: f32 = 3.0;
+/// Width/height (px) of the East/South hit strip centered on `CANVAS_HANDLE_RAIL_OFFSET`.
+const CANVAS_HANDLE_STRIP_THICKNESS: f32 = 10.0;
+/// Size (px) of the square SouthEast corner hit box.
+const CANVAS_SE_HIT_SIZE: f32 = 14.0;
+/// How far inside `(cw, ch)` the SouthEast hit box starts so the rounded corner arc hugs the pane.
+const CANVAS_SE_HIT_INSET: f32 = 3.0;
+
+/// Resolved hit-test and visual pill dimensions for the three outer canvas-frame resize grips.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct CanvasResizeHandlesLayout {
+    pub east_hit: CanvasRect,
+    pub east_grip_len: f32,
+    pub south_hit: CanvasRect,
+    pub south_grip_len: f32,
+    pub se_hit: CanvasRect,
+}
+
+/// Computes colinear, proportional hit and visual rects for the East, South, and SouthEast
+/// canvas-frame resize handles so all three share one offset rail and never crowd compact panes.
+pub(super) fn canvas_resize_handles_layout(canvas: CanvasSize) -> CanvasResizeHandlesLayout {
+    let (cw, ch) = (canvas.width, canvas.height);
+    let strip_left = cw + CANVAS_HANDLE_RAIL_OFFSET - CANVAS_HANDLE_STRIP_THICKNESS * 0.5;
+    let strip_top = ch + CANVAS_HANDLE_RAIL_OFFSET - CANVAS_HANDLE_STRIP_THICKNESS * 0.5;
+
+    let east_grip_len = (ch * 0.42).clamp(12.0, 24.0).round();
+    let east_hit_h = (east_grip_len + 10.0).min((ch - 4.0).max(16.0));
+    let east_hit = CanvasRect::new(
+        strip_left,
+        ((ch - east_hit_h) * 0.5).max(0.0),
+        CANVAS_HANDLE_STRIP_THICKNESS,
+        east_hit_h,
+    );
+
+    let south_grip_len = (cw * 0.42).clamp(12.0, 24.0).round();
+    let south_hit_w = (south_grip_len + 10.0).min((cw - 4.0).max(16.0));
+    let south_hit = CanvasRect::new(
+        ((cw - south_hit_w) * 0.5).max(0.0),
+        strip_top,
+        south_hit_w,
+        CANVAS_HANDLE_STRIP_THICKNESS,
+    );
+
+    let se_hit = CanvasRect::new(
+        cw - CANVAS_SE_HIT_INSET,
+        ch - CANVAS_SE_HIT_INSET,
+        CANVAS_SE_HIT_SIZE,
+        CANVAS_SE_HIT_SIZE,
+    );
+
+    CanvasResizeHandlesLayout {
+        east_hit,
+        east_grip_len,
+        south_hit,
+        south_grip_len,
+        se_hit,
+    }
+}
+
+/// Returns which outer canvas-frame resize grip contains canvas-local `(x, y)`, if any.
+pub(super) fn canvas_resize_handle_at(
+    x: f32,
+    y: f32,
+    canvas: CanvasSize,
+) -> Option<CanvasResizeHandle> {
+    let layout = canvas_resize_handles_layout(canvas);
+    if layout.se_hit.contains_point(x, y) {
+        Some(CanvasResizeHandle::SouthEast)
+    } else if layout.east_hit.contains_point(x, y) {
+        Some(CanvasResizeHandle::East)
+    } else if layout.south_hit.contains_point(x, y) {
+        Some(CanvasResizeHandle::South)
+    } else {
+        None
+    }
+}
+
 /// Returns `true` if canvas-local `(x, y)` falls inside one of the three outer canvas-frame
 /// resize grips (East, South, SouthEast).
 pub(super) fn is_over_canvas_resize_handle(x: f32, y: f32, canvas: CanvasSize) -> bool {
-    let (cw, ch) = (canvas.width, canvas.height);
-    let east = CanvasRect::new(cw + 4.0, (ch * 0.5 - 16.0).max(0.0), 10.0, 32.0_f32.min(ch));
-    let south = CanvasRect::new((cw * 0.5 - 16.0).max(0.0), ch + 4.0, 32.0_f32.min(cw), 10.0);
-    let se = CanvasRect::new(cw + 3.0, ch + 3.0, 12.0, 12.0);
-    east.contains_point(x, y) || south.contains_point(x, y) || se.contains_point(x, y)
+    canvas_resize_handle_at(x, y, canvas).is_some()
 }

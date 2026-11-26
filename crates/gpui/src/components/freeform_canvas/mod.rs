@@ -49,10 +49,12 @@ use crate::{
 
 use self::context_menu::{DefaultContextMenuParams, build_default_context_menu_entries};
 use self::geometry::{
-    CanvasResizeHandle, RESIZE_HANDLES_PAINT_ORDER, is_over_canvas_resize_handle,
+    CANVAS_HANDLE_THICKNESS, CanvasResizeHandle, RESIZE_HANDLES_PAINT_ORDER,
+    canvas_resize_handle_at, canvas_resize_handles_layout, is_over_canvas_resize_handle,
 };
 use self::paint::{
-    build_guide_badges, paint_dashed_rect, paint_dot_grid, paint_marquee_rect, paint_snap_guides,
+    build_guide_badges, paint_dashed_rect, paint_dot_grid, paint_marquee_rect,
+    paint_se_resize_grip, paint_snap_guides,
 };
 use super::context_menu::popup_menu;
 use super::popover::MenuEntry;
@@ -307,6 +309,7 @@ pub struct FreeformCanvasState {
     pending_narrow_click: Option<SharedString>,
     pending_cycle_click: Option<Vec<SharedString>>,
     hovered_target: Option<CanvasHitTarget>,
+    hovered_canvas_handle: Option<CanvasResizeHandle>,
     pointer_inside_root: bool,
     snap: SnapConfig,
     show_grid: bool,
@@ -337,6 +340,7 @@ impl FreeformCanvasState {
             pending_narrow_click: None,
             pending_cycle_click: None,
             hovered_target: None,
+            hovered_canvas_handle: None,
             pointer_inside_root: false,
             snap: SnapConfig::default(),
             show_grid: true,
@@ -526,6 +530,7 @@ impl FreeformCanvasState {
     pub fn open_context_menu(&mut self, target: CanvasContextMenuTarget, cx: &mut Context<Self>) {
         self.pending_cycle_click = None;
         self.hovered_target = None;
+        self.hovered_canvas_handle = None;
         self.context_menu = Some(target);
         cx.notify();
     }
@@ -548,6 +553,7 @@ impl FreeformCanvasState {
         self.pending_narrow_click = None;
         self.pending_cycle_click = None;
         self.hovered_target = None;
+        self.hovered_canvas_handle = None;
         let base_selection = if additive {
             self.selected.clone()
         } else {
@@ -1417,6 +1423,7 @@ impl RenderOnce for FreeformCanvas {
             focus_handle,
             selected,
             hovered_target,
+            hovered_canvas_handle,
             pointer_inside_root,
             snap_cfg,
             show_grid,
@@ -1434,6 +1441,7 @@ impl RenderOnce for FreeformCanvas {
                 s.focus_handle.clone(),
                 s.selected.clone(),
                 s.hovered_target.clone(),
+                s.hovered_canvas_handle,
                 s.pointer_inside_root,
                 s.snap,
                 s.show_grid,
@@ -2097,6 +2105,13 @@ impl RenderOnce for FreeformCanvas {
         let marquee_focus = focus_handle.clone();
         let marquee_items = all_rects.clone();
         let guides_for_paint = active_guides;
+        let resolved_canvas_border = if active_canvas_resize.is_some() {
+            theme.primary
+        } else if show_focus_border && is_focused {
+            theme.primary.opacity(0.6)
+        } else {
+            canvas_border
+        };
         let inner_canvas = div()
             .id((self.id.clone(), "canvas-surface"))
             .relative()
@@ -2107,14 +2122,6 @@ impl RenderOnce for FreeformCanvas {
                 el.backdrop_blur(self.canvas_backdrop_blur)
             })
             .bg(canvas_bg)
-            .border_1()
-            .border_color(if active_canvas_resize.is_some() {
-                theme.primary
-            } else if show_focus_border && is_focused {
-                theme.primary.opacity(0.6)
-            } else {
-                canvas_border
-            })
             .when(theme.elevation_shadows, |el| el.shadow_lg())
             // Measure inner canvas bounds + paint dot grid
             .child(
@@ -2132,6 +2139,16 @@ impl RenderOnce for FreeformCanvas {
                 .inset_0(),
             )
             .children(placed_elements)
+            // Non-layout hairline border painted on top of content so absolute children at (x, y)
+            // align 1:1 with the outer canvas bounds instead of shifting +1px inside CSS border-box.
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .rounded(self.canvas_radius)
+                    .border_1()
+                    .border_color(resolved_canvas_border),
+            )
             .when_some(hover_overlay, |el, ov| el.child(ov))
             .children(selection_overlays)
             .children(resize_handle_overlays)
@@ -2172,7 +2189,12 @@ impl RenderOnce for FreeformCanvas {
             )
             .children(guide_badges);
 
-        // Canvas-frame resize handles placed just outside the canvas right, bottom, and corner edges
+        // Canvas-frame resize handles placed on one colinear rail just outside the canvas edges
+        let effective_hovered_handle = if pointer_inside_root && !is_interacting && context_menu_target.is_none() {
+            hovered_canvas_handle
+        } else {
+            None
+        };
         let canvas_handles: Vec<AnyElement> = if editable {
             build_canvas_resize_handles(
                 &self.id,
@@ -2182,7 +2204,9 @@ impl RenderOnce for FreeformCanvas {
                 self.min_canvas_size,
                 self.max_canvas_size,
                 active_canvas_resize.as_ref().map(|r| r.handle),
-                theme.muted_foreground.opacity(0.45),
+                effective_hovered_handle,
+                theme.muted_foreground.opacity(0.42),
+                theme.foreground.opacity(0.78),
                 theme.primary,
             )
             .into_iter()
@@ -2269,29 +2293,40 @@ impl RenderOnce for FreeformCanvas {
                 window.refresh();
             });
 
+        // Symmetric 12px outer frame margin keeps the canvas dead-center in the preview stage
+        // while keeping the outer resize handles cleanly inside the wrapper bounds.
+        let handle_margin = 12.0_f32;
         let frame_wrapper = div()
             .relative()
-            .w(px(cw + 18.))
-            .h(px(ch + 18.))
-            .child(inner_canvas)
-            .children(canvas_handles)
-            .when_some(hud_label, |el, label| {
-                el.child(
-                    div()
-                        .absolute()
-                        .top(px(-26.))
-                        .right(px(18.))
-                        .px(px(7.))
-                        .py(px(2.))
-                        .rounded(theme.radius_sm)
-                        .bg(theme.primary)
-                        .text_color(theme.primary_foreground)
-                        .text_size(px(11.))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .font_features(tabular_numerals())
-                        .child(label),
-                )
-            });
+            .w(px(cw + handle_margin * 2.0))
+            .h(px(ch + handle_margin * 2.0))
+            .child(
+                div()
+                    .relative()
+                    .left(px(handle_margin))
+                    .top(px(handle_margin))
+                    .w(px(cw))
+                    .h(px(ch))
+                    .child(inner_canvas)
+                    .children(canvas_handles)
+                    .when_some(hud_label, |el, label| {
+                        el.child(
+                            div()
+                                .absolute()
+                                .top(px(-26.))
+                                .right(px(0.))
+                                .px(px(7.))
+                                .py(px(2.))
+                                .rounded(theme.radius_sm)
+                                .bg(theme.primary)
+                                .text_color(theme.primary_foreground)
+                                .text_size(px(11.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .font_features(tabular_numerals())
+                                .child(label),
+                        )
+                    }),
+            );
 
         let mut root = div()
             .id(self.id)
@@ -2528,41 +2563,61 @@ impl RenderOnce for FreeformCanvas {
                                 return;
                             }
                             let inside = root_hitbox.is_hovered(window);
-                            let (prev_inside, prev_target, suppress, selected_snapshot) = {
+                            let (
+                                prev_inside,
+                                prev_target,
+                                prev_canvas_handle,
+                                suppress,
+                                selected_snapshot,
+                            ) = {
                                 let s = st_hover.read(cx);
                                 (
                                     s.pointer_inside_root,
                                     s.hovered_target.clone(),
+                                    s.hovered_canvas_handle,
                                     s.is_interacting() || s.is_context_menu_open(),
                                     s.selected.clone(),
                                 )
                             };
-                            let next = if inside && !suppress {
-                                hb_bounds.get().and_then(|cb| {
-                                    let rx = (ev.position.x - cb.origin.x).0;
-                                    let ry = (ev.position.y - cb.origin.y).0;
-                                    if editable
-                                        && is_over_canvas_resize_handle(rx, ry, canvas_size)
-                                    {
-                                        None
-                                    } else {
-                                        hit_test_canvas(
-                                            (rx, ry),
-                                            &h_rects,
-                                            &selected_snapshot,
-                                            &h_locked,
-                                            editable,
-                                        )
-                                    }
-                                })
+                            let (next, next_canvas_handle) = if inside && !suppress {
+                                hb_bounds
+                                    .get()
+                                    .map(|cb| {
+                                        let rx = (ev.position.x - cb.origin.x).0;
+                                        let ry = (ev.position.y - cb.origin.y).0;
+                                        if editable
+                                            && let Some(ch_hit) =
+                                                canvas_resize_handle_at(rx, ry, canvas_size)
+                                        {
+                                            (None, Some(ch_hit))
+                                        } else {
+                                            (
+                                                hit_test_canvas(
+                                                    (rx, ry),
+                                                    &h_rects,
+                                                    &selected_snapshot,
+                                                    &h_locked,
+                                                    editable,
+                                                ),
+                                                None,
+                                            )
+                                        }
+                                    })
+                                    .unwrap_or((None, None))
                             } else {
-                                None
+                                (None, None)
                             };
-                            if prev_inside != inside || prev_target != next {
+                            if prev_inside != inside
+                                || prev_target != next
+                                || prev_canvas_handle != next_canvas_handle
+                            {
                                 st_hover.update(cx, |s, cx| {
                                     s.pointer_inside_root = inside;
-                                    if s.hovered_target != next {
+                                    let changed = s.hovered_target != next
+                                        || s.hovered_canvas_handle != next_canvas_handle;
+                                    if changed {
                                         s.hovered_target = next;
+                                        s.hovered_canvas_handle = next_canvas_handle;
                                         cx.notify();
                                     }
                                 });
@@ -2572,12 +2627,16 @@ impl RenderOnce for FreeformCanvas {
                             if phase == DispatchPhase::Capture {
                                 let needs_clear = {
                                     let s = st_exit.read(cx);
-                                    s.pointer_inside_root || s.hovered_target.is_some()
+                                    s.pointer_inside_root
+                                        || s.hovered_target.is_some()
+                                        || s.hovered_canvas_handle.is_some()
                                 };
                                 if needs_clear {
                                     st_exit.update(cx, |s, cx| {
                                         s.pointer_inside_root = false;
-                                        if s.hovered_target.take().is_some() {
+                                        let had = s.hovered_target.take().is_some()
+                                            | s.hovered_canvas_handle.take().is_some();
+                                        if had {
                                             cx.notify();
                                         }
                                     });
@@ -2662,33 +2721,34 @@ fn build_canvas_resize_handles(
     min_c: CanvasSize,
     max_c: CanvasSize,
     active_handle: Option<CanvasResizeHandle>,
+    hovered_handle: Option<CanvasResizeHandle>,
     grip_idle: Hsla,
+    grip_hover: Hsla,
     grip_active: Hsla,
 ) -> [AnyElement; 3] {
-    let (cw, ch) = (canvas_size.width, canvas_size.height);
+    let layout = canvas_resize_handles_layout(canvas_size);
     let color_for = |h: CanvasResizeHandle| {
         if active_handle == Some(h) {
             grip_active
+        } else if hovered_handle == Some(h) {
+            grip_hover
         } else {
             grip_idle
         }
     };
     let make_handle = |suffix: &'static str,
                        handle: CanvasResizeHandle,
-                       left: f32,
-                       top: f32,
-                       w: f32,
-                       h: f32,
-                       grip: crate::Div| {
+                       hit: CanvasRect,
+                       child: AnyElement| {
         let st = state.clone();
         let fh = focus_handle.clone();
         div()
             .id((id.clone(), suffix))
             .absolute()
-            .left(px(left))
-            .top(px(top))
-            .w(px(w))
-            .h(px(h))
+            .left(px(hit.x))
+            .top(px(hit.y))
+            .w(px(hit.width))
+            .h(px(hit.height))
             .flex()
             .items_center()
             .justify_center()
@@ -2700,51 +2760,43 @@ fn build_canvas_resize_handles(
                 });
                 cx.stop_propagation();
             })
-            .child(grip)
+            .child(child)
             .into_any_element()
     };
 
+    let se_color = color_for(CanvasResizeHandle::SouthEast);
     [
         make_handle(
             "canvas-resize-e",
             CanvasResizeHandle::East,
-            cw + 4.0,
-            (ch * 0.5 - 16.0).max(0.0),
-            10.0,
-            32.0_f32.min(ch),
+            layout.east_hit,
             div()
-                .w(px(3.5))
-                .h(px(22.0_f32.min((ch - 8.0).max(8.0))))
+                .w(px(CANVAS_HANDLE_THICKNESS))
+                .h(px(layout.east_grip_len))
                 .rounded_full()
-                .bg(color_for(CanvasResizeHandle::East)),
+                .bg(color_for(CanvasResizeHandle::East))
+                .into_any_element(),
         ),
         make_handle(
             "canvas-resize-s",
             CanvasResizeHandle::South,
-            (cw * 0.5 - 16.0).max(0.0),
-            ch + 4.0,
-            32.0_f32.min(cw),
-            10.0,
+            layout.south_hit,
             div()
-                .w(px(22.0_f32.min((cw - 8.0).max(8.0))))
-                .h(px(3.5))
+                .w(px(layout.south_grip_len))
+                .h(px(CANVAS_HANDLE_THICKNESS))
                 .rounded_full()
-                .bg(color_for(CanvasResizeHandle::South)),
+                .bg(color_for(CanvasResizeHandle::South))
+                .into_any_element(),
         ),
         make_handle(
             "canvas-resize-se",
             CanvasResizeHandle::SouthEast,
-            cw + 3.0,
-            ch + 3.0,
-            12.0,
-            12.0,
-            div()
-                .w(px(8.))
-                .h(px(8.))
-                .rounded_br(px(3.))
-                .border_r_2()
-                .border_b_2()
-                .border_color(color_for(CanvasResizeHandle::SouthEast)),
+            layout.se_hit,
+            canvas(|_, _, _| (), move |bounds, (), window, _| {
+                paint_se_resize_grip(bounds, se_color, window);
+            })
+            .size_full()
+            .into_any_element(),
         ),
     ]
 }

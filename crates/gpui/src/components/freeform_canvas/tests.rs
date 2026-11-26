@@ -1974,3 +1974,40 @@ fn nested_interactive_preview_child_cannot_steal_canvas_item_click(
         "preview element's internal mouse_down listener must not hijack canvas item selection"
     );
 }
+
+#[test]
+fn canvas_resize_handles_share_colinear_rail_and_scale_for_compact_canvases() {
+    for (cw, ch) in [(88.0, 32.0), (100.0, 34.0), (200.0, 38.0), (244.0, 116.0)] {
+        let size = CanvasSize::new(cw, ch);
+        let layout = canvas_resize_handles_layout(size);
+        let east_rail_x = layout.east_hit.x + layout.east_hit.width * 0.5;
+        let south_rail_y = layout.south_hit.y + layout.south_hit.height * 0.5;
+        let se_rail_x = layout.se_hit.x + 9.0;
+        let se_rail_y = layout.se_hit.y + 9.0;
+
+        assert_eq!(east_rail_x, cw + geometry::CANVAS_HANDLE_RAIL_OFFSET);
+        assert_eq!(south_rail_y, ch + geometry::CANVAS_HANDLE_RAIL_OFFSET);
+        assert_eq!(se_rail_x, east_rail_x, "SE vertical arm must align with East grip");
+        assert_eq!(se_rail_y, south_rail_y, "SE horizontal arm must align with South grip");
+
+        // East grip stays proportional on compact panes and keeps clear separation above SE tip.
+        let east_bottom = ch * 0.5 + layout.east_grip_len * 0.5;
+        let se_top = layout.se_hit.y + 1.5 - CANVAS_HANDLE_THICKNESS * 0.5;
+        assert!(
+            east_bottom + 4.0 <= se_top,
+            "East grip ({east_bottom}) must not crowd SE corner ({se_top}) on {cw}x{ch}"
+        );
+        assert_eq!(
+            canvas_resize_handle_at(east_rail_x, ch * 0.5, size),
+            Some(CanvasResizeHandle::East)
+        );
+        assert_eq!(
+            canvas_resize_handle_at(cw * 0.5, south_rail_y, size),
+            Some(CanvasResizeHandle::South)
+        );
+        assert_eq!(
+            canvas_resize_handle_at(se_rail_x, se_rail_y, size),
+            Some(CanvasResizeHandle::SouthEast)
+        );
+    }
+}

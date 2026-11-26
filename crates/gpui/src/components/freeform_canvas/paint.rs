@@ -1,11 +1,14 @@
 //! Low-level GPUI quad & badge painting helpers for [`super::FreeformCanvas`].
 
 use crate::{
-    AnyElement, Bounds, FontWeight, Hsla, IntoElement, ParentElement, Pixels, Point, Styled,
-    Window, div, fill, point, px, size,
+    AnyElement, Bounds, FontWeight, Hsla, IntoElement, LineCap, LineJoin, ParentElement,
+    PathBuilder, PathStyle, Pixels, Point, StrokeOptions, Styled, Window, div, fill, point, px,
+    size,
 };
 
-use super::geometry::{CanvasRect, GuideAxis, GuideKind, SnapGuide};
+use super::geometry::{
+    CANVAS_HANDLE_THICKNESS, CanvasRect, GuideAxis, GuideKind, SnapGuide,
+};
 use crate::components::theme::tabular_numerals;
 
 const MAX_DOT_GRID_QUADS: f32 = 12_000.0;
@@ -237,4 +240,32 @@ pub(super) fn build_guide_badges(
             )
         })
         .collect()
+}
+
+/// Paints a rounded-cap 90° SouthEast corner resize grip whose vertical and horizontal arms
+/// sit colinearly on the shared East/South rail (`cw + 6.0`, `ch + 6.0` inside the 14×14 hit box).
+pub(super) fn paint_se_resize_grip(bounds: Bounds<Pixels>, color: Hsla, window: &mut Window) {
+    let ox = bounds.origin.x.0;
+    let oy = bounds.origin.y.0;
+    // The 14x14 hit box starts at (cw - 3, ch - 3), so the shared rail centerline (cw + 6, ch + 6)
+    // sits at local (9.0, 9.0). Curve cleanly around the corner with a 5.5px bend radius and
+    // rounded caps matching the East/South pill handles.
+    let rail = 9.0_f32;
+    let tip = 1.5_f32;
+    let bend = 3.5_f32;
+    let mut pb = PathBuilder::stroke(px(CANVAS_HANDLE_THICKNESS)).with_style(PathStyle::Stroke(
+        StrokeOptions {
+            line_width: CANVAS_HANDLE_THICKNESS,
+            line_cap: LineCap::Round,
+            line_join: LineJoin::Round,
+            ..Default::default()
+        },
+    ));
+    pb.move_to(point(px(ox + rail), px(oy + tip)));
+    pb.line_to(point(px(ox + rail), px(oy + bend)));
+    pb.curve_to(point(px(ox + bend), px(oy + rail)), point(px(ox + rail), px(oy + rail)));
+    pb.line_to(point(px(ox + tip), px(oy + rail)));
+    if let Ok(path) = pb.build() {
+        window.paint_path(path, color);
+    }
 }
