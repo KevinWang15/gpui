@@ -20,9 +20,9 @@ use serde_json::Value;
 
 use crate::icons::{Icon, IconSize, LucideIcon};
 use crate::{
-    AnyElement, App, ClipboardEntry, ClipboardItem, Context, CursorStyle, ElementId, Entity,
-    EventEmitter, ExternalPaths, FileFilter, FocusHandle, Focusable as _, FontWeight, Image,
-    ImageFormat, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ObjectFit,
+    AnyElement, App, ClickEvent, ClipboardEntry, ClipboardItem, Context, CursorStyle, ElementId,
+    Entity, EventEmitter, ExternalPaths, FileFilter, FocusHandle, Focusable as _, FontWeight,
+    Image, ImageFormat, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ObjectFit,
     OpenPromptOptions, Pixels, Render, RenderOnce, ScrollEvent, ScrollHandle, ScrollbarVisibility,
     SharedString, StyleRefinement, Styled, Subscription, Task, Window, anchored, deferred, div,
     img, point, prelude::*, px, size,
@@ -50,7 +50,7 @@ use super::workspace::{
     conversation_preview, prepare_image_bytes, relative_conversation_time, select_branch_sibling,
 };
 
-use crate::components::alert::{AlertVariant, alert};
+use crate::components::alert::{Alert, AlertVariant, alert};
 use crate::components::badge::{BadgeColor, badge};
 use crate::components::button::{Button, ButtonVariant, button};
 use crate::components::floating_window::{
@@ -184,6 +184,53 @@ fn is_supported_image_path(path: &Path) -> bool {
                 "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp"
             )
         })
+}
+
+/// Splits a verbose assistant error into a concise summary title and an optional detail body
+/// (supporting either multi-line errors or `"Summary. (detailed error payload)"`).
+pub(crate) fn split_alert_message(raw: &str) -> (SharedString, Option<SharedString>) {
+    let trimmed = raw.trim();
+    if let Some((head, tail)) = trimmed.split_once('\n') {
+        let head = head.trim();
+        let tail = tail.trim();
+        if !head.is_empty() && !tail.is_empty() {
+            return (SharedString::from(head.to_owned()), Some(SharedString::from(tail.to_owned())));
+        }
+    }
+    if let Some(without_close) = trimmed.strip_suffix(')')
+        && let Some((head, detail)) = without_close.split_once(" (")
+    {
+        let head = head.trim();
+        let detail = detail.trim();
+        if !head.is_empty() && !detail.is_empty() {
+            return (
+                SharedString::from(head.to_owned()),
+                Some(SharedString::from(detail.to_owned())),
+            );
+        }
+    }
+    (SharedString::from(trimmed.to_owned()), None)
+}
+
+fn compact_dismissible_alert(
+    raw: &str,
+    variant: AlertVariant,
+    scroll_id: impl Into<ElementId>,
+    max_height: Pixels,
+    dismiss_id: impl Into<ElementId>,
+    on_dismiss: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> Alert {
+    let (title, desc) = split_alert_message(raw);
+    let mut a = alert(title)
+        .variant(variant)
+        .compact(true)
+        .max_body_height(scroll_id, max_height)
+        .scrollbar_visibility(ScrollbarVisibility::Auto)
+        .on_dismiss(dismiss_id, on_dismiss);
+    if let Some(desc) = desc {
+        a = a.description(desc);
+    }
+    a
 }
 
 /// Entity state backing [`AskAi`] and [`AskAiOverlay`] (both **Ask AI** and **Build with AI**).
@@ -1370,6 +1417,19 @@ impl AskAiState {
         self.error.as_ref()
     }
 
+    /// Dismisses the active composer/assistant error banner, if any.
+    pub fn dismiss_error(&mut self, cx: &mut Context<Self>) {
+        if self.error.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_error_for_test(&mut self, msg: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.error = Some(msg.into());
+        cx.notify();
+    }
+
     #[cfg(test)]
     pub(crate) fn composer_text(&self, cx: &App) -> String {
         self.composer_input.read(cx).value().to_owned()
@@ -2516,10 +2576,30 @@ impl AskAiState {
                 )
                 .child(fields_col)
                 .when_some(self.setup_error.clone(), |el, err| {
-                    el.child(alert(err).variant(AlertVariant::Destructive))
+                    el.child(compact_dismissible_alert(
+                        err.as_ref(),
+                        AlertVariant::Destructive,
+                        ("ask-setup-err-scroll", eid),
+                        px(108.),
+                        ("ask-setup-err-dismiss", eid),
+                        cx.listener(|this, _, _, cx| {
+                            this.setup_error = None;
+                            cx.notify();
+                        }),
+                    ))
                 })
                 .when_some(self.setup_status.clone(), |el, msg| {
-                    el.child(alert(msg).variant(AlertVariant::Info))
+                    el.child(compact_dismissible_alert(
+                        msg.as_ref(),
+                        AlertVariant::Info,
+                        ("ask-setup-status-scroll", eid),
+                        px(96.),
+                        ("ask-setup-status-dismiss", eid),
+                        cx.listener(|this, _, _, cx| {
+                            this.setup_status = None;
+                            cx.notify();
+                        }),
+                    ))
                 })
                 .child(
                     h_stack()
@@ -3724,10 +3804,14 @@ impl AskAiState {
             .bg(theme.surface)
             .when_some(self.error.clone(), |el, err| {
                 el.child(
-                    div()
-                        .px(px(12.))
-                        .pt(px(8.))
-                        .child(alert(err).variant(AlertVariant::Destructive)),
+                    div().px(px(12.)).pt(px(8.)).child(compact_dismissible_alert(
+                        err.as_ref(),
+                        AlertVariant::Destructive,
+                        ("ask-err-scroll", eid),
+                        px(96.),
+                        ("ask-err-dismiss", eid),
+                        cx.listener(|this, _, _, cx| this.dismiss_error(cx)),
+                    )),
                 )
             })
             .when_some(pending_strip, |el, strip| el.child(div().pt(px(8.)).child(strip)))

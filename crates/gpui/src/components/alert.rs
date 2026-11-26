@@ -4,8 +4,8 @@
 use smallvec::SmallVec;
 
 use crate::{
-    AnyElement, App, ClickEvent, ElementId, FontWeight, Hsla, IntoElement, RenderOnce,
-    SharedString, StyleRefinement, Styled, Window, div, prelude::*, px,
+    AnyElement, App, ClickEvent, ElementId, FontWeight, Hsla, IntoElement, Pixels, RenderOnce,
+    ScrollbarVisibility, SharedString, StyleRefinement, Styled, Window, div, prelude::*, px,
 };
 use crate::icons::{Icon, IconSize, LucideIcon};
 
@@ -32,6 +32,9 @@ pub struct Alert {
     title: SharedString,
     description: Option<SharedString>,
     icon: Option<LucideIcon>,
+    compact: bool,
+    max_body_height: Option<(ElementId, Pixels)>,
+    scrollbar_visibility: ScrollbarVisibility,
     actions: SmallVec<[AnyElement; 2]>,
     dismiss_id: Option<ElementId>,
     on_dismiss: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
@@ -51,6 +54,9 @@ impl Alert {
             title: title.into(),
             description: None,
             icon: None,
+            compact: false,
+            max_body_height: None,
+            scrollbar_visibility: ScrollbarVisibility::Auto,
             actions: SmallVec::new(),
             dismiss_id: None,
             on_dismiss: None,
@@ -93,6 +99,26 @@ impl Alert {
     /// Overrides the default variant icon.
     pub fn icon(mut self, icon: LucideIcon) -> Self {
         self.icon = Some(icon);
+        self
+    }
+
+    /// Uses denser padding and smaller typography suited for overlays, sidebars, and composers.
+    pub fn compact(mut self, compact: bool) -> Self {
+        self.compact = compact;
+        self
+    }
+
+    /// Caps the alert text area at `max_height` and enables vertical scrolling when content
+    /// overflows, keeping the icon and dismiss button pinned in place.
+    pub fn max_body_height(mut self, id: impl Into<ElementId>, max_height: Pixels) -> Self {
+        self.max_body_height = Some((id.into(), max_height));
+        self
+    }
+
+    /// Controls scrollbar visibility when [`Self::max_body_height`] overflows
+    /// (defaults to [`ScrollbarVisibility::Auto`]).
+    pub fn scrollbar_visibility(mut self, visibility: ScrollbarVisibility) -> Self {
+        self.scrollbar_visibility = visibility;
         self
     }
 
@@ -155,45 +181,96 @@ impl RenderOnce for Alert {
         let (bg, fg, accent, default_icon) = self.tokens(&theme);
         let icon = self.icon.unwrap_or(default_icon);
 
+        let (pad_x, pad_y, gap, body_gap, radius, icon_size, title_size, desc_size) =
+            if self.compact {
+                (
+                    px(10.),
+                    px(8.),
+                    px(8.),
+                    px(3.),
+                    theme.radius_md,
+                    IconSize::Sm,
+                    px(12.),
+                    px(11.5),
+                )
+            } else {
+                (
+                    px(14.),
+                    px(14.),
+                    px(12.),
+                    px(4.),
+                    theme.radius_lg,
+                    IconSize::Lg,
+                    px(14.),
+                    px(13.),
+                )
+            };
+
+        let title_el = div()
+            .text_size(title_size)
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(fg)
+            .child(self.title);
+        let desc_el = self.description.map(|desc| {
+            div()
+                .text_size(desc_size)
+                .text_color(fg.opacity(0.88))
+                .child(desc)
+        });
+
+        let text_content = if let Some((scroll_id, max_h)) = self.max_body_height {
+            div()
+                .id(scroll_id)
+                .flex()
+                .flex_col()
+                .gap(body_gap)
+                .w_full()
+                .min_w_0()
+                .max_h(max_h)
+                .overflow_y_scroll()
+                .scrollbar_visibility(self.scrollbar_visibility)
+                .pr(px(8.))
+                .child(title_el)
+                .when_some(desc_el, |el, d| el.child(d))
+                .into_any_element()
+        } else {
+            div()
+                .flex()
+                .flex_col()
+                .gap(body_gap)
+                .w_full()
+                .min_w_0()
+                .child(title_el)
+                .when_some(desc_el, |el, d| el.child(d))
+                .into_any_element()
+        };
+
         let mut root = div()
             .flex()
             .flex_row()
             .flex_shrink_0()
             .items_start()
-            .gap(px(12.))
+            .gap(gap)
             .w_full()
-            .p(px(14.))
-            .rounded(theme.radius_lg)
+            .px(pad_x)
+            .py(pad_y)
+            .rounded(radius)
             .bg(bg)
             .border_1()
             .border_color(accent.opacity(0.28))
             .child(
                 div()
+                    .flex_none()
                     .pt(px(1.))
-                    .child(Icon::new(icon).size(IconSize::Lg).color(accent)),
+                    .child(Icon::new(icon).size(icon_size).color(accent)),
             )
             .child(
                 div()
                     .flex()
                     .flex_col()
-                    .gap(px(4.))
                     .flex_1()
                     .min_w_0()
-                    .child(
-                        div()
-                            .text_size(px(14.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(fg)
-                            .child(self.title),
-                    )
-                    .when_some(self.description, |el, desc| {
-                        el.child(
-                            div()
-                                .text_size(px(13.))
-                                .text_color(fg.opacity(0.88))
-                                .child(desc),
-                        )
-                    })
+                    .child(text_content)
                     .when(!self.actions.is_empty(), |el| {
                         el.child(
                             div()
@@ -209,17 +286,24 @@ impl RenderOnce for Alert {
 
         if let (Some(dismiss_id), Some(on_dismiss)) = (self.dismiss_id, self.on_dismiss) {
             let dismiss = div().id(dismiss_id);
+            let btn_pad = if self.compact { px(2.) } else { px(4.) };
+            let x_size = if self.compact {
+                IconSize::Xs
+            } else {
+                IconSize::Sm
+            };
             root = root.child(
                 super::focus::tab_stop(dismiss, true, &theme)
+                    .flex_none()
                     .flex()
                     .items_center()
                     .justify_center()
-                    .p(px(4.))
+                    .p(btn_pad)
                     .rounded(theme.radius_sm)
                     .cursor_pointer()
                     .hover(|s| s.bg(accent.opacity(0.14)))
                     .on_click(move |ev, window, cx| on_dismiss(ev, window, cx))
-                    .child(Icon::new(LucideIcon::X).size(IconSize::Sm).color(fg)),
+                    .child(Icon::new(LucideIcon::X).size(x_size).color(fg)),
             );
         }
 

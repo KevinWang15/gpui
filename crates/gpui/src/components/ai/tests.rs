@@ -2881,3 +2881,62 @@ fn ask_ai_paste_clipboard_images_and_files_preserves_text_paste(cx: &mut crate::
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
+
+#[crate::test]
+fn ask_ai_long_error_banner_splits_and_dismisses(cx: &mut crate::TestAppContext) {
+    use crate::components::ai::ask_ai::split_alert_message;
+    use crate::components::ai::{AskAi, AskAiState};
+    use crate::prelude::*;
+
+    let (title, detail) = split_alert_message(
+        "The request failed. Check your API key, model name, endpoint URL, and MCP servers. (model attempted to call unknown tool `foo`. Available tools: [\"a\", \"b\"])",
+    );
+    assert_eq!(
+        title.as_ref(),
+        "The request failed. Check your API key, model name, endpoint URL, and MCP servers."
+    );
+    assert_eq!(
+        detail.as_deref(),
+        Some("model attempted to call unknown tool `foo`. Available tools: [\"a\", \"b\"]")
+    );
+
+    let (short_title, short_detail) = split_alert_message("You can attach up to 4 images.");
+    assert_eq!(short_title.as_ref(), "You can attach up to 4 images.");
+    assert!(short_detail.is_none());
+
+    cx.update(|cx| {
+        crate::components::init_components(cx);
+    });
+
+    struct Host {
+        ai: crate::Entity<AskAiState>,
+    }
+    impl crate::Render for Host {
+        fn render(
+            &mut self,
+            _window: &mut crate::Window,
+            _cx: &mut crate::Context<Self>,
+        ) -> impl IntoElement {
+            crate::div().size_full().child(AskAi::new(&self.ai))
+        }
+    }
+
+    let (view, vcx) = cx.add_window_view(|_window, cx| {
+        let ai = cx.new(|cx| AskAiState::build_with_ai(cx));
+        Host { ai }
+    });
+    let ai_entity = view.read_with(vcx, |h, _| h.ai.clone());
+    vcx.run_until_parked();
+
+    let huge_err = format!(
+        "The request failed. Check your API key, model name, endpoint URL, and MCP servers. ({})",
+        "tool_name ".repeat(120)
+    );
+    ai_entity.update(vcx, |ai, cx| ai.set_error_for_test(huge_err, cx));
+    vcx.run_until_parked();
+    assert!(ai_entity.read_with(vcx, |ai, _| ai.error().is_some()));
+
+    ai_entity.update(vcx, |ai, cx| ai.dismiss_error(cx));
+    vcx.run_until_parked();
+    assert!(ai_entity.read_with(vcx, |ai, _| ai.error().is_none()));
+}
