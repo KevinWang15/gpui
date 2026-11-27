@@ -177,6 +177,24 @@ fn is_color_light(color: &Color) -> bool {
     ((5 * color.G as u32) + (2 * color.R as u32) + color.B as u32) > (8 * 128)
 }
 
+pub(crate) const DISABLE_RDP_RECOVERY: &str = "GPUI_DISABLE_RDP_RECOVERY";
+
+fn parse_env_flag(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed == "1" || trimmed.eq_ignore_ascii_case("true")
+}
+
+/// Returns true when `GPUI_DISABLE_RDP_RECOVERY` is set to `"1"` or `"true"` (case-insensitive).
+/// Defaults to `false` (RDP session, live monitor DPI, and topmost recovery enabled).
+pub(crate) fn rdp_recovery_disabled() -> bool {
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| {
+        std::env::var(DISABLE_RDP_RECOVERY)
+            .ok()
+            .is_some_and(|v| parse_env_flag(&v))
+    })
+}
+
 pub(crate) fn with_dll_library<R, F>(dll_name: PCSTR, f: F) -> Result<R>
 where
     F: FnOnce(HMODULE) -> Result<R>,
@@ -191,4 +209,20 @@ where
             .log_err();
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_env_flag;
+
+    #[test]
+    fn parse_env_flag_defaults_false_and_accepts_one_or_true() {
+        assert!(parse_env_flag("1"));
+        assert!(parse_env_flag(" 1 "));
+        assert!(parse_env_flag("true"));
+        assert!(parse_env_flag("TRUE"));
+        assert!(!parse_env_flag(""));
+        assert!(!parse_env_flag("0"));
+        assert!(!parse_env_flag("false"));
+    }
 }

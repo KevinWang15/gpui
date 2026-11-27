@@ -463,7 +463,9 @@ impl WindowsPlatform {
         *self.inner.state.directx_devices.borrow_mut() = Some(devices);
         // Always subscribe to session notifications for windowed apps so RDP/console
         // reconnects reconcile displays, DPI, always-on-top state, and GPU/WinRT surfaces.
-        self.ensure_session_notification_registered();
+        if !rdp_recovery_disabled() {
+            self.ensure_session_notification_registered();
+        }
         self.begin_vsync_thread();
         Ok(())
     }
@@ -1770,17 +1772,22 @@ impl WindowsPlatformInner {
                         );
                     })
                     .detach();
-                self.reconcile_all_windows();
-                unsafe {
-                    let _ = SetTimer(
-                        Some(handle),
-                        SESSION_SETTLE_TIMER_ID,
-                        SESSION_SETTLE_DELAY_MS,
-                        None,
-                    );
+                if !rdp_recovery_disabled() {
+                    self.reconcile_all_windows();
+                    unsafe {
+                        let _ = SetTimer(
+                            Some(handle),
+                            SESSION_SETTLE_TIMER_ID,
+                            SESSION_SETTLE_DELAY_MS,
+                            None,
+                        );
+                    }
                 }
             }
             SessionChangeAction::Reconnect => {
+                if rdp_recovery_disabled() {
+                    return Some(0);
+                }
                 log::info!(
                     "Windows session reconnected (code={code}); reconciling displays, DPI, and GPU devices"
                 );

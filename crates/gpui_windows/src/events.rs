@@ -325,7 +325,7 @@ impl WindowsWindowInner {
     }
 
     pub(crate) fn restore_always_on_top_if_needed(&self, handle: HWND) {
-        if !unsafe { IsWindow(Some(handle)) }.as_bool() {
+        if rdp_recovery_disabled() || !unsafe { IsWindow(Some(handle)) }.as_bool() {
             return;
         }
         let is_visible = unsafe { IsWindowVisible(handle) }.as_bool();
@@ -1135,6 +1135,14 @@ impl WindowsWindowInner {
         // Also arm a coalescing settle timer because RDP dynamic scaling (`MS-RDPEDISP`)
         // frequently finalizes monitor DPI after the initial `WM_DISPLAYCHANGE`.
         let this = self.clone();
+        if rdp_recovery_disabled() {
+            self.executor
+                .spawn(async move {
+                    this.sync_dpi_and_size(handle);
+                })
+                .detach();
+            return Some(0);
+        }
         self.executor
             .spawn(async move {
                 this.reconcile_after_display_or_session_change(handle);
@@ -2061,6 +2069,9 @@ fn resolve_live_scale_factor(
 }
 
 fn live_window_scale_factor(handle: HWND) -> Option<f32> {
+    if rdp_recovery_disabled() {
+        return scale_factor_from_dpi(unsafe { GetDpiForWindow(handle) });
+    }
     let is_iconic = unsafe { IsIconic(handle) }.as_bool();
     let monitor_scale = if is_iconic {
         None

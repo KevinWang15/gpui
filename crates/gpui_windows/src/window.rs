@@ -850,7 +850,7 @@ impl PlatformWindow for WindowsWindow {
                         } else {
                             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
                         }
-                        if always_on_top {
+                        if always_on_top && !rdp_recovery_disabled() {
                             let _ = SetWindowPos(
                                 hwnd,
                                 Some(HWND_TOPMOST),
