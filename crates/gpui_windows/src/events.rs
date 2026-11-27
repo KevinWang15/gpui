@@ -30,6 +30,8 @@ pub(crate) const WM_GPUI_GPU_DEVICE_LOST: u32 = WM_USER + 7;
 pub(crate) const WM_GPUI_DISPLAYS_CHANGED: u32 = WM_USER + 10;
 
 const SIZE_MOVE_LOOP_TIMER_ID: usize = 1;
+const DISPLAY_SETTLE_TIMER_ID: usize = 2;
+const DISPLAY_SETTLE_DELAY_MS: u32 = 600;
 
 /// Coordinates window draws on the UI thread. Owned by the platform and
 /// shared with every window (like `WindowsPlatformState::cursor_visible`),
@@ -280,8 +282,7 @@ impl WindowsWindowInner {
     }
 
     fn sync_scale_factor(&self, handle: HWND) -> (f32, bool) {
-        let dpi = unsafe { GetDpiForWindow(handle) };
-        if let Some(new_scale_factor) = scale_factor_from_dpi(dpi) {
+        if let Some(new_scale_factor) = live_window_scale_factor(handle) {
             if (self.state.scale_factor.get() - new_scale_factor).abs() > f32::EPSILON {
                 self.apply_scale_factor(handle, new_scale_factor);
                 return (new_scale_factor, true);
@@ -321,6 +322,71 @@ impl WindowsWindowInner {
         }
         let (scale_factor, scale_changed) = self.sync_scale_factor(handle);
         self.reconcile_client_size(handle, scale_factor, scale_changed);
+    }
+
+    pub(crate) fn restore_always_on_top_if_needed(&self, handle: HWND) {
+        if !unsafe { IsWindow(Some(handle)) }.as_bool() {
+            return;
+        }
+        let is_visible = unsafe { IsWindowVisible(handle) }.as_bool();
+        let is_iconic = unsafe { IsIconic(handle) }.as_bool();
+        let ex_style = unsafe { get_window_long(handle, GWL_EXSTYLE) } as u32;
+        let has_ws_ex_topmost = (ex_style & WS_EX_TOPMOST.0) != 0;
+        if needs_topmost_reassert(
+            self.state.always_on_top.get(),
+            is_visible,
+            is_iconic,
+            has_ws_ex_topmost,
+        ) {
+            log::info!("Restoring stripped WS_EX_TOPMOST on window {handle:?}");
+            unsafe {
+                SetWindowPos(
+                    handle,
+                    Some(HWND_TOPMOST),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                )
+                .log_err();
+            }
+        }
+    }
+
+    /// Re-syncs the active monitor, live DPI scale factor, swapchain size, and
+    /// `WS_EX_TOPMOST` after display topology or RDP session changes.
+    pub(crate) fn reconcile_after_display_or_session_change(self: &Rc<Self>, handle: HWND) {
+        if !unsafe { IsWindow(Some(handle)) }.as_bool() {
+            return;
+        }
+        if !unsafe { IsIconic(handle) }.as_bool() {
+            let mut new_monitor = unsafe { MonitorFromWindow(handle, MONITOR_DEFAULTTONULL) };
+            if new_monitor.is_invalid() {
+                new_monitor = unsafe { MonitorFromWindow(handle, MONITOR_DEFAULTTONEAREST) };
+            }
+            let new_display = (!new_monitor.is_invalid())
+                .then(|| WindowsDisplay::new(WindowsDisplay::display_id_for_monitor(new_monitor)))
+                .flatten()
+                .or_else(WindowsDisplay::primary_monitor);
+            if let Some(new_display) = new_display
+                && !self.state.display.get().same_metrics(&new_display)
+            {
+                self.set_display(new_display);
+            }
+        }
+        if self.state.draw_coordinator.is_drawing() {
+            let this = self.clone();
+            self.executor
+                .spawn(async move {
+                    this.sync_dpi_and_size(handle);
+                    this.restore_always_on_top_if_needed(handle);
+                })
+                .detach();
+        } else {
+            self.sync_dpi_and_size(handle);
+            self.restore_always_on_top_if_needed(handle);
+        }
     }
 
     fn handle_size_change(
@@ -371,13 +437,24 @@ impl WindowsWindowInner {
         None
     }
 
-    fn handle_timer_msg(&self, handle: HWND, wparam: WPARAM) -> Option<isize> {
+    fn handle_timer_msg(self: &Rc<Self>, handle: HWND, wparam: WPARAM) -> Option<isize> {
         if wparam.0 == SIZE_MOVE_LOOP_TIMER_ID {
             let mut runnables = self.main_receiver.clone().try_iter();
             while let Some(Ok(runnable)) = runnables.next() {
                 WindowsDispatcher::execute_runnable(runnable);
             }
             self.handle_paint_msg(handle)
+        } else if wparam.0 == DISPLAY_SETTLE_TIMER_ID {
+            unsafe {
+                KillTimer(Some(handle), DISPLAY_SETTLE_TIMER_ID).log_err();
+            }
+            let this = self.clone();
+            self.executor
+                .spawn(async move {
+                    this.reconcile_after_display_or_session_change(handle);
+                })
+                .detach();
+            Some(0)
         } else {
             None
         }
@@ -1053,14 +1130,24 @@ impl WindowsWindowInner {
             return None;
         };
         self.set_display(new_display);
-        // Defer DPI/size reconciliation just like `set_display` so it never collides
-        // with an active GPUI update if `WM_DISPLAYCHANGE` arrived synchronously.
+        // Defer DPI/size and topmost reconciliation just like `set_display` so it never
+        // collides with an active GPUI update if `WM_DISPLAYCHANGE` arrived synchronously.
+        // Also arm a coalescing settle timer because RDP dynamic scaling (`MS-RDPEDISP`)
+        // frequently finalizes monitor DPI after the initial `WM_DISPLAYCHANGE`.
         let this = self.clone();
         self.executor
             .spawn(async move {
-                this.sync_dpi_and_size(handle);
+                this.reconcile_after_display_or_session_change(handle);
             })
             .detach();
+        unsafe {
+            let _ = SetTimer(
+                Some(handle),
+                DISPLAY_SETTLE_TIMER_ID,
+                DISPLAY_SETTLE_DELAY_MS,
+                None,
+            );
+        }
         Some(0)
     }
 
@@ -1397,17 +1484,19 @@ impl WindowsWindowInner {
     ) -> Option<isize> {
         self.report_visibility();
         if wparam.0 == 1 {
-            // Re-sync DPI and client size before painting: Windows may skip or
-            // defer `WM_DPICHANGED` while a window is hidden (`SW_HIDE`).
+            // Re-sync DPI, client size, and topmost state before painting: Windows may skip
+            // or defer `WM_DPICHANGED` (or strip `WS_EX_TOPMOST`) while hidden or during RDP.
             if self.state.draw_coordinator.is_drawing() {
                 let this = self.clone();
                 self.executor
                     .spawn(async move {
                         this.sync_dpi_and_size(handle);
+                        this.restore_always_on_top_if_needed(handle);
                     })
                     .detach();
             } else {
                 self.sync_dpi_and_size(handle);
+                self.restore_always_on_top_if_needed(handle);
             }
             self.draw_window(handle, false);
         }
@@ -1956,6 +2045,44 @@ fn scale_factor_from_dpi(dpi: u32) -> Option<f32> {
     (dpi > 0).then(|| dpi as f32 / USER_DEFAULT_SCREEN_DPI as f32)
 }
 
+fn resolve_live_scale_factor(
+    monitor_scale: Option<f32>,
+    window_dpi: u32,
+    is_iconic: bool,
+) -> Option<f32> {
+    if !is_iconic
+        && let Some(scale) = monitor_scale
+        && scale.is_finite()
+        && scale > 0.0
+    {
+        return Some(scale);
+    }
+    scale_factor_from_dpi(window_dpi)
+}
+
+fn live_window_scale_factor(handle: HWND) -> Option<f32> {
+    let is_iconic = unsafe { IsIconic(handle) }.as_bool();
+    let monitor_scale = if is_iconic {
+        None
+    } else {
+        let monitor = unsafe { MonitorFromWindow(handle, MONITOR_DEFAULTTONEAREST) };
+        (!monitor.is_invalid())
+            .then(|| get_scale_factor_for_monitor(monitor).ok())
+            .flatten()
+    };
+    let window_dpi = unsafe { GetDpiForWindow(handle) };
+    resolve_live_scale_factor(monitor_scale, window_dpi, is_iconic)
+}
+
+fn needs_topmost_reassert(
+    want_topmost: bool,
+    is_visible: bool,
+    is_iconic: bool,
+    has_ws_ex_topmost: bool,
+) -> bool {
+    want_topmost && is_visible && !is_iconic && !has_ws_ex_topmost
+}
+
 fn client_device_size(handle: HWND) -> Option<Size<DevicePixels>> {
     if unsafe { IsIconic(handle) }.as_bool() {
         return None;
@@ -2007,7 +2134,10 @@ fn notify_frame_changed(handle: HWND) {
 
 #[cfg(test)]
 mod tests {
-    use super::{needs_size_reconciliation, scale_factor_from_dpi};
+    use super::{
+        needs_size_reconciliation, needs_topmost_reassert, resolve_live_scale_factor,
+        scale_factor_from_dpi,
+    };
     use gpui::{DevicePixels, px, size};
 
     #[test]
@@ -2016,6 +2146,29 @@ mod tests {
         assert_eq!(scale_factor_from_dpi(96), Some(1.0));
         assert_eq!(scale_factor_from_dpi(120), Some(1.25));
         assert_eq!(scale_factor_from_dpi(144), Some(1.5));
+    }
+
+    #[test]
+    fn live_scale_factor_prefers_monitor_dpi_unless_iconic() {
+        // When Windows skips WM_DPICHANGED during RDP, GetDpiForWindow can stay stuck at 200%
+        // while the active monitor is 100%; prefer the live monitor scale when not minimized.
+        assert_eq!(resolve_live_scale_factor(Some(1.0), 192, false), Some(1.0));
+        assert_eq!(resolve_live_scale_factor(Some(2.0), 96, false), Some(2.0));
+        // Minimized windows sit at (-32000, -32000), so fall back to GetDpiForWindow.
+        assert_eq!(resolve_live_scale_factor(Some(1.0), 192, true), Some(2.0));
+        // Invalid/missing monitor DPI falls back cleanly to GetDpiForWindow.
+        assert_eq!(resolve_live_scale_factor(None, 144, false), Some(1.5));
+        assert_eq!(resolve_live_scale_factor(Some(0.0), 144, false), Some(1.5));
+        assert_eq!(resolve_live_scale_factor(Some(f32::NAN), 96, false), Some(1.0));
+    }
+
+    #[test]
+    fn topmost_reassert_only_runs_when_visible_and_stripped() {
+        assert!(needs_topmost_reassert(true, true, false, false));
+        assert!(!needs_topmost_reassert(true, true, false, true));
+        assert!(!needs_topmost_reassert(false, true, false, false));
+        assert!(!needs_topmost_reassert(true, false, false, false));
+        assert!(!needs_topmost_reassert(true, true, true, false));
     }
 
     #[test]

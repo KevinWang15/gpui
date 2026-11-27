@@ -142,6 +142,13 @@ impl WindowsDisplay {
         self.physical_bounds
     }
 
+    pub(crate) fn same_metrics(&self, other: &Self) -> bool {
+        self.handle == other.handle
+            && self.physical_bounds == other.physical_bounds
+            && self.physical_work_area == other.physical_work_area
+            && (self.scale_factor - other.scale_factor).abs() <= f32::EPSILON
+    }
+
     pub fn monitor_at_point(x: i32, y: i32) -> Option<Self> {
         let monitor = unsafe {
             MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST)
@@ -265,7 +272,7 @@ fn generate_uuid(device_name: &[u16]) -> Uuid {
     Uuid::new_v5(&Uuid::NAMESPACE_DNS, &name)
 }
 
-fn get_scale_factor_for_monitor(monitor: HMONITOR) -> Result<f32> {
+pub(crate) fn get_scale_factor_for_monitor(monitor: HMONITOR) -> Result<f32> {
     let mut dpi_x = 0;
     let mut dpi_y = 0;
     unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) }?;

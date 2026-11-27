@@ -510,6 +510,9 @@ impl DirectXRenderer {
         self.pipelines = pipelines;
         self.direct_composition = direct_composition;
         self.backdrop_applied_size = (0, 0);
+        if matches!(self.direct_composition, Some(DirectComposition::WinRt(_))) {
+            set_dwm_host_backdrop(self.hwnd, self.backdrop_blur_enabled);
+        }
         self.sync_backdrop(self.backdrop_blur_enabled, self.backdrop_radius_px);
         self.skip_draws = true;
         Ok(())

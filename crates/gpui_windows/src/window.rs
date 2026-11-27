@@ -55,6 +55,7 @@ pub struct WindowsWindowState {
     pub background_appearance: Cell<WindowBackgroundAppearance>,
     pub backdrop_corner_radius: Cell<Pixels>,
     pub backdrop_blur_radius: Cell<Pixels>,
+    pub always_on_top: Cell<bool>,
     pub non_activating: Cell<bool>,
     pub scale_factor: Cell<f32>,
     pub restore_from_minimized: Cell<Option<Box<dyn FnMut(RequestFrameOptions)>>>,
@@ -130,6 +131,7 @@ impl WindowsWindowState {
         disable_direct_composition: bool,
         invalidate_devices: Arc<AtomicBool>,
         draw_coordinator: Rc<DrawCoordinator>,
+        always_on_top: bool,
         non_activating: bool,
     ) -> Result<Self> {
         let scale_factor = {
@@ -176,6 +178,7 @@ impl WindowsWindowState {
             background_appearance: Cell::new(WindowBackgroundAppearance::Opaque),
             backdrop_corner_radius: Cell::new(px(0.)),
             backdrop_blur_radius: Cell::new(px(DEFAULT_HOST_BLUR_SIGMA)),
+            always_on_top: Cell::new(always_on_top),
             non_activating: Cell::new(non_activating),
             scale_factor: Cell::new(scale_factor),
             restore_from_minimized: Cell::new(restore_from_minimized),
@@ -293,6 +296,7 @@ impl WindowsWindowInner {
             context.disable_direct_composition,
             context.invalidate_devices.clone(),
             context.draw_coordinator.clone(),
+            context.always_on_top,
             context.non_activating,
         )?;
 
@@ -446,6 +450,7 @@ struct WindowCreateContext {
     invalidate_devices: Arc<AtomicBool>,
     draw_coordinator: Rc<DrawCoordinator>,
     parent_hwnd: Option<HWND>,
+    always_on_top: bool,
     non_activating: bool,
 }
 
@@ -575,6 +580,7 @@ impl WindowsWindow {
             invalidate_devices,
             draw_coordinator,
             parent_hwnd,
+            always_on_top: params.always_on_top || params.kind == WindowKind::PopUp,
             non_activating: params.non_activating,
         };
         let creation_result = unsafe {
@@ -796,6 +802,9 @@ impl PlatformWindow for WindowsWindow {
         always_on_top: Option<bool>,
     ) -> bool {
         self.state.initial_placement.take();
+        if let Some(on_top) = always_on_top {
+            self.state.always_on_top.set(on_top);
+        }
         let rect = calculate_window_rect(bounds, &self.state.border_offset);
         let hwnd = self.0.hwnd;
         self.0
@@ -830,6 +839,7 @@ impl PlatformWindow for WindowsWindow {
         }
         let hwnd = self.0.hwnd;
         let non_activating = self.state.non_activating.get();
+        let always_on_top = self.state.always_on_top.get();
         self.0
             .executor
             .spawn(async move {
@@ -839,6 +849,17 @@ impl PlatformWindow for WindowsWindow {
                             bring_hwnd_to_front(hwnd);
                         } else {
                             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                        }
+                        if always_on_top {
+                            let _ = SetWindowPos(
+                                hwnd,
+                                Some(HWND_TOPMOST),
+                                0,
+                                0,
+                                0,
+                                0,
+                                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                            );
                         }
                     } else {
                         let _ = ShowWindow(hwnd, SW_HIDE);
@@ -901,6 +922,7 @@ impl PlatformWindow for WindowsWindow {
     }
 
     fn set_always_on_top(&self, always_on_top: bool) {
+        self.state.always_on_top.set(always_on_top);
         let hwnd = self.0.hwnd;
         self.0
             .executor

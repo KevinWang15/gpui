@@ -82,10 +82,33 @@ pub struct WindowsPlatform {
 struct WindowsPlatformInner {
     state: WindowsPlatformState,
     raw_window_handles: std::sync::Weak<RwLock<SmallVec<[TrackedWindow; 4]>>>,
+    invalidate_devices: Arc<AtomicBool>,
     // The below members will never change throughout the entire lifecycle of the app.
     validation_number: usize,
     main_receiver: PriorityQueueReceiver<RunnableVariant>,
     dispatcher: Arc<WindowsDispatcher>,
+}
+
+const SESSION_SETTLE_TIMER_ID: usize = 1;
+const SESSION_SETTLE_FOLLOWUP_TIMER_ID: usize = 2;
+const SESSION_SETTLE_DELAY_MS: u32 = 500;
+const SESSION_SETTLE_FOLLOWUP_DELAY_MS: u32 = 1500;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionChangeAction {
+    Lock,
+    Unlock,
+    Reconnect,
+    Ignore,
+}
+
+fn session_change_action(code: u32) -> SessionChangeAction {
+    match code {
+        WTS_SESSION_LOCK => SessionChangeAction::Lock,
+        WTS_SESSION_UNLOCK => SessionChangeAction::Unlock,
+        WTS_REMOTE_CONNECT | WTS_CONSOLE_CONNECT => SessionChangeAction::Reconnect,
+        _ => SessionChangeAction::Ignore,
+    }
 }
 
 pub(crate) struct WindowsPlatformState {
@@ -212,11 +235,13 @@ impl WindowsPlatform {
             rand::random::<u32>() as usize
         };
         let raw_window_handles = Arc::new(RwLock::new(SmallVec::new()));
+        let invalidate_devices = Arc::new(AtomicBool::new(false));
 
         register_platform_window_class();
         let mut context = PlatformWindowCreateContext {
             inner: None,
             raw_window_handles: Arc::downgrade(&raw_window_handles),
+            invalidate_devices: invalidate_devices.clone(),
             validation_number,
             main_sender: Some(main_sender),
             main_receiver: Some(main_receiver),
@@ -295,7 +320,7 @@ impl WindowsPlatform {
             disable_direct_composition,
             has_package_identity: has_package_identity(),
             drop_target_helper,
-            invalidate_devices: Arc::new(AtomicBool::new(false)),
+            invalidate_devices,
             app_identity: RefCell::new(None),
             system_notifications: RefCell::new(SystemNotificationState::new()),
             session_notification_registered: Cell::new(false),
@@ -436,6 +461,9 @@ impl WindowsPlatform {
     fn attach_gpu(&self) -> Result<()> {
         let devices = DirectXDevices::new().context("Creating DirectX devices")?;
         *self.inner.state.directx_devices.borrow_mut() = Some(devices);
+        // Always subscribe to session notifications for windowed apps so RDP/console
+        // reconnects reconcile displays, DPI, always-on-top state, and GPU/WinRT surfaces.
+        self.ensure_session_notification_registered();
         self.begin_vsync_thread();
         Ok(())
     }
@@ -1338,6 +1366,7 @@ impl WindowsPlatformInner {
         Ok(Rc::new(Self {
             state,
             raw_window_handles: context.raw_window_handles.clone(),
+            invalidate_devices: context.invalidate_devices.clone(),
             dispatcher: context
                 .dispatcher
                 .as_ref()
@@ -1398,7 +1427,8 @@ impl WindowsPlatformInner {
             | WM_GPUI_GPU_DEVICE_LOST => self.handle_gpui_events(msg, wparam, lparam),
             WM_HOTKEY => self.handle_hotkey_msg(wparam),
             WM_GPUI_TRAY_EVENT => self.handle_tray_msg(handle, lparam),
-            WM_WTSSESSION_CHANGE => self.handle_session_change_msg(wparam),
+            WM_WTSSESSION_CHANGE => self.handle_session_change_msg(handle, wparam),
+            WM_TIMER => self.handle_timer_msg(handle, wparam),
             WM_POWERBROADCAST => self.handle_power_broadcast(wparam, lparam),
             WM_DISPLAYCHANGE => self.handle_display_change(handle),
             WM_QUERYENDSESSION => Some(1),
@@ -1678,29 +1708,108 @@ impl WindowsPlatformInner {
         Some(0)
     }
 
-    fn handle_session_change_msg(self: &Rc<Self>, wparam: WPARAM) -> Option<isize> {
-        let code = wparam.0 as u32;
-        let is_lock = match code {
-            WTS_SESSION_LOCK => true,
-            WTS_SESSION_UNLOCK => false,
-            _ => return Some(0),
+    fn reconcile_all_windows(self: &Rc<Self>) {
+        let Some(all_windows) = self.raw_window_handles.upgrade() else {
+            return;
         };
+        let hwnds: SmallVec<[SafeHwnd; 4]> = all_windows.read().iter().map(|w| w.handle).collect();
+        if hwnds.is_empty() {
+            return;
+        }
         let this = Rc::clone(self);
         ForegroundExecutor::new(self.dispatcher.clone())
             .spawn(async move {
-                if is_lock {
-                    this.with_callback(
-                        |callbacks| &callbacks.session_lock,
-                        |callback| callback(),
-                    );
-                } else {
-                    this.with_callback(
-                        |callbacks| &callbacks.session_unlock,
-                        |callback| callback(),
-                    );
+                for hwnd in hwnds {
+                    let raw = hwnd.as_raw();
+                    if let Some(window) = this.window_from_hwnd(raw) {
+                        window.reconcile_after_display_or_session_change(raw);
+                    }
                 }
             })
             .detach();
+    }
+
+    fn handle_timer_msg(self: &Rc<Self>, handle: HWND, wparam: WPARAM) -> Option<isize> {
+        if wparam.0 == SESSION_SETTLE_TIMER_ID || wparam.0 == SESSION_SETTLE_FOLLOWUP_TIMER_ID {
+            unsafe {
+                KillTimer(Some(handle), wparam.0).log_err();
+            }
+            self.handle_display_change(handle);
+            self.reconcile_all_windows();
+            Some(0)
+        } else {
+            None
+        }
+    }
+
+    fn handle_session_change_msg(
+        self: &Rc<Self>,
+        handle: HWND,
+        wparam: WPARAM,
+    ) -> Option<isize> {
+        let code = wparam.0 as u32;
+        match session_change_action(code) {
+            SessionChangeAction::Lock => {
+                let this = Rc::clone(self);
+                ForegroundExecutor::new(self.dispatcher.clone())
+                    .spawn(async move {
+                        this.with_callback(
+                            |callbacks| &callbacks.session_lock,
+                            |callback| callback(),
+                        );
+                    })
+                    .detach();
+            }
+            SessionChangeAction::Unlock => {
+                let this = Rc::clone(self);
+                ForegroundExecutor::new(self.dispatcher.clone())
+                    .spawn(async move {
+                        this.with_callback(
+                            |callbacks| &callbacks.session_unlock,
+                            |callback| callback(),
+                        );
+                    })
+                    .detach();
+                self.reconcile_all_windows();
+                unsafe {
+                    let _ = SetTimer(
+                        Some(handle),
+                        SESSION_SETTLE_TIMER_ID,
+                        SESSION_SETTLE_DELAY_MS,
+                        None,
+                    );
+                }
+            }
+            SessionChangeAction::Reconnect => {
+                log::info!(
+                    "Windows session reconnected (code={code}); reconciling displays, DPI, and GPU devices"
+                );
+                if self.state.directx_devices.borrow().is_some() {
+                    // Proactively rebuild DirectX & WinRT DesktopWindowTarget composition on
+                    // RDP/console adapter switches, even when D3D11 does not report DEVICE_REMOVED.
+                    self.invalidate_devices.store(true, Ordering::Release);
+                }
+                self.handle_display_change(handle);
+                self.reconcile_all_windows();
+                // RDP dynamic display scaling (`MS-RDPEDISP`) and DWM/Explorer topmost
+                // restoration frequently settle 300-1500ms after `WTS_REMOTE_CONNECT`.
+                unsafe {
+                    let _ = SetTimer(
+                        Some(handle),
+                        SESSION_SETTLE_TIMER_ID,
+                        SESSION_SETTLE_DELAY_MS,
+                        None,
+                    );
+                    let _ = SetTimer(
+                        Some(handle),
+                        SESSION_SETTLE_FOLLOWUP_TIMER_ID,
+                        SESSION_SETTLE_FOLLOWUP_DELAY_MS,
+                        None,
+                    );
+                }
+            }
+            SessionChangeAction::Ignore => {}
+        }
         Some(0)
     }
 }
@@ -1771,6 +1880,7 @@ pub(crate) struct WindowCreationInfo {
 struct PlatformWindowCreateContext {
     inner: Option<Result<Rc<WindowsPlatformInner>>>,
     raw_window_handles: std::sync::Weak<RwLock<SmallVec<[TrackedWindow; 4]>>>,
+    invalidate_devices: Arc<AtomicBool>,
     validation_number: usize,
     main_sender: Option<PriorityQueueSender<RunnableVariant>>,
     main_receiver: Option<PriorityQueueReceiver<RunnableVariant>>,
@@ -2405,6 +2515,31 @@ mod tests {
         unsafe { CredFree(credentials as *const _ as _) };
         unsafe { CredDeleteW(target_name, CRED_TYPE_GENERIC, None) }.unwrap();
         result.unwrap()
+    }
+
+    #[test]
+    fn test_session_change_action_classification() {
+        use super::{
+            SessionChangeAction, WTS_CONSOLE_CONNECT, WTS_REMOTE_CONNECT, WTS_REMOTE_DISCONNECT,
+            WTS_SESSION_LOCK, WTS_SESSION_UNLOCK, session_change_action,
+        };
+        assert_eq!(session_change_action(WTS_SESSION_LOCK), SessionChangeAction::Lock);
+        assert_eq!(
+            session_change_action(WTS_SESSION_UNLOCK),
+            SessionChangeAction::Unlock
+        );
+        assert_eq!(
+            session_change_action(WTS_REMOTE_CONNECT),
+            SessionChangeAction::Reconnect
+        );
+        assert_eq!(
+            session_change_action(WTS_CONSOLE_CONNECT),
+            SessionChangeAction::Reconnect
+        );
+        assert_eq!(
+            session_change_action(WTS_REMOTE_DISCONNECT),
+            SessionChangeAction::Ignore
+        );
     }
 
     #[test]
